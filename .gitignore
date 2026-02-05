@@ -1,0 +1,15 @@
+# OS / editor noise
+*.swp
+*.bak
+*~
+.DS_Store
+
+# Python cache (future-proofing)
+__pycache__/
+*.pyc
+
+# Logs
+*.log
+
+# Never commit local build artifacts
+*.tmp
