@@ -61,9 +61,9 @@ mkdir -p ~/DayZLinuxLauncher
 cd ~/DayZLinuxLauncher
 
 # Replace with your actual file path
-tar -xzf ~/Downloads/dzll_launcher.tar.gz
+tar -xzf ~/Downloads/dzll-launcher-v0.1.0-beta.tar.gz
 
-cd dzll_launcher
+cd dzll-launcher-v0.1.0-beta
 ```
 
 ---
@@ -83,7 +83,7 @@ source .venv/bin/activate
 
 ```bash
 python -m pip install --upgrade pip setuptools wheel
-python -m pip install requests python-a2s pypresence
+python -m pip install -r requirements.txt
 ```
 
 ---
@@ -168,11 +168,31 @@ tar -xzf steamcmd_linux.tar.gz
 chmod +x steamcmd.sh
 ```
 
-### Test it:
+**Do NOT install SteamCMD into random folders — use the path above exactly.**
+
+### Test it
 
 ```bash
 ~/.local/share/steamcmd/steamcmd.sh +quit
 ```
+
+If it prints SteamCMD info and exits without errors, it is working.
+
+---
+
+### 🧠 Important Notes
+
+- This installs SteamCMD locally (this is the correct location)
+- DZLL will auto-detect this path:
+
+```bash
+~/.local/share/steamcmd/steamcmd.sh
+```
+
+- You do **NOT** need to manually enter it unless detection fails
+
+**IMPORTANT:**  
+DZLL does **not** store your Steam password at all.
 
 ---
 
@@ -189,15 +209,15 @@ python -m dzll_launcher
 
 When DZLL opens:
 
-- Do NOT change settings yet  
-- Just try joining a server  
+- Do **NOT** change settings yet
+- Just try joining a server first
 
 DZLL should:
 
-- auto-detect SteamCMD  
-- auto-detect workshop directory  
-- download mods  
-- launch DayZ  
+- auto-detect SteamCMD
+- auto-detect workshop directory
+- download mods
+- launch DayZ
 
 ---
 
@@ -205,11 +225,11 @@ DZLL should:
 
 When you click **Join**:
 
-1. Reads server mod list  
-2. Uses SteamCMD to download missing mods  
-3. Creates symlinks into DayZ Launcher watch folder  
-4. Updates preset (`dayz.defaultpreset2`)  
-5. Launches DayZ via Steam  
+1. Reads server mod list
+2. Uses SteamCMD to download missing mods
+3. Creates symlinks into DayZ Launcher watch folder
+4. Updates preset (`dayz.defaultpreset2`)
+5. Launches DayZ via Steam
 
 ---
 
@@ -221,40 +241,58 @@ When you click **Join**:
 ls ~/.local/share/steamcmd/steamcmd.sh
 ```
 
----
-
-### ❌ Mods not loading
-
-- Leave settings blank (autodetect)
-- Rejoin server
+If missing, reinstall SteamCMD.
 
 ---
 
-### ❌ GTK errors
+### ❌ Mods not loading / kicked from server
 
-Reinstall system packages
+Likely causes:
+
+- broken mod (DZLL should auto-fix)
+- workshop path wrong
+
+Try:
+
+- leave settings blank (use autodetect)
+- rejoin server
 
 ---
 
-### ❌ Python too old
+### ❌ GTK / gi import errors
+
+You likely missed system packages.
+
+Reinstall your distro section above.
+
+---
+
+### ❌ Python version too old
 
 ```bash
 python3 --version
 ```
 
-Must be 3.10+
+Must be **3.10+**
 
 ---
 
-### ❌ Steam launches but no server join
+### ❌ Steam launches but does not join server
 
-Launch DayZ once from Steam first
+Make sure DayZ has been launched at least once from Steam.
+
+This creates required launcher files DZLL depends on.
 
 ---
 
 ## 🧼 Resetting DZLL safely
 
-Resets settings only:
+DZLL Reset button:
+
+- resets settings only ✅
+- does **NOT** delete mods / SteamCMD / files ❌
+
+To fully wipe DZLL state manually:
 
 ```bash
 rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
@@ -262,13 +300,14 @@ rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
 
 ---
 
-## 🧠 Project Layout
+## 🧠 Recommended Project Layout
 
-```bash
-dzll_launcher/
+```text
+dzll-launcher-v0.1.0-beta/
 ├── src/dzll_launcher/
 ├── pyproject.toml
 ├── README.md
+├── requirements.txt
 └── .venv/
 ```
 
@@ -276,6 +315,6 @@ dzll_launcher/
 
 ## 💬 Final Notes
 
-- Autodetect is preferred  
-- Do not manually set paths unless needed  
-- Reset is safe and non-destructive  
+- Leave SteamCMD + Workshop fields empty unless needed
+- Autodetect is preferred and safer
+- Reset is non-destructive and safe to use
