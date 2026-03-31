@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dzll_launcher"
+version = "0.1.0"
+description = "DZLL is a launcher application for Dayz using SteamCMD to handle mods for modded servers"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+
+dependencies = [
+# BEGIN AUTO-DEPS
+    "requests",
+    "pypresence",
+    "python-a2s",
+# END AUTO-DEPS
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+dzll_launcher = "dzll_launcher.__main__:main"

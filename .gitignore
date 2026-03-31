@@ -1,0 +1,98 @@
+# -------------------------
+# OS / Editor / IDE
+# -------------------------
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+
+.idea/
+.vscode/
+
+# -------------------------
+# Python / bytecode / caches
+# -------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.tox/
+.nox/
+
+# -------------------------
+# Virtual environments
+# -------------------------
+venv/
+.venv/
+ENV/
+env/
+
+# -------------------------
+# Packaging / build artifacts
+# -------------------------
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+.wheelhouse/
+vendor/
+
+# Setup Skeleton Files
+build-rpm.sh
+bump-version.sh
+update-deps.sh
+
+# RPM build outputs (common)
+*.rpm
+*.srpm
+rpmbuild/
+RPMBUILD/
+*.spec.rpmsave
+*.spec.rpmnew
+
+# AppImage / generic release artifacts
+*.AppImage
+*.deb
+*.tar.gz
+*.zip
+
+# -------------------------
+# Logs / temp
+# -------------------------
+*.log
+*.tmp
+*.temp
+
+# -------------------------
+# App local artifacts (DZLL)
+# -------------------------
+.db_hash
+
+# If you ever accidentally copy fetched artifacts into repo:
+data/dzll-servers.db
+data/blocklist.json
+
+# -------------------------
+# Tests (you want none in this repo)
+# -------------------------
+tests/
+
+# -------------------------
+# Coverage (just in case)
+# -------------------------
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# -------------------------
+# Optional local dev configs (uncomment if you use them)
+# -------------------------
+# .env
+# *.local
