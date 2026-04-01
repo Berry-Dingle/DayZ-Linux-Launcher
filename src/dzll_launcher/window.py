@@ -105,12 +105,18 @@ def ensure_user_desktop_integration(
     categories: str = "Game;",
 ) -> None:
     """
-    Best-effort desktop integration for "python-run/venv" usage:
-      - installs icon to ~/.local/share/icons/hicolor/256x256/apps/<name>.png
+    Best-effort desktop integration for source/venv usage via: python -m dzll_launcher
+
+    Behavior:
+      - installs icon to ~/.local/share/icons/hicolor/256x256/apps/dzll.png
       - creates ~/.local/share/applications/<app_id>.desktop
+      - launches via project venv python if available
+      - supports src-layout projects
+      - derives paths from the actual installed package location
+
     SAFETY:
-      - will NOT overwrite an existing desktop file unless it contains a DZLL marker.
-      - intended for non-packaged runs; packaged installs should ship their own .desktop/icon.
+      - will NOT overwrite an existing desktop file unless it contains the DZLL marker
+      - intended for non-packaged runs; packaged installs should ship their own .desktop/icon
     """
     try:
         home = Path.home()
@@ -122,28 +128,30 @@ def ensure_user_desktop_integration(
         # ----- icon -----
         icon_name = "dzll"
         icon_dst = user_icons / f"{icon_name}.png"
-        src = Path(icon_src_path)
+        src = Path(icon_src_path).expanduser().resolve()
 
         if src.is_file():
             need_copy = not icon_dst.exists()
             if not need_copy:
                 try:
-                    # If the source icon changed, refresh the installed one
-                    need_copy = (icon_dst.stat().st_size != src.stat().st_size)
+                    need_copy = (
+                        icon_dst.stat().st_size != src.stat().st_size
+                        or int(icon_dst.stat().st_mtime) != int(src.stat().st_mtime)
+                    )
                 except Exception:
                     need_copy = True
 
             if need_copy:
                 try:
                     shutil.copy2(src, icon_dst)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[DZLL] Failed to copy desktop icon: {e}")
 
         # ----- desktop entry -----
         desktop_path = user_apps / f"{app_id}.desktop"
         marker = "X-DZLL-AutoCreated=true"
 
-        # If it exists and wasn't created by us, do nothing (avoid clobbering RPM overrides).
+        # Do not overwrite non-DZLL desktop entries (e.g. packaged installs)
         if desktop_path.exists():
             try:
                 txt = desktop_path.read_text(encoding="utf-8", errors="replace")
@@ -152,33 +160,77 @@ def ensure_user_desktop_integration(
             except Exception:
                 return
 
-        # Exec: prefer "python <script>" for source runs.
-        # sys.executable points at venv python when run inside venv.
-        exe = sys.executable or "python3"
-        main_py = Path(__file__).resolve()
+        package_dir = Path(__file__).resolve().parent
 
-        # Quote paths safely
-        exec_line = f'"{exe}" "{main_py}"'
+        # src layout:
+        #   /some/path/project/src/dzll_launcher
+        # normal layout:
+        #   /some/path/project/dzll_launcher
+        if package_dir.parent.name == "src":
+            run_path = package_dir.parent  # .../project/src
+            project_root = run_path.parent  # .../project
+        else:
+            run_path = package_dir.parent  # .../project
+            project_root = run_path
 
-        desktop_txt = "\n".join([
-            "[Desktop Entry]",
-            "Type=Application",
-            f"Name={app_name}",
-            "Comment=Unofficial DayZ server browser and mod-aware launcher for Linux",
-            f"Exec={exec_line}",
-            f"Icon={icon_name}",
-            "Terminal=false",
-            f"Categories={categories}",
-            "StartupNotify=true",
-            marker,
-            "",
-        ])
+        # Prefer project-local venv python
+        venv_python = project_root / ".venv" / "bin" / "python3"
+        if venv_python.is_file():
+            python_exe = venv_python
+        else:
+            python_exe = Path(sys.executable) if sys.executable else Path("/usr/bin/python3")
 
-        desktop_path.write_text(desktop_txt, encoding="utf-8")
+        exec_line = f'"{python_exe}" -m dzll_launcher'
 
-    except Exception:
-        # fail-open; never block app startup
-        return
+        desktop_text = (
+            "[Desktop Entry]\n"
+            "Version=1.0\n"
+            "Type=Application\n"
+            f"Name={app_name}\n"
+            f"Comment={app_name}\n"
+            f"Exec={exec_line}\n"
+            f"Path={run_path}\n"
+            f"Icon={icon_name}\n"
+            "Terminal=false\n"
+            f"Categories={categories}\n"
+            "StartupNotify=true\n"
+            f"{marker}\n"
+        )
+
+        try:
+            old = ""
+            if desktop_path.exists():
+                old = desktop_path.read_text(encoding="utf-8", errors="replace")
+            if old != desktop_text:
+                desktop_path.write_text(desktop_text, encoding="utf-8")
+                os.chmod(desktop_path, 0o755)
+        except Exception as e:
+            print(f"[DZLL] Failed to write desktop entry: {e}")
+            return
+
+        # Refresh desktop/icon caches best-effort
+        try:
+            subprocess.run(
+                ["update-desktop-database", str(user_apps)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+
+        try:
+            subprocess.run(
+                ["gtk-update-icon-cache", "-f", "-t", str(home / ".local/share/icons/hicolor")],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"[DZLL] Desktop integration skipped: {e}")
 
 def fav_key(ip: str, gport: int) -> str:
     return f"{ip}:{int(gport)}"

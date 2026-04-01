@@ -8,7 +8,6 @@ from .ui_row import attach_pointer_cursor
 from gi.repository import Gtk, GLib, Pango
 
 from .steamcmd_mods import delete_single_mod
-from .ui_row import attach_pointer_cursor  # pointer hover helper
 
 APPID = "221100"
 
