@@ -1,6 +1,6 @@
 Name:           dzll_launcher
-Version:        0.1.0
-Release:        1%{?dist}
+Version:        0.2.0
+Release:        0.beta%{?dist}
 Summary:        DZLL is a launcher application for DayZ using SteamCMD to handle mods for modded servers
 
 License:        MIT
@@ -49,5 +49,5 @@ install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 %pytest
 
 %changelog
-* Tue Mar 31 2026 Gareth Brown - 0.1.0-1
+* Tue Mar 31 2026 Gareth Brown - 0.2.0-0.beta
 - Initial build

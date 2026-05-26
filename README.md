@@ -61,9 +61,9 @@ mkdir -p ~/DayZLinuxLauncher
 cd ~/DayZLinuxLauncher
 
 # Replace with your actual file path
-tar -xzf ~/Downloads/dzll-launcher-v0.1.0-beta.tar.gz
+tar -xzf ~/Downloads/dzll-launcher-v0.2.0-beta.tar.gz
 
-cd dzll-launcher-v0.1.0-beta
+cd dzll-launcher-v0.2.0-beta
 ```
 
 ---
@@ -105,7 +105,7 @@ python - <<'PY'
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
-import requests, a2s, pypresence
+import requests, pypresence
 print("✅ All dependencies OK")
 PY
 ```
@@ -303,7 +303,7 @@ rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
 ## 🧠 Recommended Project Layout
 
 ```text
-dzll-launcher-v0.1.0-beta/
+dzll-launcher-v0.2.0-beta/
 ├── src/dzll_launcher/
 ├── pyproject.toml
 ├── README.md

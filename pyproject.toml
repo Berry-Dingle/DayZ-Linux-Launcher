@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dzll_launcher"
-version = "0.1.0"
+version = "0.2.0b0"
 description = "DZLL is a launcher application for Dayz using SteamCMD to handle mods for modded servers"
 readme = "README.md"
 license = "MIT"
