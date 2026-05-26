@@ -2,4 +2,12 @@ include LICENSE
 include README.md
 include dzll_launcher.desktop
 include requirements.txt
+
 recursive-include src/dzll_launcher *
+
+recursive-exclude src/dzll_launcher __pycache__ *
+recursive-exclude src/dzll_launcher *.pyc
+recursive-exclude src/dzll_launcher *.pyo
+recursive-exclude src/dzll_launcher *.bak
+recursive-exclude src/dzll_launcher *.bak_*
+recursive-exclude src/dzll_launcher *~
