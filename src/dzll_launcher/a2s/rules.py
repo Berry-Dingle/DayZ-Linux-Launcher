@@ -1,10 +1,10 @@
 import io
 from typing import overload, Union
 
-from a2s.defaults import DEFAULT_TIMEOUT, DEFAULT_ENCODING
-from a2s.a2s_sync import request_sync
-from a2s.a2s_async import request_async
-from a2s.byteio import ByteReader
+from .defaults import DEFAULT_TIMEOUT, DEFAULT_ENCODING
+from .a2s_sync import request_sync
+from .a2s_async import request_async
+from .byteio import ByteReader
 
 
 

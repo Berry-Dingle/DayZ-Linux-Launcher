@@ -98,7 +98,7 @@ REFRESH_RATE_LIMIT_SECS = 1.0   # per-server
 # Logo (relative path for RPM safety)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(BASE_DIR, "images")
-LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
+LOGO_PATH = os.path.join(IMAGES_DIR, "logo2.png")
 
 DISCLAIMER_TEXT = (
     "DayZ® is a registered trademark of\n"

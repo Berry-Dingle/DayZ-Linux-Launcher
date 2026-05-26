@@ -3,10 +3,10 @@ import logging
 import time
 import io
 
-from a2s.exceptions import BrokenMessageError
-from a2s.a2s_fragment import decode_fragment
-from a2s.defaults import DEFAULT_RETRIES
-from a2s.byteio import ByteReader
+from .exceptions import BrokenMessageError
+from .a2s_fragment import decode_fragment
+from .defaults import DEFAULT_RETRIES
+from .byteio import ByteReader
 
 
 

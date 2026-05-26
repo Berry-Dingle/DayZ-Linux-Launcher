@@ -1,4 +1,5 @@
 # db.py
+import json
 import os, requests
 import sqlite3
 import urllib.request
@@ -16,6 +17,33 @@ def fetch_db_overwrite_local() -> bool:
             raise RuntimeError("Downloaded DB looks too small")
         with open(tmp_path, "wb") as f:
             f.write(data)
+        con = sqlite3.connect(f"file:{tmp_path}?mode=ro", uri=True)
+        try:
+            cur = con.cursor()
+            if cur.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise RuntimeError("Downloaded DB failed integrity check")
+            cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='servers'")
+            if cur.fetchone() is None:
+                raise RuntimeError("Downloaded DB missing servers table")
+            required_columns = {
+                "ip", "gport", "qport",
+                "name", "map",
+                "players", "maxPlayers",
+                "password", "mods", "modCount",
+                "third_person",
+                "timeWarp", "time",
+                "country", "ping", "bm_rank",
+            }
+            cur.execute("PRAGMA table_info(servers)")
+            columns = {row[1] for row in cur.fetchall()}
+            missing_columns = sorted(required_columns - columns)
+            if missing_columns:
+                raise RuntimeError(f"Downloaded DB servers table missing columns: {', '.join(missing_columns)}")
+            row_count = cur.execute("SELECT COUNT(*) FROM servers").fetchone()[0]
+            if row_count <= 0:
+                raise RuntimeError("Downloaded DB servers table is empty")
+        finally:
+            con.close()
         os.replace(tmp_path, DB_LOCAL_PATH)
         return True
     except Exception as e:
@@ -36,9 +64,11 @@ def fetch_bl_overwrite_local(timeout=12) -> bool:
         r.raise_for_status()
         data = r.text or ""
 
-        # sanity-check "JSON-ish" (after whitespace must start with '{')
-        if not data.lstrip().startswith("{"):
+        parsed = json.loads(data)
+        if not isinstance(parsed, dict):
             raise ValueError("Blocklist not JSON object")
+        if "version" in parsed and parsed["version"] != 2:
+            raise ValueError("Blocklist version is not 2")
 
         with open(tmp, "w", encoding="utf-8") as f:
             f.write(data)
@@ -71,7 +101,7 @@ def read_servers_from_db() -> list:
                 password, mods, modCount,
                 third_person,
                 timeWarp, time,
-                country, ping
+                country, ping, bm_rank
             FROM servers
             ORDER BY players DESC, ping ASC
         """)

@@ -83,7 +83,7 @@ def build_sidebar(window) -> Gtk.Widget:
     sidebar.append(Gtk.Label(label="Search", xalign=0))
     window.search_entry = Gtk.Entry()
     window.search_entry.set_placeholder_text("Filter By Name Or IP")
-    window.search_entry.connect("changed", window._on_filter_changed)
+    window.search_entry.connect("changed", lambda *_: window._on_filter_changed(scroll=True))
     sidebar.append(window.search_entry)
 
     sidebar.append(hr())
@@ -91,11 +91,11 @@ def build_sidebar(window) -> Gtk.Widget:
     sidebar.append(Gtk.Label(label="Map", xalign=0))
     window.map_model = Gtk.StringList.new(["All"])
     window.map_dropdown = Gtk.DropDown.new(window.map_model, None)
-    window.map_dropdown.connect("notify::selected", window._on_filter_changed)
+    window.map_dropdown.connect("notify::selected", lambda *_: window._on_filter_changed(scroll=True))
     sidebar.append(window.map_dropdown)
 
     window.cb_show_fav = Gtk.CheckButton(label="Show Favorites")
-    window.cb_show_fav.connect("toggled", window._on_filter_changed)
+    window.cb_show_fav.connect("toggled", lambda *_: window._on_filter_changed(scroll=True))
     sidebar.append(window.cb_show_fav)
 
     window.cb_1pp_only = Gtk.CheckButton(label="1st Person Only")
@@ -107,19 +107,19 @@ def build_sidebar(window) -> Gtk.Widget:
     connect_mutually_exclusive_checkbuttons(
         window.cb_1pp_only,
         window.cb_3pp_only,
-        window._on_filter_changed,
+        lambda *_: window._on_filter_changed(scroll=True),
     )
 
     window.cb_no_password = Gtk.CheckButton(label="No Password")
-    window.cb_no_password.connect("toggled", window._on_filter_changed)
+    window.cb_no_password.connect("toggled", lambda *_: window._on_filter_changed(scroll=True))
     sidebar.append(window.cb_no_password)
 
     window.cb_online_only = Gtk.CheckButton(label="Online Only")
-    window.cb_online_only.connect("toggled", window._on_filter_changed)
+    window.cb_online_only.connect("toggled", lambda *_: window._on_filter_changed(scroll=True))
     sidebar.append(window.cb_online_only)
 
     window.cb_played_only = Gtk.CheckButton(label="Played (Has History)")
-    window.cb_played_only.connect("toggled", window._on_filter_changed)
+    window.cb_played_only.connect("toggled", lambda *_: window._on_filter_changed(scroll=True))
     sidebar.append(window.cb_played_only)
 
     sidebar.append(hr())

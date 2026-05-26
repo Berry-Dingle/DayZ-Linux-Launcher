@@ -1,7 +1,7 @@
 import bz2
 import io
 
-from a2s.byteio import ByteReader
+from .byteio import ByteReader
 
 
 

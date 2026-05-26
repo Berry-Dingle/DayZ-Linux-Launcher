@@ -9,8 +9,10 @@ SETTINGS_PATH = os.path.join(CFG_DIR, "settings.json")
 
 DEFAULTS: Dict[str, Any] = {
     # General
+    "show_server_companion": False,
     "ingame_name": "",
     "high_ping_cutoff_ms": 250,
+    "hide_below_max_players": 0,
     "hide_test_servers": True,
     "enable_blocklist_filter": True,
 
@@ -28,11 +30,12 @@ DEFAULTS: Dict[str, Any] = {
 
     # Launch
     "steam_install_type": "auto",  # auto | native | flatpak
+    "skip_dayz_launcher": True,
     "no_splash": True,
     "windowed_mode": False,
     "additional_launch_params": "",
     "warn_on_blocked_join": True,
-    "minimize_dayz_launcher": True,
+    "minimize_dayz_launcher": False,
     "force_fullscreen": True,
 
     # Mods
@@ -82,6 +85,16 @@ def load_settings() -> Dict[str, Any]:
     for k, v in raw.items():
         if k in DEFAULTS:
             out[k] = v
+    if (
+        "auto_install_update_mods" in raw
+        and "auto_install_missing_mods" not in raw
+        and "auto_update_required_mods" not in raw
+    ):
+        legacy = bool(raw["auto_install_update_mods"])
+        out["auto_install_missing_mods"] = legacy
+        out["auto_update_required_mods"] = legacy
+    if bool(out.get("skip_dayz_launcher", True)) and bool(out.get("minimize_dayz_launcher", False)):
+        out["minimize_dayz_launcher"] = False
     return out
 
 def save_settings(settings: Dict[str, Any]) -> None:
@@ -97,16 +110,42 @@ def reset_settings() -> Dict[str, Any]:
     return s
 
 def autodetect_steamcmd_path() -> str:
+    """
+    Attempt to locate a valid SteamCMD executable.
+
+    Order matters:
+    - Prefer user-level wrappers (~/bin)
+    - Then common manual installs (~/SteamCMD, ~/steamcmd)
+    - Then local-share installs
+    - Then system package installs
+    """
+
     candidates = [
+        # --- User preferred / wrappers ---
+        os.path.expanduser("~/bin/steamcmd"),
+
+        # --- Common manual installs ---
+        os.path.expanduser("~/SteamCMD/steamcmd.sh"),
+        os.path.expanduser("~/SteamCMD/linux32/steamcmd"),
+        os.path.expanduser("~/steamcmd/steamcmd.sh"),
+        os.path.expanduser("~/steamcmd/linux32/steamcmd"),
+
+        # --- Local share installs ---
         os.path.expanduser("~/.local/share/steamcmd/steamcmd.sh"),
+        os.path.expanduser("~/.local/share/steamcmd/linux32/steamcmd"),
+
+        # --- System installs ---
         "/usr/bin/steamcmd",
+        "/usr/games/steamcmd",
     ]
+
     for p in candidates:
         try:
-            if os.path.exists(p) and os.access(p, os.X_OK):
+            if os.path.isfile(p) and os.access(p, os.X_OK):
                 return p
         except Exception:
             continue
+
     return ""
 
 def autodetect_workshop_dir() -> str:

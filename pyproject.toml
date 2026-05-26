@@ -14,7 +14,6 @@ dependencies = [
 # BEGIN AUTO-DEPS
     "requests",
     "pypresence",
-    "python-a2s",
 # END AUTO-DEPS
 ]
 

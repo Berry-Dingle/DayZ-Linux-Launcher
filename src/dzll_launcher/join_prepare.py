@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-
+from . import steamcmd_mods
+from .launcher_state import linux_to_win_path_under_prefix
 
 def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_user, validate, dry,
                             proton_prefix, watch_folder_linux, use_steamcmd,
                             auto_install_missing, auto_update_required):
     ok = True
     err_msg = None
+    selected_mod_win_paths_for_launch = []
 
     try:
         # Decide what SteamCMD should do for THIS join
@@ -41,17 +43,23 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             win._steamcmd_started_missing = 0
             win._steamcmd_seen_mod_ids = set()
 
-            # Reset auth/overlay state every run
             win._steamcmd_auth_request = None
             win._steamcmd_auth_result = None
             win._steamcmd_auth_wait_count = 0
             win._steamcmd_auth_event = None
 
-            # Fresh cancel event every run (avoid sticky carry-over)
-            win.threading.Event  # sanity keep reference style stable
-            win._steamcmd_reset_state_for_new_run()
+            reset_done = win.threading.Event()
 
-            # Ensure login form is visible
+            def _ui_reset_steamcmd_state():
+                try:
+                    win._steamcmd_reset_state_for_new_run()
+                finally:
+                    reset_done.set()
+                return False
+
+            win.GLib.idle_add(_ui_reset_steamcmd_state)
+            reset_done.wait(timeout=2.0)
+
             try:
                 win.GLib.idle_add(win.steamcmd_spinner.set_spinning, False)
             except Exception:
@@ -87,10 +95,8 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                         )
 
                 if ok:
-                    # Clear totals at start of a run (UI thread)
                     win.GLib.idle_add(lambda: setattr(win, "_steamcmd_total_sizes", {}) or False)
 
-                    # Fetch total sizes for progress bar (%). Worker thread (safe).
                     try:
                         sizes = win.fetch_workshop_sizes_bytes(list(steamcmd_ids or []), appid=221100, timeout_s=20)
                     except Exception as e:
@@ -102,21 +108,17 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                             win._steamcmd_total_sizes = {int(k): int(v) for k, v in (sizes or {}).items()}
                         except Exception:
                             win._steamcmd_total_sizes = {}
-
-                        # Force L2 refresh so "- 8GB" appears immediately
                         win.GLib.idle_add(win._steamcmd_refresh_active_download_line2)
                         return False
 
                     win.GLib.idle_add(_ui_set_sizes)
 
-                    # Discord status: installing mods
                     try:
                         if getattr(win, "_discord", None):
                             win._discord.set_installing_mods(server_name=str(obj.name or ""))
                     except Exception:
                         pass
 
-                    # NOW start SteamCMD
                     win._steamcmd_install_in_progress = True
                     try:
                         ok = win.run_steamcmd_install(
@@ -143,7 +145,6 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     else:
                         err_msg = "SteamCMD install failed"
 
-                    # Discord: reset back to menu on failure/cancel
                     try:
                         if getattr(win, "_discord", None):
                             win._discord.set_menu()
@@ -156,17 +157,36 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             else:
                 print("[JOIN] SteamCMD mod handling disabled; proceeding with local mods only")
 
+        # =========================
+        # FIX STARTS HERE
+        # =========================
+
+        mods_for_launch = mods
+
         if ok:
             missing_after = win.compute_missing_mods(workshop_dir, mods)
+
             if missing_after:
-                ok = False
-                err_msg = f"Required mods still missing after install: {[mid for mid, _ in missing_after]}"
+                denied_ids = set(getattr(steamcmd_mods, "LAST_ACCESS_DENIED_IDS", set()))
+
+                unresolved = [pair for pair in missing_after if int(pair[0]) not in denied_ids]
+
+                if unresolved:
+                    ok = False
+                    err_msg = f"Required mods still missing after install: {[mid for mid, _ in unresolved]}"
+                else:
+                    mods_for_launch = [pair for pair in mods if int(pair[0]) not in denied_ids]
+                    print(f"[JOIN] Skipping inaccessible mods: {sorted(denied_ids)}")
+
+        # =========================
+        # FIX ENDS HERE
+        # =========================
 
         link_info = None
         if ok:
             link_info = win.ensure_watch_symlinks(
                 workshop_dir=workshop_dir,
-                mods=mods,
+                mods=mods_for_launch,
                 watch_folder=watch_folder_linux,
                 cleanup_stale=True,
             )
@@ -178,7 +198,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
 
             if link_info.get("errors"):
                 selected_paths = link_info.get("selected_paths", [])
-                if len(selected_paths) < len(mods):
+                if len(selected_paths) < len(mods_for_launch):
                     ok = False
                     err_msg = "Failed to create all watch-folder symlinks"
 
@@ -193,6 +213,15 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             )
             print(f"[JOIN] launcher state written: {paths}")
 
+            selected_mod_win_paths_for_launch = [
+                wp
+                for wp in (
+                    linux_to_win_path_under_prefix(p, proton_prefix=proton_prefix)
+                    for p in selected_mods_for_preset
+                )
+                if wp
+            ]
+
     except Exception as e:
         ok = False
         err_msg = str(e)
@@ -206,11 +235,13 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     win._discord.set_menu()
             except Exception:
                 pass
+            if getattr(win, "_pending_server_companion_obj", None) is obj:
+                win._pending_server_companion_obj = None
             print(f"[JOIN] Aborting launch: {err_msg or 'unknown error'}")
             win._on_filter_changed()
             return False
 
-        win._launch_direct_steam_url(obj)
+        win._launch_direct_steam_url(obj, selected_mod_win_paths_for_launch)
         win._on_filter_changed()
         return False
 

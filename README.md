@@ -219,11 +219,6 @@ DZLL should:
 - download mods
 - launch DayZ
 
-DZLL will also install a .desktop entry at the following locations:
-
-- ~/.local/share/applications/com.bdingle.dzll.desktop
-- ~/.local/share/icons/hicolor/256x256/apps/dzll.png
-
 ---
 
 ## 🧠 How DZLL Works

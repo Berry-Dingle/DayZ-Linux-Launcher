@@ -1,3 +1,2 @@
 requests
 pypresence
-python-a2s

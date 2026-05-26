@@ -7,16 +7,18 @@ from pathlib import Path
 from .ui_row import attach_pointer_cursor
 from gi.repository import Gtk, GLib, Pango
 
+from .settings import autodetect_workshop_dir
 from .steamcmd_mods import delete_single_mod
 
 APPID = "221100"
 
 
-def _paths():
+def _paths(workshop_dir: str = "", proton_prefix: str = ""):
     home = Path.home()
     steamapps = home / ".local/share/Steam/steamapps"
-    workshop = steamapps / "workshop"
-    pfx_user = steamapps / f"compatdata/{APPID}/pfx/drive_c/users/steamuser"
+    workshop = Path(workshop_dir).expanduser() if workshop_dir else steamapps / "workshop"
+    pfx = Path(proton_prefix).expanduser() if proton_prefix else steamapps / f"compatdata/{APPID}/pfx"
+    pfx_user = pfx / "drive_c/users/steamuser"
     return {
         "steamapps": steamapps,
         "workshop": workshop,
@@ -33,8 +35,8 @@ def _paths():
     }
 
 
-def _read_installed_mod_ids() -> list[int]:
-    p = _paths()["acf"]
+def _read_installed_mod_ids(workshop_dir: str = "") -> list[int]:
+    p = _paths(workshop_dir=workshop_dir)["acf"]
     if not p.is_file():
         return []
     try:
@@ -77,8 +79,8 @@ def _read_installed_mod_ids() -> list[int]:
     return out
 
 
-def _name_map_from_symlinks() -> dict[int, str]:
-    watch = _paths()["watch_1"]
+def _name_map_from_symlinks(proton_prefix: str = "") -> dict[int, str]:
+    watch = _paths(proton_prefix=proton_prefix)["watch_1"]
     mp: dict[int, str] = {}
     if not watch.is_dir():
         return mp
@@ -100,7 +102,7 @@ def _name_map_from_symlinks() -> dict[int, str]:
     return mp
 
 
-def reset_all_mods_safely(log_fn=None) -> bool:
+def reset_all_mods_safely(log_fn=None, *, workshop_dir: str = "", proton_prefix: str = "") -> bool:
     """
     Delete ALL DayZ workshop mods + workshop staging/state.
     HARD SAFETY: never touches appmanifest_221100.acf or steamapps/common/DayZ.
@@ -113,7 +115,24 @@ def reset_all_mods_safely(log_fn=None) -> bool:
         else:
             print(msg)
 
-    p = _paths()
+    p = _paths(workshop_dir=workshop_dir, proton_prefix=proton_prefix)
+    workshop = p["workshop"].resolve()
+    if (
+        not workshop.is_dir()
+        or workshop.name != "workshop"
+        or workshop.parent.name != "steamapps"
+        or not any(
+            marker.exists()
+            for marker in (
+                workshop / f"appworkshop_{APPID}.acf",
+                workshop / f"content/{APPID}",
+                workshop / "downloads",
+                workshop / "temp",
+            )
+        )
+    ):
+        log(f"[MOD RESET] Refusing to delete: workshop path is not a valid DayZ Steam workshop root: {workshop}")
+        return False
 
     # Stop Steam/SteamCMD best-effort
     try:
@@ -398,6 +417,23 @@ class ModsManagerOverlay:
 
         self.refresh()
 
+    def _workshop_dir(self) -> str:
+        try:
+            win = getattr(self.host, "_win", None)
+            val = str(win.settings.get("workshop_dir") or "").strip() if win else ""
+            return val or autodetect_workshop_dir() or ""
+        except Exception:
+            return ""
+
+    def _proton_prefix(self) -> str:
+        try:
+            win = getattr(self.host, "_win", None)
+            if win and hasattr(win, "_get_dayz_proton_prefix"):
+                return str(win._get_dayz_proton_prefix() or "").strip()
+        except Exception:
+            pass
+        return ""
+
     def _clear_list(self):
         child = self.lb.get_first_child()
         while child is not None:
@@ -409,8 +445,10 @@ class ModsManagerOverlay:
         self._rows_cache.clear()
         self._clear_list()
 
-        ids = _read_installed_mod_ids()
-        name_map = _name_map_from_symlinks()
+        workshop_dir = self._workshop_dir()
+        proton_prefix = self._proton_prefix()
+        ids = _read_installed_mod_ids(workshop_dir=workshop_dir)
+        name_map = _name_map_from_symlinks(proton_prefix=proton_prefix)
 
         items = []
         for mid in ids:
@@ -490,7 +528,11 @@ class ModsManagerOverlay:
             def worker():
                 ok2 = False
                 try:
-                    ok2 = bool(delete_single_mod(int(mod_id)))
+                    ok2 = bool(delete_single_mod(
+                        int(mod_id),
+                        workshop_dir=self._workshop_dir(),
+                        proton_prefix=self._proton_prefix(),
+                    ))
                 except Exception:
                     ok2 = False
 
@@ -516,7 +558,10 @@ class ModsManagerOverlay:
                 return
 
             def worker():
-                ok2 = reset_all_mods_safely()
+                ok2 = reset_all_mods_safely(
+                    workshop_dir=self._workshop_dir(),
+                    proton_prefix=self._proton_prefix(),
+                )
 
                 def done():
                     if ok2:

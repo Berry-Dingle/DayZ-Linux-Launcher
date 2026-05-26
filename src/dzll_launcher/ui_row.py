@@ -127,6 +127,7 @@ class ServerObject(GObject.Object):
     max_players = GObject.Property(type=int, default=0)
 
     ping = GObject.Property(type=int, default=-1)  # <0 = offline
+    bm_rank = GObject.Property(type=int, default=999999999)
 
     # Snapshot sort keys (stable until user clicks sort)
     sort_ping = GObject.Property(type=int, default=999999)

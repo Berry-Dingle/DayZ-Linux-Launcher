@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 import subprocess
-import threading
+import shlex
 
 from .launcher_user_config import set_launcher_shutdown_mode
 from .maps import standardize_map
 
 
-def launch_direct_steam_url(win, obj):
+def launch_direct_steam_url(win, obj, mod_win_paths=None):
     ip_port = f"{obj.ip}:{int(obj.gport)}"
     try:
-        set_launcher_shutdown_mode(win.settings.get("minimize_dayz_launcher", True))
+        set_launcher_shutdown_mode(win.settings.get("minimize_dayz_launcher", False))
 
         cmd = win._steam_launch_prefix()
+
+        skip_dayz_launcher = bool(win.settings.get("skip_dayz_launcher", True))
+        if skip_dayz_launcher:
+            cmd.append("-nolauncher")
+            if mod_win_paths:
+                cmd.append(f"-mod={';'.join(mod_win_paths)}")
 
         # Window/fullscreen toggles (windowed wins if both are set)
         if bool(win.settings.get("windowed_mode", False)):
@@ -28,7 +34,11 @@ def launch_direct_steam_url(win, obj):
 
         extra = str(win.settings.get("additional_launch_params") or "").strip()
         if extra:
-            cmd.extend(extra.split())
+            try:
+                cmd.extend(shlex.split(extra))
+            except ValueError as e:
+                print(f"[JOIN] Failed To Parse Additional Launch Params: {e}")
+                return False
 
         cmd.append(f"-connect={ip_port}")
 
@@ -52,12 +62,7 @@ def launch_direct_steam_url(win, obj):
 
         # Launch DayZ via Steam
         subprocess.Popen(cmd)
-
-        # Watch DayZ lifecycle (start -> set playing; exit -> reset)
-        try:
-            threading.Thread(target=win._discord_watch_dayz_until_exit, daemon=True).start()
-        except Exception:
-            pass
+        return True
 
     except Exception as e:
         print(f"[JOIN] Failed To Launch Steam/DayZ: {e}")
@@ -68,3 +73,4 @@ def launch_direct_steam_url(win, obj):
                 win._discord.set_menu()
         except Exception:
             pass
+        return False

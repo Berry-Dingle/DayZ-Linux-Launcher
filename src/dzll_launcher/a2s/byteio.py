@@ -1,7 +1,7 @@
 import struct
 import io
 
-from a2s.exceptions import BufferExhaustedError
+from .exceptions import BufferExhaustedError
 
 
 

@@ -6,7 +6,7 @@ import json
 import time
 import subprocess
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 import threading
 import re
 import gi
@@ -32,7 +32,6 @@ from .config import (
     DISCLAIMER_COLOR,
     ICON_COL_WIDTH,
     PING_MAX,
-    STARTUP_PING_FIRST_N,
     BATCH_SIZE,
     MAX_WORKERS,
     HI_WORKERS,
@@ -94,6 +93,7 @@ from .steamcmd_overlay_ui import SteamCMDOverlayUI
 from .launcher_state import bootstrap_launcher_state
 from .blocklist_utils import bl_normalize_key, bl_load_local, bl_status
 from .join_prepare import join_prepare_and_launch
+from .server_companion_ui import ServerCompanionPanel
 from .launch_utils import launch_direct_steam_url
 from .block_warning import preflight_block_warning_ui_blocking, preflight_block_warning
 
@@ -126,7 +126,7 @@ def ensure_user_desktop_integration(
         user_icons.mkdir(parents=True, exist_ok=True)
 
         # ----- icon -----
-        icon_name = "dzll"
+        icon_name = "dzll2"
         icon_dst = user_icons / f"{icon_name}.png"
         src = Path(icon_src_path).expanduser().resolve()
 
@@ -282,7 +282,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             ensure_user_desktop_integration(
                 app_id=APP_ID,
                 app_name="DayZ Linux Launcher",
-                icon_src_path=os.path.join(IMAGES_DIR, "dzll.png"),
+                icon_src_path=os.path.join(IMAGES_DIR, "dzll2.png"),
                 categories="Game;",
             )
         except Exception:
@@ -298,6 +298,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             w, h = (1200, 690)
         self.set_default_size(int(w), int(h))
+
+        self._shutdown_cleanup_done = False
+        self.connect("close-request", self._on_close_request)
 
         # SETTINGS (persisted)
         self.settings = load_settings()
@@ -326,6 +329,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # Sort defaults
         self.sort_key = "ping"
         self.sort_asc = False  # default: highest ping / offline first
+        self._sort_changed_by_user = False
 
         self.favorites = load_favorites()
         self.last_played = load_last_played()
@@ -572,6 +576,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         main.set_hexpand(True)
         main.set_vexpand(True)
+        self.main_browser_box = main
         root.append(main)
 
         self.header_widget = HeaderUI(self, self._col_groups).build()
@@ -609,6 +614,35 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.scroller.set_vexpand(True)
         self.scroller.set_hexpand(True)
         main.append(self.scroller)
+
+        self._server_companion_snapshot = None
+        self._server_companion_poll_interval_secs = 15
+        self._server_companion_poll_timer_id = 0
+        self._server_companion_poll_paused = False
+        self._server_companion_poll_inflight = False
+        self._server_companion_poll_token = 0
+        self._server_companion_last_online = None
+        self._pending_server_companion_obj = None
+        self._server_companion_restart_alert_enabled = False
+        self._server_companion_alert_volume = 80
+
+        self.server_companion_panel = ServerCompanionPanel()
+        self.server_companion_panel.set_on_clear(self.clear_server_companion)
+        self.server_companion_panel.set_on_play_pause(self.toggle_server_companion_polling)
+        self.server_companion_panel.set_on_restart_alert_toggled(self.set_server_companion_restart_alert_enabled)
+        self.server_companion_panel.set_on_alert_volume_changed(self.set_server_companion_alert_volume)
+        self.server_companion_panel.set_alert_volume(self._server_companion_alert_volume)
+
+        self.server_companion_revealer = Gtk.Revealer()
+        self.server_companion_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_LEFT)
+        self.server_companion_revealer.set_transition_duration(180)
+        self.server_companion_revealer.set_reveal_child(False)
+        self.server_companion_revealer.set_hexpand(False)
+        self.server_companion_revealer.set_vexpand(True)
+        self.server_companion_revealer.set_child(self.server_companion_panel)
+        root.append(self.server_companion_revealer)
+
+        self.set_server_companion_visible(bool(self.settings.get("show_server_companion", False)))
 
         self._update_sort_indicators()
         self._apply_titlebar_counts()
@@ -801,12 +835,345 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         return False
 
+    def _on_close_request(self, *_args):
+        self._shutdown_cleanup()
+        return False
+
+    def _shutdown_cleanup(self):
+        if getattr(self, "_shutdown_cleanup_done", False):
+            return
+        self._shutdown_cleanup_done = True
+
+        try:
+            self._stop_server_companion_polling()
+        except Exception:
+            pass
+
+        try:
+            self._steamcmd_stop_progress_timer()
+        except Exception:
+            try:
+                tid = int(getattr(self, "_steamcmd_progress_timer_id", 0) or 0)
+                if tid:
+                    GLib.source_remove(tid)
+            except Exception:
+                pass
+            self._steamcmd_progress_timer_id = 0
+
+        try:
+            cancel_event = getattr(self, "_steamcmd_cancel_event", None)
+            if isinstance(cancel_event, threading.Event):
+                cancel_event.set()
+        except Exception:
+            pass
+
+        try:
+            self._steamcmd_auth_result = {"ok": False, "cancelled": True, "shutdown": True}
+            self._steamcmd_auth_request = None
+            ev = getattr(self, "_steamcmd_auth_event", None)
+            if isinstance(ev, threading.Event):
+                ev.set()
+            self._steamcmd_auth_event = None
+        except Exception:
+            pass
+
+        try:
+            if getattr(self, "_discord", None):
+                self._discord.clear()
+                self._discord.disconnect()
+        except Exception:
+            pass
+
+        for name in ("_executor", "_hi_executor"):
+            try:
+                executor = getattr(self, name, None)
+                if executor:
+                    executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+
+    # ----------------------------
+    # Server companion panel
+    # ----------------------------
+    def set_server_companion_visible(self, visible: bool):
+        visible = bool(visible)
+        if visible:
+            try:
+                self.main_browser_box.set_size_request(int(WINDOW_DEFAULT_SIZE[0]) - int(SIDEBAR_WIDTH), -1)
+            except Exception:
+                pass
+            self.server_companion_revealer.set_visible(True)
+            self.server_companion_revealer.set_reveal_child(True)
+            self._start_server_companion_polling()
+        else:
+            self.server_companion_revealer.set_reveal_child(False)
+            self.server_companion_revealer.set_visible(False)
+            try:
+                self.main_browser_box.set_size_request(-1, -1)
+            except Exception:
+                pass
+            try:
+                width = int(WINDOW_DEFAULT_SIZE[0])
+                try:
+                    height = int(self.get_height())
+                except Exception:
+                    height = int(WINDOW_DEFAULT_SIZE[1])
+                if height <= 0:
+                    height = int(WINDOW_DEFAULT_SIZE[1])
+                self.set_default_size(width, height)
+            except Exception:
+                pass
+            self._stop_server_companion_polling()
+
+    def toggle_server_companion(self):
+        self.set_server_companion_visible(
+            not bool(self.server_companion_revealer.get_reveal_child())
+        )
+
+    def _server_companion_snapshot_from_obj(self, obj: ServerObject) -> dict:
+        try:
+            ping = int(getattr(obj, "ping", -1))
+        except Exception:
+            ping = -1
+        try:
+            players = int(getattr(obj, "players", 0))
+        except Exception:
+            players = 0
+        try:
+            max_players = int(getattr(obj, "max_players", 0))
+        except Exception:
+            max_players = 0
+        try:
+            mod_count = int(getattr(obj, "mod_count", 0))
+        except Exception:
+            mod_count = 0
+
+        mode_parts = []
+        mode_parts.append("3PP" if bool(getattr(obj, "third_person", False)) else "1PP")
+        mode_parts.append("Password" if bool(getattr(obj, "password", False)) else "No password")
+        mode_parts.append(f"Mods: {mod_count}")
+
+        return {
+            "name": str(getattr(obj, "name", "") or ""),
+            "map": str(getattr(obj, "map_name", "") or ""),
+            "ping": ping,
+            "players": players,
+            "max_players": max_players,
+            "time": str(getattr(obj, "time", "") or ""),
+            "online": ping >= 0,
+            "mode": " / ".join(mode_parts),
+            "ip": str(getattr(obj, "ip", "") or ""),
+            "qport": int(getattr(obj, "qport", 0) or 0),
+        }
+
+    def set_server_companion_server(self, obj: ServerObject):
+        snapshot = self._server_companion_snapshot_from_obj(obj)
+        self._server_companion_poll_token += 1
+        self._server_companion_poll_paused = False
+        self._server_companion_last_online = None
+        self._server_companion_snapshot = snapshot
+        panel = getattr(self, "server_companion_panel", None)
+        if panel is not None:
+            panel.set_server_snapshot(snapshot)
+            panel.set_polling_paused(False)
+        self._start_server_companion_polling()
+
+    def clear_server_companion(self):
+        self._server_companion_poll_token += 1
+        self._server_companion_snapshot = None
+        self._server_companion_last_online = None
+        self._stop_server_companion_polling()
+        panel = getattr(self, "server_companion_panel", None)
+        if panel is not None:
+            panel.clear_server()
+
+    def _server_companion_should_poll(self) -> bool:
+        return (
+            bool(self.settings.get("show_server_companion", False))
+            and getattr(self, "server_companion_revealer", None) is not None
+            and bool(self.server_companion_revealer.get_reveal_child())
+            and getattr(self, "_server_companion_snapshot", None) is not None
+            and not bool(getattr(self, "_server_companion_poll_paused", False))
+        )
+
+    def _start_server_companion_polling(self):
+        if not self._server_companion_should_poll():
+            return
+        if not self._server_companion_poll_timer_id:
+            self._server_companion_poll_timer_id = GLib.timeout_add_seconds(
+                self._server_companion_poll_interval_secs,
+                self._server_companion_poll_tick,
+            )
+        self._submit_server_companion_poll()
+
+    def _stop_server_companion_polling(self):
+        timer_id = int(getattr(self, "_server_companion_poll_timer_id", 0) or 0)
+        if timer_id:
+            try:
+                GLib.source_remove(timer_id)
+            except Exception:
+                pass
+        self._server_companion_poll_timer_id = 0
+
+    def _server_companion_poll_tick(self):
+        if not self._server_companion_should_poll():
+            self._server_companion_poll_timer_id = 0
+            return False
+        self._submit_server_companion_poll()
+        return True
+
+    def _submit_server_companion_poll(self):
+        if self._server_companion_poll_inflight or not self._server_companion_should_poll():
+            return
+        snapshot = dict(self._server_companion_snapshot or {})
+        ip = str(snapshot.get("ip") or "")
+        qport = int(snapshot.get("qport") or 0)
+        if not ip or qport <= 0:
+            return
+
+        token = int(self._server_companion_poll_token)
+        self._server_companion_poll_inflight = True
+
+        def worker():
+            info = query_server_live(ip, qport)
+            GLib.idle_add(self._apply_server_companion_live_result, token, info)
+
+        try:
+            self._hi_executor.submit(worker)
+        except Exception:
+            self._server_companion_poll_inflight = False
+
+    def _apply_server_companion_live_result(self, token: int, info: dict):
+        self._server_companion_poll_inflight = False
+        if token != int(getattr(self, "_server_companion_poll_token", 0)):
+            return False
+        if not self._server_companion_should_poll():
+            return False
+
+        snapshot = dict(self._server_companion_snapshot or {})
+        prev_online = self._server_companion_last_online
+        if bool((info or {}).get("ok", False)):
+            snapshot["ping"] = int((info or {}).get("ping_ms", snapshot.get("ping", -1)) or 0)
+            snapshot["players"] = int((info or {}).get("players", snapshot.get("players", 0)) or 0)
+            snapshot["max_players"] = int((info or {}).get("max_players", snapshot.get("max_players", 0)) or 0)
+            live_time = str((info or {}).get("time") or "")
+            if live_time:
+                snapshot["time"] = live_time
+            snapshot["online"] = True
+        else:
+            snapshot["ping"] = -1
+            snapshot["online"] = False
+
+        new_online = bool(snapshot.get("online", False))
+        if (
+            prev_online is False
+            and new_online
+            and bool(getattr(self, "_server_companion_restart_alert_enabled", False))
+        ):
+            self._server_companion_alert_back_online(snapshot)
+        self._server_companion_last_online = new_online
+        self._server_companion_snapshot = snapshot
+        panel = getattr(self, "server_companion_panel", None)
+        if panel is not None:
+            panel.set_server_snapshot(snapshot)
+            panel.set_polling_paused(False)
+        return False
+
+    def toggle_server_companion_polling(self):
+        if getattr(self, "_server_companion_snapshot", None) is None:
+            return
+        self._server_companion_poll_paused = not bool(getattr(self, "_server_companion_poll_paused", False))
+        panel = getattr(self, "server_companion_panel", None)
+        if panel is not None:
+            panel.set_polling_paused(self._server_companion_poll_paused)
+        if self._server_companion_poll_paused:
+            self._stop_server_companion_polling()
+        else:
+            self._start_server_companion_polling()
+
+    def set_server_companion_restart_alert_enabled(self, enabled: bool):
+        self._server_companion_restart_alert_enabled = bool(enabled)
+
+    def set_server_companion_alert_volume(self, volume: int):
+        try:
+            self._server_companion_alert_volume = max(0, min(100, int(volume)))
+        except Exception:
+            self._server_companion_alert_volume = 80
+
+    def _server_companion_alert_back_online(self, snapshot: dict):
+        self._play_server_companion_online_sound()
+        self._notify_server_companion_back_online(snapshot)
+
+    def _play_server_companion_online_sound(self):
+        try:
+            volume = max(0, min(100, int(getattr(self, "_server_companion_alert_volume", 80))))
+        except Exception:
+            volume = 80
+        if volume <= 0:
+            return
+        audio_path = os.path.join(os.path.dirname(__file__), "audio", "serverOnline.mp3")
+        if not os.path.exists(audio_path):
+            return
+        player = shutil.which("ffplay")
+        cmd = None
+        if player:
+            cmd = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", "-af", f"volume={volume / 100:.2f}", audio_path]
+        else:
+            player = shutil.which("mpg123")
+            if player:
+                cmd = [player, "-g", str(volume), audio_path]
+        if not cmd:
+            return
+        try:
+            subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception:
+            pass
+
+    def _notify_server_companion_back_online(self, snapshot: dict):
+        try:
+            app = self.get_application()
+            if app is None:
+                return
+            notification = Gio.Notification.new("Server back online")
+            name = str((snapshot or {}).get("name") or "").strip()
+            if name:
+                notification.set_body(name)
+            app.send_notification("dzll-server-companion-back-online", notification)
+        except Exception:
+            pass
+
     # ----------------------------
     # Startup sequence
     # ----------------------------
     def _begin_startup_update(self):
         self._set_updating(True, "Updating The Server Database, Please Wait…")
         self.empty_label.set_visible(False)
+        self._startup_db_applied = False
+        self._startup_db_provisional = False
+
+        def apply_db_rows_once(rows, ok, provisional=False):
+            if getattr(self, "_startup_db_applied", False):
+                return False
+            if provisional:
+                if getattr(self, "_startup_db_provisional", False):
+                    return False
+                self._startup_db_provisional = True
+                return self._apply_db_rows(rows, ok)
+            self._startup_db_applied = True
+            return self._apply_db_rows(rows, ok)
+
+        def db_watchdog():
+            if getattr(self, "_startup_db_applied", False):
+                return False
+            rows = read_servers_from_db()
+            apply_db_rows_once(rows, False, True)
+            return False
+
+        GLib.timeout_add_seconds(30, db_watchdog)
 
         def worker():
             try:
@@ -836,7 +1203,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._bl_soft = set()
                 self._bl_hard = set()
 
-            GLib.idle_add(self._apply_db_rows, rows, ok)
+            GLib.idle_add(apply_db_rows_once, rows, ok)
 
         self._executor.submit(worker)
         return False
@@ -903,12 +1270,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
 
         self._set_updating(True, "Updating The Server Database, Please Wait…")
-        self._submit_live_first_n_then_hide_band(STARTUP_PING_FIRST_N)
-
-        keys = list(self._obj_by_key.keys())
-        rest = keys[STARTUP_PING_FIRST_N:]
-        for i in range(0, len(rest), BATCH_SIZE):
-            self._submit_live_batch(rest[i:i + BATCH_SIZE], reason="startup-batch")
+        if not fetched_ok:
+            self._set_updating(False)
+            self._apply_titlebar_counts()
+            return False
+        keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
+        first_n = min(100, len(keys))
+        first_keys = keys[:first_n]
+        rest_keys = keys[first_n:]
+        self._submit_live_first_n_then_hide_band(first_n, first_keys, rest_keys)
 
         GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
         self._apply_titlebar_counts()
@@ -979,6 +1349,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
             except Exception:
                 ping_db = -1
+            try:
+                bm_rank = int(dbrow.get("bm_rank")) if dbrow.get("bm_rank") is not None else 999999999
+            except Exception:
+                bm_rank = 999999999
 
             k = fav_key(ip, gport)
             fav = bool(self.favorites.get(k, False))
@@ -1005,6 +1379,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 players=players,
                 max_players=maxp,
                 ping=ping_db,
+                bm_rank=bm_rank,
             )
 
             self.store.append(obj)
@@ -1019,6 +1394,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         self._apply_titlebar_counts()
+
+        GLib.timeout_add_seconds(1, self._auto_sort_lowest_ping_after_startup)
 
         # ---- Init Discord Status ----
         try:
@@ -1066,21 +1443,67 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     # Live refresh
     # ----------------------------
-    def _submit_live_first_n_then_hide_band(self, n: int):
-        keys = list(self._obj_by_key.keys())[:max(0, int(n))]
+    def _bm_live_group(self, k) -> int:
+        obj = self._obj_by_key.get(k)
+        try:
+            rank = int(getattr(obj, "bm_rank", 999999999))
+        except Exception:
+            return 3
+        return 0 if rank <= 100 else (1 if rank <= 1000 else (2 if rank <= 2000 else 3))
+
+    def _submit_startup_rest_batches(self, keys):
+        for i in range(0, len(keys or []), BATCH_SIZE):
+            self._submit_live_batch(keys[i:i + BATCH_SIZE], reason="startup-batch")
+        return False
+
+    def _submit_live_first_n_then_hide_band(self, n: int, ordered_keys=None, rest_keys=None):
+        keys = list(ordered_keys or self._obj_by_key.keys())[:max(0, int(n))]
         if not keys:
             self._set_updating(False)
+            GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
             return
 
-        def worker():
-            results = []
-            for k in keys:
+        def query_one(k):
+            try:
                 obj = self._obj_by_key.get(k)
                 if not obj:
-                    continue
-                info = query_server_live(obj.ip, obj.qport)
-                results.append((k, info))
+                    return None
+                return (k, query_server_live(obj.ip, obj.qport))
+            except Exception as e:
+                return (k, {"ok": False, "err": str(e)})
+
+        def apply_late_result(fut):
+            try:
+                result = fut.result()
+                if result:
+                    GLib.idle_add(self._apply_live_results, [result], "startup-first")
+            except Exception:
+                pass
+
+        def worker():
+            futures = [self._executor.submit(query_one, k) for k in keys]
+            target = max(1, (len(futures) * 65 + 99) // 100)
+            deadline = time.monotonic() + 6.0
+            done = set()
+            pending = set(futures)
+            while pending and len(done) < target:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                newly_done, pending = wait(pending, timeout=min(0.2, remaining))
+                done.update(newly_done)
+            results = []
+            for fut in done:
+                try:
+                    result = fut.result()
+                    if result:
+                        results.append(result)
+                except Exception:
+                    pass
+            for fut in pending:
+                fut.add_done_callback(apply_late_result)
             GLib.idle_add(self._apply_live_results_and_hide_band, results)
+            GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
 
         self._executor.submit(worker)
 
@@ -1138,6 +1561,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         now = int(time.time())
         changed_any = False
         trigger_filter = (reason != "manual-refresh")
+        manual_success = False
+        startup_live = reason in ("startup-first", "startup-batch")
 
         for k, info in (results or []):
             obj = self._obj_by_key.get(k)
@@ -1198,8 +1623,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._dead_session.discard(k)
 
             changed_any = True
+            manual_success = (reason == "manual-refresh")
 
-        if changed_any and trigger_filter:
+        if changed_any and (trigger_filter or manual_success) and not startup_live:
             self._on_filter_changed()
 
         self._apply_titlebar_counts()
@@ -1252,17 +1678,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
 
         k = fav_key(obj.ip, obj.gport)
+        is_fav = bool(obj.fav)
         now = int(time.time())
 
-        if k in self._dead_session:
+        if (not is_fav) and k in self._dead_session:
             return False
 
         d = self.dead.get(k)
-        if d and int(d.get("dead_until", 0)) > now:
+        if (not is_fav) and d and int(d.get("dead_until", 0)) > now:
             return False
 
         live = self.live.get(k)
-        if live and bool(live.get("hide_high_ping", False)):
+        if (not is_fav) and live and bool(live.get("hide_high_ping", False)):
             return False
 
         q = (self.search_entry.get_text() or "").strip().lower()
@@ -1278,7 +1705,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if q != ipport:
                     return False
 
-        if bool(self.settings.get("hide_test_servers", True)) and self._is_likely_test_server_name(nm):
+        if (not is_fav) and bool(self.settings.get("hide_test_servers", True)) and self._is_likely_test_server_name(nm):
+            return False
+
+        try:
+            max_players_cutoff = int(self.settings.get("hide_below_max_players", 0) or 0)
+        except Exception:
+            max_players_cutoff = 0
+        if (not is_fav) and max_players_cutoff > 0 and int(obj.max_players) < max_players_cutoff:
             return False
 
         if self.cb_show_fav.get_active() and not bool(obj.fav):
@@ -1327,11 +1761,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         return True
 
-    def _on_filter_changed(self, *_args):
+    def _on_filter_changed(self, *_args, scroll: bool = False):
         try:
             self.combined_filter.changed(Gtk.FilterChange.DIFFERENT)
         except Exception:
             pass
+        if scroll:
+            GLib.idle_add(self._scroll_to_top)
 
     def _on_reset_clicked(self, *_args):
         try:
@@ -1347,7 +1783,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 cb.set_active(False)
             except Exception:
                 pass
-        self._on_filter_changed()
+        self._on_filter_changed(scroll=True)
 
     # ----------------------------
     # Sorting
@@ -1360,6 +1796,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
             x = (x or "").lower()
             y = (y or "").lower()
             return -1 if x < y else (1 if x > y else 0)
+
+        def bm_group(obj: ServerObject) -> int:
+            try:
+                rank = int(getattr(obj, "bm_rank", 999999999))
+            except Exception:
+                return 3
+            return 0 if rank <= 100 else (1 if rank <= 1000 else (2 if rank <= 2000 else 3))
+
+        ga = bm_group(a)
+        gb = bm_group(b)
+        c = cmp_int(ga, gb)
+
+        if c != 0:
+            return Gtk.Ordering.SMALLER if c < 0 else Gtk.Ordering.LARGER
 
         if self.sort_key == "ping":
             ka = int(getattr(a, "sort_ping", 999999))
@@ -1393,9 +1843,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return Gtk.Ordering.EQUAL
         return Gtk.Ordering.SMALLER if c < 0 else Gtk.Ordering.LARGER
 
-    def _set_sort(self, key: str):
+    def _set_sort(self, key: str, user_initiated: bool = True):
         if key not in self.SORT_KEYS:
             return
+        if user_initiated:
+            self._sort_changed_by_user = True
         if self.sort_key == key:
             self.sort_asc = not self.sort_asc
         else:
@@ -1410,6 +1862,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._update_sort_indicators()
         GLib.idle_add(self._scroll_to_top)
+
+    def _auto_sort_lowest_ping_after_startup(self):
+        if self._sort_changed_by_user or self.sort_key != "ping" or self.sort_asc:
+            return False
+
+        self._set_sort("ping", user_initiated=False)
+        return False
 
     def _update_sort_indicators(self):
         def with_arrow(base: str, key: str) -> str:
@@ -1488,7 +1947,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     def _steam_launch_prefix(self) -> list[str]:
         # Native-only for now.
-        return ["steam", "-applaunch", "221100", "--"]
+        steam_cmd = shutil.which("steam") or "steam"
+        print(f"[JOIN] Using Steam command: {steam_cmd}")
+        return [steam_cmd, "-applaunch", "221100", "--"]
 
     def _get_dayz_proton_prefix(self) -> str:
         return os.path.expanduser("~/.local/share/Steam/steamapps/compatdata/221100/pfx")
@@ -1503,16 +1964,37 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _get_dzll_watch_folder_linux(self) -> str:
         return os.path.join(self._get_dayz_proton_prefix(), "drive_c", "users", "steamuser", "DZLLMods")
 
-    def _launch_direct_steam_url(self, obj: ServerObject):
-        return launch_direct_steam_url(self, obj)
+    def _launch_direct_steam_url(self, obj: ServerObject, mod_win_paths=None):
+        result = launch_direct_steam_url(self, obj, mod_win_paths=mod_win_paths)
+        if result is False:
+            if getattr(self, "_pending_server_companion_obj", None) is obj:
+                self._pending_server_companion_obj = None
+            return result
+        self._start_dayz_session_watch()
+        return result
 
     # ----------------------------
     # Watch Steam Game State
     # ----------------------------
+    def _start_dayz_session_watch(self) -> None:
+        try:
+            with self._discord_watch_lock:
+                if self._discord_watch_active:
+                    return
+        except Exception:
+            pass
+        try:
+            threading.Thread(target=self._watch_dayz_session_until_exit, daemon=True).start()
+        except Exception:
+            pass
+
     def _discord_watch_dayz_until_exit(self) -> None:
+        self._watch_dayz_session_until_exit()
+
+    def _watch_dayz_session_until_exit(self) -> None:
         """
         Watch for actual DayZ game process (launcher may remain open).
-        When the game starts, update Discord to the "playing" state.
+        When the game starts, activate Companion and update Discord if available.
         When the game exits, reset Discord back to menus.
 
         Edge case handled:
@@ -1584,6 +2066,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                             GLib.idle_add(self._discord.set_menu)
                     except Exception:
                         pass
+                    self._pending_server_companion_obj = None
                     return
 
                 time.sleep(1.0)
@@ -1595,6 +2078,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         GLib.idle_add(self._discord.set_menu)
                 except Exception:
                     pass
+                self._pending_server_companion_obj = None
                 return
 
             # GAME STARTED -> now count it as "played"
@@ -1612,6 +2096,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     self._pending_last_played_obj = None
             except Exception:
                 pass
+
+            # GAME STARTED -> activate Companion for the pending join target
+            try:
+                obj = getattr(self, "_pending_server_companion_obj", None)
+                if obj is not None:
+                    self._pending_server_companion_obj = None
+                    GLib.idle_add(self.set_server_companion_server, obj)
+            except Exception:
+                self._pending_server_companion_obj = None
 
             # GAME STARTED -> set Discord "playing" state according to user setting
             try:
@@ -1731,6 +2224,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._on_filter_changed()
             return
 
+        self._pending_server_companion_obj = obj
+
         # Defer "last played" until DayZ process is actually detected.
         try:
             self._pending_last_played_obj = obj
@@ -1760,6 +2255,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 print(f"[JOIN] launcher state cleared for no-mod server: {paths}")
             except Exception as e:
                 print(f"[JOIN] failed to clear launcher state for no-mod server: {e}")
+                if getattr(self, "_pending_server_companion_obj", None) is obj:
+                    self._pending_server_companion_obj = None
+                return
 
             self._launch_direct_steam_url(obj)
             self._on_filter_changed()
@@ -1978,5 +2476,3 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         return False
-
-

@@ -16,7 +16,7 @@ import select
 import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
-from .settings import autodetect_workshop_dir
+from .settings import autodetect_workshop_dir, autodetect_steamcmd_path
 
 DAYZ_APPID = 221100
 
@@ -30,6 +30,7 @@ STEAMCMD_DISK_ACTIVITY_POLL_S = 5.0  # how often we check disk progress while St
 STEAM_DETAILS_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublishedFileDetails/v1/"
 STEAM_WORKSHOP_BATCH_MAX = 100
 
+LAST_ACCESS_DENIED_IDS: set[int] = set()
 
 def _best_effort_shutdown_steam(log_fn=None, timeout_s: float = 10.0) -> None:
     """
@@ -218,12 +219,15 @@ def compute_missing_mods(workshop_dir: str, mods: List[Tuple[int, str]]) -> List
 
 
 def _resolve_path(p: str) -> str:
-    return os.path.abspath(os.path.expanduser(p or "").strip())
+    p = (p or "").strip()
+    if not p:
+        return ""
+    return os.path.abspath(os.path.expanduser(p))
 
 
 def _looks_executable(p: str) -> bool:
     try:
-        return bool(p) and os.path.exists(p) and os.access(p, os.X_OK)
+        return bool(p) and os.path.isfile(p) and os.access(p, os.X_OK)
     except Exception:
         return False
 
@@ -314,6 +318,19 @@ def run_steamcmd_install(
 
     Returns True on success, False on any failure/cancel/stall after retries.
     """
+
+    global LAST_ACCESS_DENIED_IDS
+    LAST_ACCESS_DENIED_IDS = set()
+
+    raw_steamcmd_path = (steamcmd_path or "").strip()
+    detected_steamcmd_path = ""
+
+    if raw_steamcmd_path:
+        steamcmd_path = raw_steamcmd_path
+    else:
+        detected_steamcmd_path = (autodetect_steamcmd_path() or "").strip()
+        steamcmd_path = detected_steamcmd_path
+
     steamcmd_path = _resolve_path(steamcmd_path)
     workshop_dir = _resolve_path(workshop_dir)
 
@@ -358,6 +375,8 @@ def run_steamcmd_install(
     workshop_dir = _refresh_workshop_dir(workshop_dir)
 
     try:
+        print(f"[SteamCMD][DEBUG] raw_steamcmd_path={raw_steamcmd_path!r}")
+        print(f"[SteamCMD][DEBUG] detected_steamcmd_path={detected_steamcmd_path!r}")
         print(f"[SteamCMD][DEBUG] steamcmd_path={steamcmd_path!r}")
         print(f"[SteamCMD][DEBUG] workshop_dir={workshop_dir!r}")
     except Exception:
@@ -402,6 +421,10 @@ def run_steamcmd_install(
     # Track inflight/completed (for cancel cleanup)
     start_re = re.compile(r"\bworkshop_download_item\s+221100\s+(\d+)\b", re.IGNORECASE)
     success_re = re.compile(r"\bSuccess\.\s+Downloaded item\s+(\d+)\b", re.IGNORECASE)
+    access_denied_re = re.compile(
+        r"ERROR!\s+Download item\s+(\d+)\s+failed\s+\(Access Denied\)",
+        re.IGNORECASE,
+    )
 
     # Workshop log auto-heal (Missing game files -> poisoned MID)
     workshop_log_path = os.path.join(str(Path.home()), ".local/share/Steam/logs/workshop_log.txt")
@@ -480,7 +503,7 @@ def run_steamcmd_install(
             log(f"[SteamCMD] Auto-heal: poisoned mods detected in workshop log: {sorted(poisoned)}")
             emit_line("[DZLL] Fixing broken workshop mod(s)…")
             for mid in sorted(poisoned):
-                delete_single_mod(mid, log_fn=log_fn)
+                delete_single_mod(mid, workshop_dir=workshop_dir, log_fn=log_fn)
             return True
         except Exception:
             return False
@@ -532,9 +555,9 @@ def run_steamcmd_install(
                 out.append(int(mid))
         return out
 
-    def _run_once(batch: List[int]) -> tuple[bool, int, set[int]]:
+    def _run_once(batch: List[int]) -> tuple[bool, int, set[int], set[int]]:
         """
-        Returns (ok, rc, timed_out_ids).
+        Returns (ok, rc, timed_out_ids, access_denied_ids).
         ok True means rc==0.
         """
         if is_cancelled():
@@ -543,9 +566,10 @@ def run_steamcmd_install(
                 _maybe_heal_poison((0, 0.0))
             except Exception:
                 pass
-            return (False, -1, set())
+            return (False, -1, set(), set())
 
         timed_out_ids: set[int] = set()
+        access_denied_ids: set[int] = set()
         inflight_ids: List[int] = []
         completed_ids: set[int] = set()
 
@@ -555,6 +579,14 @@ def run_steamcmd_install(
                 m = timeout_re.search(line)
                 if m:
                     timed_out_ids.add(int(m.group(1)))
+            except Exception:
+                pass
+
+            # access denied tracking
+            try:
+                m = access_denied_re.search(line)
+                if m:
+                    access_denied_ids.add(int(m.group(1)))
             except Exception:
                 pass
 
@@ -658,7 +690,7 @@ def run_steamcmd_install(
                         emit_line(f"[DZLL] Cancel cleanup: removed {len(poison)} incomplete mod(s).")
                         for mid in poison:
                             log(f"[SteamCMD] Cancel cleanup: deleting in-flight mod {mid}")
-                            delete_single_mod(mid, log_fn=log_fn)
+                            delete_single_mod(mid, workshop_dir=workshop_dir, log_fn=log_fn)
                     except Exception as e:
                         log(f"[SteamCMD] Cancel cleanup failed: {e}")
 
@@ -666,7 +698,7 @@ def run_steamcmd_install(
                         os.close(master_fd)
                     except Exception:
                         pass
-                    return (False, -1, timed_out_ids)
+                    return (False, -1, timed_out_ids, access_denied_ids)
 
                 # Disk activity can keep SteamCMD "alive" even if it prints nothing.
                 now = time.time()
@@ -692,7 +724,7 @@ def run_steamcmd_install(
                         os.close(master_fd)
                     except Exception:
                         pass
-                    return (False, -2, timed_out_ids)
+                    return (False, -2, timed_out_ids, access_denied_ids)
 
                 rlist, _, _ = select.select([master_fd], [], [], 0.20)
 
@@ -749,7 +781,7 @@ def run_steamcmd_install(
                     except Exception:
                         pass
 
-                    return (rc == 0, int(rc), timed_out_ids)
+                    return (rc == 0, int(rc), timed_out_ids, access_denied_ids)
 
         finally:
             try:
@@ -788,13 +820,14 @@ def run_steamcmd_install(
             emit_line(f"[DZLL] SteamCMD attempt {attempt}/{MAX_PASSES}: downloading missing mods ({len(batch)})…")
 
         marker = _workshop_log_marker()
-        ok, rc, timed_out = _run_once(batch)
+        ok, rc, timed_out, access_denied = _run_once(batch)
 
         workshop_dir = _refresh_workshop_dir(workshop_dir)
         missing_now = _missing_from_batch(deduped_mod_ids)
 
         try:
             print(f"[SteamCMD][DEBUG] missing_now={missing_now}")
+            print(f"[SteamCMD][DEBUG] access_denied={sorted(access_denied)}")
             for _mid in deduped_mod_ids:
                 try:
                     _path = workshop_mod_path(workshop_dir, int(_mid))
@@ -804,6 +837,30 @@ def run_steamcmd_install(
                     print(f"[SteamCMD][DEBUG] mid={_mid!r} check failed: {_e}")
         except Exception:
             pass
+
+        if access_denied:
+            denied_sorted = sorted(access_denied)
+            log(f"[SteamCMD] Skipping inaccessible workshop mod(s): {denied_sorted}")
+            LAST_ACCESS_DENIED_IDS = set(access_denied)
+            emit_line(f"[DZLL] Skipping inaccessible mod(s): {', '.join(str(x) for x in denied_sorted)}")
+
+            deduped_mod_ids = [mid for mid in deduped_mod_ids if mid not in access_denied]
+
+            workshop_dir = _refresh_workshop_dir(workshop_dir)
+            missing_now = _missing_from_batch(deduped_mod_ids)
+
+            if not deduped_mod_ids:
+                log("[SteamCMD] No remaining downloadable mods required for this pass.")
+                emit_line("[DZLL] Continuing without inaccessible mod(s).")
+                return True
+
+            if not missing_now:
+                log("[SteamCMD] Remaining accessible mods are present.")
+                emit_line("[DZLL] Remaining accessible mods are ready.")
+                return True
+
+            emit_line("[DZLL] Retrying with inaccessible mods removed…")
+            continue
 
         if ok and not missing_now:
             log("[SteamCMD] All SteamCMD downloads completed successfully.")
@@ -908,7 +965,7 @@ def ensure_dir(path: str) -> str:
 
 def symlink_name_for_mod(mod_name: str, mod_id: int) -> str:
     """
-    Prefer launcher-friendly @Name if available, fallback @<id>.
+    Prefer launcher-friendly @Name__<id> if available, fallback @<id>.
     We keep spaces (launcher sample shows '@Code Lock').
     """
     nm = (mod_name or "").strip()
@@ -916,7 +973,7 @@ def symlink_name_for_mod(mod_name: str, mod_id: int) -> str:
         nm = nm.replace("/", "_").replace("\x00", "")
         if not nm.startswith("@"):
             nm = "@" + nm
-        return nm
+        return f"{nm}__{int(mod_id)}"
     return f"@{int(mod_id)}"
 
 
@@ -1123,7 +1180,7 @@ def remove_mid_from_appworkshop_acf(acf_path: str, mid: int) -> bool:
     return True
 
 
-def delete_single_mod(mid: int, *, log_fn=None) -> bool:
+def delete_single_mod(mid: int, *, workshop_dir: str = "", proton_prefix: str = "", log_fn=None) -> bool:
     """
     Delete ONE DayZ workshop mod safely:
       - remove from workshop content + staging
@@ -1144,16 +1201,15 @@ def delete_single_mod(mid: int, *, log_fn=None) -> bool:
 
     home = str(Path.home())
     steamapps = os.path.join(home, ".local/share/Steam/steamapps")
-    workshop = os.path.join(steamapps, "workshop")
+    workshop = _resolve_path(workshop_dir) if workshop_dir else os.path.join(steamapps, "workshop")
 
     content_dir = os.path.join(workshop, "content", "221100", str(mid))
     downloads_dir = os.path.join(workshop, "downloads", "221100", str(mid))
     patch_file = os.path.join(workshop, "downloads", f"state_221100_221100_{mid}.patch")
     acf_path = os.path.join(workshop, "appworkshop_221100.acf")
 
-    pfx_user = os.path.join(
-        home, ".local/share/Steam/steamapps/compatdata/221100/pfx/drive_c/users/steamuser"
-    )
+    pfx = _resolve_path(proton_prefix) if proton_prefix else os.path.join(steamapps, "compatdata/221100/pfx")
+    pfx_user = os.path.join(pfx, "drive_c/users/steamuser")
     watch_folders = [
         os.path.join(pfx_user, "DZLLMods"),
         os.path.join(pfx_user, "Documents", "Templates"),

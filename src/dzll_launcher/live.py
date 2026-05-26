@@ -26,9 +26,9 @@ def extract_time_from_keywords(keywords: str) -> str:
 
 def query_server_live(ip: str, qport: int) -> dict:
     try:
-        import a2s  # python-a2s
+        from . import a2s
     except Exception:
-        return {"ok": False, "err": "python-a2s not installed"}
+        return {"ok": False, "err": "vendored a2s unavailable"}
 
     addr = (ip, int(qport))
     try:

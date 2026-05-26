@@ -1,5 +1,5 @@
-from a2s.exceptions import BrokenMessageError, BufferExhaustedError
+from .exceptions import BrokenMessageError, BufferExhaustedError
 
-from a2s.info import info, ainfo, SourceInfo, GoldSrcInfo
-from a2s.players import players, aplayers, Player
-from a2s.rules import rules, arules
+from .info import info, ainfo, SourceInfo, GoldSrcInfo
+from .players import players, aplayers, Player
+from .rules import rules, arules

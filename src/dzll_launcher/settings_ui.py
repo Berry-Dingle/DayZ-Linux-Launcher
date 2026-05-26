@@ -475,8 +475,10 @@ class SettingsUI:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.append(self._settings_section_header("General"))
 
+        box.append(self._settings_row_switch("Show Server Companion", "show_server_companion", default=False))
         box.append(self._settings_row_entry("Ingame Name", "ingame_name", "Required By Many Servers"))
         box.append(self._settings_row_entry("High Ping Cutoff (ms)", "high_ping_cutoff_ms", "250", is_int=True))
+        box.append(self._settings_row_entry("Hide Servers Below Max Players", "hide_below_max_players", "0", is_int=True))
         box.append(self._settings_row_switch("Hide Test Servers By Default", "hide_test_servers", default=True))
 
         # Blocklist toggle
@@ -538,9 +540,15 @@ class SettingsUI:
         box.append(hr())
 
         box.append(self._settings_row_switch(
+            "Skip DayZ Launcher",
+            "skip_dayz_launcher",
+            default=True,
+        ))
+
+        box.append(self._settings_row_switch(
             "Minimise DayZ Launcher",
             "minimize_dayz_launcher",
-            default=True,
+            default=False,
             tooltip="Minimise the DayZ launcher on game start. Helps prevent the launcher border being visible in-game.",
         ))
 
@@ -942,12 +950,16 @@ class SettingsUI:
 
         # Re-apply runtime-only effects from clean settings
         self._win._apply_setting_runtime_effects("high_ping_cutoff_ms")
+        self._win._apply_setting_runtime_effects("hide_below_max_players")
         self._win._apply_setting_runtime_effects("hide_test_servers")
         self._win._apply_setting_runtime_effects("enable_blocklist_filter")
+        self._win._apply_setting_runtime_effects("show_server_companion")
         self._win._apply_setting_runtime_effects("show_counts_in_title_bar")
         self._win._apply_setting_runtime_effects("show_counts_servers_loaded")
         self._win._apply_setting_runtime_effects("show_counts_global_players")
         self._win._apply_setting_runtime_effects("enable_steamcmd_mod_handling")
+        self._win._apply_setting_runtime_effects("skip_dayz_launcher")
+        self._win._apply_setting_runtime_effects("minimize_dayz_launcher")
         self._win._apply_setting_runtime_effects("force_fullscreen")
         self._win._apply_setting_runtime_effects("windowed_mode")
         self._win._apply_setting_runtime_effects("discord_detail_level")
@@ -982,8 +994,14 @@ class SettingsUI:
         if key == "hide_test_servers":
             self._win._on_filter_changed()
 
+        if key == "hide_below_max_players":
+            self._win._on_filter_changed()
+
         if key == "enable_blocklist_filter":
             self._win._on_filter_changed()
+
+        if key == "show_server_companion":
+            self._win.set_server_companion_visible(bool(self._win.settings.get("show_server_companion", False)))
 
         if key in ("show_counts_in_title_bar", "show_counts_servers_loaded", "show_counts_global_players"):
             master = bool(self._win.settings.get("show_counts_in_title_bar", False))
@@ -1047,6 +1065,33 @@ class SettingsUI:
                 # Prefer windowed (safer/less surprising).
                 if fs and wn:
                     _set_switch("force_fullscreen", False)
+
+        # Skip DayZ Launcher <-> Minimise DayZ Launcher
+        if key in ("skip_dayz_launcher", "minimize_dayz_launcher", "settings_init"):
+            skip = bool(self._win.settings.get("skip_dayz_launcher", True))
+            mini = bool(self._win.settings.get("minimize_dayz_launcher", False))
+
+            def _set_switch(keyname: str, val: bool):
+                try:
+                    self._win._settings_update_guard = True
+                    self._win.settings[keyname] = bool(val)
+                    w = self._win._settings_widgets.get(keyname)
+                    if w:
+                        w.set_active(bool(val))
+                    save_settings(self._win.settings)
+                except Exception:
+                    pass
+                finally:
+                    self._win._settings_update_guard = False
+
+            if key == "skip_dayz_launcher":
+                if skip and mini:
+                    _set_switch("minimize_dayz_launcher", False)
+            elif key == "minimize_dayz_launcher":
+                if mini and skip:
+                    _set_switch("skip_dayz_launcher", False)
+            elif skip and mini:
+                _set_switch("minimize_dayz_launcher", False)
 
         # ---- Discord Rich Presence ----
         if key in ("discord_rich_presence", "discord_privacy_mode", "discord_detail_level", "settings_init"):

@@ -50,7 +50,8 @@ def load_last_played() -> dict:
             continue
         if now - ts <= cutoff:
             out[str(k)] = ts
-    save_last_played(out)  # persist prune
+    if out != raw:
+        save_last_played(out)  # persist prune
     return out
 
 def save_last_played(lp: dict) -> None:

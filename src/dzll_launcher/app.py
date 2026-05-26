@@ -22,13 +22,9 @@ class DZLLApp(Gtk.Application):
         # Cleanly tear down Discord RPC if present
         try:
             w = getattr(self, "window", None)
-            if w and getattr(w, "_discord", None):
+            if w:
                 try:
-                    w._discord.clear()
-                except Exception:
-                    pass
-                try:
-                    w._discord.disconnect()
+                    w._shutdown_cleanup()
                 except Exception:
                     pass
         except Exception:

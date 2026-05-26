@@ -4,18 +4,23 @@ MIN_MAP_COUNT = 5
 
 # Canonical normalisation rules (lowercased keys)
 _MAP_NORMALISE = {
-    "chernarusplus":    "Chernarus",
-    "ChernarusPlus":    "Chernarus",
-    "chernarus plus":   "Chernarus",
-    "chernarus_plus":   "Chernarus",
-    "enoch":            "Livonia",
-    "livonia":          "Livonia",
-    "deerisle":         "DeerIsle",
-    "Deerisle":         "DeerIsle",
-    "pnw":              "PNW",
-    "Pnw":              "PNW",
-    "Takistanplus":     "TakistanPlus",
-    "takistanplus":     "TakistanPlus",
+    "chernarusplus":        "Chernarus",
+    "ChernarusPlus":        "Chernarus",
+    "chernarus plus":       "Chernarus",
+    "chernarus_plus":       "Chernarus",
+    "ChernarusPlusGloom":   "Chernarus",
+    "chernarusplusgloom":   "Chernarus",
+    "enoch":                "Livonia",
+    "ExclusionZonePlus":    "ExclusionZone",
+    "exclusionzoneplus":    "ExclusionZone",
+    "exclusionzonePlus":    "ExclusionZone",
+    "livonia":              "Livonia",
+    "deerisle":             "DeerIsle",
+    "Deerisle":             "DeerIsle",
+    "pnw":                  "PNW",
+    "Pnw":                  "PNW",
+    "Takistanplus":         "TakistanPlus",
+    "takistanplus":         "TakistanPlus",
 }
 
 def standardize_map(raw: str) -> str:
