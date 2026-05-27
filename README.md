@@ -14,6 +14,7 @@ A native Linux launcher for DayZ with automatic mod handling via SteamCMD.
 - Flatpak Steam is not currently supported — use native Steam for full functionality
 - DayZ must have been launched at least once to create the files DZLL needs
 - SteamCMD (for mod handling)
+- Optional: FFmpeg / `ffplay` for Companion server restart alert sounds
 
 ---
 
@@ -53,6 +54,42 @@ sudo pacman -S python python-pip python-gobject gtk4
 sudo zypper refresh
 sudo zypper install python3 python3-pip python3-gobject python3-gobject-Gdk typelib-1_0-Gtk-4_0 libgtk-4-1
 ```
+
+---
+
+### 🔊 Optional: Companion alert sounds
+
+DZLL includes the alert sound file, but uses the system audio player `ffplay` to play Companion server restart alerts.
+
+If you want Companion alert sounds, install FFmpeg:
+
+#### Fedora / Nobara / Bazzite
+
+```bash
+sudo dnf install ffmpeg
+```
+
+> Fedora may require RPM Fusion for FFmpeg.
+
+#### Ubuntu / Debian / Mint / Pop!_OS
+
+```bash
+sudo apt install ffmpeg
+```
+
+#### Arch / EndeavourOS / CachyOS
+
+```bash
+sudo pacman -S ffmpeg
+```
+
+#### openSUSE
+
+```bash
+sudo zypper install ffmpeg
+```
+
+If `ffplay` is not installed, DZLL will still work, but Companion alert sounds will be unavailable.
 
 ---
 
@@ -266,6 +303,29 @@ Try:
 You likely missed system packages.
 
 Reinstall your distro section above.
+
+---
+
+### ❌ Companion alert sound does not play
+
+Companion alert sounds require `ffplay`, which is usually provided by FFmpeg.
+
+Check:
+
+```bash
+which ffplay
+```
+
+If missing, install FFmpeg for your distro:
+
+```bash
+sudo dnf install ffmpeg      # Fedora / Nobara / Bazzite
+sudo apt install ffmpeg      # Ubuntu / Debian / Mint / Pop!_OS
+sudo pacman -S ffmpeg        # Arch / EndeavourOS / CachyOS
+sudo zypper install ffmpeg   # openSUSE
+```
+
+DZLL will still work without `ffplay`; only Companion alert sounds are affected.
 
 ---
 
