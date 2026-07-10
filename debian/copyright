@@ -1,0 +1,234 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: DZLL
+Source: https://dzllauncher.uk/
+
+Files: *
+Copyright: Gareth Brown and DZLL contributors
+License: LicenseRef-DZLL-Community-Source-1.0
+
+Files: src/dzll_launcher/a2s/*
+Copyright: 2020 Gabriel Huber
+License: MIT
+Comment: Modified vendored python-a2s snapshot; exact upstream version/commit unknown.
+
+Files: src/dzll_launcher/vendor/pypresence/*
+Copyright: 2022 qwertyquerty
+License: MIT
+Comment: Unmodified pypresence 4.6.1 snapshot from upstream tag v4.6.1,
+ commit 54a4dc1f6c0d6feed47e3e8285b8cb83d843c091.
+
+License: LicenseRef-DZLL-Community-Source-1.0
+ .
+ Copyright (c) Gareth Brown and DZLL contributors.
+ .
+ This licence applies to DZLL, also known as DayZ Linux Launcher, including its
+ source code, packaged releases, images, audio, icons, documentation, branding,
+ and other project materials, unless a file clearly states otherwise.
+ .
+ DZLL is made source-available so that the DayZ Linux community can inspect it,
+ audit it, learn from it, improve it, and use it safely. DZLL is intended to
+ remain free for players and the community. It must not be turned into a paid
+ product, paid service, advertising platform, paid server-promotion system, or
+ other monetised product.
+ .
+ 1. Permission
+ .
+ Subject to the terms of this licence, you may:
+ .
+ a. use DZLL free of charge;
+ .
+ b. view, inspect, and audit the source code;
+ .
+ c. modify DZLL for personal, private, educational, or community use;
+ .
+ d. share unmodified copies of DZLL free of charge;
+ .
+ e. share modified copies or forks of DZLL free of charge, provided that you
+    comply with this licence;
+ .
+ f. submit patches, pull requests, bug reports, translations, documentation, or
+    other contributions to the DZLL project.
+ .
+ 2. Non-Commercial Requirement
+ .
+ DZLL must remain free of charge.
+ .
+ You may not, directly or indirectly:
+ .
+ a. sell, rent, lease, license, sublicense, or charge for DZLL;
+ .
+ b. place DZLL, modified versions of DZLL, or access to DZLL behind a paywall,
+    subscription, donation requirement, membership requirement, paid Discord role,
+    paid Patreon tier, paid website account, or similar access restriction;
+ .
+ c. bundle DZLL with a paid product, paid launcher, paid mod pack, paid server
+    package, paid hosting package, paid support package, or paid service;
+ .
+ d. use DZLL as part of a commercial service, hosted service, managed service,
+    software-as-a-service offering, launcher service, server-listing service, or
+    server-management service;
+ .
+ e. monetise DZLL through advertisements, affiliate links, referral links,
+    sponsorships, paid placement, paid ranking, promoted servers, boosted server
+    visibility, paid recommendations, paid search priority, or similar schemes;
+ .
+ f. charge server owners, communities, players, clans, groups, or any other party
+    for inclusion in DZLL, visibility in DZLL, priority in DZLL, compatibility
+    with DZLL, or support by DZLL;
+ .
+ g. use DZLL to collect payments, commissions, referral fees, server-promotion
+    fees, listing fees, or other financial benefits connected to DayZ servers,
+    mods, communities, or players;
+ .
+ h. remove this non-commercial requirement from DZLL or from any modified version
+    or redistribution of DZLL.
+ .
+ This section does not prevent ordinary players, server owners, or communities
+ from using DZLL for free. A DayZ server or community may recommend DZLL to its
+ players, link to the official DZLL project, or help users install DZLL, provided
+ that DZLL itself is not sold, paywalled, bundled into a paid service, used for
+ paid placement, or otherwise monetised.
+ .
+ 3. Attribution and Licence Notices
+ .
+ All copies, redistributions, modified versions, forks, packages, and substantial
+ portions of DZLL must include:
+ .
+ a. this licence;
+ .
+ b. the original copyright notice;
+ .
+ c. clear attribution to the original DZLL project;
+ .
+ d. a link or reference to the official DZLL project, where reasonably possible;
+ .
+ e. any notices required by third-party dependencies or assets.
+ .
+ You may not remove, obscure, falsify, or misrepresent DZLL copyright notices,
+ licence notices, attribution notices, or original project references.
+ .
+ 4. Modified Versions and Forks
+ .
+ You may create and share modified versions or forks of DZLL free of charge,
+ provided that:
+ .
+ a. the modified version remains under this licence;
+ .
+ b. the modified version remains free of charge and non-commercial;
+ .
+ c. the modified version includes this licence and the required attribution;
+ .
+ d. the modified version clearly states that it has been modified;
+ .
+ e. the modified version clearly states that it is not an official DZLL release,
+    unless it has been approved by the original DZLL maintainer;
+ .
+ f. the modified version does not mislead users about its origin, authorship,
+    safety, endorsement, or relationship to the official DZLL project.
+ .
+ 5. Branding, Names, and Logos
+ .
+ The DZLL name, DayZ Linux Launcher name, DZLL logos, icons, visual identity,
+ project identity, and other branding are part of the identity of the official
+ project.
+ .
+ You may not use DZLL branding in a way that:
+ .
+ a. falsely suggests that a modified version, fork, package, website, server list,
+    service, or community is official;
+ .
+ b. falsely suggests endorsement, approval, partnership, or sponsorship by the
+    original DZLL project or its maintainer;
+ .
+ c. confuses users about whether they are using the official DZLL release;
+ .
+ d. removes the original project identity from an official or unmodified
+    redistribution;
+ .
+ e. uses DZLL branding to promote a paid product, paid service, paid server
+    listing, paid server placement, advertisement, sponsorship, or other
+    monetised activity.
+ .
+ Modified versions and forks must use clear naming, labelling, or visual
+ distinction so that users can tell they are not official DZLL releases.
+ .
+ 6. Source Availability and Transparency
+ .
+ If you distribute a modified version of DZLL, you must make the corresponding
+ modified source code available under this licence at no charge.
+ .
+ The source code must be sufficient for users to inspect, audit, build, and
+ understand the modified version. You may not distribute a modified binary,
+ installer, package, or bundled version of DZLL without making the corresponding
+ modified source code available under the same terms.
+ .
+ 7. Contributions
+ .
+ By submitting a contribution to DZLL, including code, documentation, assets,
+ translations, bug fixes, patches, pull requests, or other project materials, you
+ agree that your contribution may be included in DZLL and licensed under this
+ licence.
+ .
+ You confirm that you have the right to submit the contribution and that, to the
+ best of your knowledge, it does not knowingly infringe the rights of others.
+ .
+ 8. Third-Party Components
+ .
+ DZLL may use third-party libraries, tools, assets, or dependencies. Those
+ third-party components remain subject to their own licences.
+ .
+ This licence does not grant rights to third-party materials beyond the rights
+ granted by their respective owners and licences.
+ .
+ 9. No Warranty
+ .
+ DZLL is provided "as is", without warranty of any kind, express or implied,
+ including but not limited to warranties of merchantability, fitness for a
+ particular purpose, non-infringement, availability, reliability, security, or
+ compatibility.
+ .
+ Use DZLL at your own risk.
+ .
+ 10. Limitation of Liability
+ .
+ To the maximum extent permitted by law, the authors, maintainers, contributors,
+ and copyright holders of DZLL shall not be liable for any claim, damage, loss,
+ cost, data loss, account issue, service interruption, game issue, system issue,
+ or other liability arising from or related to DZLL, whether in contract, tort, or
+ otherwise.
+ .
+ 11. Termination
+ .
+ If you violate this licence, your rights under this licence terminate
+ automatically.
+ .
+ To regain permission, you must stop the violation, remove or correct any
+ non-compliant copies or distributions, and comply with any reasonable request
+ from the DZLL maintainer to cure the violation.
+ .
+ 12. No Other Rights
+ .
+ All rights not expressly granted by this licence are reserved.
+ .
+ DZLL is free, source-available community software. It is made available for
+ trust, transparency, safety, and community benefit, not for commercial
+ exploitation.
+
+License: MIT
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the Software), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in
+ all copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED AS IS, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+ THE SOFTWARE.

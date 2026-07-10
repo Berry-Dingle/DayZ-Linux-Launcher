@@ -96,3 +96,10 @@ htmlcov/
 # -------------------------
 # .env
 # *.local
+
+# Debian package build outputs
+/debian/.debhelper/
+/debian/dzll-launcher/
+/debian/debhelper-build-stamp
+/debian/files
+/debian/*.substvars

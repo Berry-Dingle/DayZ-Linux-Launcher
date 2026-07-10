@@ -1,8 +1,0 @@
-[Desktop Entry]
-Name=Dzll-launcher
-Comment=DZLL is a launcher application for Dayz using SteamCMD to handle mods for modded servers
-Exec=dzll_launcher
-Icon=icon
-Terminal=false
-Type=Application
-Categories=Utility;Game;

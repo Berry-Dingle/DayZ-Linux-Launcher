@@ -1,2 +1,5 @@
 requests
-pypresence
+
+# Optional: install this only if you want to test/use an external system
+# pypresence provider instead of DZLL's bundled Rich Presence fallback.
+# pypresence>=4.6.1,<5

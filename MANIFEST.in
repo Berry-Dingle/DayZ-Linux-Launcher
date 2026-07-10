@@ -1,13 +1,16 @@
 include LICENSE
 include README.md
-include dzll_launcher.desktop
+include com.bdingle.dzll.desktop
 include requirements.txt
 
-recursive-include src/dzll_launcher *
+graft src/dzll_launcher
 
-recursive-exclude src/dzll_launcher __pycache__ *
-recursive-exclude src/dzll_launcher *.pyc
-recursive-exclude src/dzll_launcher *.pyo
-recursive-exclude src/dzll_launcher *.bak
-recursive-exclude src/dzll_launcher *.bak_*
-recursive-exclude src/dzll_launcher *~
+prune src/dzll_launcher/audio/old
+
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.pyo
+global-exclude *.old
+global-exclude *.bak
+global-exclude *.bak_*
+global-exclude *~

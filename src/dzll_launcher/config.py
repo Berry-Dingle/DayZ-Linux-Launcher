@@ -6,14 +6,14 @@ APP_ID = "com.bdingle.dzll"
 # ----------------------------
 # VERSION / UPDATES
 # ----------------------------
-APP_VERSION = "v0.2.0-beta"
+APP_VERSION = "v0.3.0-beta"
 RELEASES_URL = "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
 GITHUB_LATEST_API = "https://api.github.com/repos/Berry-Dingle/DayZ-Linux-Launcher/releases/latest"
 
 # ----------------------------
 # WINDOW (LOCKED)
 # ----------------------------
-WINDOW_DEFAULT_SIZE = (1200, 708)
+WINDOW_DEFAULT_SIZE = (1200, 754)
 
 # ----------------------------
 # TWEAKABLES (LOCKED LAYOUT)
@@ -30,7 +30,7 @@ DIVIDER_COLOR = "#56575a"
 SIDEBAR_WIDTH = 220          # HARD fixed sidebar width (px)
 SIDEBAR_INNER_PADDING = 10   # padding implemented as margins inside sidebar frame (px)
 
-DISCLAIMER_GAP_ABOVE = 20    # gap between logo/BMC and disclaimer (px)
+DISCLAIMER_GAP_ABOVE = 4    # gap between logo/BMC and disclaimer (px)
 DISCLAIMER_COLOR = "#717171"
 
 ICON_COL_WIDTH = 18          # width for lock/3pp icon column
@@ -55,6 +55,10 @@ FAV_PATH = os.path.join(CFG_DIR, "favorites.json")
 LAST_PLAYED_PATH = os.path.join(CFG_DIR, "last_played.json")
 LAST_PLAYED_PRUNE_DAYS = 90
 
+# Last Companion server (local app state)
+LAST_COMPANION_SERVER_PATH = os.path.join(CFG_DIR, "last_companion_server.json")
+COMPANION_RESTART_LEARNING_PATH = os.path.join(CFG_DIR, "companion_restart_learning.json")
+
 # Dead server cache (local)
 CACHE_DIR = os.path.expanduser("~/.cache/dzll")
 DEAD_PATH = os.path.join(CACHE_DIR, "dead.json")
@@ -62,11 +66,16 @@ DEAD_PATH = os.path.join(CACHE_DIR, "dead.json")
 # Steam global player count (official endpoint)
 STEAM_CURRENT_PLAYERS_URL = "https://api.steampowered.com/ISteamUserStats/GetNumberOfCurrentPlayers/v1/?appid=221100"
 # How often we poll Steam for global players (seconds)
-GLOBAL_PLAYERS_POLL_SECS = 300  # 5 minutes
+GLOBAL_PLAYERS_POLL_SECS = 60
+
+# Companion server polling
+COMPANION_POLL_ONLINE_SECONDS = 10
+COMPANION_POLL_OFFLINE_SECONDS = 3
+COMPANION_ALERT_REARM_OFFLINE_SECONDS = 60
 
 # Offline behavior:
 # - offline recheck runs every 5 minutes
-# - if a server fails 6 offline rechecks (~30 minutes), hide it until next app run
+# - repeated failures keep a server marked OFFLINE; Online Only is the user-visible hide control
 DEAD_MAX_FAILS = 6
 DEAD_HIDE_DAYS = 0  # not used in current logic
 
@@ -87,6 +96,10 @@ BL_LOCAL_PATH = os.path.join(BL_LOCAL_DIR, "blocklist.json")
 # Live refresh rules
 PING_CUTOFF_MS = 250
 STARTUP_PING_FIRST_N = 50
+STARTUP_LIVE_REST_WORKERS = 32
+STARTUP_LIVE_REST_TIMEOUT_SECS = 0.9
+STARTUP_LIVE_FLUSH_MAX = 75
+STARTUP_LIVE_FLUSH_MS = 150
 BATCH_SIZE = 100
 MAX_WORKERS = 20
 # High-priority executor for manual refresh
@@ -95,10 +108,17 @@ HI_WORKERS = 4
 OFFLINE_RECHECK_SECS = 300      # 5 minutes
 REFRESH_RATE_LIMIT_SECS = 1.0   # per-server
 
-# Logo (relative path for RPM safety)
+# Browser live-refresh: only visible rows plus a small lookahead, non-structural.
+BROWSER_LIVE_INTERVAL_SECS = 5
+BROWSER_LIVE_AHEAD_ROWS = 20
+BROWSER_LIVE_AHEAD_PER_TICK = 8
+BROWSER_LIVE_WORKERS = 8
+BROWSER_LIVE_TIMEOUT_SECS = 1.25
+BROWSER_LIVE_PING_DAMPEN_MS = 8
+BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX = 64
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(BASE_DIR, "images")
-LOGO_PATH = os.path.join(IMAGES_DIR, "logo2.png")
 
 DISCLAIMER_TEXT = (
     "DayZ® is a registered trademark of\n"

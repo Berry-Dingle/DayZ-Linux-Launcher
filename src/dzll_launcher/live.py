@@ -3,9 +3,22 @@ import time
 import re
 
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+_QUEUE_RE = re.compile(r"^lqs(\d+)$", re.IGNORECASE)
 
 def is_valid_hhmm(s: str) -> bool:
     return bool(_TIME_RE.match((s or "").strip()))
+
+def extract_queue_from_keywords(keywords) -> int | None:
+    if not keywords:
+        return None
+    try:
+        for token in str(keywords).split(","):
+            match = _QUEUE_RE.fullmatch(token.strip())
+            if match:
+                return int(match.group(1))
+    except Exception:
+        pass
+    return None
 
 def extract_time_from_keywords(keywords: str) -> str:
     """
@@ -24,7 +37,7 @@ def extract_time_from_keywords(keywords: str) -> str:
         pass
     return ""
 
-def query_server_live(ip: str, qport: int) -> dict:
+def query_server_live(ip: str, qport: int, timeout: float = 2.0) -> dict:
     try:
         from . import a2s
     except Exception:
@@ -33,7 +46,7 @@ def query_server_live(ip: str, qport: int) -> dict:
     addr = (ip, int(qport))
     try:
         t0 = time.time()
-        info = a2s.info(addr, timeout=2.0)
+        info = a2s.info(addr, timeout=float(timeout))
         t1 = time.time()
 
         ping_s = None
@@ -50,6 +63,7 @@ def query_server_live(ip: str, qport: int) -> dict:
 
         kw = getattr(info, "keywords", "") or ""
         t = extract_time_from_keywords(kw)
+        queue = extract_queue_from_keywords(kw)
 
         pw = bool(getattr(info, "password_protected", False))
 
@@ -58,6 +72,7 @@ def query_server_live(ip: str, qport: int) -> dict:
             "ping_ms": ping_ms,
             "players": players,
             "max_players": maxp,
+            "queue": queue,
             "time": t,
             "password": pw,
         }

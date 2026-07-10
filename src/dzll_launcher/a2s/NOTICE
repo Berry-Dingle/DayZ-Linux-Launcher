@@ -1,0 +1,6 @@
+Component: python-a2s
+Upstream: https://github.com/Yepoleb/python-a2s
+Copyright: Copyright (c) 2020 Gabriel Huber
+Licence: MIT
+Status: Modified vendored snapshot used by DZLL
+Exact upstream version/commit: Unknown

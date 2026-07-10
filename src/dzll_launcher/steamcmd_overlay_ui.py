@@ -246,8 +246,11 @@ class SteamCMDOverlayUI:
             pass
 
         try:
-            self.steamcmd_spinner.set_spinning(bool(spinning))
-            self.steamcmd_spinner.set_visible(bool(spinning))
+            spinner_visible = bool(spinning)
+            if getattr(self.win, "_mod_download_backend_active", "") == "steam_client":
+                spinner_visible = False
+            self.steamcmd_spinner.set_spinning(spinner_visible)
+            self.steamcmd_spinner.set_visible(spinner_visible)
         except Exception:
             pass
 
@@ -263,7 +266,15 @@ class SteamCMDOverlayUI:
         # Busy => hide login form to become a pure 3-line log view
         try:
             busy = bool(spinning)
-            if busy:
+            steam_client_busy = busy and getattr(self.win, "_mod_download_backend_active", "") == "steam_client"
+            if steam_client_busy:
+                self.win._steamcmd_stop_progress_timer()
+                try:
+                    self.steamcmd_prog_bar.set_visible(False)
+                    self.steamcmd_prog_bar.set_show_text(False)
+                except Exception:
+                    pass
+            elif busy:
                 self.win._steamcmd_start_progress_timer()
             else:
                 self.win._steamcmd_stop_progress_timer()
@@ -331,7 +342,46 @@ class SteamCMDOverlayUI:
         except Exception:
             pass
 
+    def _show_steam_client_download_overlay(self, status: str = ""):
+        self.win._steamcmd_heading = "Checking/Updating Required Mods…"
+        self.win._steamcmd_l1 = "Steam is handling the required Workshop mods."
+        self.win._steamcmd_l2 = status or "Required mods are being prepared."
+        self.win._steamcmd_overlay_render(
+            self.win._steamcmd_heading,
+            self.win._steamcmd_l1,
+            self.win._steamcmd_l2,
+            True,
+        )
+        try:
+            self._steamcmd_stop_progress_timer()
+            self.steamcmd_prog_bar.set_visible(False)
+            self.steamcmd_prog_bar.set_show_text(False)
+        except Exception:
+            pass
+        for widget in getattr(self.win, "_steamcmd_form_widgets", []):
+            try:
+                widget.set_visible(False)
+            except Exception:
+                pass
+        self.steamcmd_login_btn.set_visible(False)
+        self.steamcmd_cancel_btn.set_visible(True)
+        self.steamcmd_auth_scrim.set_visible(True)
+        self.steamcmd_auth_box.set_visible(True)
+
     def _hide_steamcmd_auth_overlay(self):
+        self._steamcmd_stop_progress_timer()
+        try:
+            self.steamcmd_spinner.set_spinning(False)
+            self.steamcmd_spinner.set_visible(False)
+        except Exception:
+            pass
+        try:
+            self.steamcmd_prog_bar.set_fraction(0.0)
+            self.steamcmd_prog_bar.set_show_text(False)
+            self.steamcmd_prog_bar.set_text("")
+            self.steamcmd_prog_bar.set_visible(False)
+        except Exception:
+            pass
         try:
             self.steamcmd_pass_entry.set_text("")
         except Exception:
@@ -409,29 +459,35 @@ class SteamCMDOverlayUI:
 
         Critical: always release any pending auth wait to avoid deadlocks.
         """
-        try:
-            GLib.idle_add(self.win._steamcmd_reset_state_for_new_run)
-        except Exception:
-            pass
-
         ev = getattr(self.win, "_steamcmd_auth_event", None)
         req = getattr(self.win, "_steamcmd_auth_request", None)
         auth_pending = bool(req) and isinstance(req, dict) and req.get("pending")
 
         # If install running => set cancel event and show cancelling UI; do NOT hide overlay here.
         try:
-            if bool(getattr(self.win, "_steamcmd_install_in_progress", False)):
+            if (
+                bool(getattr(self.win, "_steamcmd_install_in_progress", False))
+                or getattr(self.win, "_mod_download_backend_active", "") == "steam_client"
+            ):
                 try:
                     self.win._steamcmd_cancel_event.set()
                 except Exception:
                     pass
 
-                self.win._steamcmd_set_state(
-                    heading="Cancelling SteamCMD…",
-                    line1=getattr(self.win, "_steamcmd_l1", "") or "",
-                    line2="Stopping SteamCMD…",
-                    spinning=True,
-                )
+                if getattr(self.win, "_mod_download_backend_active", "") == "steam_client":
+                    self.win._steamcmd_set_state(
+                        heading="Cancelling…",
+                        line1=getattr(self.win, "_steamcmd_l1", "") or "",
+                        line2="Cancelling after current Steam download finishes…",
+                        spinning=True,
+                    )
+                else:
+                    self.win._steamcmd_set_state(
+                        heading="Cancelling SteamCMD…",
+                        line1=getattr(self.win, "_steamcmd_l1", "") or "",
+                        line2="Stopping SteamCMD…",
+                        spinning=True,
+                    )
 
                 # ALSO release a pending auth wait if one exists (stale state protection)
                 if auth_pending and isinstance(ev, threading.Event):
@@ -443,6 +499,11 @@ class SteamCMDOverlayUI:
                     except Exception:
                         pass
                 return
+        except Exception:
+            pass
+
+        try:
+            GLib.idle_add(self.win._steamcmd_reset_state_for_new_run)
         except Exception:
             pass
 
@@ -465,9 +526,6 @@ class SteamCMDOverlayUI:
                 pass
 
     def _request_steamcmd_credentials_blocking(self, username_prefill: str = "", status: str = ""):
-        # ===== DEBUGGING ===== #
-        print("[STEAMCMD AUTH] blocking credentials request starting")
-        # ===================== #
         """
         Show SteamCMD auth overlay and block (from a worker thread) until user submits/cancels.
 
@@ -637,7 +695,7 @@ class SteamCMDOverlayUI:
 
             mid_i = int(mid)
 
-            # read bytes on disk (downloads + content)
+            # read bytes on disk (downloads + patch state + content)
             workshop_dir = str(self.win.settings.get("workshop_dir") or "").strip()
             if not workshop_dir:
                 workshop_dir = autodetect_workshop_dir() or ""
@@ -645,6 +703,7 @@ class SteamCMDOverlayUI:
 
             dl_dir = os.path.join(workshop_dir, "downloads", "221100", str(mid_i))
             ct_dir = os.path.join(workshop_dir, "content", "221100", str(mid_i))
+            patch_file = os.path.join(workshop_dir, "downloads", f"state_221100_221100_{mid_i}.patch")
 
             def dir_bytes(p: str) -> int:
                 total = 0
@@ -660,7 +719,16 @@ class SteamCMDOverlayUI:
                     return 0
                 return int(total)
 
-            have = dir_bytes(dl_dir) + dir_bytes(ct_dir)
+            download_bytes = dir_bytes(dl_dir)
+            content_bytes = dir_bytes(ct_dir)
+            try:
+                patch_bytes = int(os.path.getsize(patch_file))
+            except Exception:
+                patch_bytes = 0
+            if getattr(self.win, "_mod_download_backend_active", "") == "steam_client":
+                have = max(download_bytes, content_bytes, patch_bytes)
+            else:
+                have = download_bytes + content_bytes
 
             # clamp monotonic (avoid "going backwards" during file moves)
             last = int(getattr(self.win, "_steamcmd_last_progress_bytes", 0) or 0)
@@ -821,12 +889,12 @@ class SteamCMDOverlayUI:
 
             size_suffix = f" ({size_str})" if size_str else ""
             if done_id:
-                l1 = f"Done: Mod {done_id} Successfully Downloaded{size_suffix}"
+                l1 = f"Done: Mod {done_id} Checked/Updated{size_suffix}"
             else:
-                l1 = "Done: Mod Successfully Downloaded"
+                l1 = "Done: Mod Checked/Updated"
 
             self.win._steamcmd_set_state(
-                heading="Downloading Required Mods, This Might Take a While…",
+                heading="Checking/Updating Required Mods, This Might Take a While…",
                 line1=l1,
                 line2=self.win._steamcmd_l2 or "",
                 spinning=True,
@@ -884,9 +952,9 @@ class SteamCMDOverlayUI:
             suffix = f" ({frac})" if frac else ""
 
             self.win._steamcmd_set_state(
-                heading="Downloading Required Mods, This Might Take a While…",
+                heading="Checking/Updating Required Mods, This Might Take a While…",
                 line1=self.win._steamcmd_l1 or "",
-                line2=f"Downloading: Mod {mod_id}{size_suffix}{suffix}",
+                line2=f"Checking/Updating: Mod {mod_id}{size_suffix}{suffix}",
                 spinning=True,
             )
             return False
@@ -919,16 +987,16 @@ class SteamCMDOverlayUI:
             suffix = f" - {frac}..." if frac else "..."
 
             self.win._steamcmd_set_state(
-                heading="Downloading Required Mods, This Might Take a While…",
+                heading="Checking/Updating Required Mods, This Might Take a While…",
                 line1=self.win._steamcmd_l1 or "",
-                line2=f"Downloading: Mod {mod_id}{size_suffix}{suffix}",
+                line2=f"Checking/Updating: Mod {mod_id}{size_suffix}{suffix}",
                 spinning=True,
             )
             return False
 
         if "error! timeout downloading item" in low:
             self.win._steamcmd_set_state(
-                heading="Downloading Required Mods…",
+                heading="Checking/Updating Required Mods…",
                 line1="SteamCMD download timed out.",
                 line2="Check disk space / connection and try again.",
                 spinning=False,
@@ -937,7 +1005,7 @@ class SteamCMDOverlayUI:
 
         if "error! download item" in low and "failed" in low:
             self.win._steamcmd_set_state(
-                heading="Downloading Required Mods…",
+                heading="Checking/Updating Required Mods…",
                 line1="SteamCMD failed to download a mod.",
                 line2="Check disk space / connection and try again.",
                 spinning=False,

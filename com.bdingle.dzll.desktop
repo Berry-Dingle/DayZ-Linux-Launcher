@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=DayZ Linux Launcher
+Comment=DayZ Linux launcher with Steam Workshop mod handling
+Exec=dzll_launcher
+Icon=com.bdingle.dzll
+Terminal=false
+Type=Application
+Categories=Utility;Game;

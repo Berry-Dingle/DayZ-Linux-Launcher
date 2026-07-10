@@ -14,12 +14,19 @@ DEFAULTS: Dict[str, Any] = {
     "high_ping_cutoff_ms": 250,
     "hide_below_max_players": 0,
     "hide_test_servers": True,
-    "enable_blocklist_filter": True,
+    "prioritise_trusted_servers": False,
+    "pin_favorite_servers": False,
+    "enable_blocklist_filter": False,
 
     # Title bar counts
     "show_counts_in_title_bar": False,
     "show_counts_servers_loaded": True,
     "show_counts_global_players": True,
+
+    # Server Companion
+    "server_companion_restart_alert_enabled": False,
+    "server_companion_alert_sound": "female",
+    "server_companion_alert_volume": 30,
 
     # Updates
     "auto_check_updates": True,
@@ -27,10 +34,12 @@ DEFAULTS: Dict[str, Any] = {
     "latest_release_tag": "",
     "latest_release_url": "",
     "update_remind_after_ts": 0,
+    "skipped_release_tag": "",
 
     # Launch
-    "steam_install_type": "auto",  # auto | native | flatpak
+    "steam_install_type": "auto",  # legacy: auto | native
     "skip_dayz_launcher": True,
+    "start_steam_on_join": False,
     "no_splash": True,
     "windowed_mode": False,
     "additional_launch_params": "",
@@ -40,6 +49,7 @@ DEFAULTS: Dict[str, Any] = {
 
     # Mods
     "enable_steamcmd_mod_handling": True,
+    "mod_download_backend": "steam_client",  # steam_client | steamcmd
     "steamcmd_username": "",
     "steamcmd_path": "",
     "steamcmd_path_user_set": False,
@@ -50,6 +60,7 @@ DEFAULTS: Dict[str, Any] = {
     "workshop_dir_user_set": False,
     "additional_mod_ids": "",
     "verify_mod_files": False,
+    "restart_steam_after_local_cleanup": False,
 
     # Discord
     "discord_rich_presence": True,
@@ -93,6 +104,10 @@ def load_settings() -> Dict[str, Any]:
         legacy = bool(raw["auto_install_update_mods"])
         out["auto_install_missing_mods"] = legacy
         out["auto_update_required_mods"] = legacy
+    if out.get("mod_download_backend") not in ("steam_client", "steamcmd"):
+        out["mod_download_backend"] = "steam_client"
+    if out.get("steam_install_type") not in ("auto", "native"):
+        out["steam_install_type"] = "auto"
     if bool(out.get("skip_dayz_launcher", True)) and bool(out.get("minimize_dayz_launcher", False)):
         out["minimize_dayz_launcher"] = False
     return out
@@ -102,6 +117,8 @@ def save_settings(settings: Dict[str, Any]) -> None:
     for k, v in (settings or {}).items():
         if k in DEFAULTS:
             clean[k] = v
+    if clean.get("steam_install_type") not in ("auto", "native"):
+        clean["steam_install_type"] = "auto"
     _write_json(SETTINGS_PATH, clean)
 
 def reset_settings() -> Dict[str, Any]:
@@ -152,7 +169,6 @@ def autodetect_workshop_dir() -> str:
     candidates = [
         os.path.expanduser("~/.local/share/Steam/steamapps/workshop"),
         os.path.expanduser("~/.steam/steam/steamapps/workshop"),
-        os.path.expanduser("~/.var/app/com.valvesoftware.Steam/data/Steam/steamapps/workshop"),
     ]
     for p in candidates:
         try:

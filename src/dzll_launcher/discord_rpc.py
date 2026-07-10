@@ -14,7 +14,10 @@ from typing import Optional
 try:
     from pypresence import Presence
 except Exception:
-    Presence = None  # handled gracefully
+    try:
+        from .vendor.pypresence import Presence
+    except Exception:
+        Presence = None  # handled gracefully
 
 
 # TODO: set your real Discord app client ID here

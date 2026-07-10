@@ -31,6 +31,7 @@ STEAM_DETAILS_URL = "https://api.steampowered.com/ISteamRemoteStorage/GetPublish
 STEAM_WORKSHOP_BATCH_MAX = 100
 
 LAST_ACCESS_DENIED_IDS: set[int] = set()
+LAST_EFFECTIVE_WORKSHOP_DIR = ""
 
 def _best_effort_shutdown_steam(log_fn=None, timeout_s: float = 10.0) -> None:
     """
@@ -225,6 +226,37 @@ def _resolve_path(p: str) -> str:
     return os.path.abspath(os.path.expanduser(p))
 
 
+def _resolved_dayz_workshop_root() -> str:
+    try:
+        from .steam_native import dayz_workshop_content_dir
+
+        content_dir = dayz_workshop_content_dir()
+        if content_dir is not None:
+            return _resolve_path(str(Path(content_dir).parent.parent))
+    except Exception:
+        pass
+    return ""
+
+
+def _resolved_dayz_proton_prefix() -> str:
+    try:
+        from .steam_native import dayz_compatdata_dir
+
+        compatdata = dayz_compatdata_dir()
+        if compatdata is not None:
+            return _resolve_path(str(Path(compatdata) / "pfx"))
+    except Exception:
+        pass
+    return ""
+
+
+def _real_path(p: str) -> str:
+    p = _resolve_path(p)
+    if not p:
+        return ""
+    return os.path.realpath(p)
+
+
 def _looks_executable(p: str) -> bool:
     try:
         return bool(p) and os.path.isfile(p) and os.access(p, os.X_OK)
@@ -319,8 +351,9 @@ def run_steamcmd_install(
     Returns True on success, False on any failure/cancel/stall after retries.
     """
 
-    global LAST_ACCESS_DENIED_IDS
+    global LAST_ACCESS_DENIED_IDS, LAST_EFFECTIVE_WORKSHOP_DIR
     LAST_ACCESS_DENIED_IDS = set()
+    LAST_EFFECTIVE_WORKSHOP_DIR = ""
 
     raw_steamcmd_path = (steamcmd_path or "").strip()
     detected_steamcmd_path = ""
@@ -333,6 +366,7 @@ def run_steamcmd_install(
 
     steamcmd_path = _resolve_path(steamcmd_path)
     workshop_dir = _resolve_path(workshop_dir)
+    LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
 
     def log(msg: str):
         if callable(log_fn):
@@ -354,6 +388,7 @@ def run_steamcmd_install(
             return False
 
     def _refresh_workshop_dir(current: str) -> str:
+        global LAST_EFFECTIVE_WORKSHOP_DIR
         """
         Re-resolve the workshop root while SteamCMD is running/retrying.
 
@@ -366,6 +401,7 @@ def run_steamcmd_install(
                 fresh = _resolve_path(fresh)
                 if fresh != current:
                     log(f"[SteamCMD][FIX] workshop_dir refreshed: {current!r} -> {fresh!r}")
+                    LAST_EFFECTIVE_WORKSHOP_DIR = fresh
                     return fresh
         except Exception:
             pass
@@ -373,6 +409,7 @@ def run_steamcmd_install(
 
     # First refresh before any validation/checks
     workshop_dir = _refresh_workshop_dir(workshop_dir)
+    LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
 
     try:
         print(f"[SteamCMD][DEBUG] raw_steamcmd_path={raw_steamcmd_path!r}")
@@ -806,23 +843,27 @@ def run_steamcmd_install(
 
         # Always refresh before each pass in case Steam/SteamCMD has just initialized the workshop path
         workshop_dir = _refresh_workshop_dir(workshop_dir)
+        LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
 
         if attempt == 1:
             batch = list(deduped_mod_ids)
-            emit_line(f"[DZLL] SteamCMD attempt {attempt}/{MAX_PASSES}: downloading required mods…")
+            action = "validating required mods" if validate else "checking/updating required mods"
+            emit_line(f"[DZLL] SteamCMD attempt {attempt}/{MAX_PASSES}: {action}…")
         else:
             workshop_dir = _refresh_workshop_dir(workshop_dir)
+            LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
             batch = _missing_from_batch(deduped_mod_ids)
             if not batch:
-                log("[SteamCMD] All SteamCMD downloads completed successfully.")
-                emit_line("[DZLL] All SteamCMD downloads completed.")
+                log("[SteamCMD] All SteamCMD required mod work completed successfully.")
+                emit_line("[DZLL] All SteamCMD required mods are ready.")
                 return True
-            emit_line(f"[DZLL] SteamCMD attempt {attempt}/{MAX_PASSES}: downloading missing mods ({len(batch)})…")
+            emit_line(f"[DZLL] SteamCMD attempt {attempt}/{MAX_PASSES}: checking missing mods ({len(batch)})…")
 
         marker = _workshop_log_marker()
         ok, rc, timed_out, access_denied = _run_once(batch)
 
         workshop_dir = _refresh_workshop_dir(workshop_dir)
+        LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
         missing_now = _missing_from_batch(deduped_mod_ids)
 
         try:
@@ -847,6 +888,7 @@ def run_steamcmd_install(
             deduped_mod_ids = [mid for mid in deduped_mod_ids if mid not in access_denied]
 
             workshop_dir = _refresh_workshop_dir(workshop_dir)
+            LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
             missing_now = _missing_from_batch(deduped_mod_ids)
 
             if not deduped_mod_ids:
@@ -863,8 +905,8 @@ def run_steamcmd_install(
             continue
 
         if ok and not missing_now:
-            log("[SteamCMD] All SteamCMD downloads completed successfully.")
-            emit_line("[DZLL] All SteamCMD downloads completed.")
+            log("[SteamCMD] All SteamCMD required mod work completed successfully.")
+            emit_line("[DZLL] All SteamCMD required mods are ready.")
             return True
 
         # Heal poison if present (does not consume an extra attempt by itself)
@@ -893,6 +935,7 @@ def run_steamcmd_install(
             continue
 
     workshop_dir = _refresh_workshop_dir(workshop_dir)
+    LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
     final_missing = _missing_from_batch(deduped_mod_ids)
     log(f"[SteamCMD] Still missing after {MAX_PASSES} attempt(s): {final_missing}")
     emit_line("[DZLL] Some mods are still missing after several attempts. Please press Join again to retry.")
@@ -970,11 +1013,160 @@ def symlink_name_for_mod(mod_name: str, mod_id: int) -> str:
     """
     nm = (mod_name or "").strip()
     if nm:
-        nm = nm.replace("/", "_").replace("\x00", "")
+        nm = "".join(ch for ch in nm if ch >= " " and ch != "\x7f")
+        nm = nm.replace("++", "pp").replace("+", "plus")
+        nm = re.sub(r"\]\s*\[|\)\s*\(|}\s*{", "_", nm)
+        nm = re.sub(r"[\[\](){}]", "", nm)
+        nm = re.sub(r'[/\\:;|"<>*?%&#=,.]', "_", nm)
+        nm = re.sub(r"\s+", " ", nm)
+        nm = re.sub(r"_+", "_", nm)
+        nm = re.sub(r"\s*_\s*", "_", nm)
+        nm = nm.strip(" _.") or "Mod"
         if not nm.startswith("@"):
             nm = "@" + nm
         return f"{nm}__{int(mod_id)}"
     return f"@{int(mod_id)}"
+
+
+def _is_dzll_owned_symlink_name(name: str) -> bool:
+    """
+    Names DZLL has created for watch-folder symlinks.
+    Keep this narrow so cleanup never removes arbitrary user symlinks.
+    """
+    s = str(name or "")
+    return bool(
+        re.match(r"^@.+__\d+$", s)
+        or re.match(r"^@\d+$", s)
+    )
+
+
+def _mod_id_from_dzll_symlink_name(name: str) -> int | None:
+    s = str(name or "")
+    m = re.search(r"__(\d+)$", s) or re.match(r"^@(\d+)$", s)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def _resolve_symlink_target(link_path: str) -> str:
+    raw = os.readlink(link_path)
+    if os.path.isabs(raw):
+        return _real_path(raw)
+    return _real_path(os.path.join(os.path.dirname(link_path), raw))
+
+
+def remove_dzll_symlinks_for_mod(mod_id, *, proton_prefix: str = "", log_fn=None) -> List[str]:
+    """
+    Remove only DZLL-owned watch-folder symlinks whose name encodes mod_id.
+    This intentionally does not remove arbitrary symlinks or non-symlink paths.
+    """
+    def log(msg: str):
+        try:
+            if callable(log_fn):
+                log_fn(msg)
+            else:
+                print(msg)
+        except Exception:
+            pass
+
+    try:
+        mid = int(mod_id)
+    except Exception:
+        return []
+    if mid <= 0:
+        return []
+
+    pfx = _resolve_path(proton_prefix)
+    if not pfx:
+        try:
+            from .steam_native import dayz_compatdata_dir
+
+            compatdata = dayz_compatdata_dir()
+            if compatdata is not None:
+                pfx = str(Path(compatdata) / "pfx")
+        except Exception:
+            pfx = ""
+    if not pfx:
+        home = str(Path.home())
+        pfx = os.path.join(home, ".local/share/Steam/steamapps/compatdata/221100/pfx")
+
+    pfx_user = os.path.join(pfx, "drive_c/users/steamuser")
+    watch_folders = [
+        os.path.join(pfx_user, "DZLLMods"),
+        os.path.join(pfx_user, "Documents", "Templates"),
+    ]
+    removed: List[str] = []
+
+    for watch_folder in watch_folders:
+        if not os.path.isdir(watch_folder):
+            continue
+        try:
+            for name in os.listdir(watch_folder):
+                if not _is_dzll_owned_symlink_name(name):
+                    continue
+                if _mod_id_from_dzll_symlink_name(name) != mid:
+                    continue
+                path = os.path.join(watch_folder, name)
+                if not os.path.islink(path):
+                    continue
+                try:
+                    os.unlink(path)
+                    removed.append(path)
+                    log(f"[MOD DELETE] removed DZLL symlink: {path}")
+                except Exception as exc:
+                    log(f"[MOD DELETE] failed to remove DZLL symlink {path}: {exc}")
+        except Exception as exc:
+            log(f"[MOD DELETE] failed to scan DZLL symlinks in {watch_folder}: {exc}")
+
+    return removed
+
+
+def _debug_join_paths_enabled() -> bool:
+    return str(os.environ.get("DZLL_DEBUG_JOIN_PATHS") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def validate_selected_watch_symlinks(
+    *,
+    selected_paths: List[str],
+    mods: List[Tuple[int, str]],
+) -> List[str]:
+    """
+    Validate selected -mod symlink paths immediately before launch.
+    Returns human-readable error strings. Does not modify the filesystem.
+    """
+    errors: List[str] = []
+    by_path: Dict[str, Tuple[int, str]] = {}
+    for idx, link_path in enumerate(selected_paths or []):
+        mid = 0
+        name = ""
+        try:
+            if idx < len(mods or []):
+                mid, name = mods[idx]
+        except Exception:
+            pass
+        by_path[str(link_path)] = (int(mid or 0), str(name or ""))
+
+    for link_path in selected_paths or []:
+        mid, name = by_path.get(str(link_path), (0, ""))
+        label = f"{mid}"
+        if name:
+            label = f"{mid} ({name})"
+        try:
+            if not os.path.islink(link_path):
+                errors.append(f"mod {label}: selected path is not a symlink: {link_path}")
+                continue
+            target = _resolve_symlink_target(link_path)
+            if not os.path.isdir(target):
+                errors.append(f"mod {label}: symlink target is missing/not a directory: {link_path} -> {target}")
+                continue
+            if not _has_real_mod_content(target):
+                errors.append(f"mod {label}: symlink target has no real mod content: {link_path} -> {target}")
+        except Exception as e:
+            errors.append(f"mod {label}: failed to validate selected path {link_path}: {e}")
+    return errors
 
 
 def ensure_watch_symlinks(
@@ -991,6 +1183,7 @@ def ensure_watch_symlinks(
     """
     workshop_dir = _resolve_path(workshop_dir)
     watch_folder = ensure_dir(watch_folder)
+    debug_join_paths = _debug_join_paths_enabled()
 
     result = {
         "created": [],
@@ -1010,7 +1203,14 @@ def ensure_watch_symlinks(
             continue
         target = workshop_mod_path(workshop_dir, mid_i)
         if not os.path.isdir(target):
-            result["errors"].append(f"missing target for mod {mid_i}: {target}")
+            msg = f"missing target for mod {mid_i}: {target}"
+            print(f"[JOIN][SYMLINK] missing target: {msg}")
+            result["errors"].append(msg)
+            continue
+        if not _has_real_mod_content(target):
+            msg = f"invalid/missing mod content for mod {mid_i}: {target}"
+            print(f"[JOIN][SYMLINK] missing target content: {msg}")
+            result["errors"].append(msg)
             continue
         link_name = symlink_name_for_mod(name, mid_i)
         link_path = os.path.join(watch_folder, link_name)
@@ -1020,19 +1220,28 @@ def ensure_watch_symlinks(
     for link_path, target in desired_links.items():
         try:
             if os.path.islink(link_path):
-                cur = os.readlink(link_path)
-                cur_abs = os.path.abspath(os.path.join(os.path.dirname(link_path), cur))
-                tgt_abs = os.path.abspath(target)
-                if cur_abs == tgt_abs:
+                cur_real = _resolve_symlink_target(link_path)
+                tgt_real = _real_path(target)
+                if cur_real == tgt_real:
+                    if debug_join_paths:
+                        print(f"[JOIN][SYMLINK] kept valid symlink: {link_path} -> {cur_real}")
                     result["kept"].append(link_path)
                 else:
+                    print(
+                        f"[JOIN][SYMLINK] replaced wrong-target symlink: "
+                        f"{link_path} old={cur_real} expected={tgt_real}"
+                    )
                     os.unlink(link_path)
                     os.symlink(target, link_path)
                     result["updated"].append(link_path)
             elif os.path.exists(link_path):
-                result["errors"].append(f"path exists and is not symlink: {link_path}")
+                msg = f"path exists and is not symlink: {link_path}"
+                print(f"[JOIN][SYMLINK] non-symlink collision: {msg}")
+                result["errors"].append(msg)
                 continue
             else:
+                if debug_join_paths:
+                    print(f"[JOIN][SYMLINK] created symlink: {link_path} -> {_real_path(target)}")
                 os.symlink(target, link_path)
                 result["created"].append(link_path)
 
@@ -1048,9 +1257,14 @@ def ensure_watch_symlinks(
                 if p in desired_set:
                     continue
                 if os.path.islink(p):
+                    if not _is_dzll_owned_symlink_name(name):
+                        continue
                     try:
+                        mid = _mod_id_from_dzll_symlink_name(name)
+                        target = _resolve_symlink_target(p)
                         os.unlink(p)
                         result["removed"].append(p)
+                        print(f"[JOIN][SYMLINK] removed stale DZLL symlink: {p} mid={mid} target={target}")
                     except Exception as e:
                         result["errors"].append(f"remove stale {p}: {e}")
         except Exception as e:
@@ -1089,95 +1303,13 @@ def remove_mid_from_appworkshop_acf(acf_path: str, mid: int) -> bool:
 
     Returns True if anything was removed.
     """
-    mid_str = str(int(mid))
-    acf_path = os.path.abspath(os.path.expanduser(acf_path))
-    if not os.path.isfile(acf_path):
+    try:
+        from .steam_ugc_backend import _remove_workshop_acf_entries_from_paths
+
+        result = _remove_workshop_acf_entries_from_paths([Path(acf_path)], [int(mid)])
+        return int(mid) in set(result.get("removed_ids") or [])
+    except Exception:
         return False
-
-    with open(acf_path, "r", encoding="utf-8", errors="replace") as f:
-        text = f.read()
-
-    def _remove_from_section(full_text: str, section_name: str) -> tuple[str, bool]:
-        m = re.search(rf'"{re.escape(section_name)}"\s*\{{', full_text)
-        if not m:
-            return full_text, False
-
-        start_brace = full_text.find("{", m.start())
-        if start_brace < 0:
-            return full_text, False
-
-        depth = 0
-        end_brace = -1
-        for i in range(start_brace, len(full_text)):
-            c = full_text[i]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-                if depth == 0:
-                    end_brace = i
-                    break
-        if end_brace < 0:
-            return full_text, False
-
-        block = full_text[start_brace:end_brace + 1]
-
-        mid_pat = re.search(rf'^\s*"{re.escape(mid_str)}"\s*\{{', block, flags=re.MULTILINE)
-        if not mid_pat:
-            return full_text, False
-
-        mid_open = block.find("{", mid_pat.start())
-        if mid_open < 0:
-            return full_text, False
-
-        d = 0
-        mid_end = -1
-        for j in range(mid_open, len(block)):
-            cj = block[j]
-            if cj == "{":
-                d += 1
-            elif cj == "}":
-                d -= 1
-                if d == 0:
-                    mid_end = j
-                    break
-        if mid_end < 0:
-            return full_text, False
-
-        line_start = block.rfind("\n", 0, mid_pat.start())
-        if line_start < 0:
-            line_start = 0
-        else:
-            line_start += 1
-
-        cut_start = line_start
-        cut_end = mid_end + 1
-        while cut_end < len(block) and block[cut_end] in " \t\r\n":
-            cut_end += 1
-
-        new_block = block[:cut_start] + block[cut_end:]
-        new_full = full_text[:start_brace] + new_block + full_text[end_brace + 1:]
-        return new_full, True
-
-    new_text = text
-    changed_any = False
-    for section in ("WorkshopItemsInstalled", "WorkshopItemDetails"):
-        new_text, changed = _remove_from_section(new_text, section)
-        changed_any = changed_any or changed
-
-    if not changed_any:
-        return False
-
-    ts = int(time.time())
-    bak = f"{acf_path}.bak.{ts}"
-    with open(bak, "w", encoding="utf-8") as f:
-        f.write(text)
-
-    tmp = f"{acf_path}.tmp.{ts}"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(new_text)
-    os.replace(tmp, acf_path)
-    return True
 
 
 def delete_single_mod(mid: int, *, workshop_dir: str = "", proton_prefix: str = "", log_fn=None) -> bool:
@@ -1201,14 +1333,14 @@ def delete_single_mod(mid: int, *, workshop_dir: str = "", proton_prefix: str = 
 
     home = str(Path.home())
     steamapps = os.path.join(home, ".local/share/Steam/steamapps")
-    workshop = _resolve_path(workshop_dir) if workshop_dir else os.path.join(steamapps, "workshop")
+    workshop = _resolve_path(workshop_dir) if workshop_dir else (_resolved_dayz_workshop_root() or os.path.join(steamapps, "workshop"))
 
     content_dir = os.path.join(workshop, "content", "221100", str(mid))
     downloads_dir = os.path.join(workshop, "downloads", "221100", str(mid))
     patch_file = os.path.join(workshop, "downloads", f"state_221100_221100_{mid}.patch")
     acf_path = os.path.join(workshop, "appworkshop_221100.acf")
 
-    pfx = _resolve_path(proton_prefix) if proton_prefix else os.path.join(steamapps, "compatdata/221100/pfx")
+    pfx = _resolve_path(proton_prefix) if proton_prefix else (_resolved_dayz_proton_prefix() or os.path.join(steamapps, "compatdata/221100/pfx"))
     pfx_user = os.path.join(pfx, "drive_c/users/steamuser")
     watch_folders = [
         os.path.join(pfx_user, "DZLLMods"),

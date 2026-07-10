@@ -1,0 +1,35 @@
+Source: dzll-launcher
+Section: utils
+Priority: optional
+Maintainer: Gareth Brown <dzll-launcher@tutamail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-setuptools,
+ python3-wheel
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://dzllauncher.uk/
+
+Package: dzll-launcher
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ python3,
+ python3-gi,
+ python3-gi-cairo,
+ python3-requests,
+ gir1.2-gtk-4.0,
+ gir1.2-gdkpixbuf-2.0,
+ gir1.2-graphene-1.0
+Description: native Linux launcher for DayZ
+ DZLL is a native Linux launcher for DayZ with Steam Client Workshop mod
+ handling and SteamCMD as an advanced fallback. Native Steam is required;
+ Flatpak Steam is unsupported. Discord Rich Presence is supported through
+ the bundled pypresence fallback.
+ .
+ This is a project-distributed source-available package and is not intended
+ for acceptance into Debian or Ubuntu official free-software archives.

@@ -19,6 +19,33 @@ class SettingsUI:
     def __init__(self, window):
         self._win = window
 
+    def open_mods_manager(self):
+        try:
+            ov = getattr(self, "_main_overlay", None)
+            if ov is None:
+                ov = getattr(self._win, "_main_overlay", None)
+            if ov is None:
+                print("[MODS UI] No main overlay found on settings host.")
+                return
+            if not hasattr(self, "_mods_mgr_overlay") or self._mods_mgr_overlay is None:
+                self._mods_mgr_overlay = ModsManagerOverlay(self, ov)
+
+            def _ui_open():
+                try:
+                    self._mods_mgr_overlay.refresh()
+                except Exception:
+                    pass
+                try:
+                    self._mods_mgr_overlay.show()
+                except Exception:
+                    pass
+                return False
+
+            GLib.idle_add(_ui_open)
+
+        except Exception as e:
+            print(f"[MODS UI] Failed to open mods manager: {e}")
+
     def build_panel(self) -> Gtk.Widget:
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         panel.set_size_request(480, -1)
@@ -194,6 +221,7 @@ class SettingsUI:
             user_set_flag: str | None = None,  # optional bool key to mark "user typed"
             browse: bool = False,  # NEW: show Browse… button
             browse_select_folder: bool = False,  # NEW: folder picker vs file picker
+            show_autodetect_guess: bool = True,
     ) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
@@ -220,7 +248,7 @@ class SettingsUI:
         # If empty and autodetect available, display suggestion (dimmed) but do NOT mark user-set.
         # If empty and autodetect available, display suggestion (dimmed) but do NOT
         # write it into live settings. Runtime code must resolve the path itself.
-        if (not cur_s) and callable(autodetect_fn):
+        if (not cur_s) and callable(autodetect_fn) and show_autodetect_guess:
             guess = ""
             try:
                 guess = (str(autodetect_fn() or "")).strip()
@@ -247,20 +275,21 @@ class SettingsUI:
             if getattr(self._win, "_settings_update_guard", False):
                 return
 
-            # First manual edit => mark as user-set and undim
-            if user_set_flag and not bool(self._win.settings.get(user_set_flag, False)):
-                self._win.settings[user_set_flag] = True
+            val = e.get_text()
+            val_s = (val or "").strip()
+
+            if user_set_flag:
+                self._win.settings[user_set_flag] = bool(val_s)
                 e.remove_css_class("dimmed-entry")
 
-            val = e.get_text()
             if is_int:
                 try:
-                    val_i = int(str(val).strip())
+                    val_i = int(val_s)
                 except Exception:
                     val_i = int(self._win.settings.get(key, 0) or 0)
                 self._win.settings[key] = val_i
             else:
-                self._win.settings[key] = (val or "").strip()
+                self._win.settings[key] = val_s
 
             try:
                 save_settings(self._win.settings)
@@ -397,6 +426,48 @@ class SettingsUI:
         row.append(sw)
         return row
 
+    def _settings_row_backend_switch(self) -> Gtk.Widget:
+        key = "mod_download_backend"
+        tooltip = (
+            "Use SteamCMD instead of the recommended Steam client downloader. "
+            "Only needed for troubleshooting."
+        )
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        row.set_hexpand(True)
+        row.set_tooltip_text(tooltip)
+
+        label = Gtk.Label(label="Advanced SteamCMD Fallback")
+        label.set_xalign(0)
+        label.set_hexpand(True)
+
+        sw = Gtk.Switch()
+        sw.set_active(str(self._win.settings.get(key) or "steam_client") == "steamcmd")
+        sw.set_tooltip_text(tooltip)
+        attach_pointer_cursor(sw)
+
+        def on_toggled(_sw, _pspec):
+            if getattr(self._win, "_settings_update_guard", False):
+                return
+
+            self._win.settings[key] = "steamcmd" if sw.get_active() else "steam_client"
+            try:
+                save_settings(self._win.settings)
+            except Exception:
+                pass
+
+            try:
+                self._win._apply_setting_runtime_effects(key)
+            except Exception:
+                pass
+
+        sw.connect("notify::active", on_toggled)
+        self._win._settings_widgets[key] = sw
+
+        row.append(label)
+        row.append(sw)
+        return row
+
     def _settings_row_dropdown(self, title: str, key: str, options: list[tuple[str, str]], default_val: str) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
@@ -477,12 +548,9 @@ class SettingsUI:
 
         box.append(self._settings_row_switch("Show Server Companion", "show_server_companion", default=False))
         box.append(self._settings_row_entry("Ingame Name", "ingame_name", "Required By Many Servers"))
-        box.append(self._settings_row_entry("High Ping Cutoff (ms)", "high_ping_cutoff_ms", "250", is_int=True))
-        box.append(self._settings_row_entry("Hide Servers Below Max Players", "hide_below_max_players", "0", is_int=True))
         box.append(self._settings_row_switch("Hide Test Servers By Default", "hide_test_servers", default=True))
-
-        # Blocklist toggle
-        box.append(self._settings_row_switch("Enable Blocklist For Suspicious Servers", "enable_blocklist_filter", default=True))
+        # These controls are currently exposed in the sidebar; the underlying
+        # settings are intentionally retained for persistence and future reuse.
 
         box.append(hr())
         box.append(self._settings_row_switch("Show Counts In Title Bar", "show_counts_in_title_bar", default=False))
@@ -503,33 +571,17 @@ class SettingsUI:
 
         box.append(hr())
         box.append(self._settings_row_switch("Auto Check For Updates", "auto_check_updates", default=True))
+
+        update_db_btn = Gtk.Button(label="Update Server Database")
+        update_db_btn.set_halign(Gtk.Align.START)
+        attach_pointer_cursor(update_db_btn)
+        update_db_btn.connect("clicked", lambda _b: self._win._manual_update_server_database())
+        box.append(update_db_btn)
         return box
 
     def _settings_page_launch(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.append(self._settings_section_header("Launch"))
-
-        # ==========================
-        # FUTURE FLATPACK SUPPORT
-        # ==========================
-        box.append(self._settings_row_dropdown(
-            "Steam Installation Type",
-            "steam_install_type",
-            options=[
-                ("auto", "Auto"),
-                ("native", "Native"),
-                ("flatpak", "Flatpak"),
-            ],
-            default_val="auto",
-        ))
-        self._win._set_widget_sensitive("steam_install_type", False)
-        try:
-            w = self._win._settings_widgets.get("steam_install_type")
-            if w:
-                w.set_tooltip_text("For future release: Flatpak Steam support")
-        except Exception:
-            pass
-        # ==========================
 
         box.append(self._settings_row_entry(
             "Additional Launch Params",
@@ -538,6 +590,13 @@ class SettingsUI:
         ))
 
         box.append(hr())
+
+        box.append(self._settings_row_switch(
+            "Start Steam Automatically on Join",
+            "start_steam_on_join",
+            default=False,
+            tooltip="Automatically start Steam when joining a server if Steam is closed.",
+        ))
 
         box.append(self._settings_row_switch(
             "Skip DayZ Launcher",
@@ -575,37 +634,22 @@ class SettingsUI:
         box.append(self._settings_section_header("Mods"))
 
         box.append(self._settings_row_switch(
-            "Enable SteamCMD Mod Handling",
+            "Enable DZLL Mod Management",
             "enable_steamcmd_mod_handling",
-            default=True
-        ))
-
-        box.append(self._settings_row_entry(
-            "Steam Username",
-            "steamcmd_username",
-            "Username Only (No Password Stored)",
-        ))
-
-        box.append(self._settings_row_entry(
-            "SteamCMD Install Path",
-            "steamcmd_path",
-            "Auto Detect If Empty",
-            tooltip="If empty, DZLL attempts to autodetect SteamCMD.",
-            autodetect_fn=autodetect_steamcmd_path,
-            user_set_flag="steamcmd_path_user_set",
-            browse=True,
-            browse_select_folder=False,  # file
+            default=True,
+            tooltip="Master switch for DZLL required-mod handling, downloads, and link management.",
         ))
 
         box.append(self._settings_row_entry(
             "Workshop Directory",
             "workshop_dir",
-            "Auto Detect If Empty",
-            tooltip="If empty, DZLL attempts to autodetect the workshop directory.",
+            "Auto-detected if empty",
+            tooltip="If empty, DZLL uses the auto-detected Steam Workshop directory.",
             autodetect_fn=autodetect_workshop_dir,
             user_set_flag="workshop_dir_user_set",
             browse=True,
             browse_select_folder=True,  # folder
+            show_autodetect_guess=False,
         ))
 
         box.append(self._settings_row_entry(
@@ -615,25 +659,58 @@ class SettingsUI:
         ))
 
         box.append(self._settings_row_switch(
-            "Auto Install Missing Mods",
+            "Auto-install Missing Mods",
             "auto_install_missing_mods",
             default=True,
-            tooltip="Downloads required mods only if they're missing.",
+            tooltip="When joining a server, automatically download required mods that are missing.",
         ))
 
-        box.append(self._settings_row_switch(
-            "Auto Update Required Mods",
-            "auto_update_required_mods",
-            default=False,
-            tooltip="Runs SteamCMD for all required mods on join (even if already installed). May prompt for Steam Guard more often.",
-        ))
+        box.append(hr())
+        box.append(self._settings_section_header("Advanced / Fallback (Not Recommended)"))
 
-        box.append(self._settings_row_switch(
-            "Verify Mod Files (Slower)",
-            "verify_mod_files",
-            default=False,
-            tooltip="Uses SteamCMD validate to repair/verify workshop files. Implies updating required mods for this join.",
-        ))
+        box.append(self._settings_row_backend_switch())
+
+        steamcmd_warning = Gtk.Label(
+            label="SteamCMD fallback may close Steam during mod downloads to avoid login/session conflicts."
+        )
+        steamcmd_warning.set_xalign(0.0)
+        steamcmd_warning.set_wrap(True)
+        steamcmd_warning.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        steamcmd_warning.add_css_class("settings-warning-label")
+
+        steamcmd_rows = [
+            steamcmd_warning,
+            self._settings_row_entry(
+                "Steam Username",
+                "steamcmd_username",
+                "Username Only (No Password Stored)",
+            ),
+            self._settings_row_entry(
+                "SteamCMD Install Path",
+                "steamcmd_path",
+                "Auto Detect If Empty",
+                tooltip="If empty, DZLL attempts to autodetect SteamCMD.",
+                autodetect_fn=autodetect_steamcmd_path,
+                user_set_flag="steamcmd_path_user_set",
+                browse=True,
+                browse_select_folder=False,
+            ),
+            self._settings_row_switch(
+                "Verify Mod Files (Slower)",
+                "verify_mod_files",
+                default=False,
+                tooltip="SteamCMD only: validate and repair required workshop files.",
+            ),
+            self._settings_row_switch(
+                "Auto Update Required Mods",
+                "auto_update_required_mods",
+                default=False,
+                tooltip="SteamCMD fallback only: request all required mods again on join so SteamCMD can update them.",
+            ),
+        ]
+        self._steamcmd_advanced_rows = steamcmd_rows
+        for row in steamcmd_rows:
+            box.append(row)
 
         box.append(hr())
 
@@ -641,36 +718,7 @@ class SettingsUI:
         btn.set_halign(Gtk.Align.START)
         attach_pointer_cursor(btn)
         box.append(btn)
-
-        def _open_mods_mgr(_btn):
-            try:
-                ov = getattr(self, "_main_overlay", None)
-                if ov is None:
-                    app = getattr(self, "app", None) or getattr(self, "_app", None) or getattr(self, "host", None)
-                    ov = getattr(app, "_main_overlay", None) if app is not None else None
-                if ov is None:
-                    print("[MODS UI] No main overlay found on settings host.")
-                    return
-                if not hasattr(self, "_mods_mgr_overlay") or self._mods_mgr_overlay is None:
-                    self._mods_mgr_overlay = ModsManagerOverlay(self, ov)
-
-                def _ui_open():
-                    try:
-                        self._mods_mgr_overlay.refresh()
-                    except Exception:
-                        pass
-                    try:
-                        self._mods_mgr_overlay.show()
-                    except Exception:
-                        pass
-                    return False
-
-                GLib.idle_add(_ui_open)
-
-            except Exception as e:
-                print(f"[MODS UI] Failed to open mods manager: {e}")
-
-        btn.connect("clicked", _open_mods_mgr)
+        btn.connect("clicked", lambda *_: self.open_mods_manager())
 
         return box
 
@@ -709,10 +757,21 @@ class SettingsUI:
         lbl.set_halign(Gtk.Align.CENTER)
         box.append(lbl)
 
+        update_status = Gtk.Label(label="")
+        update_status.set_xalign(0.5)
+        update_status.set_halign(Gtk.Align.CENTER)
+        box.append(update_status)
+
         btn_updates = Gtk.Button(label="Check For Updates")
         btn_updates.set_can_focus(False)
         attach_pointer_cursor(btn_updates)
-        btn_updates.connect("clicked", lambda *_: Gio.AppInfo.launch_default_for_uri(RELEASES_URL, None))
+        btn_updates.connect(
+            "clicked",
+            lambda *_: (
+                update_status.set_text("Checking for updates…"),
+                self._win._manual_check_for_updates(update_status.set_text),
+            ),
+        )
 
         center_box = Gtk.Box(halign=Gtk.Align.CENTER)
         center_box.append(btn_updates)
@@ -843,7 +902,6 @@ class SettingsUI:
                     break
 
             options_map = {
-                "steam_install_type": ["auto", "native", "flatpak"],
                 "discord_detail_level": ["menus", "ingame", "server"],
             }
 
@@ -862,6 +920,15 @@ class SettingsUI:
             pass
 
     def _reset_entry_with_autodetect(self, key: str, autodetect_fn=None, user_set_flag: str | None = None):
+        self._reset_entry_value(key, autodetect_fn=autodetect_fn, user_set_flag=user_set_flag, show_autodetect_guess=True)
+
+    def _reset_entry_value(
+            self,
+            key: str,
+            autodetect_fn=None,
+            user_set_flag: str | None = None,
+            show_autodetect_guess: bool = True,
+    ):
         e = self._win._settings_widgets.get(key)
         if not isinstance(e, Gtk.Entry):
             return
@@ -883,7 +950,7 @@ class SettingsUI:
             return
 
         guess = ""
-        if callable(autodetect_fn):
+        if show_autodetect_guess and callable(autodetect_fn):
             try:
                 guess = str(autodetect_fn() or "").strip()
             except Exception:
@@ -923,7 +990,10 @@ class SettingsUI:
                             pass
 
                 elif isinstance(w, Gtk.Switch):
-                    w.set_active(bool(val))
+                    if key == "mod_download_backend":
+                        w.set_active(str(val or "steam_client") == "steamcmd")
+                    else:
+                        w.set_active(bool(val))
 
                 elif isinstance(w, Gtk.CheckButton):
                     w.set_active(bool(val))
@@ -937,10 +1007,11 @@ class SettingsUI:
                 autodetect_fn=autodetect_steamcmd_path,
                 user_set_flag="steamcmd_path_user_set",
             )
-            self._reset_entry_with_autodetect(
+            self._reset_entry_value(
                 "workshop_dir",
                 autodetect_fn=autodetect_workshop_dir,
                 user_set_flag="workshop_dir_user_set",
+                show_autodetect_guess=False,
             )
 
         except Exception:
@@ -952,18 +1023,19 @@ class SettingsUI:
         self._win._apply_setting_runtime_effects("high_ping_cutoff_ms")
         self._win._apply_setting_runtime_effects("hide_below_max_players")
         self._win._apply_setting_runtime_effects("hide_test_servers")
-        self._win._apply_setting_runtime_effects("enable_blocklist_filter")
+        self._win._apply_setting_runtime_effects("prioritise_trusted_servers")
+        self._win._apply_setting_runtime_effects("pin_favorite_servers")
         self._win._apply_setting_runtime_effects("show_server_companion")
         self._win._apply_setting_runtime_effects("show_counts_in_title_bar")
         self._win._apply_setting_runtime_effects("show_counts_servers_loaded")
         self._win._apply_setting_runtime_effects("show_counts_global_players")
         self._win._apply_setting_runtime_effects("enable_steamcmd_mod_handling")
+        self._win._apply_setting_runtime_effects("mod_download_backend")
         self._win._apply_setting_runtime_effects("skip_dayz_launcher")
         self._win._apply_setting_runtime_effects("minimize_dayz_launcher")
         self._win._apply_setting_runtime_effects("force_fullscreen")
         self._win._apply_setting_runtime_effects("windowed_mode")
         self._win._apply_setting_runtime_effects("discord_detail_level")
-        self._win._apply_setting_runtime_effects("steam_install_type")
         self._win._apply_titlebar_counts()
 
     def _set_widget_sensitive(self, key: str, sensitive: bool):
@@ -975,7 +1047,50 @@ class SettingsUI:
         except Exception:
             pass
 
+    def _sync_sidebar_setting_widget(self, key: str):
+        widget = getattr(self._win, "_sidebar_settings_widgets", {}).get(key)
+        if widget is None:
+            return
+
+        def _entry_has_focus(entry):
+            try:
+                return bool(entry.has_focus())
+            except Exception:
+                return False
+
+        def _set_entry_text_if_changed(entry, text):
+            text = "" if text is None else str(text)
+            if (entry.get_text() or "") == text:
+                return
+            try:
+                pos = int(entry.get_position())
+            except Exception:
+                pos = -1
+            entry.set_text(text)
+            if pos >= 0:
+                try:
+                    entry.set_position(min(pos, len(text)))
+                except Exception:
+                    pass
+
+        old_guard = bool(getattr(self._win, "_settings_update_guard", False))
+        try:
+            self._win._settings_update_guard = True
+            val = self._win.settings.get(key)
+            if isinstance(widget, Gtk.Entry):
+                if not _entry_has_focus(widget):
+                    _set_entry_text_if_changed(widget, "" if val is None else str(val))
+            elif isinstance(widget, Gtk.CheckButton):
+                if bool(widget.get_active()) != bool(val):
+                    widget.set_active(bool(val))
+        except Exception:
+            pass
+        finally:
+            self._win._settings_update_guard = old_guard
+
     def _apply_setting_runtime_effects(self, key: str):
+        self._sync_sidebar_setting_widget(key)
+
         if key == "high_ping_cutoff_ms":
             try:
                 self._win._ping_cutoff_ms = int(self._win.settings.get("high_ping_cutoff_ms", 250) or 250)
@@ -989,16 +1104,53 @@ class SettingsUI:
                     p = -1
                 if p >= 0:
                     self._win.live.setdefault(k, {})["hide_high_ping"] = (p > self._win._ping_cutoff_ms)
-            self._win._on_filter_changed()
+            self._win._on_filter_changed(reason="settings")
 
         if key == "hide_test_servers":
-            self._win._on_filter_changed()
+            self._win._on_filter_changed(reason="settings")
 
         if key == "hide_below_max_players":
-            self._win._on_filter_changed()
+            self._win._on_filter_changed(reason="settings")
 
-        if key == "enable_blocklist_filter":
-            self._win._on_filter_changed()
+        if key == "prioritise_trusted_servers":
+            try:
+                self._win._snapshot_all_sort_keys()
+                sorter = getattr(self._win, "sorter", None)
+                if sorter is not None:
+                    sorter.changed(Gtk.SorterChange.DIFFERENT)
+                GLib.idle_add(self._win._scroll_to_top)
+            except Exception:
+                pass
+
+        if key == "pin_favorite_servers":
+            scroll_value = None
+            try:
+                vadj = self._win.scroller.get_vadjustment()
+                if vadj:
+                    scroll_value = float(vadj.get_value())
+            except Exception:
+                scroll_value = None
+
+            try:
+                self._win._snapshot_all_sort_keys()
+                sorter = getattr(self._win, "sorter", None)
+                if sorter is not None:
+                    sorter.changed(Gtk.SorterChange.DIFFERENT)
+                self._win._rebuild_column_view_store(reorder_reason="settings:pin-favorite-servers")
+            except Exception:
+                pass
+
+            if scroll_value is not None:
+                def restore_pin_favorites_scroll(value=scroll_value):
+                    try:
+                        vadj = self._win.scroller.get_vadjustment()
+                        if vadj:
+                            vadj.set_value(value)
+                    except Exception:
+                        pass
+                    return False
+
+                GLib.idle_add(restore_pin_favorites_scroll)
 
         if key == "show_server_companion":
             self._win.set_server_companion_visible(bool(self._win.settings.get("show_server_companion", False)))
@@ -1009,17 +1161,22 @@ class SettingsUI:
             self._set_widget_sensitive("show_counts_global_players", master)
             self._win._apply_titlebar_counts()
 
-        if key == "enable_steamcmd_mod_handling":
+        if key in ("enable_steamcmd_mod_handling", "mod_download_backend", "settings_init"):
             enabled = bool(self._win.settings.get("enable_steamcmd_mod_handling", True))
+            backend = str(self._win.settings.get("mod_download_backend") or "steam_client")
+            steamcmd_selected = backend == "steamcmd"
+
+            for row in getattr(self, "_steamcmd_advanced_rows", []):
+                try:
+                    row.set_visible(steamcmd_selected)
+                    row.set_sensitive(enabled and steamcmd_selected)
+                except Exception:
+                    pass
+
             for dep in (
-                    "steamcmd_username",
-                    "steamcmd_path",
                     "auto_install_missing_mods",
-                    "auto_update_required_mods",
                     "workshop_dir",
                     "additional_mod_ids",
-                    "verify_mod_files",
-                    # "steamcmd_dry_run",  # removed from UI; leave commented or delete later
             ):
                 self._set_widget_sensitive(dep, enabled)
 
@@ -1141,7 +1298,7 @@ class SettingsUI:
             pass
 
         try:
-            self._win._on_filter_changed()
+            self._win._on_filter_changed(reason="settings")
         except Exception:
             pass
 

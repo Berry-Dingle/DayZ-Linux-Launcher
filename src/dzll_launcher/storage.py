@@ -7,6 +7,8 @@ from .config import (
     FAV_PATH,
     LAST_PLAYED_PATH,
     LAST_PLAYED_PRUNE_DAYS,
+    LAST_COMPANION_SERVER_PATH,
+    COMPANION_RESTART_LEARNING_PATH,
     DEAD_PATH,
     CACHE_DIR,
 )
@@ -66,6 +68,29 @@ def save_last_played(lp: dict) -> None:
         if now - its <= cutoff:
             clean[str(k)] = its
     save_json_dict(LAST_PLAYED_PATH, clean)
+
+def load_last_companion_server() -> dict:
+    return load_json_dict(LAST_COMPANION_SERVER_PATH)
+
+def save_last_companion_server(data: dict) -> None:
+    clean = {}
+    for k, v in (data or {}).items():
+        if isinstance(v, (str, int, float, bool)) or v is None:
+            clean[str(k)] = v
+    save_json_dict(LAST_COMPANION_SERVER_PATH, clean)
+
+def clear_last_companion_server() -> None:
+    try:
+        if os.path.exists(LAST_COMPANION_SERVER_PATH):
+            os.remove(LAST_COMPANION_SERVER_PATH)
+    except Exception:
+        pass
+
+def load_companion_restart_learning() -> dict:
+    return load_json_dict(COMPANION_RESTART_LEARNING_PATH)
+
+def save_companion_restart_learning(data: dict) -> None:
+    save_json_dict(COMPANION_RESTART_LEARNING_PATH, data or {})
 
 def human_last_played(ts: int) -> str:
     try:

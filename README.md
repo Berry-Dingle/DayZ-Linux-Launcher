@@ -1,8 +1,10 @@
 # 🧠 DZLL (DayZ Linux Launcher) — Python Version
 
-A native Linux launcher for DayZ with automatic mod handling via SteamCMD.
+A native Linux launcher for DayZ with Steam Client Workshop mod handling. SteamCMD is available as an advanced fallback.
 
 🌐 Website: https://dzllauncher.uk/
+
+![DZLL main launcher screen](src/dzll_launcher/images/dzll_main_screen.png)
 
 ---
 
@@ -11,10 +13,10 @@ A native Linux launcher for DayZ with automatic mod handling via SteamCMD.
 - Linux (Fedora / Ubuntu / Arch / openSUSE)
 - Python 3.10 or newer
 - Native Steam (with DayZ installed)
-- Flatpak Steam is not currently supported — use native Steam for full functionality
+- Flatpak Steam is unsupported — use native Steam
 - DayZ must have been launched at least once to create the files DZLL needs
-- SteamCMD (for mod handling)
-- Optional: FFmpeg / `ffplay` for Companion server restart alert sounds
+- Steam Client Workshop backend is the default/recommended mod handler
+- SteamCMD is optional and only needed for Advanced SteamCMD Fallback troubleshooting
 
 ---
 
@@ -57,42 +59,6 @@ sudo zypper install python3 python3-pip python3-gobject python3-gobject-Gdk type
 
 ---
 
-### 🔊 Optional: Companion alert sounds
-
-DZLL includes the alert sound file, but uses the system audio player `ffplay` to play Companion server restart alerts.
-
-If you want Companion alert sounds, install FFmpeg:
-
-#### Fedora / Nobara / Bazzite
-
-```bash
-sudo dnf install ffmpeg
-```
-
-> Fedora may require RPM Fusion for FFmpeg.
-
-#### Ubuntu / Debian / Mint / Pop!_OS
-
-```bash
-sudo apt install ffmpeg
-```
-
-#### Arch / EndeavourOS / CachyOS
-
-```bash
-sudo pacman -S ffmpeg
-```
-
-#### openSUSE
-
-```bash
-sudo zypper install ffmpeg
-```
-
-If `ffplay` is not installed, DZLL will still work, but Companion alert sounds will be unavailable.
-
----
-
 ## 📁 2. Extract DZLL
 
 ```bash
@@ -100,9 +66,9 @@ mkdir -p ~/DayZLinuxLauncher
 cd ~/DayZLinuxLauncher
 
 # Replace with your actual file path
-tar -xzf ~/Downloads/dzll-launcher-v0.2.0-beta.tar.gz
+tar -xzf ~/Downloads/dzll-launcher-v0.3.0-beta.tar.gz
 
-cd dzll-launcher-v0.2.0-beta
+cd dzll-launcher-v0.3.0-beta
 ```
 
 ---
@@ -144,12 +110,14 @@ python - <<'PY'
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk
-import requests, pypresence
-print("✅ All dependencies OK")
+import requests
+print("✅ Required dependencies OK")
 PY
 ```
 
-If you see `✅ All dependencies OK`, continue.
+`pypresence` does not need to be installed separately for normal use. DZLL includes a bundled Rich Presence fallback. To test an external/system `pypresence` provider instead, install the optional `discord-system` extra or uncomment the optional line in `requirements.txt`.
+
+If you see `✅ Required dependencies OK`, continue.
 
 ---
 
@@ -185,9 +153,13 @@ Launch Steam once and install **DayZ**, then launch DayZ at least once before co
 
 ---
 
-## ⚙️ 8. Install SteamCMD (REQUIRED for mods)
+## ⚙️ 8. Optional: Install SteamCMD fallback
 
-Make sure `wget` is installed:
+Most users should skip this section. DZLL uses the native Steam Client Workshop backend by default.
+
+Install SteamCMD only if you need the Advanced SteamCMD Fallback for troubleshooting.
+
+If you do need it, make sure `wget` is installed:
 
 ```bash
 sudo apt install wget      # Ubuntu/Debian
@@ -196,7 +168,7 @@ sudo pacman -S wget        # Arch
 sudo zypper install wget   # openSUSE
 ```
 
-### Install SteamCMD
+### Install SteamCMD fallback
 
 ```bash
 mkdir -p ~/.local/share/steamcmd
@@ -207,7 +179,7 @@ tar -xzf steamcmd_linux.tar.gz
 chmod +x steamcmd.sh
 ```
 
-**Do NOT install SteamCMD into random folders — use the path above exactly.**
+Use the path above if possible so DZLL can auto-detect the fallback.
 
 ### Test it
 
@@ -215,20 +187,21 @@ chmod +x steamcmd.sh
 ~/.local/share/steamcmd/steamcmd.sh +quit
 ```
 
-If it prints SteamCMD info and exits without errors, it is working.
+If it prints SteamCMD info and exits without errors, the fallback is available.
 
 ---
 
 ### 🧠 Important Notes
 
-- This installs SteamCMD locally (this is the correct location)
-- DZLL will auto-detect this path:
+- This installs SteamCMD locally for the advanced fallback
+- DZLL will auto-detect this fallback path:
 
 ```bash
 ~/.local/share/steamcmd/steamcmd.sh
 ```
 
 - You do **NOT** need to manually enter it unless detection fails
+- Normal Steam Client backend users should not need SteamCMD credentials
 
 **IMPORTANT:**  
 DZLL does **not** store your Steam password at all.
@@ -253,9 +226,8 @@ When DZLL opens:
 
 DZLL should:
 
-- auto-detect SteamCMD
-- auto-detect workshop directory
-- download mods
+- use native Steam to check and download required Workshop mods
+- auto-detect the DayZ Steam library and Workshop paths
 - launch DayZ
 
 ---
@@ -265,7 +237,7 @@ DZLL should:
 When you click **Join**:
 
 1. Reads server mod list
-2. Uses SteamCMD to download missing mods
+2. Uses the Steam Client Workshop backend to check and download required mods
 3. Creates symlinks into DayZ Launcher watch folder
 4. Updates preset (`dayz.defaultpreset2`)
 5. Launches DayZ via Steam
@@ -274,27 +246,31 @@ When you click **Join**:
 
 ## 🧪 Troubleshooting
 
-### ❌ SteamCMD not found
-
-```bash
-ls ~/.local/share/steamcmd/steamcmd.sh
-```
-
-If missing, reinstall SteamCMD.
-
----
-
 ### ❌ Mods not loading / kicked from server
 
 Likely causes:
 
 - broken mod (DZLL should auto-fix)
-- workshop path wrong
+- Steam not running or not logged in
+- Workshop path wrong
 
 Try:
 
 - leave settings blank (use autodetect)
+- make sure native Steam is running and logged in
 - rejoin server
+
+---
+
+### ❌ Advanced SteamCMD fallback not found
+
+Only use this if you enabled Advanced SteamCMD Fallback in Settings.
+
+```bash
+ls ~/.local/share/steamcmd/steamcmd.sh
+```
+
+If missing, reinstall SteamCMD fallback.
 
 ---
 
@@ -303,29 +279,6 @@ Try:
 You likely missed system packages.
 
 Reinstall your distro section above.
-
----
-
-### ❌ Companion alert sound does not play
-
-Companion alert sounds require `ffplay`, which is usually provided by FFmpeg.
-
-Check:
-
-```bash
-which ffplay
-```
-
-If missing, install FFmpeg for your distro:
-
-```bash
-sudo dnf install ffmpeg      # Fedora / Nobara / Bazzite
-sudo apt install ffmpeg      # Ubuntu / Debian / Mint / Pop!_OS
-sudo pacman -S ffmpeg        # Arch / EndeavourOS / CachyOS
-sudo zypper install ffmpeg   # openSUSE
-```
-
-DZLL will still work without `ffplay`; only Companion alert sounds are affected.
 
 ---
 
@@ -365,7 +318,7 @@ rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
 ## 🧠 Recommended Project Layout
 
 ```text
-dzll-launcher-v0.2.0-beta/
+dzll-launcher-v0.3.0-beta/
 ├── src/dzll_launcher/
 ├── pyproject.toml
 ├── README.md
@@ -377,6 +330,52 @@ dzll-launcher-v0.2.0-beta/
 
 ## 💬 Final Notes
 
-- Leave SteamCMD + Workshop fields empty unless needed
+- Leave SteamCMD fallback settings empty unless troubleshooting
 - Autodetect is preferred and safer
 - Reset is non-destructive and safe to use
+
+---
+
+## Community / Support
+
+Join the DZLL Discord for help, feedback, testing, and community discussion: https://discord.gg/vhd6SbvAqS
+
+## Licence
+
+DZLL is free, source-available community software under the DZLL Community
+Source Licence v1.0.
+
+The source is public for inspection, auditing, and community improvement. DZLL
+may not be sold, paywalled, monetised, bundled into paid services, or used for
+paid server promotion, paid placement, advertising, affiliate schemes, or
+referral schemes.
+
+Modified versions must remain free, include the licence, keep attribution, and
+clearly state that they are unofficial. See [LICENSE](LICENSE) for the full
+terms.
+
+### Third-Party Components
+
+DZLL includes a modified vendored snapshot of
+[python-a2s](https://github.com/Yepoleb/python-a2s), which is licensed under the
+MIT License. Its licence and notice are included at
+[`src/dzll_launcher/a2s/LICENSE`](src/dzll_launcher/a2s/LICENSE) and
+[`src/dzll_launcher/a2s/NOTICE`](src/dzll_launcher/a2s/NOTICE). python-a2s is
+not covered by the DZLL Community Source Licence.
+
+DZLL also includes an unmodified vendored snapshot of
+[pypresence 4.6.1](https://github.com/qwertyquerty/pypresence/tree/v4.6.1),
+which is licensed under the MIT License. Its licence and notice are included at
+[`src/dzll_launcher/vendor/pypresence/LICENSE`](src/dzll_launcher/vendor/pypresence/LICENSE)
+and
+[`src/dzll_launcher/vendor/pypresence/NOTICE`](src/dzll_launcher/vendor/pypresence/NOTICE).
+pypresence is not covered by the DZLL Community Source Licence.
+
+## Disclaimer
+
+DZLL is an independent community project and is not affiliated with, endorsed
+by, sponsored by, or authorized by Bohemia Interactive a.s.
+
+Bohemia Interactive, DAYZ, and all associated logos and designs are trademarks
+or registered trademarks of Bohemia Interactive a.s. All other trademarks are
+the property of their respective owners.

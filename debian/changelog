@@ -1,0 +1,5 @@
+dzll-launcher (0.3.0~b0-1) noble; urgency=medium
+
+  * Initial Debian package for DZLL v0.3.0 Beta.
+
+ -- Gareth Brown <dzll-launcher@tutamail.com>  Fri, 10 Jul 2026 00:00:00 +0100

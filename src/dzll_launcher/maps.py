@@ -52,7 +52,7 @@ def map_choices_from_db_rows(rows: list[dict]) -> list[str]:
     Build dropdown choices from already-loaded DB rows:
     - standardize names
     - include only maps that appear in >= MIN_MAP_COUNT servers
-    - "All" always first
+    - "All Maps" always first
     """
     counts: dict[str, int] = {}
 
@@ -65,4 +65,4 @@ def map_choices_from_db_rows(rows: list[dict]) -> list[str]:
     maps = [m for m, c in counts.items() if c >= MIN_MAP_COUNT]
     maps.sort(key=lambda x: x.lower())
 
-    return ["All"] + maps
+    return ["All Maps"] + maps

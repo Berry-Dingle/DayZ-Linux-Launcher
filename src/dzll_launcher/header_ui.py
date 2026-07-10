@@ -187,39 +187,8 @@ class HeaderUI:
 
         w, _ = self._hdr_cell_label(5, "", False, False, width_px=RIGHT_COL_PX[5], max_chars=1)
         stats_hdr.append(w)
-        w, _ = self._hdr_cell_label(6, "", False, False, noborder_left=True, width_px=RIGHT_COL_PX[6], max_chars=1)
+        w, _ = self._hdr_cell_label(6, "", False, False, noborder_left=True, width_px=RIGHT_COL_PX[6], max_chars=6)
         stats_hdr.append(w)
 
-        stats_overlay = Gtk.Overlay()
-        stats_overlay.set_child(stats_hdr)
-
-        settings_w = int(RIGHT_COL_PX[5]) + int(RIGHT_COL_PX[6])
-
-        settings_btn = Gtk.Button()
-        settings_btn.set_can_focus(False)
-        settings_btn.add_css_class("flat")
-        attach_pointer_cursor(settings_btn)
-        settings_btn.connect("clicked", self._win._on_settings_clicked)
-
-        settings_lbl = Gtk.Label(label="SETTINGS")
-        settings_lbl.set_xalign(0.5)
-        settings_lbl.set_halign(Gtk.Align.CENTER)
-        settings_lbl.set_single_line_mode(True)
-        settings_lbl.add_css_class("colhdr")
-        settings_lbl.set_ellipsize(Pango.EllipsizeMode.END)
-        settings_btn.set_child(settings_lbl)
-
-        settings_holder = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
-        settings_holder.set_halign(Gtk.Align.END)
-        settings_holder.set_valign(Gtk.Align.FILL)
-        settings_holder.set_hexpand(False)
-        settings_holder.set_vexpand(True)
-        settings_holder.set_size_request(settings_w, -1)
-        settings_holder.set_margin_start(5)
-        settings_holder.set_margin_end(5)
-        settings_holder.append(settings_btn)
-
-        stats_overlay.add_overlay(settings_holder)
-
-        header.append(stats_overlay)
+        header.append(stats_hdr)
         return header
