@@ -1,0 +1,9 @@
+Component: pypresence
+Version: 4.6.1
+Upstream: https://github.com/qwertyquerty/pypresence
+Copyright: Copyright (c) 2022 qwertyquerty
+Licence: MIT
+Authors: qwertyquerty and LewdNeko, as identified upstream
+Status: Unmodified vendored source snapshot used by DZLL
+Source tag: v4.6.1
+Source commit: 54a4dc1f6c0d6feed47e3e8285b8cb83d843c091

@@ -42,6 +42,8 @@ site/
 pip-wheel-metadata/
 .wheelhouse/
 vendor/
+!src/dzll_launcher/vendor/
+!src/dzll_launcher/vendor/**
 
 # Setup Skeleton Files
 build-rpm.sh
