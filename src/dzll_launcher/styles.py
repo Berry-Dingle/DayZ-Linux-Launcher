@@ -1603,29 +1603,6 @@ def get_app_css(
           border-left: 1px solid @dzll_divider;
         }}
 
-        button.server-companion-power-on-button {{
-          background: transparent;
-          color: @dzll_restart_learning;
-          padding: 0;
-          min-height: 0;
-          min-width: 0;
-          border: none;
-          box-shadow: none;
-        }}
-
-        button.server-companion-power-on-button:hover,
-        button.server-companion-power-on-button:active,
-        button.server-companion-power-on-button:focus,
-        button.server-companion-power-on-button:focus-visible {{
-          background: transparent;
-          color: @dzll_restart_learning;
-          box-shadow: none;
-        }}
-
-        button.server-companion-power-on-button image {{
-          color: @dzll_restart_learning;
-        }}
-
         button.server-companion-power-off-button {{
           background: transparent;
           color: @dzll_error;
@@ -1650,11 +1627,6 @@ def get_app_css(
 
         button.server-companion-power-off-button .server-companion-power-off-icon {{
           color: @dzll_error;
-        }}
-
-        .server-companion-panel button.server-companion-power-on-button,
-        .server-companion-panel button.server-companion-power-on-button image {{
-          color: @dzll_restart_learning;
         }}
 
         .dzll-app-root button.server-companion-power-off-button,

@@ -3120,7 +3120,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         enabled = bool(self.settings.get("show_server_companion", False))
         undocked = enabled and not bool(getattr(self, "_server_companion_docked", True))
-        show_btn.set_visible((not enabled) or undocked)
+        show_btn.set_visible(undocked)
 
         icon = getattr(self, "server_companion_show_icon", None)
         if undocked:
