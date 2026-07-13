@@ -7494,6 +7494,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._update_row_sort_ping(obj)
                 debug_row_notifications += 1
                 debug_ping_updates += 1
+                if reason == "browser-live":
+                    obj.refresh_pulse = int(obj.refresh_pulse) + 1
                 self.live.setdefault(k, {})["offline"] = True
                 STATUS_DIAGNOSTICS.emit(
                     "status-observation",
@@ -7635,6 +7637,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._update_row_sort_ping(obj)
                 debug_row_notifications += 1
                 debug_ping_updates += 1
+            if reason == "browser-live":
+                obj.refresh_pulse = int(obj.refresh_pulse) + 1
             self.live.setdefault(k, {})["offline"] = False
             if debug_success:
                 for notify_id in notify_ids:

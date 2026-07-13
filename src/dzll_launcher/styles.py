@@ -766,7 +766,17 @@ def get_app_css(
         .dzll-app-root listview row {{ background: transparent; }}
         .dzll-app-root listview row:hover {{ background: transparent; }}
         .dzll-app-root listview row:selected {{ background: transparent; }}
-        
+
+        /* ---------- Live-refresh pulse on browser rows ---------- */
+        .dzll-app-root columnview.dzll-column-view > listview > row {{
+          transition: box-shadow 500ms ease-out;
+        }}
+
+        .dzll-app-root columnview.dzll-column-view > listview > row.dzll-live-refresh-flash {{
+          transition: none;
+          box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+        }}
+
         /* ---------- Favorites star ---------- */
         /* ON star stays yellow even when unfocused */
         button.fav-star {{ font-size: 1.8em; padding: 0; }}

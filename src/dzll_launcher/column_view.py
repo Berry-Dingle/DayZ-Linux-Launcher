@@ -632,6 +632,40 @@ def _bind_center_label(label: Gtk.Label, obj: ServerObject, binder) -> None:
         label.set_text("")
 
 
+_LIVE_FLASH_CSS_CLASS = "dzll-live-refresh-flash"
+_LIVE_FLASH_HOLD_MS = 350
+
+
+def _flash_row_from_cell(cell) -> None:
+    row = cell
+    while row is not None and not _css_name_is(row, "row"):
+        row = row.get_parent()
+    if row is None:
+        return
+
+    tid = int(getattr(row, "_dzll_live_flash_timeout_id", 0) or 0)
+    if tid:
+        try:
+            GLib.source_remove(tid)
+        except Exception:
+            pass
+        row._dzll_live_flash_timeout_id = 0
+    row.add_css_class(_LIVE_FLASH_CSS_CLASS)
+
+    def _clear(target=row):
+        try:
+            target.remove_css_class(_LIVE_FLASH_CSS_CLASS)
+        except Exception:
+            pass
+        target._dzll_live_flash_timeout_id = 0
+        return False
+
+    try:
+        row._dzll_live_flash_timeout_id = GLib.timeout_add(_LIVE_FLASH_HOLD_MS, _clear)
+    except Exception:
+        row._dzll_live_flash_timeout_id = 0
+
+
 def _make_label_factory(
     binder,
     *,
@@ -640,6 +674,7 @@ def _make_label_factory(
     drag_light=None,
     light_binder=None,
     notify_props=(),
+    flash_row_props=(),
     max_chars: int | None = None,
     cell_css_classes=None,
 ):
@@ -675,7 +710,7 @@ def _make_label_factory(
             perf_metrics.count("ping_label_writes")
             if isinstance(obj, ServerObject):
                 perf_metrics.count("ping_format_calls")
-        if not isinstance(obj, ServerObject) or not notify_props:
+        if not isinstance(obj, ServerObject) or not (notify_props or flash_row_props):
             return
         hids = []
 
@@ -696,6 +731,11 @@ def _make_label_factory(
                 if perf_metrics is not None:
                     perf_metrics.count("notify_connects")
                     perf_metrics.count(f"{factory_name}_notify_connects")
+            except Exception:
+                pass
+        for prop in flash_row_props:
+            try:
+                hids.append(obj.connect(f"notify::{prop}", lambda _obj, _pspec, cell=label: _flash_row_from_cell(cell)))
             except Exception:
                 pass
         label._dzll_notify_obj = obj
@@ -2299,6 +2339,7 @@ def build_server_column_view(
             drag_light=drag_light,
             light_binder=_bind_ping_light,
             notify_props=("ping",),
+            flash_row_props=("refresh-pulse",),
             max_chars=8,
             cell_css_classes=right_border,
         ),
