@@ -2888,7 +2888,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         btn.connect("clicked", lambda *_: self.open_mods_manager())
         attach_pointer_cursor(btn)
         try:
-            parent.append(btn)
+            parent.insert_child_after(btn, refresh_btn)
             self.mod_manager_header_btn = btn
         except Exception:
             pass
