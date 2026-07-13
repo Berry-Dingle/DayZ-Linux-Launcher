@@ -13,7 +13,7 @@ GITHUB_LATEST_API = "https://api.github.com/repos/Berry-Dingle/DayZ-Linux-Launch
 # ----------------------------
 # WINDOW (LOCKED)
 # ----------------------------
-WINDOW_DEFAULT_SIZE = (1200, 754)
+WINDOW_DEFAULT_SIZE = (1420, 754)
 
 # ----------------------------
 # TWEAKABLES (LOCKED LAYOUT)
