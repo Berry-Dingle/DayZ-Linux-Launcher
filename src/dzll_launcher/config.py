@@ -131,22 +131,3 @@ DISCLAIMER_TEXT = (
     "DayZ® is a registered trademark of Bohemia Interactive.\n"
     "DZLL is an unofficial community-made launcher and is not affiliated with or endorsed by Bohemia Interactive."
 )
-
-# Test server identification
-TEST_SERVER_MARKERS = (
-    "test",
-    "testserver",
-    "test server",
-    "testing",
-    "tester",
-    "dev",
-    "dev server",
-    "devserver",
-    "development",
-    "development server",
-    "developpement",
-    "playtest",
-    "dev build",
-    "teste",
-    "|test|",
-)

@@ -428,7 +428,6 @@ class ServerObject(GObject.Object):
         self.ipport_lc = f"{self.ip}:{int(self.gport)}".lower()
         self.search_blob = f"{self.name_lc}\n{self.ipport_lc}"
         self.filter_key = self.ipport_lc
-        self.is_likely_test_server = False
 
 
 class ServerRowWidget(Gtk.Box):

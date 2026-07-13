@@ -79,7 +79,6 @@ from .config import (
     AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED,
     SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED,
     SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED,
-    TEST_SERVER_MARKERS,
 )
 
 from .storage import (
@@ -1351,7 +1350,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # Titlebar counts
     # ----------------------------
     def _apply_titlebar_counts(self):
-        show_master = bool(self.settings.get("show_counts_in_title_bar", False))
+        show_master = bool(self.settings.get("show_counts_in_title_bar", True))
         show_servers = bool(self.settings.get("show_counts_servers_loaded", False))
         show_global = bool(self.settings.get("show_counts_global_players", False))
 
@@ -1387,7 +1386,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _steam_global_players_tick(self):
         if bool(getattr(self, "_shutdown_cleanup_done", False)):
             return False
-        if not bool(self.settings.get("show_counts_in_title_bar", False)):
+        if not bool(self.settings.get("show_counts_in_title_bar", True)):
             return True
         if not bool(self.settings.get("show_counts_global_players", True)):
             return True
@@ -5738,7 +5737,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             obj.ipport_lc = f"{ip}:{gport}".lower()
             obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
             obj.filter_key = k
-            obj.is_likely_test_server = self._is_likely_test_server_name(obj.name_lc)
             obj.mod_search_index = build_server_mod_index(mods_json)
             self._debug_sort_attach_notify_probe(obj)
 
@@ -7780,43 +7778,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._apply_titlebar_counts()
         return False
 
-    def _is_likely_test_server_name(self, name: str) -> bool:
-        s = str(name or "").strip().lower()
-        if not s:
-            return False
-
-        # Normalize separators/punctuation to spaces
-        s = re.sub(r"[_\-\.\[\]\(\)#*/!]+", " ", s)
-
-        # Split joined alpha/number boundaries: test2 -> test 2, dev1 -> dev 1
-        s = re.sub(r"([a-z])(\d)", r"\1 \2", s)
-        s = re.sub(r"(\d)([a-z])", r"\1 \2", s)
-
-        # Collapse whitespace
-        s = re.sub(r"\s+", " ", s).strip()
-        if not s:
-            return False
-
-        tokens = set(s.split())
-
-        for marker in TEST_SERVER_MARKERS:
-            m = marker.strip().lower()
-            if not m:
-                continue
-
-            if " " in m:
-                if m in s:
-                    return True
-            else:
-                if m in tokens:
-                    return True
-
-                # Allow marker glued to start/end of a token, but not buried in the middle
-                for tok in tokens:
-                    if tok.startswith(m) or tok.endswith(m):
-                        return True
-
-        return False
 
 # ==== MAIN.PY PART 3 ==== #
     # ----------------------------
@@ -7843,9 +7804,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         q = str(state.get("query") or "")
         ipport = getattr(obj, "ipport_lc", "") or f"{obj.ip}:{obj.gport}".lower()
-
-        if bool(state.get("hide_test_servers", True)) and bool(getattr(obj, "is_likely_test_server", False)):
-            return False
 
         max_players_cutoff = int(state.get("max_players_cutoff", 0) or 0)
         if not is_fav and max_players_cutoff > 0 and int(obj.max_players) < max_players_cutoff:
@@ -7936,7 +7894,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "online_only": active("cb_online_only"),
             "played_only": active("cb_played_only"),
             "selected_map": selected_map,
-            "hide_test_servers": bool(self.settings.get("hide_test_servers", True)),
             "max_players_cutoff": max_players_cutoff,
         }
 
