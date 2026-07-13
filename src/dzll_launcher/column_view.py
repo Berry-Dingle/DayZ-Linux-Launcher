@@ -2247,7 +2247,7 @@ def build_server_column_view(
             perf_metrics=perf_metrics,
             drag_light=drag_light,
             light_binder=_bind_time_light,
-            notify_props=("time",),
+            notify_props=("time", "timewarp"),
             max_chars=11,
             cell_css_classes=right_border,
         ),
