@@ -906,6 +906,15 @@ def build_search_area(window) -> Gtk.Widget:
     window.mod_search_control.append(window.search_entry)
     search_row.append(window.mod_search_control)
 
+    manage_mods_btn = Gtk.Button(label="Manage Mods")
+    manage_mods_btn.set_can_focus(False)
+    manage_mods_btn.set_tooltip_text("Manage installed mods")
+    manage_mods_btn.connect("clicked", lambda *_: window.open_mods_manager())
+    attach_pointer_cursor(manage_mods_btn)
+    manage_mods_btn.set_margin_start(6)
+    search_row.append(manage_mods_btn)
+    window.mod_manager_header_btn = manage_mods_btn
+
     settings_btn = Gtk.Button()
     settings_btn.set_can_focus(False)
     settings_btn.add_css_class("flat")

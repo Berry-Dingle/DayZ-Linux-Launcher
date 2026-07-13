@@ -1020,7 +1020,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         sidebar_stack.append(build_sidebar_toolbar(self))
 
         sidebar_frame = build_sidebar(self, include_toolbar=False)
-        self._install_header_mod_manager_button()
         try:
             self.refresh_status_btn.set_tooltip_text("Refresh all server status")
         except Exception:
@@ -2866,32 +2865,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._settings_ui.open_mods_manager()
         except Exception as e:
             print(f"[MODS UI] Failed to open mods manager: {e}")
-
-    def _install_header_mod_manager_button(self):
-        if getattr(self, "mod_manager_header_btn", None) is not None:
-            return
-        refresh_btn = getattr(self, "refresh_status_btn", None)
-        if refresh_btn is None:
-            return
-        try:
-            parent = refresh_btn.get_parent()
-        except Exception:
-            parent = None
-        if parent is None:
-            return
-
-        btn = Gtk.Button()
-        btn.set_can_focus(False)
-        btn.add_css_class("flat")
-        btn.set_child(Gtk.Image.new_from_icon_name("view-list-symbolic"))
-        btn.set_tooltip_text("Manage installed mods")
-        btn.connect("clicked", lambda *_: self.open_mods_manager())
-        attach_pointer_cursor(btn)
-        try:
-            parent.insert_child_after(btn, refresh_btn)
-            self.mod_manager_header_btn = btn
-        except Exception:
-            pass
 
     def _on_close_request(self, *_args):
         self._shutdown_cleanup()
