@@ -906,6 +906,22 @@ def build_search_area(window) -> Gtk.Widget:
     window.mod_search_control.append(window.search_entry)
     search_row.append(window.mod_search_control)
 
+    settings_btn = Gtk.Button()
+    settings_btn.set_can_focus(False)
+    settings_btn.add_css_class("flat")
+    settings_icon = Gtk.Image.new_from_icon_name("applications-system-symbolic")
+    settings_icon.set_pixel_size(24)
+    settings_btn.set_child(settings_icon)
+    settings_btn.set_tooltip_text("Settings")
+    try:
+        settings_btn.set_accessible_name("Settings")
+    except Exception:
+        pass
+    settings_btn.connect("clicked", window._on_settings_clicked)
+    attach_pointer_cursor(settings_btn)
+    settings_btn.set_margin_start(6)
+    search_row.append(settings_btn)
+
     window.mod_suggestion_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     window.mod_suggestion_panel.add_css_class("mod-suggestion-panel")
     window.mod_suggestion_panel.set_visible(False)
@@ -964,28 +980,6 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     search_header.set_halign(Gtk.Align.FILL)
     search_header.set_valign(Gtk.Align.CENTER)
     search_header.set_overflow(Gtk.Overflow.HIDDEN)
-
-    settings_btn = Gtk.Button()
-    settings_btn.set_can_focus(False)
-    settings_btn.add_css_class("flat")
-    settings_btn.set_child(Gtk.Image.new_from_icon_name("preferences-system-symbolic"))
-    settings_btn.set_tooltip_text("Settings")
-    try:
-        settings_btn.set_accessible_name("Settings")
-    except Exception:
-        pass
-    settings_btn.connect("clicked", window._on_settings_clicked)
-    attach_pointer_cursor(settings_btn)
-    search_header.append(settings_btn)
-
-    window.mod_manager_header_btn = Gtk.Button()
-    window.mod_manager_header_btn.set_can_focus(False)
-    window.mod_manager_header_btn.add_css_class("flat")
-    window.mod_manager_header_btn.set_child(Gtk.Image.new_from_icon_name("view-list-symbolic"))
-    window.mod_manager_header_btn.set_tooltip_text("Manage installed mods")
-    window.mod_manager_header_btn.connect("clicked", lambda *_: window.open_mods_manager())
-    attach_pointer_cursor(window.mod_manager_header_btn)
-    search_header.append(window.mod_manager_header_btn)
 
     window.refresh_status_btn = Gtk.Button()
     window.refresh_status_btn.set_can_focus(False)
