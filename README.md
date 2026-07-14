@@ -66,9 +66,9 @@ mkdir -p ~/DayZLinuxLauncher
 cd ~/DayZLinuxLauncher
 
 # Replace with your actual file path
-tar -xzf ~/Downloads/dzll-launcher-v0.3.0-beta.tar.gz
+tar -xzf ~/Downloads/dzll-launcher-v0.3.1-beta.tar.gz
 
-cd dzll-launcher-v0.3.0-beta
+cd dzll-launcher-v0.3.1-beta
 ```
 
 ---
@@ -318,7 +318,7 @@ rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
 ## 🧠 Recommended Project Layout
 
 ```text
-dzll-launcher-v0.3.0-beta/
+dzll-launcher-v0.3.1-beta/
 ├── src/dzll_launcher/
 ├── pyproject.toml
 ├── README.md

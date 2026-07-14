@@ -463,6 +463,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._debug_sort_stats = None
         self._search_filter_debounce_id = 0
         self._scroll_to_top_idle_id = 0
+        self._sort_generation = 0
         self._filter_state = {}
         self._filter_query = ""
         self._filter_refresh_suppress_depth = 0
@@ -2037,7 +2038,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _queue_scroll_to_top(self, reason: str = "unknown"):
         self._force_scroll_to_top_after_rebuild(reason=reason)
 
-    def _force_scroll_to_top_after_rebuild(self, reason: str = ""):
+    def _force_scroll_to_top_after_rebuild(
+        self,
+        reason: str = "",
+        sort_generation: int | None = None,
+        delay_ms: int = 0,
+    ):
         tid = int(getattr(self, "_scroll_to_top_idle_id", 0) or 0)
         if tid:
             try:
@@ -2047,14 +2053,32 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._scroll_to_top_idle_id = 0
         self._programmatic_scroll_to_top_active_until = time.monotonic() + 0.35
         if DEBUG_COLUMN_SORT:
-            print(f"[COLUMN-SORT] scroll top queued reason={reason}", flush=True)
+            print(
+                f"[COLUMN-SORT] scroll top queued reason={reason} generation={sort_generation}",
+                flush=True,
+            )
         try:
-            self._scroll_to_top_idle_id = GLib.idle_add(self._scroll_to_top, reason)
+            if delay_ms > 0:
+                self._scroll_to_top_idle_id = GLib.timeout_add(
+                    delay_ms, self._scroll_to_top, reason, sort_generation
+                )
+            else:
+                self._scroll_to_top_idle_id = GLib.idle_add(
+                    self._scroll_to_top, reason, sort_generation
+                )
         except Exception:
             self._scroll_to_top_idle_id = 0
 
-    def _scroll_to_top(self, reason: str = ""):
+    def _scroll_to_top(self, reason: str = "", sort_generation: int | None = None):
         self._scroll_to_top_idle_id = 0
+        if sort_generation is not None and sort_generation != self._sort_generation:
+            if DEBUG_COLUMN_SORT:
+                print(
+                    f"[COLUMN-SORT] scroll top skipped reason={reason} "
+                    f"generation={sort_generation} current={self._sort_generation}",
+                    flush=True,
+                )
+            return False
         self._programmatic_scroll_to_top_active_until = time.monotonic() + 0.35
         flags = 0
         try:
@@ -2072,7 +2096,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._debug_sort_note_scroll_to_skipped(pos, count, "out_of_range")
                 self._set_scroller_to_top()
                 try:
-                    self._scroll_to_top_idle_id = GLib.idle_add(self._scroll_to_top_final, reason)
+                    self._scroll_to_top_idle_id = GLib.idle_add(
+                        self._scroll_to_top_final, reason, sort_generation
+                    )
                 except Exception:
                     self._scroll_to_top_idle_id = 0
                 return False
@@ -2087,15 +2113,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
         self._set_scroller_to_top()
         try:
-            self._scroll_to_top_idle_id = GLib.idle_add(self._scroll_to_top_final, reason)
+            self._scroll_to_top_idle_id = GLib.idle_add(
+                self._scroll_to_top_final, reason, sort_generation
+            )
         except Exception:
             self._scroll_to_top_idle_id = 0
         if DEBUG_COLUMN_SORT:
             print(f"[COLUMN-SORT] scroll top applied reason={reason}", flush=True)
         return False
 
-    def _scroll_to_top_final(self, reason: str = ""):
+    def _scroll_to_top_final(self, reason: str = "", sort_generation: int | None = None):
         self._scroll_to_top_idle_id = 0
+        if sort_generation is not None and sort_generation != self._sort_generation:
+            if DEBUG_COLUMN_SORT:
+                print(
+                    f"[COLUMN-SORT] scroll top final skipped reason={reason} "
+                    f"generation={sort_generation} current={self._sort_generation}",
+                    flush=True,
+                )
+            return False
         self._programmatic_scroll_to_top_active_until = time.monotonic() + 0.2
         self._set_scroller_to_top()
         if DEBUG_COLUMN_SORT:
@@ -5502,8 +5538,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             obj.players = players
             debug_row_notifications += 1
             debug_player_updates += 1
-            if not background_live_update:
-                self._update_row_sort_players(obj)
+            self._update_row_sort_players(obj)
             obj.max_players = maxp
             debug_row_notifications += 1
             queue = info.get("queue")
@@ -7135,6 +7170,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.sort_key = key
             self.sort_asc = True
 
+        self._sort_generation += 1
+        sort_generation = self._sort_generation
+        self._update_sort_indicators()
+
         self._debug_browser_reorder(
             "set-sort",
             old=f"{old_sort_key}:{'asc' if old_sort_asc else 'desc'}",
@@ -7162,11 +7201,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         finally:
             self._debug_sort_finish()
 
-        self._update_sort_indicators()
         if DEBUG_FILTER_TIMING and isinstance(timing_ctx, dict):
             timing_ctx["sort_set_ms"] = (time.perf_counter() - sort_set_start) * 1000.0
             timing_ctx["scroll_queued"] = True
-        self._force_scroll_to_top_after_rebuild(reason="sort")
+        self._force_scroll_to_top_after_rebuild(
+            reason="sort", sort_generation=sort_generation, delay_ms=40
+        )
 
     def _on_column_view_sort_header_clicked(self, key_or_title):
         ctx = self._filter_timing_context("sort", time.perf_counter()) if DEBUG_FILTER_TIMING else None
@@ -7251,7 +7291,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _monitor_server_companion_for_obj(self, obj: ServerObject):
         self.set_server_companion_server(obj)
-        self.set_server_companion_enabled(True)
+        if not bool(self.settings.get("show_server_companion", False)):
+            self.set_server_companion_enabled(True)
 
     # ----------------------------
     # Prepare to Join Server

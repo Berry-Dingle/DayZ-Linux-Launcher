@@ -1,3 +1,12 @@
+dzll-launcher (0.3.1~b0-1) noble; urgency=medium
+
+  * Improve sort header responsiveness.
+  * Keep Players sort keys synced during live updates.
+  * Preserve undocked Server Companion when switching monitored server with
+    the eye button.
+
+ -- Gareth Brown <dzll-launcher@tutamail.com>  Tue, 14 Jul 2026 00:00:00 +0100
+
 dzll-launcher (0.3.0~b0-1) noble; urgency=medium
 
   * Initial Debian package for DZLL v0.3.0 Beta.

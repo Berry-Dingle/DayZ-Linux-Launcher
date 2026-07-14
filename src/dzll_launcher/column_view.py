@@ -253,7 +253,7 @@ def _attach_sort_header_gesture(view: Gtk.ColumnView, widget, sort_key: str) -> 
 
         now = time.monotonic()
         last_key, last_time = getattr(sort_view, "_dzll_sort_header_last_click", (None, 0.0))
-        if last_key == key and now - float(last_time or 0.0) < 0.12:
+        if last_key == key and now - float(last_time or 0.0) < 0.01:
             return
         sort_view._dzll_sort_header_last_click = (key, now)
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dzll_launcher"
-version = "0.3.0b0"
+version = "0.3.1b0"
 description = "DZLL is a native Linux launcher for DayZ with Steam Client Workshop mod handling and SteamCMD as an advanced fallback."
 readme = "README.md"
 license = { text = "LicenseRef-DZLL-Community-Source-1.0" }
