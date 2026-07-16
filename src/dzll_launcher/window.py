@@ -3524,7 +3524,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         confidence = self._safe_float_value(server.get("confidence"))
         cycle_seconds = self._safe_positive_int(server.get("learned_cycle_seconds"))
         last_restart_at = self._safe_positive_int(server.get("last_restart_event_at"))
-        if confidence < 0.80 or cycle_seconds <= 0 or last_restart_at <= 0:
+        if (
+            not companion_restart_learning.is_established_model(server)
+            or cycle_seconds <= 0
+            or last_restart_at <= 0
+        ):
             self._debug_server_companion_alert(
                 "restart-warning skipped: model not ready "
                 f"confidence={confidence:.3f} cycle_seconds={cycle_seconds} last_restart_at={last_restart_at}"

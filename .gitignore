@@ -44,6 +44,8 @@ pip-wheel-metadata/
 vendor/
 !src/dzll_launcher/vendor/
 !src/dzll_launcher/vendor/**
+src/dzll_launcher/vendor/**/__pycache__/
+src/dzll_launcher/vendor/**/*.py[cod]
 
 # Setup Skeleton Files
 build-rpm.sh
@@ -81,9 +83,16 @@ data/dzll-servers.db
 data/blocklist.json
 
 # -------------------------
-# Tests (you want none in this repo)
+# Tests: track intended Python sources, keep local data and generated output private
 # -------------------------
-tests/
+tests/*
+!tests/test_*.py
+tests/fixtures/
+tests/output/
+tests/outputs/
+tests/artifacts/
+tests/snapshots/
+tests/dumps/
 
 # -------------------------
 # Coverage (just in case)

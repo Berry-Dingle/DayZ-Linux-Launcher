@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import math
 import time
 
 
@@ -9,16 +10,32 @@ MIN_SOFT_RESTART_OUTAGE_SECONDS = 45
 MIN_RESTART_INTERVAL_SECONDS = 3 * 3600
 MAX_RESTART_INTERVAL_SECONDS = 24 * 3600
 CYCLE_BUCKETS_SECONDS = (3 * 3600, 4 * 3600, 6 * 3600, 8 * 3600, 12 * 3600)
+STATE_VERSION = 2
+SCORING_ALGORITHM_VERSION = 2
 UI_CONFIDENCE_THRESHOLD = 0.80
 MODEL_RESET_CONFIDENCE = 0.40
 RAW_OUTAGE_LIMIT = 100
 RAW_QUERY_VISIBLE_RESTART_LIMIT = 100
-RESTART_EVENT_LIMIT = 30
-EXPECTED_WINDOW_MISS_LIMIT = 30
+RESTART_EVENT_LIMIT = 100
+EXPECTED_WINDOW_MISS_LIMIT = 100
 MONITOR_SESSION_LIMIT = 100
 MONITOR_HEARTBEAT_SECONDS = 120
 MONITOR_MAX_COVERAGE_GAP_SECONDS = 240
 MONITOR_WINDOW_MIN_COVERAGE_RATIO = 0.75
+CONTRADICTION_LIMIT = 100
+PROJECTED_UNMONITORED_WEIGHT_FACTOR = 0.05
+PROJECTED_COVERED_WEIGHT_FACTOR = 0.50
+HARD_CONTRADICTION_PENALTY = 0.75
+SOFT_CONTRADICTION_PENALTY = 0.35
+NO_CYCLE_CONTRADICTION_PENALTY = 0.50
+ONE_INTERVAL_CONFIDENCE_CAP = 0.25
+TWO_INTERVAL_CONFIDENCE_CAP = 0.45
+FEWER_THAN_FOUR_EVENTS_CONFIDENCE_CAP = 0.60
+NO_COVERED_CYCLE_CONFIDENCE_CAP = 0.50
+ONLY_UNMONITORED_MULTIPLES_CONFIDENCE_CAP = 0.35
+AMBIGUOUS_PROJECTED_OBSERVATION_RATIO = 0.50
+AMBIGUOUS_PROJECTED_MINIMUM_COUNT = 2
+TWELVE_HOUR_CYCLE_SECONDS = 12 * 3600
 MAX_LEARNING_EVENT_AGE_SECONDS = 48 * 3600
 MIN_QUERY_VISIBLE_ZERO_SECONDS = 45
 MAX_QUERY_VISIBLE_ZERO_SECONDS = 8 * 60
@@ -27,7 +44,7 @@ DEBUG_SC_ALERTS = os.environ.get("DZLL_DEBUG_SC_ALERTS") == "1"
 
 
 def new_state() -> dict:
-    return {"version": 1, "servers": {}}
+    return {"version": STATE_VERSION, "servers": {}}
 
 
 def normalize_state(state: dict | None) -> dict:
@@ -36,9 +53,25 @@ def normalize_state(state: dict | None) -> dict:
     servers = state.get("servers")
     if not isinstance(servers, dict):
         servers = {}
+    normalized_servers = {}
+    for key, server in servers.items():
+        try:
+            normalized = _normalize_server(server)
+            if _safe_int(normalized.get("scoring_algorithm_version"), 0) != SCORING_ALGORITHM_VERSION:
+                _recalculate_model(normalized)
+        except Exception as exc:
+            # One damaged record must not expose stale confidence or prevent
+            # other servers from being migrated at startup.
+            try:
+                normalized = _safe_server_fallback(server)
+            except Exception:
+                normalized = _safe_server_fallback({})
+            if DEBUG_SC_ALERTS:
+                print(f"[SC-ALERT] restart-learning normalization failed for {key!s}: {exc!r}", flush=True)
+        normalized_servers[str(key)] = normalized
     return {
-        "version": 1,
-        "servers": servers,
+        "version": STATE_VERSION,
+        "servers": normalized_servers,
     }
 
 
@@ -51,6 +84,15 @@ def make_server_key(ip: str, gport: int) -> str | None:
     if not ip or gport <= 0:
         return None
     return f"{ip}:{gport}"
+
+
+def is_established_model(server: dict | None) -> bool:
+    server = _normalize_server(server)
+    return (
+        _safe_int(server.get("learned_cycle_seconds"), 0) > 0
+        and _safe_float(server.get("confidence"), 0.0) >= UI_CONFIDENCE_THRESHOLD
+        and _safe_int(server.get("scoring_algorithm_version"), 0) == SCORING_ALGORITHM_VERSION
+    )
 
 
 def scheduled_outage_alert_threshold(
@@ -66,7 +108,7 @@ def scheduled_outage_alert_threshold(
     server = _normalize_server(server)
     threshold = _safe_int(server.get("learned_min_offline_alert_seconds"), 0)
     learned_cycle = _safe_int(server.get("learned_cycle_seconds"), 0)
-    if threshold <= 0 or learned_cycle <= 0:
+    if threshold <= 0 or learned_cycle <= 0 or not is_established_model(server):
         return None
     offline_at = _safe_int(offline_at, 0)
     online_at = _safe_int(online_at, 0)
@@ -141,6 +183,7 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
                     cycle_seconds=cycle_seconds,
                     model_generation=_model_generation(server),
                     soft=True,
+                    interval_start_at=_safe_int(prior_outage.get("online_at"), 0),
                 )
                 _recalculate_model(server)
                 server["last_restart_event_at"] = online_at
@@ -184,8 +227,9 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
         online_at,
         learned_cycle,
     )
+    projected_contradiction_recorded = False
     if projected_match is not None and projected_match[0] > 1:
-        _, projected_delta = projected_match
+        projected_cycle_count, projected_delta = projected_match
         projected_match_blocked = False
         if abs(projected_delta) <= projected_window_tolerance_seconds(learned_cycle):
             projected_match_blocked = has_observed_miss_between(
@@ -196,6 +240,14 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
                 _model_generation(server),
             )
         if abs(projected_delta) <= projected_window_tolerance_seconds(learned_cycle) and not projected_match_blocked:
+            evidence_weight, coverage_quality = projected_multiple_evidence_weight(
+                server,
+                _safe_int((projected_anchor or {}).get("online_at"), 0),
+                online_at,
+                learned_cycle,
+                projected_cycle_count,
+                soft=is_soft,
+            )
             _append_raw_outage(
                 server,
                 offline_at,
@@ -213,27 +265,48 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
                 cycle_seconds=learned_cycle,
                 model_generation=_model_generation(server),
                 soft=is_soft,
+                evidence_weight=evidence_weight,
+                evidence_kind="projected_multiple",
+                coverage_quality=coverage_quality,
+                projected_cycle_count=projected_cycle_count,
+                interval_start_at=_safe_int((projected_anchor or {}).get("online_at"), 0),
             )
             _recalculate_model(server)
             server["last_restart_event_at"] = online_at
             server["last_observed_outage_at"] = online_at
             return state
 
+        # A plausible outage outside the projection must continue through ordinary
+        # bucket analysis. Otherwise the selected model suppresses its challengers.
         if not projected_match_blocked:
-            _append_raw_outage(
+            _append_contradiction(
                 server,
-                offline_at,
-                online_at,
-                duration_seconds,
-                False,
-                "soft_projected_window_miss" if is_soft else "projected_window_miss",
+                observed_at=online_at,
+                contradicted_cycle_seconds=learned_cycle,
+                observed_cycle_seconds=None,
+                reason="soft_projected_window_miss" if is_soft else "projected_window_miss",
+                soft=is_soft,
             )
-            server["last_observed_outage_at"] = online_at
-            return state
+            projected_contradiction_recorded = True
 
     if interval_seconds > MAX_RESTART_INTERVAL_SECONDS:
         reason = "soft_too_long_interval" if is_soft else "too_long_interval"
-        _append_raw_outage(server, offline_at, online_at, duration_seconds, not is_soft, reason)
+        _append_raw_outage(server, offline_at, online_at, duration_seconds, True, reason)
+        _append_restart_event(
+            server,
+            offline_at=offline_at,
+            online_at=online_at,
+            duration_seconds=duration_seconds,
+            interval_seconds=interval_seconds,
+            cycle_seconds=None,
+            model_generation=_model_generation(server),
+            soft=is_soft,
+            evidence_kind="anchor",
+            interval_start_at=_safe_int(previous_event.get("online_at"), 0),
+        )
+        if projected_contradiction_recorded:
+            _recalculate_model(server)
+        server["last_restart_event_at"] = online_at
         server["last_observed_outage_at"] = online_at
         return state
 
@@ -250,9 +323,16 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
         if plausible_soft_cycle is None:
             reason = "soft_no_cycle_bucket" if is_soft else "no_cycle_bucket"
             _append_raw_outage(server, offline_at, online_at, duration_seconds, not is_soft, reason)
-            if not is_soft:
-                _record_mismatch(server, online_at)
-                _reset_model_if_needed(server)
+            if learned_cycle > 0 and not projected_contradiction_recorded:
+                _append_contradiction(
+                    server,
+                    observed_at=online_at,
+                    contradicted_cycle_seconds=learned_cycle,
+                    observed_cycle_seconds=None,
+                    reason=reason,
+                    soft=is_soft,
+                )
+                _recalculate_model(server)
             server["last_observed_outage_at"] = online_at
             return state
     elif learned_cycle <= 0 or learned_cycle == int(cycle_seconds):
@@ -277,7 +357,19 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
             cycle_seconds=plausible_cycle_seconds,
             model_generation=_safe_int(anchor_event.get("model_generation"), _model_generation(server)),
             soft=True,
+            evidence_kind="direct",
+            coverage_quality=_interval_coverage_quality(server, anchor_event, online_at),
+            interval_start_at=_safe_int(anchor_event.get("online_at"), 0),
         )
+        if learned_cycle > 0 and learned_cycle != plausible_cycle_seconds:
+            _append_contradiction(
+                server,
+                observed_at=online_at,
+                contradicted_cycle_seconds=learned_cycle,
+                observed_cycle_seconds=plausible_cycle_seconds,
+                reason="soft_cycle_mismatch",
+                soft=True,
+            )
         _recalculate_model(server)
         server["last_restart_event_at"] = online_at
         server["last_observed_outage_at"] = online_at
@@ -285,21 +377,30 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
 
     if learned_cycle > 0 and learned_cycle != int(cycle_seconds):
         reason = "soft_cycle_mismatch" if is_soft else "cycle_mismatch"
-        _append_raw_outage(server, offline_at, online_at, duration_seconds, not is_soft, reason)
-        if not is_soft:
-            _record_mismatch(server, online_at)
-            reset = _reset_model_if_needed(server)
-            if reset:
-                _append_restart_event(
-                    server,
-                    offline_at=offline_at,
-                    online_at=online_at,
-                    duration_seconds=duration_seconds,
-                    interval_seconds=None,
-                    cycle_seconds=None,
-                    model_generation=_model_generation(server),
-                )
-                server["last_restart_event_at"] = online_at
+        _append_raw_outage(server, offline_at, online_at, duration_seconds, True, reason)
+        _append_contradiction(
+            server,
+            observed_at=online_at,
+            contradicted_cycle_seconds=learned_cycle,
+            observed_cycle_seconds=cycle_seconds,
+            reason=reason,
+            soft=is_soft,
+        )
+        _append_restart_event(
+            server,
+            offline_at=offline_at,
+            online_at=online_at,
+            duration_seconds=duration_seconds,
+            interval_seconds=interval_seconds,
+            cycle_seconds=cycle_seconds,
+            model_generation=_model_generation(server),
+            soft=is_soft,
+            evidence_kind="direct",
+            coverage_quality=_interval_coverage_quality(server, previous_event, online_at),
+            interval_start_at=_safe_int(previous_event.get("online_at"), 0),
+        )
+        _recalculate_model(server)
+        server["last_restart_event_at"] = online_at
         server["last_observed_outage_at"] = online_at
         return state
 
@@ -320,6 +421,9 @@ def record_confirmed_outage(state: dict | None, key: str, outage: dict) -> dict:
         cycle_seconds=cycle_seconds,
         model_generation=_model_generation(server),
         soft=is_soft,
+        evidence_kind="direct",
+        coverage_quality=_interval_coverage_quality(server, previous_event, online_at),
+        interval_start_at=_safe_int(previous_event.get("online_at"), 0),
     )
     _recalculate_model(server)
     server["last_restart_event_at"] = online_at
@@ -434,6 +538,7 @@ def record_query_visible_restart(state: dict | None, key: str, event: dict) -> d
         name=name,
         map_name=map_name,
         reject_reason=reject_reason,
+        interval_start_at=_safe_int((previous_event or {}).get("online_at"), 0),
     )
     server["last_restart_event_at"] = players_return_at
     server["last_query_visible_restart_at"] = players_return_at
@@ -631,6 +736,35 @@ def has_unmonitored_expected_windows_between(
     return False
 
 
+def projected_multiple_evidence_weight(
+    server: dict | None,
+    anchor_at,
+    event_at,
+    cycle_seconds,
+    cycle_count,
+    *,
+    soft: bool,
+) -> tuple[float, str]:
+    """Return cautious exact-cycle evidence for a projected multiple."""
+    base_weight = 0.5 if soft else 1.0
+    cycle_count = _safe_int(cycle_count, 0)
+    if cycle_count <= 1:
+        return base_weight, "direct"
+    if has_unmonitored_expected_windows_between(server, anchor_at, event_at, cycle_seconds):
+        return round(base_weight * PROJECTED_UNMONITORED_WEIGHT_FACTOR, 2), "unmonitored_multiple"
+    # Even covered multiples share an anchor and are weaker than an adjacent cycle.
+    weight = base_weight * PROJECTED_COVERED_WEIGHT_FACTOR / max(1.0, cycle_count / 2.0)
+    return round(max(0.05, weight), 2), "covered_multiple"
+
+
+def _interval_coverage_quality(server: dict, previous_event: dict | None, online_at: int) -> str:
+    anchor_at = _safe_int((previous_event or {}).get("online_at"), 0)
+    if anchor_at <= 0 or online_at <= anchor_at:
+        return "unknown"
+    coverage = server_monitored_window(server, anchor_at, online_at)
+    return "covered_direct" if bool(coverage.get("covered", False)) else "uncovered_direct"
+
+
 def record_expected_window_miss(state: dict | None, key: str, miss: dict) -> dict:
     state = normalize_state(state)
     if not key:
@@ -669,16 +803,9 @@ def record_expected_window_miss(state: dict | None, key: str, miss: dict) -> dic
         "coverage_ratio": round(max(0.0, min(1.0, coverage_ratio)), 3),
         "max_gap_seconds": max(0, max_gap_seconds),
     }):
-        current_generation_misses = [
-            item for item in (server.get("expected_window_misses") or [])
-            if isinstance(item, dict)
-            and _safe_int(item.get("model_generation"), 0) == _model_generation(server)
-        ]
-        penalty = 0.20 if len(current_generation_misses) <= 1 else 0.30
-        server["confidence"] = max(0.0, round(_safe_float(server.get("confidence"), 0.0) - penalty, 2))
         server["last_mismatch_at"] = expected_at
         server["updated_at"] = int(time.time())
-        _reset_model_if_needed(server)
+        _recalculate_model(server)
 
     return state
 
@@ -735,7 +862,7 @@ def summarize_server(
     except Exception:
         return None
 
-    if confidence < UI_CONFIDENCE_THRESHOLD:
+    if not is_established_model(server):
         return None
 
     if cycle_seconds <= 0:
@@ -906,7 +1033,34 @@ def _format_elapsed_text(seconds: int) -> str:
 def _normalize_server(server: dict | None) -> dict:
     if not isinstance(server, dict):
         server = {}
-    restart_events = list(server.get("restart_events") or [])[-RESTART_EVENT_LIMIT:]
+    restart_events, restart_events_valid = _normalize_restart_events(server.get("restart_events"))
+    candidate_scores, candidate_scores_valid = _normalize_candidate_scores(
+        server.get("candidate_scores")
+    )
+    anchors, anchors_valid = _normalize_anchor_list(
+        server.get("independent_direct_interval_anchors")
+    )
+    scoring_version = _safe_nonnegative_int(server.get("scoring_algorithm_version"), 0)
+    diagnostic_fields = (
+        "confidence", "confidence_cap", "matching_event_count", "evidence_score",
+        "supporting_evidence_score", "contradiction_penalty", "effective_evidence_score",
+        "independent_interval_count", "covered_direct_cycle_count", "direct_interval_count",
+        "projected_interval_count", "unmonitored_projected_interval_count",
+        "covered_projected_cycle_count", "qualifying_covered_evidence_count",
+    )
+    expected_window_misses, misses_valid = _normalize_expected_window_misses(
+        server.get("expected_window_misses")
+    )
+    contradictions, contradictions_valid = _normalize_contradictions(
+        server.get("contradictions")
+    )
+    diagnostics_valid = all(
+        field not in server or _is_nonnegative_number(server.get(field))
+        for field in diagnostic_fields
+    )
+    if not all((candidate_scores_valid, anchors_valid, restart_events_valid,
+                misses_valid, contradictions_valid, diagnostics_valid)):
+        scoring_version = 0
     learned_min_offline_alert_seconds = _safe_int(
         server.get("learned_min_offline_alert_seconds"),
         0,
@@ -926,9 +1080,11 @@ def _normalize_server(server: dict | None) -> dict:
     return {
         "name": str(server.get("name") or ""),
         "map": str(server.get("map") or ""),
-        "raw_outages": list(server.get("raw_outages") or [])[-RAW_OUTAGE_LIMIT:],
+        "raw_outages": _bounded_dict_list(server.get("raw_outages"), RAW_OUTAGE_LIMIT),
         "raw_query_visible_restarts": (
-            list(server.get("raw_query_visible_restarts") or [])[-RAW_QUERY_VISIBLE_RESTART_LIMIT:]
+            _bounded_dict_list(
+                server.get("raw_query_visible_restarts"), RAW_QUERY_VISIBLE_RESTART_LIMIT
+            )
         ),
         "restart_events": restart_events,
         "learned_min_offline_alert_seconds": (
@@ -936,17 +1092,52 @@ def _normalize_server(server: dict | None) -> dict:
             if learned_min_offline_alert_seconds > 0
             else None
         ),
-        "expected_window_misses": list(server.get("expected_window_misses") or [])[-EXPECTED_WINDOW_MISS_LIMIT:],
+        "expected_window_misses": expected_window_misses,
+        "contradictions": contradictions,
         "monitor_sessions": _normalize_monitor_sessions(server.get("monitor_sessions")),
         "learned_cycle_seconds": (
             _safe_int(server.get("learned_cycle_seconds"), 0)
             if _safe_int(server.get("learned_cycle_seconds"), 0) > 0
             else None
         ),
-        "expected_restart_minutes_of_day": list(server.get("expected_restart_minutes_of_day") or []),
-        "confidence": _safe_float(server.get("confidence"), 0.0),
-        "matching_event_count": _safe_int(server.get("matching_event_count"), 0),
-        "evidence_score": _safe_float(server.get("evidence_score"), 0.0),
+        "expected_restart_minutes_of_day": _normalize_minute_list(
+            server.get("expected_restart_minutes_of_day")
+        ),
+        "confidence": _safe_bounded_float(server.get("confidence"), 0.0, 0.0, 1.0),
+        "matching_event_count": _safe_nonnegative_int(server.get("matching_event_count"), 0),
+        "evidence_score": _safe_nonnegative_float(server.get("evidence_score"), 0.0),
+        "supporting_evidence_score": _safe_nonnegative_float(
+            server.get("supporting_evidence_score"), 0.0
+        ),
+        "contradiction_penalty": _safe_nonnegative_float(
+            server.get("contradiction_penalty"), 0.0
+        ),
+        "effective_evidence_score": _safe_nonnegative_float(
+            server.get("effective_evidence_score"), 0.0
+        ),
+        "confidence_cap": _safe_bounded_float(server.get("confidence_cap"), 1.0, 0.0, 1.0),
+        "independent_interval_count": _safe_nonnegative_int(
+            server.get("independent_interval_count"), 0
+        ),
+        "covered_direct_cycle_count": _safe_nonnegative_int(
+            server.get("covered_direct_cycle_count"), 0
+        ),
+        "candidate_scores": candidate_scores,
+        "scoring_algorithm_version": scoring_version,
+        "direct_interval_count": _safe_nonnegative_int(server.get("direct_interval_count"), 0),
+        "projected_interval_count": _safe_nonnegative_int(
+            server.get("projected_interval_count"), 0
+        ),
+        "unmonitored_projected_interval_count": _safe_nonnegative_int(
+            server.get("unmonitored_projected_interval_count"), 0
+        ),
+        "covered_projected_cycle_count": _safe_nonnegative_int(
+            server.get("covered_projected_cycle_count"), 0
+        ),
+        "qualifying_covered_evidence_count": _safe_nonnegative_int(
+            server.get("qualifying_covered_evidence_count"), 0
+        ),
+        "independent_direct_interval_anchors": anchors,
         "model_generation": max(1, _safe_int(server.get("model_generation"), 1)),
         "last_restart_event_at": server.get("last_restart_event_at"),
         "last_observed_outage_at": server.get("last_observed_outage_at"),
@@ -955,6 +1146,140 @@ def _normalize_server(server: dict | None) -> dict:
         "last_mismatch_at": server.get("last_mismatch_at"),
         "updated_at": _safe_int(server.get("updated_at"), 0),
     }
+
+
+def _safe_server_fallback(server) -> dict:
+    source = server if isinstance(server, dict) else {}
+    fallback = _normalize_server({
+        "name": source.get("name"),
+        "map": source.get("map"),
+        "raw_outages": source.get("raw_outages"),
+        "raw_query_visible_restarts": source.get("raw_query_visible_restarts"),
+        "restart_events": source.get("restart_events"),
+        "expected_window_misses": source.get("expected_window_misses"),
+        "contradictions": source.get("contradictions"),
+        "monitor_sessions": source.get("monitor_sessions"),
+        "model_generation": source.get("model_generation"),
+    })
+    fallback["learned_cycle_seconds"] = None
+    fallback["confidence"] = 0.0
+    fallback["scoring_algorithm_version"] = 0
+    return fallback
+
+
+def _bounded_dict_list(value, limit: int) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    return [dict(item) for item in value if isinstance(item, dict)][-limit:]
+
+
+def _normalize_restart_events(value) -> tuple[list[dict], bool]:
+    events = _bounded_dict_list(value, RESTART_EVENT_LIMIT)
+    valid = value is None or (
+        isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    )
+    for event in events:
+        for field in ("offline_at", "online_at", "duration_seconds", "interval_seconds", "cycle_seconds", "model_generation", "projected_cycle_count", "interval_start_at"):
+            if field in event:
+                valid = valid and (event.get(field) is None or _is_nonnegative_number(event.get(field)))
+                normalized = _safe_nonnegative_int(event.get(field), 0)
+                event[field] = normalized if normalized > 0 else None
+        if "evidence_weight" in event:
+            weight = _optional_nonnegative_float(event.get("evidence_weight"))
+            if weight is None:
+                valid = False
+                event.pop("evidence_weight", None)
+            else:
+                event["evidence_weight"] = weight
+    return events, valid
+
+
+def _normalize_expected_window_misses(value) -> tuple[list[dict], bool]:
+    misses = _bounded_dict_list(value, EXPECTED_WINDOW_MISS_LIMIT)
+    valid = value is None or (
+        isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    )
+    for miss in misses:
+        for field in ("expected_at", "window_start", "window_end", "cycle_seconds", "model_generation"):
+            if field in miss:
+                valid = valid and _is_nonnegative_number(miss.get(field))
+                miss[field] = _safe_nonnegative_int(miss.get(field), 0)
+    return misses, valid
+
+
+def _normalize_contradictions(value) -> tuple[list[dict], bool]:
+    contradictions = _bounded_dict_list(value, CONTRADICTION_LIMIT)
+    valid = value is None or (
+        isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    )
+    for item in contradictions:
+        for field in ("observed_at", "contradicted_cycle_seconds", "observed_cycle_seconds", "model_generation"):
+            if field in item:
+                valid = valid and (
+                    item.get(field) is None or _is_nonnegative_number(item.get(field))
+                )
+                item[field] = _safe_nonnegative_int(item.get(field), 0)
+        valid = valid and _is_nonnegative_number(item.get("penalty", 0.0))
+        item["penalty"] = _safe_nonnegative_float(item.get("penalty"), 0.0)
+        reasons = item.get("reasons")
+        item["reasons"] = sorted({str(reason) for reason in reasons if str(reason)}) if isinstance(reasons, list) else []
+    return contradictions, valid
+
+
+def _normalize_candidate_scores(value) -> tuple[dict, bool]:
+    if value is None:
+        return {}, True
+    if not isinstance(value, dict):
+        return {}, False
+    normalized = {}
+    valid = True
+    numeric_fields = {
+        "supporting_evidence_score", "contradiction_penalty", "effective_evidence_score",
+        "confidence_cap", "ambiguous_projected_observation_ratio",
+    }
+    count_fields = {
+        "direct_interval_count", "projected_interval_count", "independent_direct_interval_count",
+        "covered_direct_interval_count", "covered_projected_interval_count",
+        "qualifying_covered_evidence_count", "unmonitored_projected_interval_count",
+        "qualifying_restart_event_count",
+    }
+    for key, entry in value.items():
+        if not isinstance(entry, dict):
+            valid = False
+            continue
+        clean = {}
+        for field in numeric_fields:
+            if field in entry:
+                valid = valid and _is_nonnegative_number(entry.get(field))
+                clean[field] = _safe_nonnegative_float(entry.get(field), 0.0)
+        if "confidence_cap" in clean:
+            clean["confidence_cap"] = min(1.0, clean["confidence_cap"])
+        for field in count_fields:
+            if field in entry:
+                valid = valid and _is_nonnegative_number(entry.get(field))
+                clean[field] = _safe_nonnegative_int(entry.get(field), 0)
+        anchors, anchors_valid = _normalize_anchor_list(
+            entry.get("independent_direct_interval_anchors")
+        )
+        if "independent_direct_interval_anchors" in entry:
+            clean["independent_direct_interval_anchors"] = anchors
+            valid = valid and anchors_valid
+        normalized[str(key)] = clean
+    return normalized, valid
+
+
+def _normalize_anchor_list(value) -> tuple[list[int], bool]:
+    if value is None:
+        return [], True
+    if not isinstance(value, list):
+        return [], False
+    return sorted({anchor for item in value if (anchor := _safe_nonnegative_int(item, 0)) > 0}), True
+
+
+def _normalize_minute_list(value) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    return sorted({minute for item in value if 0 <= (minute := _safe_int(item, -1)) < 1440})
 
 
 def _append_raw_outage(
@@ -1016,6 +1341,10 @@ def _append_restart_event(
     name: str | None = None,
     map_name: str | None = None,
     reject_reason: str | None = None,
+    evidence_kind: str | None = None,
+    coverage_quality: str | None = None,
+    projected_cycle_count: int | None = None,
+    interval_start_at: int | None = None,
 ) -> None:
     item = {
         "offline_at": int(offline_at),
@@ -1042,6 +1371,14 @@ def _append_restart_event(
         item["map"] = str(map_name)
     if reject_reason:
         item["reject_reason"] = str(reject_reason)
+    if evidence_kind:
+        item["evidence_kind"] = str(evidence_kind)
+    if coverage_quality:
+        item["coverage_quality"] = str(coverage_quality)
+    if projected_cycle_count is not None:
+        item["projected_cycle_count"] = max(1, int(projected_cycle_count))
+    if interval_start_at is not None and _safe_int(interval_start_at, 0) > 0:
+        item["interval_start_at"] = int(interval_start_at)
     restart_events = server.setdefault("restart_events", [])
     restart_events.append(item)
     del restart_events[:-RESTART_EVENT_LIMIT]
@@ -1273,6 +1610,205 @@ def _has_query_visible_evidence(server: dict) -> bool:
     return any(isinstance(item, dict) for item in (server.get("raw_query_visible_restarts") or []))
 
 
+def _append_contradiction(
+    server: dict,
+    *,
+    observed_at: int,
+    contradicted_cycle_seconds: int,
+    observed_cycle_seconds: int | None,
+    reason: str,
+    soft: bool,
+) -> None:
+    penalty = SOFT_CONTRADICTION_PENALTY if soft else HARD_CONTRADICTION_PENALTY
+    if observed_cycle_seconds is None:
+        penalty = min(penalty, NO_CYCLE_CONTRADICTION_PENALTY)
+    item = {
+        "observed_at": int(observed_at),
+        "contradicted_cycle_seconds": int(contradicted_cycle_seconds),
+        "observed_cycle_seconds": (
+            None if observed_cycle_seconds is None else int(observed_cycle_seconds)
+        ),
+        "reason": str(reason),
+        "reasons": [str(reason)],
+        "soft": bool(soft),
+        "penalty": round(penalty, 2),
+        "model_generation": _model_generation(server),
+    }
+    contradictions = server.setdefault("contradictions", [])
+    existing_item = next((
+        existing for existing in contradictions
+        if isinstance(existing, dict)
+        and _safe_int(existing.get("observed_at"), 0) == item["observed_at"]
+        and _safe_int(existing.get("contradicted_cycle_seconds"), 0)
+        == item["contradicted_cycle_seconds"]
+    ), None)
+    if existing_item is None:
+        contradictions.append(item)
+        del contradictions[:-CONTRADICTION_LIMIT]
+    else:
+        reasons = {
+            str(value) for value in (existing_item.get("reasons") or []) if str(value)
+        }
+        prior_reason = str(existing_item.get("reason") or "")
+        if prior_reason:
+            reasons.add(prior_reason)
+        reasons.add(str(reason))
+        existing_item["reasons"] = sorted(reasons)
+        existing_item["reason"] = str(reason)
+        if (
+            _safe_int(existing_item.get("observed_cycle_seconds"), 0) <= 0
+            and item["observed_cycle_seconds"] is not None
+        ):
+            existing_item["observed_cycle_seconds"] = item["observed_cycle_seconds"]
+        if penalty > _safe_float(existing_item.get("penalty"), 0.0):
+            existing_item["penalty"] = round(penalty, 2)
+            existing_item["soft"] = bool(soft)
+            existing_item["observed_cycle_seconds"] = item["observed_cycle_seconds"]
+    server["last_mismatch_at"] = int(observed_at)
+
+
+def _event_evidence_kind(event: dict, cycle: int) -> str:
+    kind = str(event.get("evidence_kind") or "")
+    if kind:
+        return kind
+    projected = nearest_projected_cycle_delta(
+        _safe_int(event.get("online_at"), 0) - _safe_int(event.get("interval_seconds"), 0),
+        _safe_int(event.get("online_at"), 0),
+        cycle,
+    )
+    return "projected_multiple" if projected is not None and projected[0] > 1 else "direct"
+
+
+def _event_interval_pair(event: dict) -> tuple[int, int] | None:
+    end_at = _safe_int(event.get("online_at"), 0)
+    start_at = _safe_int(event.get("interval_start_at"), 0)
+    if start_at <= 0:
+        interval_seconds = _safe_int(event.get("interval_seconds"), 0)
+        if end_at > 0 and interval_seconds > 0:
+            start_at = end_at - interval_seconds
+    if start_at <= 0 or end_at <= start_at:
+        return None
+    return start_at, end_at
+
+
+def _event_evidence_weight(event: dict, cycle: int) -> float:
+    stored_weight = _optional_nonnegative_float(event.get("evidence_weight"))
+    if stored_weight is not None:
+        return stored_weight
+
+    base_weight = 0.5 if event.get("soft") else 1.0
+    if _event_evidence_kind(event, cycle) != "projected_multiple":
+        return base_weight
+
+    cycle_count = _safe_nonnegative_int(event.get("projected_cycle_count"), 0)
+    pair = _event_interval_pair(event)
+    if cycle_count <= 1 and pair is not None and cycle > 0:
+        cycle_count = max(2, int(round((pair[1] - pair[0]) / float(cycle))))
+    cycle_count = max(2, cycle_count)
+    multiple_discount = max(1.0, cycle_count / 2.0)
+    if str(event.get("coverage_quality") or "") == "covered_multiple":
+        return round(max(0.05, base_weight * PROJECTED_COVERED_WEIGHT_FACTOR / multiple_discount), 2)
+    # Missing or malformed coverage is ambiguous, so incomplete projected
+    # records receive weak support and an additional long-multiple discount.
+    return round(max(0.0, base_weight * PROJECTED_UNMONITORED_WEIGHT_FACTOR / multiple_discount), 2)
+
+
+def _candidate_evidence_diagnostics(cycle: int, events: list[dict]) -> dict:
+    useful = [
+        event for event in events
+        if _event_evidence_weight(event, cycle) > 0.0
+    ]
+    direct_pairs = {
+        pair for event in useful
+        if _event_evidence_kind(event, cycle) == "direct"
+        for pair in [_event_interval_pair(event)] if pair is not None
+    }
+    projected_pairs = {
+        pair for event in useful
+        if _event_evidence_kind(event, cycle) == "projected_multiple"
+        for pair in [_event_interval_pair(event)] if pair is not None
+    }
+    # One reused anchor supplies at most one independent direct interval. An
+    # adjacent A->B, B->C chain still has distinct anchors and counts normally.
+    independent_anchors = sorted({start for start, _end in direct_pairs})
+    covered_direct_count = sum(
+        1 for event in useful
+        if _event_evidence_kind(event, cycle) == "direct"
+        and str(event.get("coverage_quality") or "") == "covered_direct"
+    )
+    covered_projected_count = sum(
+        1 for event in useful
+        if _event_evidence_kind(event, cycle) == "projected_multiple"
+        and str(event.get("coverage_quality") or "") == "covered_multiple"
+    )
+    unmonitored_projected_count = sum(
+        1 for event in useful
+        if _event_evidence_kind(event, cycle) == "projected_multiple"
+        and str(event.get("coverage_quality") or "") in {"", "unmonitored_multiple"}
+    )
+    observation_count = len(direct_pairs) + len(projected_pairs)
+    ambiguous_ratio = unmonitored_projected_count / float(max(1, observation_count))
+    return {
+        "direct_interval_count": len(direct_pairs),
+        "projected_interval_count": len(projected_pairs),
+        "independent_direct_interval_count": len(independent_anchors),
+        "independent_direct_interval_anchors": independent_anchors,
+        "covered_direct_interval_count": covered_direct_count,
+        "covered_projected_interval_count": covered_projected_count,
+        "qualifying_covered_evidence_count": covered_direct_count + covered_projected_count,
+        "unmonitored_projected_interval_count": unmonitored_projected_count,
+        "ambiguous_projected_observation_ratio": round(ambiguous_ratio, 3),
+    }
+
+
+def _confidence_cap_for_cycle(
+    cycle: int,
+    events: list[dict],
+    contradiction_penalty: float,
+    supporting_score: float,
+) -> tuple[float, dict]:
+    diagnostics = _candidate_evidence_diagnostics(cycle, events)
+    interval_count = diagnostics["independent_direct_interval_count"]
+    restart_count = interval_count + (1 if interval_count else 0)
+    covered_direct_count = diagnostics["covered_direct_interval_count"]
+    cap = 1.0
+    if interval_count <= 1:
+        cap = min(cap, ONE_INTERVAL_CONFIDENCE_CAP)
+    elif interval_count == 2:
+        cap = min(cap, TWO_INTERVAL_CONFIDENCE_CAP)
+    if restart_count < 4:
+        cap = min(cap, FEWER_THAN_FOUR_EVENTS_CONFIDENCE_CAP)
+    if covered_direct_count <= 0:
+        cap = min(cap, NO_COVERED_CYCLE_CONFIDENCE_CAP)
+    if (
+        covered_direct_count <= 0
+        and diagnostics["unmonitored_projected_interval_count"] >= AMBIGUOUS_PROJECTED_MINIMUM_COUNT
+        and diagnostics["ambiguous_projected_observation_ratio"]
+        >= AMBIGUOUS_PROJECTED_OBSERVATION_RATIO
+    ):
+        cap = min(cap, ONLY_UNMONITORED_MULTIPLES_CONFIDENCE_CAP)
+    if contradiction_penalty >= max(1.0, supporting_score * 0.4):
+        cap = min(cap, 0.60)
+    if contradiction_penalty >= supporting_score and contradiction_penalty > 0:
+        cap = min(cap, 0.35)
+
+    if cycle == TWELVE_HOUR_CYCLE_SECONDS:
+        if restart_count < 5:
+            cap = min(cap, 0.45)
+        elif restart_count < 10:
+            cap = min(cap, 0.60)
+        if covered_direct_count < 3:
+            cap = min(cap, 0.60)
+        if restart_count < 10 or covered_direct_count < 6:
+            cap = min(cap, 0.79)
+    elif cycle == 6 * 3600 and restart_count < 5:
+        cap = min(cap, 0.60)
+    elif cycle in {3 * 3600, 4 * 3600} and restart_count < 3:
+        cap = min(cap, 0.45)
+    diagnostics["qualifying_restart_event_count"] = restart_count
+    return round(cap, 2), diagnostics
+
+
 def _recalculate_model(server: dict) -> None:
     generation = _model_generation(server)
     events = [
@@ -1292,14 +1828,27 @@ def _recalculate_model(server: dict) -> None:
         server["confidence"] = 0.0
         server["matching_event_count"] = 0
         server["evidence_score"] = 0.0
+        server["supporting_evidence_score"] = 0.0
+        server["contradiction_penalty"] = 0.0
+        server["effective_evidence_score"] = 0.0
+        server["confidence_cap"] = 1.0
+        server["independent_interval_count"] = 0
+        server["covered_direct_cycle_count"] = 0
+        server["covered_projected_cycle_count"] = 0
+        server["qualifying_covered_evidence_count"] = 0
+        server["direct_interval_count"] = 0
+        server["projected_interval_count"] = 0
+        server["unmonitored_projected_interval_count"] = 0
+        server["independent_direct_interval_anchors"] = []
+        server["candidate_scores"] = {}
+        server["scoring_algorithm_version"] = SCORING_ALGORITHM_VERSION
         return
 
     evidence = {}
     for event in events:
         cycle = _safe_int(event.get("cycle_seconds"), 0)
         if cycle > 0:
-            default_weight = 0.5 if event.get("soft") else 1.0
-            weight = _safe_float(event.get("evidence_weight"), default_weight)
+            weight = _event_evidence_weight(event, cycle)
             evidence[cycle] = evidence.get(cycle, 0.0) + max(0.0, weight)
 
     miss_penalties = {}
@@ -1312,40 +1861,87 @@ def _recalculate_model(server: dict) -> None:
         if cycle > 0:
             miss_penalties[cycle] = miss_penalties.get(cycle, 0.0) + 1.0
 
+    contradiction_penalties = {}
+    for contradiction in server.get("contradictions") or []:
+        if not isinstance(contradiction, dict):
+            continue
+        if _safe_int(contradiction.get("model_generation"), generation) != generation:
+            continue
+        cycle = _safe_int(contradiction.get("contradicted_cycle_seconds"), 0)
+        if cycle > 0:
+            contradiction_penalties[cycle] = contradiction_penalties.get(cycle, 0.0) + max(
+                0.0, _safe_float(contradiction.get("penalty"), 0.0)
+            )
+
     net_evidence = {
-        cycle: max(0.0, score - miss_penalties.get(cycle, 0.0))
+        cycle: max(
+            0.0,
+            score - miss_penalties.get(cycle, 0.0) - contradiction_penalties.get(cycle, 0.0),
+        )
         for cycle, score in evidence.items()
     }
+    candidate_scores = {}
+    for cycle, score in net_evidence.items():
+        cycle_events = [event for event in events if _safe_int(event.get("cycle_seconds"), 0) == cycle]
+        cycle_penalty = miss_penalties.get(cycle, 0.0) + contradiction_penalties.get(cycle, 0.0)
+        cap, diagnostics = _confidence_cap_for_cycle(
+            cycle, cycle_events, cycle_penalty, evidence.get(cycle, 0.0)
+        )
+        candidate_scores[str(cycle)] = {
+            "supporting_evidence_score": round(evidence.get(cycle, 0.0), 2),
+            "contradiction_penalty": round(cycle_penalty, 2),
+            "effective_evidence_score": round(score, 2),
+            "confidence_cap": cap,
+            **diagnostics,
+        }
+    server["candidate_scores"] = candidate_scores
 
     learned_cycle, evidence_score = sorted(net_evidence.items(), key=lambda item: (-item[1], item[0]))[0]
     matching_count = counts.get(learned_cycle, 0)
     server["learned_cycle_seconds"] = learned_cycle
     server["matching_event_count"] = matching_count
     server["evidence_score"] = round(evidence_score, 2)
-    server["confidence"] = confidence_for_match_count(evidence_score)
+    supporting_score = evidence.get(learned_cycle, 0.0)
+    contradiction_penalty = (
+        miss_penalties.get(learned_cycle, 0.0)
+        + contradiction_penalties.get(learned_cycle, 0.0)
+    )
+    selected_diagnostics = candidate_scores[str(learned_cycle)]
+    confidence_cap = _safe_float(selected_diagnostics.get("confidence_cap"), 1.0)
+    server["supporting_evidence_score"] = round(supporting_score, 2)
+    server["contradiction_penalty"] = round(contradiction_penalty, 2)
+    server["effective_evidence_score"] = round(evidence_score, 2)
+    server["confidence_cap"] = confidence_cap
+    server["independent_interval_count"] = _safe_int(
+        selected_diagnostics.get("independent_direct_interval_count"), 0
+    )
+    server["direct_interval_count"] = _safe_int(selected_diagnostics.get("direct_interval_count"), 0)
+    server["projected_interval_count"] = _safe_int(
+        selected_diagnostics.get("projected_interval_count"), 0
+    )
+    server["unmonitored_projected_interval_count"] = _safe_int(
+        selected_diagnostics.get("unmonitored_projected_interval_count"), 0
+    )
+    server["covered_direct_cycle_count"] = _safe_int(
+        selected_diagnostics.get("covered_direct_interval_count"), 0
+    )
+    server["covered_projected_cycle_count"] = _safe_int(
+        selected_diagnostics.get("covered_projected_interval_count"), 0
+    )
+    server["qualifying_covered_evidence_count"] = _safe_int(
+        selected_diagnostics.get("qualifying_covered_evidence_count"), 0
+    )
+    server["independent_direct_interval_anchors"] = list(
+        selected_diagnostics.get("independent_direct_interval_anchors") or []
+    )
+    server["confidence"] = min(confidence_for_match_count(evidence_score), confidence_cap)
+    server["scoring_algorithm_version"] = SCORING_ALGORITHM_VERSION
     minutes = [
         _safe_int(event.get("minute_of_day"), -1)
         for event in events
         if _safe_int(event.get("cycle_seconds"), 0) == learned_cycle
     ]
     server["expected_restart_minutes_of_day"] = sorted({m for m in minutes if 0 <= m < 1440})
-
-
-def _record_mismatch(server: dict, online_at: int) -> None:
-    server["last_mismatch_at"] = int(online_at)
-    server["confidence"] = max(0.0, round(_safe_float(server.get("confidence"), 0.0) - 0.30, 2))
-
-
-def _reset_model_if_needed(server: dict) -> bool:
-    if _safe_float(server.get("confidence"), 0.0) >= MODEL_RESET_CONFIDENCE:
-        return False
-    server["learned_cycle_seconds"] = None
-    server["expected_restart_minutes_of_day"] = []
-    server["confidence"] = 0.0
-    server["matching_event_count"] = 0
-    server["evidence_score"] = 0.0
-    server["model_generation"] = _model_generation(server) + 1
-    return True
 
 
 def _model_generation(server: dict) -> int:
@@ -1368,14 +1964,55 @@ def _minute_of_day(epoch_seconds: int) -> int:
 
 
 def _safe_int(value, default: int) -> int:
+    if isinstance(value, bool):
+        return int(default)
     try:
-        return int(value)
+        converted = int(value)
+        return converted
     except Exception:
         return int(default)
 
 
 def _safe_float(value, default: float) -> float:
+    if isinstance(value, bool):
+        return float(default)
     try:
-        return float(value)
+        converted = float(value)
+        return converted if math.isfinite(converted) else float(default)
     except Exception:
         return float(default)
+
+
+def _is_finite_number(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except Exception:
+        return False
+
+
+def _is_nonnegative_number(value) -> bool:
+    return _is_finite_number(value) and float(value) >= 0.0
+
+
+def _optional_nonnegative_float(value) -> float | None:
+    if not _is_nonnegative_number(value):
+        return None
+    converted = float(value)
+    return converted if converted >= 0.0 else None
+
+
+def _safe_nonnegative_float(value, default: float) -> float:
+    converted = _optional_nonnegative_float(value)
+    return float(default) if converted is None else converted
+
+
+def _safe_bounded_float(value, default: float, minimum: float, maximum: float) -> float:
+    converted = _safe_float(value, default)
+    return min(maximum, max(minimum, converted))
+
+
+def _safe_nonnegative_int(value, default: int) -> int:
+    converted = _safe_int(value, default)
+    return max(0, converted)
