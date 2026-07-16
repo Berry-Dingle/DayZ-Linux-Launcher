@@ -58,6 +58,12 @@ LAST_PLAYED_PRUNE_DAYS = 90
 # Last Companion server (local app state)
 LAST_COMPANION_SERVER_PATH = os.path.join(CFG_DIR, "last_companion_server.json")
 COMPANION_RESTART_LEARNING_PATH = os.path.join(CFG_DIR, "companion_restart_learning.json")
+# Dormant Phase 2 state. The current application continues to use the Phase 1
+# path above until the later integration stage explicitly activates migration.
+COMPANION_RESTART_LEARNING_PHASE2_PATH = os.path.join(
+    CFG_DIR,
+    "companion_restart_learning_phase2.json",
+)
 
 # Dead server cache (local)
 CACHE_DIR = os.path.expanduser("~/.cache/dzll")
