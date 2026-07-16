@@ -210,10 +210,10 @@ def initialize_phase2_state(
     now: int | float | None = None,
     generation_id: str | None = None,
 ) -> Phase2MigrationResult:
-    """Load or safely initialize dormant Phase 2 restart-learning storage.
+    """Load or safely initialize Phase 2 restart-learning storage.
 
-    This helper deliberately has no production call site in Stage 1. Explicit
-    paths keep every migration test isolated from the user's configuration.
+    Explicit paths keep migration tests isolated from the user's configuration
+    while the application supplies its production paths at startup.
     """
 
     active = Path(active_path)

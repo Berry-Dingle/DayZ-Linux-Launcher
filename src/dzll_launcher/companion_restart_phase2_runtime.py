@@ -75,6 +75,11 @@ MAX_INCOMPLETE_EPISODES = 30
 MAX_MONITORING_SESSIONS = 120
 PERSIST_HEARTBEAT_SECONDS = 60.0
 COVERAGE_MAX_AGE_SECONDS = 60 * 24 * 3600
+PERSISTED_FUTURE_SKEW_SECONDS = 5 * 60
+MAX_FULL_DETAIL_SERVERS = 32
+MAX_COMPACT_DETAIL_SERVERS = 250
+COMPACT_EVENT_LIMIT = 12
+COLD_EVENT_LIMIT = 2
 
 
 class RuntimePersistenceStatus(str, Enum):
@@ -605,62 +610,99 @@ class Phase2RestartRuntime:
             server.dirty = True
         return tuple(accepted)
 
-    def _fold_old_events(self, server: _ServerRuntime, *, now: float) -> None:
-        trim = len(server.events) - MAX_FINALIZED_EVENTS
+    def _fold_old_events(
+        self,
+        server: _ServerRuntime,
+        *,
+        now: float,
+        target_limit: int = MAX_FINALIZED_EVENTS,
+    ) -> None:
+        trim = len(server.events) - max(0, int(target_limit))
         if trim <= 0:
             return
-        old_events = tuple(server.events[:trim])
-        old_score = self.scorer.score(
-            old_events,
-            CoverageTimeline(tuple(server.coverage)),
-            now=now,
-            aggregate=server.aggregate,
-        )
-        candidates = []
-        for scored in old_score.candidates:
-            prior = server.aggregate.candidate(scored.period_seconds)
-            candidates.append(
-                CandidateAggregate(
-                    period_seconds=scored.period_seconds,
-                    direct_count=prior.direct_count + scored.strict_direct_interval_count,
-                    direct_weight=prior.direct_weight + scored.direct_support,
-                    miss_count=prior.miss_count + scored.covered_miss_count,
-                    miss_penalty=prior.miss_penalty + scored.covered_miss_penalty,
-                    off_grid_count=prior.off_grid_count + scored.off_grid_event_count,
-                    off_grid_penalty=prior.off_grid_penalty + scored.off_grid_penalty,
-                    hint_count=prior.hint_count + scored.hints.event_count,
-                    hint_weight=prior.hint_weight + scored.hints.weighted_alignment,
-                    first_hint_at=_minimum_optional(prior.first_hint_at, scored.hints.first_at),
-                    last_hint_at=_maximum_optional(prior.last_hint_at, scored.hints.last_at),
-                    phase_vector_sin=prior.phase_vector_sin,
-                    phase_vector_cos=prior.phase_vector_cos,
-                    divisor_resolution_count=(
-                        prior.divisor_resolution_count
-                        + sum(item.covered_window_count for item in scored.divisor_resolution)
-                    ),
-                )
+        # Fold one boundary pair at a time. Scoring only the removed prefix loses
+        # the adjacent interval from its last event to the first retained event;
+        # feeding the existing aggregate back into that score can also compound
+        # already-folded evidence. A two-event, aggregate-free score captures the
+        # one semantic relationship that disappears at each trim exactly once.
+        for _index in range(trim):
+            removed = server.events[0]
+            boundary = server.events[1] if len(server.events) > 1 else None
+            pair_events = (removed, boundary) if boundary is not None else (removed,)
+            pair_score = self.scorer.score(
+                pair_events,
+                CoverageTimeline(tuple(server.coverage)),
+                now=now,
             )
-        server.aggregate = LongTermAggregate(
-            semantics_version=AGGREGATE_SEMANTICS_VERSION,
-            candidates=tuple(candidates),
-            source_quality_counts=server.aggregate.source_quality_counts,
-            first_observation_at=_minimum_optional(
-                server.aggregate.first_observation_at,
-                min((_event_at(item) for item in old_events if _event_at(item) is not None), default=None),
-            ),
-            last_observation_at=_maximum_optional(
-                server.aggregate.last_observation_at,
-                max((_event_at(item) for item in old_events if _event_at(item) is not None), default=None),
-            ),
-            anomaly_count=server.aggregate.anomaly_count
-            + sum(item.outcome in {EventOutcome.AMBIGUOUS_DRAIN, EventOutcome.UNCERTAIN_A2S_INTERRUPTION} for item in old_events),
-            prior_regimes=server.aggregate.prior_regimes,
-        )
-        server.folded_through_event_seq = max(
-            server.folded_through_event_seq,
-            max((item.sequence for item in old_events), default=0),
-        )
-        server.events = server.events[trim:]
+            candidates = []
+            removed_at = _event_at(removed)
+            for scored in pair_score.candidates:
+                prior = server.aggregate.candidate(scored.period_seconds)
+                has_hint = scored.hints.event_count > 0 and removed_at is not None
+                # Each endpoint eventually becomes the removed endpoint. Retain
+                # only this endpoint's share now so the boundary is not counted
+                # again on the next trim.
+                hint_share = (
+                    scored.hints.weighted_alignment / scored.hints.event_count
+                    if has_hint
+                    else 0.0
+                )
+                candidates.append(
+                    CandidateAggregate(
+                        period_seconds=scored.period_seconds,
+                        direct_count=prior.direct_count + scored.strict_direct_interval_count,
+                        direct_weight=prior.direct_weight + scored.direct_support,
+                        miss_count=prior.miss_count + scored.covered_miss_count,
+                        miss_penalty=prior.miss_penalty + scored.covered_miss_penalty,
+                        off_grid_count=prior.off_grid_count + scored.off_grid_event_count,
+                        off_grid_penalty=prior.off_grid_penalty + scored.off_grid_penalty,
+                        hint_count=prior.hint_count + int(has_hint),
+                        hint_weight=prior.hint_weight + hint_share,
+                        first_hint_at=_minimum_optional(
+                            prior.first_hint_at, removed_at if has_hint else None
+                        ),
+                        last_hint_at=_maximum_optional(
+                            prior.last_hint_at, removed_at if has_hint else None
+                        ),
+                        phase_vector_sin=prior.phase_vector_sin,
+                        phase_vector_cos=prior.phase_vector_cos,
+                        divisor_resolution_count=(
+                            prior.divisor_resolution_count
+                            + sum(
+                                item.covered_window_count
+                                for item in scored.divisor_resolution
+                            )
+                        ),
+                    )
+                )
+            source_counts = dict(server.aggregate.source_quality_counts)
+            source_counts[removed.outcome.value] = (
+                source_counts.get(removed.outcome.value, 0) + 1
+            )
+            server.aggregate = LongTermAggregate(
+                semantics_version=AGGREGATE_SEMANTICS_VERSION,
+                candidates=tuple(candidates),
+                source_quality_counts=tuple(sorted(source_counts.items())),
+                first_observation_at=_minimum_optional(
+                    server.aggregate.first_observation_at, removed_at
+                ),
+                last_observation_at=_maximum_optional(
+                    server.aggregate.last_observation_at, removed_at
+                ),
+                anomaly_count=server.aggregate.anomaly_count
+                + int(
+                    removed.outcome
+                    in {
+                        EventOutcome.AMBIGUOUS_DRAIN,
+                        EventOutcome.UNCERTAIN_A2S_INTERRUPTION,
+                    }
+                ),
+                prior_regimes=server.aggregate.prior_regimes,
+            )
+            server.folded_through_event_seq = max(
+                server.folded_through_event_seq, removed.sequence
+            )
+            server.events.pop(0)
 
     def _evaluate(
         self,
@@ -847,6 +889,7 @@ class Phase2RestartRuntime:
             return False
         servers = self.state.setdefault("servers", {})
         servers[server.key] = _serialize_server(server)
+        self._compact_global_history(active_key=server.key, now=now)
         self.state["updated_at"] = max(int(now), int(self.state.get("created_at", 0) or 0))
         try:
             atomic_write_json(self.active_path, self.state)
@@ -857,6 +900,73 @@ class Phase2RestartRuntime:
         server.dirty = False
         server.last_saved_at = now
         return True
+
+    def _compact_global_history(self, *, active_key: str, now: float) -> None:
+        """Bound total state while retaining compact knowledge for old identities."""
+
+        ranked = sorted(
+            self._servers.values(),
+            key=lambda item: (_server_activity_at(item), item.key),
+            reverse=True,
+        )
+        full_keys = {active_key}
+        for item in ranked:
+            if len(full_keys) >= MAX_FULL_DETAIL_SERVERS:
+                break
+            full_keys.add(item.key)
+        remaining = [item for item in ranked if item.key not in full_keys]
+        compact_keys = {
+            item.key
+            for item in remaining[: max(0, MAX_COMPACT_DETAIL_SERVERS - len(full_keys))]
+        }
+        serialized = self.state.setdefault("servers", {})
+        for item in ranked:
+            if item.key in full_keys:
+                continue
+            compact = item.key in compact_keys
+            event_limit = COMPACT_EVENT_LIMIT if compact else COLD_EVENT_LIMIT
+            coverage_limit = 24 if compact else 4
+            session_limit = 24 if compact else 4
+            miss_limit = 12 if compact else 0
+            incomplete_limit = 10 if compact else 3
+            fired_limit = 50 if compact else 10
+            changed = False
+            if len(item.events) > event_limit:
+                self._fold_old_events(item, now=now, target_limit=event_limit)
+                changed = True
+            without_samples = [
+                event if not event.samples else replace(event, samples=())
+                for event in item.events
+            ]
+            if without_samples != item.events:
+                item.events = without_samples
+                changed = True
+            if len(item.coverage) > coverage_limit:
+                item.coverage = item.coverage[-coverage_limit:]
+                changed = True
+            if len(item.monitoring_sessions) > session_limit:
+                item.monitoring_sessions = item.monitoring_sessions[-session_limit:]
+                changed = True
+            if len(item.expected_misses) > miss_limit:
+                fold_count = len(item.expected_misses) - miss_limit
+                self._fold_expected_misses(item, item.expected_misses[:fold_count])
+                item.expected_misses = item.expected_misses[fold_count:]
+                changed = True
+            if len(item.incomplete_episodes) > incomplete_limit:
+                item.incomplete_episodes = item.incomplete_episodes[-incomplete_limit:]
+                changed = True
+            if len(item.fired_keys) > fired_limit:
+                item.fired_keys = set(
+                    sorted(item.fired_keys, key=lambda value: value.serialize())[-fired_limit:]
+                )
+                changed = True
+            retained_fingerprints = {event.fingerprint for event in item.events}
+            if item.routed_fingerprints != retained_fingerprints:
+                item.routed_fingerprints = retained_fingerprints
+                changed = True
+            if changed:
+                item.dirty = True
+                serialized[item.key] = _serialize_server(item)
 
     def _server(self, key: str) -> _ServerRuntime:
         key = str(key or "").strip()
@@ -878,6 +988,32 @@ class Phase2RestartRuntime:
                 continue
             try:
                 server = _deserialize_server(key, raw_record, self.detection_config)
+                future_cutoff = now + PERSISTED_FUTURE_SKEW_SECONDS
+                retained_events = [
+                    item
+                    for item in server.events
+                    if _persisted_event_not_in_future(item, future_cutoff)
+                ]
+                retained_coverage = [
+                    item for item in server.coverage if item.end_at <= future_cutoff
+                ]
+                retained_misses = [
+                    item
+                    for item in server.expected_misses
+                    if item.expected_at <= future_cutoff
+                ]
+                if (
+                    len(retained_events) != len(server.events)
+                    or len(retained_coverage) != len(server.coverage)
+                    or len(retained_misses) != len(server.expected_misses)
+                ):
+                    server.events = retained_events
+                    server.coverage = retained_coverage
+                    server.expected_misses = retained_misses
+                    server.routed_fingerprints = {
+                        item.fingerprint for item in retained_events
+                    }
+                    server.dirty = True
                 server.score = self.scorer.score(
                     server.events,
                     CoverageTimeline(tuple(server.coverage)),
@@ -1011,12 +1147,33 @@ def _deserialize_server(key: str, raw: object, config: DetectionConfig) -> _Serv
     if not isinstance(raw, dict):
         raise ValueError("server record must be a mapping")
     events = []
+    sanitized_events = False
     for item in raw.get("events") if isinstance(raw.get("events"), list) else []:
         try:
-            events.append(_deserialize_event(item))
+            event = _deserialize_event(item)
+            if event.server_key != key:
+                sanitized_events = True
+                continue
+            events.append(event)
         except Exception:
+            sanitized_events = True
             continue
     events = sorted(events, key=lambda item: (item.canonical_phase_at or item.episode_started_at, item.sequence))
+    unique_events = []
+    seen_ids: set[str] = set()
+    seen_fingerprints: set[str] = set()
+    seen_sequences: set[int] = set()
+    for event in events:
+        if event.event_id in seen_ids or event.fingerprint in seen_fingerprints:
+            sanitized_events = True
+            continue
+        if event.sequence in seen_sequences:
+            raise ValueError("conflicting persisted event sequence")
+        seen_ids.add(event.event_id)
+        seen_fingerprints.add(event.fingerprint)
+        seen_sequences.add(event.sequence)
+        unique_events.append(event)
+    events = unique_events
     coverage = []
     for item in raw.get("coverage_segments") if isinstance(raw.get("coverage_segments"), list) else []:
         try:
@@ -1103,9 +1260,21 @@ def _deserialize_server(key: str, raw: object, config: DetectionConfig) -> _Serv
         expected_misses=misses[-60:],
         monitoring_sessions=sessions[-MAX_MONITORING_SESSIONS:],
     )
+    server.dirty = server.dirty or sanitized_events
     server.folded_through_event_seq = min(
         server.folded_through_event_seq, server.event_seq
     )
+    unfolded_events = [
+        item
+        for item in server.events
+        if item.sequence > server.folded_through_event_seq
+    ]
+    if len(unfolded_events) != len(server.events):
+        server.events = unfolded_events
+        server.routed_fingerprints = {
+            item.fingerprint for item in unfolded_events
+        }
+        server.dirty = True
     last_observed = max(
         (item.end_at for item in server.coverage),
         default=max((item.get("started_at", 0.0) for item in server.monitoring_sessions), default=0.0),
@@ -1193,12 +1362,12 @@ def _deserialize_event(raw: object) -> PhysicalRestartEvent:
             last_positive_at=_optional_nonnegative_float(drain.get("last_positive_at")),
             drain_at=_optional_nonnegative_float(drain.get("drain_at")),
             low_started_at=_optional_nonnegative_float(drain.get("low_started_at")),
-            zero_reached=bool(drain.get("zero_reached", False)),
+            zero_reached=_strict_bool(drain.get("zero_reached"), False),
             minimum_players=_optional_count(drain.get("minimum_players")),
             drop_fraction=_optional_bounded_float(drain.get("drop_fraction"), 0.0, 1.0),
             low_sample_count=_nonnegative_int(drain.get("low_sample_count"), 0),
             low_duration=_safe_nonnegative_float(drain.get("low_duration"), 0.0),
-            abrupt=bool(drain.get("abrupt", False)),
+            abrupt=_strict_bool(drain.get("abrupt"), False),
         ),
         outage=OutageSummary(
             first_failure_at=_optional_nonnegative_float(outage.get("first_failure_at")),
@@ -1215,15 +1384,15 @@ def _deserialize_event(raw: object) -> PhysicalRestartEvent:
             first_player_at=_optional_nonnegative_float(recovery.get("first_player_at")),
             stable_recovery_at=_optional_nonnegative_float(recovery.get("stable_recovery_at")),
             positive_sample_count=_nonnegative_int(recovery.get("positive_sample_count"), 0),
-            bounced_to_zero=bool(recovery.get("bounced_to_zero", False)),
+            bounced_to_zero=_strict_bool(recovery.get("bounced_to_zero"), False),
         ),
         query_health=QueryHealthSummary(
             healthy_samples=_nonnegative_int(health.get("healthy_samples"), 0),
             failed_samples=_nonnegative_int(health.get("failed_samples"), 0),
             missing_player_samples=_nonnegative_int(health.get("missing_player_samples"), 0),
-            continuous=bool(health.get("continuous", False)),
+            continuous=_strict_bool(health.get("continuous"), False),
         ),
-        coverage_complete=bool(raw.get("coverage_complete", False)),
+        coverage_complete=_strict_bool(raw.get("coverage_complete"), False),
         lifecycle_interruption=LifecycleMarker(lifecycle) if lifecycle in {item.value for item in LifecycleMarker} else None,
         samples=tuple(samples),
         reason_codes=tuple(str(item) for item in raw.get("reason_codes", []) if isinstance(item, str)),
@@ -1580,6 +1749,21 @@ def _optional_count(value: object) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+def _strict_bool(value: object, default: bool) -> bool:
+    return value if type(value) is bool else bool(default)
+
+
+def _persisted_event_not_in_future(
+    event: PhysicalRestartEvent, future_cutoff: float
+) -> bool:
+    timestamps = (
+        event.episode_started_at,
+        event.finalized_at,
+        event.canonical_phase_at,
+    )
+    return all(value is None or value <= future_cutoff for value in timestamps)
+
+
 def _minimum_optional(left: float | None, right: float | None) -> float | None:
     values = [item for item in (left, right) if item is not None]
     return min(values) if values else None
@@ -1588,3 +1772,24 @@ def _minimum_optional(left: float | None, right: float | None) -> float | None:
 def _maximum_optional(left: float | None, right: float | None) -> float | None:
     values = [item for item in (left, right) if item is not None]
     return max(values) if values else None
+
+
+def _server_activity_at(server: _ServerRuntime) -> float:
+    values = [
+        *(
+            value
+            for event in server.events
+            for value in (event.finalized_at, event.canonical_phase_at)
+            if value is not None
+        ),
+        *(segment.end_at for segment in server.coverage),
+        *(
+            value
+            for session in server.monitoring_sessions
+            for value in (session.get("started_at"), session.get("ended_at"))
+            if isinstance(value, (int, float)) and math.isfinite(value)
+        ),
+    ]
+    if server.aggregate.last_observation_at is not None:
+        values.append(server.aggregate.last_observation_at)
+    return max(values, default=0.0)
