@@ -73,6 +73,22 @@ class EvidenceKind(str, Enum):
 
 
 @dataclass(frozen=True)
+class CoveredExpectedMiss:
+    period_seconds: int
+    expected_at: float
+    key: str
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        if self.period_seconds not in CANDIDATE_PERIODS:
+            raise ValueError("unsupported candidate period")
+        _finite_nonnegative("expected_at", self.expected_at)
+        _finite_nonnegative("weight", self.weight)
+        if not isinstance(self.key, str) or not self.key:
+            raise ValueError("expected miss key must be non-empty")
+
+
+@dataclass(frozen=True)
 class CoverageSegment:
     start_at: float
     end_at: float
@@ -484,12 +500,22 @@ class RestartScheduleScorer:
         previous: ScheduleScore | None = None,
         incumbent_period_seconds: int | None = None,
         aggregate: LongTermAggregate | None = None,
+        expected_misses: Iterable[CoveredExpectedMiss] = (),
     ) -> ScheduleScore:
         _finite_nonnegative("now", now)
         unique = _unique_events(events)
         recent = _recent_events(unique)
         work = {period: _CandidateWork(period) for period in CANDIDATE_PERIODS}
         self._collect_interval_evidence(recent, coverage, work)
+        seen_miss_keys: set[tuple[int, str]] = set()
+        for miss in expected_misses:
+            if not isinstance(miss, CoveredExpectedMiss):
+                raise ValueError("expected_misses must contain CoveredExpectedMiss values")
+            identity = (miss.period_seconds, miss.key)
+            if identity in seen_miss_keys:
+                continue
+            seen_miss_keys.add(identity)
+            work[miss.period_seconds].misses.append((miss.expected_at, miss.weight, miss.key))
         self._collect_offgrid_evidence(recent, work)
         candidate_scores = tuple(
             self._finish_candidate(period, recent, work[period], now, aggregate)
@@ -667,7 +693,15 @@ class RestartScheduleScorer:
         weak_count = len(work.weak_pairs)
         hint = _hint_diagnostics(work, period)
         evidence_started_at = min((pair[2] for pair in work.strict_pairs), default=-math.inf)
-        recent_misses = [item for item in work.misses if item[0] >= evidence_started_at]
+        unique_misses: dict[int, tuple[float, float, str]] = {}
+        for item in work.misses:
+            if item[0] < evidence_started_at:
+                continue
+            identity = int(round(item[0]))
+            previous_miss = unique_misses.get(identity)
+            if previous_miss is None or item[1] > previous_miss[1]:
+                unique_misses[identity] = item
+        recent_misses = list(unique_misses.values())
         miss_penalty = sum(item[1] for item in recent_misses)
         direct_support = round(work.direct_support, 6)
         old = aggregate.candidate(period) if aggregate is not None else CandidateAggregate(period)

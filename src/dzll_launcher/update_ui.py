@@ -132,6 +132,9 @@ class UpdateUI:
             self.scrim.set_visible(bool(show))
         if self.revealer:
             self.revealer.set_reveal_child(bool(show))
+        callback = getattr(self._win, "_on_update_ui_visibility_changed", None)
+        if callable(callback):
+            callback(bool(show))
 
     def close_for_session(self, *_args):
         try:
@@ -200,6 +203,7 @@ class UpdateUI:
             if self.update_sub_lbl:
                 self.update_sub_lbl.set_text(f"Version {tag} can be downloaded via the button below.")
             self._set_visible(True)
+            return True
         except Exception:
-            pass
+            return False
         return False

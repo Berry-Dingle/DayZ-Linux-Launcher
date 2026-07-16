@@ -64,6 +64,8 @@ from .config import (
     COMPANION_POLL_ONLINE_SECONDS,
     COMPANION_POLL_OFFLINE_SECONDS,
     COMPANION_ALERT_REARM_OFFLINE_SECONDS,
+    COMPANION_RESTART_LEARNING_PATH,
+    COMPANION_RESTART_LEARNING_PHASE2_PATH,
     TEST_SERVER_MARKERS,
 )
 
@@ -76,8 +78,6 @@ from .storage import (
     load_last_companion_server,
     save_last_companion_server,
     clear_last_companion_server,
-    load_companion_restart_learning,
-    save_companion_restart_learning,
     load_dead_cache,
     save_dead_cache,
 )
@@ -103,6 +103,8 @@ from .settings import (
 
 from .styles import get_app_css
 from .update_ui import UpdateUI
+from .restart_learning_notice_ui import RestartLearningNoticeUI
+from .startup_presentation import StartupPresentationCoordinator
 from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
 from .startup_ui import build_startup_overlay
@@ -140,7 +142,13 @@ from .mod_suggestions import (
     replace_comma_token,
     suggest_mods,
 )
-from . import companion_restart_learning
+from .companion_restart_phase2_consumers import AlertKeyKind, RecoveryAction
+from .companion_restart_phase2_detection import LifecycleMarker
+from .companion_restart_phase2_runtime import (
+    Phase2RestartRuntime,
+    phase2_alert_usability,
+    phase2_learning_summary,
+)
 
 SERVER_COMPANION_ALERT_SOUNDS = {
     "online": {
@@ -155,11 +163,6 @@ SERVER_COMPANION_ALERT_SOUNDS = {
     },
 }
 MOD_SUGGESTION_RESULT_LIMIT = 50
-QUERY_VISIBLE_RECENT_PLAYERS_SECONDS = getattr(
-    companion_restart_learning,
-    "QUERY_VISIBLE_RECENT_PLAYERS_SECONDS",
-    10 * 60,
-)
 PERF_LOG_ENABLED = os.environ.get("DZLL_PERF_LOG") == "1"
 DEBUG_COLUMN_SORT = os.environ.get("DZLL_DEBUG_COLUMN_SORT") == "1"
 DEBUG_SORT = os.environ.get("DZLL_DEBUG_SORT") == "1"
@@ -481,8 +484,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.favorites = load_favorites()
         self.last_played = load_last_played()
         self._last_server_companion_saved = load_last_companion_server()
-        self._companion_restart_learning = companion_restart_learning.normalize_state(
-            load_companion_restart_learning()
+        self._companion_restart_phase2 = Phase2RestartRuntime.initialize(
+            active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+            legacy_path=COMPANION_RESTART_LEARNING_PATH,
         )
         self._pending_last_played_obj = None
         self._pending_join_mod_ids = []
@@ -622,6 +626,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # Update card (extracted)
         self.update_ui = UpdateUI(self)
         self.update_revealer = self.update_ui.build(overlay)
+
+        self.restart_learning_notice_ui = RestartLearningNoticeUI(self)
+        self.restart_learning_notice_revealer = self.restart_learning_notice_ui.build(overlay)
 
         # SETTINGS SLIDE-OUT
         self.settings_scrim = Gtk.Box()
@@ -858,6 +865,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         # startup overlay (extracted)
         build_startup_overlay(self, overlay)
+        self._startup_presentation = StartupPresentationCoordinator(
+            pending_notice=self._companion_restart_phase2.pending_notice,
+            hide_startup=lambda: self._set_updating(False),
+            maybe_show_update=lambda: self.update_ui.maybe_show(),
+            blockers_visible=self._startup_notice_blockers_visible,
+            show_notice=self.restart_learning_notice_ui.show,
+        )
+        self._connect_startup_notice_blockers()
 
         # MAIN UI
         self.content_root.append(hr())
@@ -2193,7 +2208,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._shutdown_cleanup_done = True
 
         try:
+            self._startup_presentation.begin_shutdown()
+        except Exception:
+            pass
+
+        try:
             self._record_server_companion_monitor_ended("shutdown")
+        except Exception:
+            pass
+
+        try:
+            self._companion_restart_phase2.shutdown(
+                wall_at=time.time(), monotonic_at=time.monotonic()
+            )
         except Exception:
             pass
 
@@ -2775,90 +2802,74 @@ class DZLLWindow(Gtk.ApplicationWindow):
         obj = getattr(self, "_server_companion_obj", None)
         if not isinstance(obj, ServerObject):
             return None
-        return companion_restart_learning.make_server_key(
-            str(getattr(obj, "ip", "") or ""),
-            int(getattr(obj, "gport", 0) or 0),
-        )
+        ip = str(getattr(obj, "ip", "") or "").strip()
+        gport = self._safe_positive_int(getattr(obj, "gport", 0))
+        return f"{ip}:{gport}" if ip and gport > 0 else None
 
     def _record_server_companion_monitor_started(self, key: str | None = None) -> None:
         key = key or self._server_companion_restart_learning_key()
         if not key:
             return
-        self._companion_restart_learning = companion_restart_learning.record_monitor_started(
-            getattr(self, "_companion_restart_learning", None),
-            key,
-        )
         try:
-            save_companion_restart_learning(self._companion_restart_learning)
+            self._companion_restart_phase2.begin_monitoring(
+                key,
+                wall_at=time.time(),
+                monotonic_at=time.monotonic(),
+                poll_generation=int(getattr(self, "_server_companion_poll_token", 0) or 0),
+            )
         except Exception:
             pass
-        last_saved = getattr(self, "_server_companion_monitor_last_saved_at", None)
-        if not isinstance(last_saved, dict):
-            last_saved = {}
-            self._server_companion_monitor_last_saved_at = last_saved
-        last_saved[str(key)] = int(time.time())
 
     def _record_server_companion_monitor_heartbeat(self, key: str | None = None) -> None:
-        key = key or self._server_companion_restart_learning_key()
-        if not key:
-            return
-        now = int(time.time())
-        self._companion_restart_learning = companion_restart_learning.record_monitor_heartbeat(
-            getattr(self, "_companion_restart_learning", None),
-            key,
-            now=now,
-        )
-        last_saved = getattr(self, "_server_companion_monitor_last_saved_at", None)
-        if not isinstance(last_saved, dict):
-            last_saved = {}
-            self._server_companion_monitor_last_saved_at = last_saved
-        previous_saved_at = self._safe_positive_int(last_saved.get(str(key)))
-        if now - previous_saved_at < int(companion_restart_learning.MONITOR_HEARTBEAT_SECONDS):
-            return
-        try:
-            save_companion_restart_learning(self._companion_restart_learning)
-            last_saved[str(key)] = now
-        except Exception:
-            pass
+        # Phase 2 persists dense coverage from actual poll results.  A coarse
+        # Phase 1 heartbeat would overstate monitoring and is intentionally gone.
+        return
 
     def _record_server_companion_monitor_ended(self, reason: str, key: str | None = None) -> None:
         key = key or self._server_companion_restart_learning_key()
         if not key:
             return
-        self._companion_restart_learning = companion_restart_learning.record_monitor_ended(
-            getattr(self, "_companion_restart_learning", None),
-            key,
-            reason,
-        )
+        marker = {
+            "paused": LifecycleMarker.PAUSE,
+            "server_switch": LifecycleMarker.SERVER_SWITCH,
+            "clear": LifecycleMarker.CLEAR,
+            "shutdown": LifecycleMarker.SHUTDOWN,
+        }.get(str(reason), LifecycleMarker.PAUSE)
         try:
-            save_companion_restart_learning(self._companion_restart_learning)
+            self._companion_restart_phase2.end_monitoring(
+                key,
+                marker=marker,
+                wall_at=time.time(),
+                monotonic_at=time.monotonic(),
+            )
         except Exception:
             pass
-        last_saved = getattr(self, "_server_companion_monitor_last_saved_at", None)
-        if isinstance(last_saved, dict):
-            last_saved[str(key)] = int(time.time())
 
     def _server_companion_restart_learning_summary(self):
         key = self._server_companion_restart_learning_key()
         if not key:
             return None
-        snapshot = getattr(self, "_server_companion_snapshot", None)
-        server_online = None
-        if isinstance(snapshot, dict) and "online" in snapshot:
-            server_online = bool(snapshot.get("online", False))
-        return companion_restart_learning.summarize_server(
-            getattr(self, "_companion_restart_learning", None),
-            key,
-            server_online=server_online,
-            offline_since_at=getattr(self, "_server_companion_offline_since_wall", None),
-        )
+        try:
+            decision = self._companion_restart_phase2.decision(
+                key,
+                now=time.time(),
+                server_online_healthy=bool((getattr(self, "_server_companion_snapshot", None) or {}).get("online", False)),
+                restart_alert_enabled=bool(getattr(self, "_server_companion_restart_alert_enabled", False)),
+            )
+            return phase2_learning_summary(decision, now=time.time())
+        except Exception:
+            return None
 
     def _server_companion_restart_alert_usability_summary(self):
         key = self._server_companion_restart_learning_key()
-        return companion_restart_learning.summarize_alert_usability(
-            getattr(self, "_companion_restart_learning", None),
-            key,
-        )
+        if not key:
+            return phase2_alert_usability(None)
+        try:
+            return phase2_alert_usability(
+                self._companion_restart_phase2.decision(key, now=time.time())
+            )
+        except Exception:
+            return phase2_alert_usability(None)
 
     def _refresh_server_companion_restart_learning_summary(self) -> None:
         panel = getattr(self, "server_companion_panel", None)
@@ -2876,266 +2887,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
         duration_seconds: int,
         snapshot: dict,
     ) -> int | None:
-        key = self._server_companion_restart_learning_key()
-        if not key:
-            return None
-        outage = {
-            "offline_at": int(offline_at),
-            "online_at": int(online_at),
-            "duration_seconds": int(duration_seconds),
-            "name": str((snapshot or {}).get("name") or ""),
-            "map": str((snapshot or {}).get("map") or ""),
-        }
-        self._companion_restart_learning = companion_restart_learning.record_confirmed_outage(
-            getattr(self, "_companion_restart_learning", None),
-            key,
-            outage,
-        )
-        try:
-            save_companion_restart_learning(self._companion_restart_learning)
-        except Exception:
-            pass
-        self._refresh_server_companion_restart_learning_summary()
-        return companion_restart_learning.scheduled_outage_alert_threshold(
-            self._companion_restart_learning,
-            key,
-            offline_at,
-            online_at,
-        )
+        # The unified Phase 2 episode receives the same outage through the live
+        # poll mapper.  Keeping this compatibility hook as a no-op prevents a
+        # second physical event and retires all Phase 1 writes.
+        return None
 
     def _reset_server_companion_visible_zero_state(self) -> None:
         self._server_companion_visible_zero_state = None
 
     def _feed_server_companion_visible_restart_detector(self, players: int, snapshot: dict) -> bool:
-        key = self._server_companion_restart_learning_key()
-        if not key:
-            self._reset_server_companion_visible_zero_state()
-            self._debug_server_companion_alert("query-visible detector skipped: no restart-learning key")
-            return False
-
-        now_wall = int(time.time())
-        try:
-            players = max(0, int(players))
-        except Exception:
-            players = 0
-        try:
-            max_players = max(0, int((snapshot or {}).get("max_players", 0) or 0))
-        except Exception:
-            max_players = 0
-
-        state = getattr(self, "_server_companion_visible_zero_state", None)
-        if not isinstance(state, dict) or state.get("key") != str(key):
-            self._debug_server_companion_alert(
-                f"query-visible detector state reset: server={self._server_companion_alert_server_label(snapshot)} "
-                f"players={players}/{max_players}"
-            )
-            state = {
-                "key": str(key),
-                "last_positive_at": 0,
-                "last_positive_players": 0,
-                "zero_start_at": 0,
-                "pre_zero_players": 0,
-            }
-
-        zero_start_at = self._safe_positive_int(state.get("zero_start_at"))
-        if players > 0:
-            query_visible_alert_usable = False
-            if zero_start_at > 0:
-                duration_seconds = now_wall - zero_start_at
-                min_zero = int(companion_restart_learning.MIN_QUERY_VISIBLE_ZERO_SECONDS)
-                max_zero = int(companion_restart_learning.MAX_QUERY_VISIBLE_ZERO_SECONDS)
-                self._debug_server_companion_alert(
-                    f"query-visible players returned: server={self._server_companion_alert_server_label(snapshot)} "
-                    f"players={players}/{max_players} zero_seconds={duration_seconds} "
-                    f"valid_window={min_zero}-{max_zero}"
-                )
-                if min_zero <= duration_seconds <= max_zero:
-                    self._companion_restart_learning = companion_restart_learning.record_query_visible_restart(
-                        getattr(self, "_companion_restart_learning", None),
-                        key,
-                        {
-                            "zero_start_at": zero_start_at,
-                            "players_return_at": now_wall,
-                            "duration_seconds": duration_seconds,
-                            "pre_zero_players": self._safe_positive_int(state.get("pre_zero_players")),
-                            "return_players": players,
-                            "name": str((snapshot or {}).get("name") or ""),
-                            "map": str((snapshot or {}).get("map") or ""),
-                        },
-                    )
-                    try:
-                        save_companion_restart_learning(self._companion_restart_learning)
-                    except Exception:
-                        pass
-                    self._refresh_server_companion_restart_learning_summary()
-                    alert_usability = self._server_companion_restart_alert_usability_summary()
-                    query_visible_alert_usable = (
-                        isinstance(alert_usability, dict)
-                        and bool(alert_usability.get("usable", False))
-                        and str(alert_usability.get("mode") or "") == "query_visible"
-                    )
-                    self._debug_server_companion_alert(
-                        f"query-visible restart event recorded: usable={bool(query_visible_alert_usable)} "
-                        f"mode={str((alert_usability or {}).get('mode') or '')!r} "
-                        f"message={str((alert_usability or {}).get('message') or '')!r}"
-                    )
-                else:
-                    self._debug_server_companion_alert("query-visible restart event not recorded: zero duration outside valid window")
-            self._server_companion_visible_zero_state = {
-                "key": str(key),
-                "last_positive_at": now_wall,
-                "last_positive_players": players,
-                "zero_start_at": 0,
-                "pre_zero_players": 0,
-            }
-            return query_visible_alert_usable
-
-        if zero_start_at > 0:
-            if now_wall - zero_start_at > int(companion_restart_learning.MAX_QUERY_VISIBLE_ZERO_SECONDS):
-                self._debug_server_companion_alert(
-                    f"query-visible zero state expired: zero_seconds={now_wall - zero_start_at}"
-                )
-                self._reset_server_companion_visible_zero_state()
-            else:
-                self._server_companion_visible_zero_state = state
-                self._debug_server_companion_alert(
-                    f"query-visible still zero: server={self._server_companion_alert_server_label(snapshot)} "
-                    f"players={players}/{max_players} zero_seconds={now_wall - zero_start_at}"
-                )
-            return False
-
-        last_positive_at = self._safe_positive_int(state.get("last_positive_at"))
-        last_positive_players = self._safe_positive_int(state.get("last_positive_players"))
-        if (
-            last_positive_at > 0
-            and last_positive_players > 0
-            and now_wall - last_positive_at <= int(QUERY_VISIBLE_RECENT_PLAYERS_SECONDS)
-        ):
-            state["zero_start_at"] = now_wall
-            state["pre_zero_players"] = last_positive_players
-            self._debug_server_companion_alert(
-                f"query-visible zero observed: server={self._server_companion_alert_server_label(snapshot)} "
-                f"previous_players={last_positive_players} current_players={players}/{max_players}"
-            )
-        self._server_companion_visible_zero_state = state
+        # Retained as a private compatibility hook for older tests/callers. Live
+        # data is now fed exactly once to the unified Phase 2 episode engine.
         return False
 
     def _append_server_companion_observation_sample(self, key: str | None, online: bool) -> None:
-        if not key:
-            return
-        samples = getattr(self, "_server_companion_observation_samples", None)
-        if samples is None:
-            samples = deque(maxlen=5000)
-            self._server_companion_observation_samples = samples
-        samples.append({
-            "wall_at": int(time.time()),
-            "online": bool(online),
-            "key": str(key),
-        })
+        return
 
     def _maybe_record_server_companion_expected_window_miss(self) -> None:
-        key = self._server_companion_restart_learning_key()
-        if not key or bool(getattr(self, "_server_companion_poll_paused", False)):
-            return
-
-        state = companion_restart_learning.normalize_state(
-            getattr(self, "_companion_restart_learning", None)
-        )
-        server = (state.get("servers") or {}).get(str(key))
-        if not isinstance(server, dict):
-            return
-
-        cycle_seconds = self._safe_positive_int(server.get("learned_cycle_seconds"))
-        last_restart_at = self._safe_positive_int(server.get("last_restart_event_at"))
-        confidence = self._safe_float_value(server.get("confidence"))
-        generation = self._safe_positive_int(server.get("model_generation")) or 1
-        if (
-            cycle_seconds <= 0
-            or last_restart_at <= 0
-            or confidence < companion_restart_learning.MODEL_RESET_CONFIDENCE
-        ):
-            return
-
-        now = int(time.time())
-        tolerance = companion_restart_learning.projected_window_tolerance_seconds(cycle_seconds)
-        expected_at = int(last_restart_at) + int(cycle_seconds)
-        while expected_at + int(cycle_seconds) + tolerance <= now:
-            expected_at += int(cycle_seconds)
-        window_start = expected_at - tolerance
-        window_end = expected_at + tolerance
-        if window_end > now:
-            return
-
-        if self._server_companion_expected_miss_exists(server, expected_at, cycle_seconds, generation):
-            return
-
-        if self._server_companion_restart_event_overlaps(server, window_start, window_end):
-            return
-
-        persistent_coverage = companion_restart_learning.server_monitored_window(
-            server,
-            window_start,
-            window_end,
-        )
-        if not bool(persistent_coverage.get("covered", False)):
-            return
-
-        max_gap = max(2 * int(COMPANION_POLL_ONLINE_SECONDS) + 10, 60)
-        samples = [
-            sample for sample in (getattr(self, "_server_companion_observation_samples", None) or [])
-            if isinstance(sample, dict)
-            and sample.get("key") == str(key)
-            and window_start - max_gap <= self._safe_positive_int(sample.get("wall_at")) <= window_end + max_gap
-        ]
-        if len(samples) < 3:
-            return
-
-        samples.sort(key=lambda item: self._safe_positive_int(item.get("wall_at")))
-        inside_samples = [
-            sample for sample in samples
-            if window_start <= self._safe_positive_int(sample.get("wall_at")) <= window_end
-        ]
-        if len(inside_samples) < 3:
-            return
-        if any(not bool(sample.get("online", False)) for sample in samples):
-            return
-
-        first_at = self._safe_positive_int(samples[0].get("wall_at"))
-        last_at = self._safe_positive_int(samples[-1].get("wall_at"))
-        if first_at > window_start + max_gap or last_at < window_end - max_gap:
-            return
-
-        max_seen_gap = 0
-        for prev, cur in zip(samples, samples[1:]):
-            gap = self._safe_positive_int(cur.get("wall_at")) - self._safe_positive_int(prev.get("wall_at"))
-            max_seen_gap = max(max_seen_gap, gap)
-        if max_seen_gap > max_gap:
-            return
-
-        covered_start = max(window_start, first_at)
-        covered_end = min(window_end, last_at)
-        coverage_ratio = (covered_end - covered_start) / float(max(1, window_end - window_start))
-        if coverage_ratio < 0.75:
-            return
-
-        self._companion_restart_learning = companion_restart_learning.record_expected_window_miss(
-            state,
-            key,
-            {
-                "expected_at": expected_at,
-                "window_start": window_start,
-                "window_end": window_end,
-                "cycle_seconds": cycle_seconds,
-                "model_generation": generation,
-                "observed_poll_count": len(inside_samples),
-                "coverage_ratio": min(coverage_ratio, self._safe_float_value(persistent_coverage.get("coverage_ratio"))),
-                "max_gap_seconds": max(max_seen_gap, self._safe_positive_int(persistent_coverage.get("max_gap_seconds"))),
-            },
-        )
-        try:
-            save_companion_restart_learning(self._companion_restart_learning)
-        except Exception:
-            pass
+        # Stage 3 evaluates all candidate windows from dense Phase 2 coverage
+        # whenever a poll/event closes an inspectable interval.
+        return
 
     def _server_companion_expected_miss_exists(
         self,
@@ -3182,10 +2953,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def set_server_companion_server(self, obj: ServerObject, persist: bool = True):
         old_key = self._server_companion_restart_learning_key()
         snapshot = self._server_companion_snapshot_from_obj(obj)
-        new_key = companion_restart_learning.make_server_key(
-            str(getattr(obj, "ip", "") or ""),
-            int(getattr(obj, "gport", 0) or 0),
-        )
+        ip = str(getattr(obj, "ip", "") or "").strip()
+        gport = self._safe_positive_int(getattr(obj, "gport", 0))
+        new_key = f"{ip}:{gport}" if ip and gport > 0 else None
         if old_key and old_key != new_key:
             self._record_server_companion_monitor_ended("server_switch", old_key)
         self._server_companion_poll_token += 1
@@ -3307,6 +3077,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
 
     def _stop_server_companion_polling(self):
+        self._server_companion_poll_token = int(
+            getattr(self, "_server_companion_poll_token", 0) or 0
+        ) + 1
+        self._server_companion_poll_inflight = False
         self._server_companion_consecutive_offline_polls = 0
         self._server_companion_visible_snapshot = None
         timer_id = int(getattr(self, "_server_companion_poll_timer_id", 0) or 0)
@@ -3346,14 +3120,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._server_companion_poll_inflight = False
 
     def _apply_server_companion_live_result(self, token: int, info: dict):
-        self._server_companion_poll_inflight = False
         if token != int(getattr(self, "_server_companion_poll_token", 0)):
             return False
+        self._server_companion_poll_inflight = False
         if not self._server_companion_should_poll():
             return False
 
         snapshot = dict(self._server_companion_snapshot or {})
         now = time.monotonic()
+        now_wall = time.time()
+        key = self._server_companion_restart_learning_key()
+        phase2_update = None
+        if key:
+            try:
+                phase2_update = self._companion_restart_phase2.ingest_live_result(
+                    key,
+                    poll_generation=token,
+                    info=info,
+                    wall_at=now_wall,
+                    monotonic_at=now,
+                )
+            except Exception as exc:
+                self._debug_server_companion_alert(f"Phase 2 poll mapping failed safely: {exc!r}")
         if bool((info or {}).get("ok", False)):
             self._debug_server_companion_alert(
                 f"poll result: online name={str(snapshot.get('name') or '')!r} alert_enabled={bool(getattr(self, '_server_companion_restart_alert_enabled', False))}"
@@ -3375,55 +3163,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if live_time:
                 snapshot["time"] = live_time
             snapshot["online"] = True
-            query_visible_alert_usable = self._feed_server_companion_visible_restart_detector(
-                snapshot.get("players", 0),
-                snapshot,
-            )
-            query_visible_usability = self._server_companion_restart_alert_usability_summary()
-            self._debug_server_companion_alert(
-                f"query-visible alert decision: server={self._server_companion_alert_server_label(snapshot)} "
-                f"players={int(snapshot.get('players', 0) or 0)}/{int(snapshot.get('max_players', 0) or 0)} "
-                f"enabled={bool(getattr(self, '_server_companion_restart_alert_enabled', False))} "
-                f"detector_usable={bool(query_visible_alert_usable)} "
-                f"mode={str((query_visible_usability or {}).get('mode') or '')!r} "
-                f"message={str((query_visible_usability or {}).get('message') or '')!r}"
-            )
             offline_since = getattr(self, "_server_companion_offline_since", None)
             offline_long_enough = (
                 offline_since is not None
                 and now - float(offline_since) >= COMPANION_ALERT_REARM_OFFLINE_SECONDS
             )
-            outage_alert_usable = False
-            learned_restart_long_enough = False
-            if offline_since is not None:
-                online_at = int(time.time())
-                duration_seconds = max(0, int(round(now - float(offline_since))))
-                offline_since_wall = getattr(self, "_server_companion_offline_since_wall", None)
+            scheduled_restart_long_enough = False
+            if offline_since is not None and key:
                 try:
-                    offline_at = int(float(offline_since_wall))
+                    scheduled_restart_long_enough = (
+                        now - float(offline_since) >= 30
+                        and int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) >= 2
+                        and self._companion_restart_phase2.scheduled_outage_relaxation_usable(
+                            key, observed_at=now_wall
+                        )
+                    )
                 except Exception:
-                    offline_at = online_at - duration_seconds
-                learned_threshold = self._record_server_companion_restart_learning_outage(
-                    offline_at=offline_at,
-                    online_at=online_at,
-                    duration_seconds=duration_seconds,
-                    snapshot=snapshot,
-                )
-                alert_usability = self._server_companion_restart_alert_usability_summary()
-                outage_alert_usable = (
-                    isinstance(alert_usability, dict)
-                    and bool(alert_usability.get("usable", False))
-                    and str(alert_usability.get("mode") or "") == "outage"
-                )
-                learned_restart_long_enough = (
-                    learned_threshold is not None
-                    and duration_seconds >= learned_threshold
-                )
+                    scheduled_restart_long_enough = False
             online_again_alert_fired = False
             if (
                 bool(getattr(self, "_server_companion_alert_armed", False))
                 or offline_long_enough
-                or learned_restart_long_enough
+                or scheduled_restart_long_enough
             ) and bool(
                 getattr(self, "_server_companion_restart_alert_enabled", False)
             ):
@@ -3431,37 +3192,33 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     "back-online alert emitted: "
                     f"armed={bool(getattr(self, '_server_companion_alert_armed', False))} "
                     f"offline_long_enough={bool(offline_long_enough)} "
-                    f"learned_restart_long_enough={bool(learned_restart_long_enough)}"
+                    f"scheduled_restart_long_enough={bool(scheduled_restart_long_enough)}"
                 )
                 self._server_companion_alert_back_online(snapshot, alert_type="back online")
                 online_again_alert_fired = True
+                if key:
+                    event_id = self._companion_restart_phase2.provisional_event_id(key)
+                    if event_id:
+                        suppression = self._companion_restart_phase2.event_suppression_key(
+                            key,
+                            kind=AlertKeyKind.GENERIC_RECOVERY,
+                            event_id=event_id,
+                        )
+                        self._companion_restart_phase2.mark_fired(key, suppression, now=now_wall)
             elif offline_since is not None:
                 self._debug_server_companion_alert(
                     "back-online alert not emitted: "
                     f"enabled={bool(getattr(self, '_server_companion_restart_alert_enabled', False))} "
                     f"armed={bool(getattr(self, '_server_companion_alert_armed', False))} "
                     f"offline_seconds={now - float(offline_since):.1f} "
-                    f"required_seconds={int(COMPANION_ALERT_REARM_OFFLINE_SECONDS)} "
-                    f"learned_restart_long_enough={bool(learned_restart_long_enough)}"
+                    f"required_seconds={int(COMPANION_ALERT_REARM_OFFLINE_SECONDS)}"
                 )
-            if (
-                not online_again_alert_fired
-                and query_visible_alert_usable
-                and bool(getattr(self, "_server_companion_restart_alert_enabled", False))
-            ):
-                self._debug_server_companion_alert("query-visible back-online alert emitted")
-                self._server_companion_alert_back_online(snapshot, alert_type="query-visible rejoin")
-            elif not online_again_alert_fired and not query_visible_alert_usable:
-                self._debug_server_companion_alert("query-visible alert not emitted: detector/model not usable")
-            elif query_visible_alert_usable and not bool(getattr(self, "_server_companion_restart_alert_enabled", False)):
-                self._debug_server_companion_alert("query-visible alert suppressed: restart alert disabled")
             self._server_companion_alert_armed = False
             self._server_companion_offline_since = None
             self._server_companion_offline_since_wall = None
             self._server_companion_consecutive_offline_polls = 0
             self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
         else:
-            self._reset_server_companion_visible_zero_state()
             snapshot["ping"] = -1
             snapshot["online"] = False
             self._server_companion_consecutive_offline_polls = (
@@ -3484,10 +3241,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         new_online = bool(snapshot.get("online", False))
         self._server_companion_last_online = new_online
         self._server_companion_snapshot = snapshot
-        key = self._server_companion_restart_learning_key()
-        self._record_server_companion_monitor_heartbeat(key)
-        self._append_server_companion_observation_sample(key, new_online)
-        self._maybe_record_server_companion_expected_window_miss()
+        if phase2_update is not None:
+            self._handle_phase2_finalized_events(phase2_update, snapshot)
         self._maybe_play_server_companion_restart_warning(snapshot)
         panel = getattr(self, "server_companion_panel", None)
         if panel is not None:
@@ -3503,64 +3258,72 @@ class DZLLWindow(Gtk.ApplicationWindow):
             panel.set_polling_paused(False)
         return False
 
+    def _handle_phase2_finalized_events(self, update, snapshot: dict) -> None:
+        key = self._server_companion_restart_learning_key()
+        if not key:
+            return
+        for event in tuple(getattr(update, "finalized_events", ()) or ()):
+            outage_start = event.outage.first_failure_at
+            outage_end = event.outage.info_return_at
+            generic_duration_ok = bool(
+                outage_start is not None
+                and outage_end is not None
+                and outage_end - outage_start >= COMPANION_ALERT_REARM_OFFLINE_SECONDS
+            )
+            try:
+                decision = self._companion_restart_phase2.decision(
+                    key,
+                    now=time.time(),
+                    server_online_healthy=bool((snapshot or {}).get("online", False)),
+                    restart_alert_enabled=bool(getattr(self, "_server_companion_restart_alert_enabled", False)),
+                    event=event,
+                    generic_duration_ok=generic_duration_ok,
+                )
+            except Exception as exc:
+                self._debug_server_companion_alert(f"Phase 2 event policy failed safely: {exc!r}")
+                continue
+            action = decision.preferred_recovery_action
+            key_to_record = None
+            alert_type = "back online"
+            if action is RecoveryAction.QUERY_VISIBLE_RECOVERY:
+                key_to_record = decision.query_visible_key
+                alert_type = "query-visible rejoin"
+            elif action is RecoveryAction.SCHEDULED_RECOVERY:
+                key_to_record = decision.scheduled_event_key
+                alert_type = "scheduled restart recovery"
+            elif action is RecoveryAction.GENERIC_RECOVERY:
+                key_to_record = decision.generic_recovery_key
+            if key_to_record is not None:
+                self._server_companion_alert_back_online(snapshot, alert_type=alert_type)
+                self._companion_restart_phase2.mark_fired(key, key_to_record, now=time.time())
+        self._refresh_server_companion_restart_learning_summary()
+
     def _maybe_play_server_companion_restart_warning(self, snapshot: dict | None):
-        if not bool(getattr(self, "_server_companion_restart_alert_enabled", False)):
-            self._debug_server_companion_alert("restart-warning skipped: restart alerts disabled")
-            return
-        if not bool((snapshot or {}).get("online", False)):
-            self._debug_server_companion_alert("restart-warning skipped: server offline")
-            return
         key = self._server_companion_restart_learning_key()
         if not key:
             self._debug_server_companion_alert("restart-warning skipped: no restart-learning key")
             return
-        state = companion_restart_learning.normalize_state(
-            getattr(self, "_companion_restart_learning", None)
-        )
-        server = (state.get("servers") or {}).get(str(key))
-        if not isinstance(server, dict):
-            self._debug_server_companion_alert("restart-warning skipped: no learned server state")
+        try:
+            decision = self._companion_restart_phase2.decision(
+                key,
+                now=time.time(),
+                server_online_healthy=bool((snapshot or {}).get("online", False)),
+                restart_alert_enabled=bool(getattr(self, "_server_companion_restart_alert_enabled", False)),
+            )
+        except Exception as exc:
+            self._debug_server_companion_alert(f"restart-warning policy unavailable: {exc!r}")
             return
-        confidence = self._safe_float_value(server.get("confidence"))
-        cycle_seconds = self._safe_positive_int(server.get("learned_cycle_seconds"))
-        last_restart_at = self._safe_positive_int(server.get("last_restart_event_at"))
-        if (
-            not companion_restart_learning.is_established_model(server)
-            or cycle_seconds <= 0
-            or last_restart_at <= 0
-        ):
+        if not decision.warning_eligible or decision.warning_key is None:
             self._debug_server_companion_alert(
-                "restart-warning skipped: model not ready "
-                f"confidence={confidence:.3f} cycle_seconds={cycle_seconds} last_restart_at={last_restart_at}"
+                "restart-warning skipped: "
+                + ",".join(item.value for item in decision.warning_reasons)
             )
             return
-        now = int(time.time())
-        next_restart_at = int(last_restart_at)
-        while next_restart_at <= now:
-            next_restart_at += int(cycle_seconds)
-        seconds_until = next_restart_at - now
-        self._debug_server_companion_alert(
-            f"restart-warning check: server={self._server_companion_alert_server_label(snapshot)} "
-            f"seconds_until={seconds_until} window=240-300 next_restart_at={next_restart_at}"
-        )
-        if seconds_until > 300:
-            self._debug_server_companion_alert("restart-warning skipped: too early")
-            return
-        if seconds_until < 240:
-            self._debug_server_companion_alert("restart-warning skipped: too late")
-            return
-        fired = getattr(self, "_server_companion_restart_warning_fired", None)
-        if not isinstance(fired, set):
-            fired = set()
-            self._server_companion_restart_warning_fired = fired
-        warning_key = f"{key}:{next_restart_at}"
-        if warning_key in fired:
-            self._debug_server_companion_alert(f"restart-warning skipped: already fired key={warning_key}")
-            return
-        self._debug_server_companion_alert(f"restart-warning playing now: key={warning_key} seconds_until={seconds_until}")
         ok, message = self._play_server_companion_restart_warning_sound()
         if ok:
-            fired.add(warning_key)
+            self._companion_restart_phase2.mark_fired(
+                key, decision.warning_key, now=time.time()
+            )
         else:
             self._debug_server_companion_alert(f"restart-warning playback failed; not marking fired: {message}")
         self._set_server_companion_alert_audio_status(None if ok else message)
@@ -3698,6 +3461,82 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     # Startup sequence
     # ----------------------------
+    def _startup_notice_blockers_visible(self) -> bool:
+        widgets = (
+            getattr(self, "settings_scrim", None),
+            getattr(self, "settings_revealer", None),
+            getattr(self, "warn_scrim", None),
+            getattr(self, "warn_box", None),
+            getattr(self, "start_steam_join_scrim", None),
+            getattr(self, "start_steam_join_box", None),
+            getattr(getattr(self, "_steamcmd_overlay_ui", None), "scrim", None),
+            getattr(getattr(self, "_steamcmd_overlay_ui", None), "revealer", None),
+        )
+        for widget in widgets:
+            if widget is None:
+                continue
+            reveal_getter = getattr(widget, "get_reveal_child", None)
+            if callable(reveal_getter):
+                try:
+                    if bool(reveal_getter()):
+                        return True
+                except Exception:
+                    pass
+                continue
+            try:
+                if bool(widget.get_visible()):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _connect_startup_notice_blockers(self) -> None:
+        widgets = (
+            getattr(self, "settings_scrim", None),
+            getattr(self, "settings_revealer", None),
+            getattr(self, "warn_scrim", None),
+            getattr(self, "warn_box", None),
+            getattr(self, "start_steam_join_scrim", None),
+            getattr(self, "start_steam_join_box", None),
+            getattr(getattr(self, "_steamcmd_overlay_ui", None), "scrim", None),
+            getattr(getattr(self, "_steamcmd_overlay_ui", None), "revealer", None),
+        )
+        for widget in widgets:
+            if widget is None:
+                continue
+            for signal in ("notify::visible", "notify::reveal-child"):
+                try:
+                    widget.connect(signal, lambda *_: self._retry_restart_learning_notice())
+                except Exception:
+                    pass
+
+    def _retry_restart_learning_notice(self):
+        coordinator = getattr(self, "_startup_presentation", None)
+        if coordinator is not None:
+            coordinator.blocker_visibility_changed()
+        return False
+
+    def _on_update_ui_visibility_changed(self, visible: bool):
+        coordinator = getattr(self, "_startup_presentation", None)
+        if coordinator is not None:
+            coordinator.update_visibility_changed(bool(visible))
+        return False
+
+    def _on_restart_learning_notice_hidden(self):
+        coordinator = getattr(self, "_startup_presentation", None)
+        if coordinator is not None:
+            coordinator.notice_dismissed()
+        return False
+
+    def _complete_startup_presentation(self):
+        coordinator = getattr(self, "_startup_presentation", None)
+        if coordinator is not None:
+            coordinator.complete_startup()
+        else:
+            self._set_updating(False)
+        self._apply_titlebar_counts()
+        return False
+
     def _begin_startup_update(self):
         if getattr(self, "_server_db_update_inflight", False):
             self._set_updating(True, "Updating The Server Database, Please Wait…")
@@ -3732,8 +3571,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     return False
                 if getattr(self, "_startup_db_provisional", False):
                     self._startup_db_applied = True
-                    self._set_updating(False)
-                    self._apply_titlebar_counts()
+                    self._complete_startup_presentation()
                     self._server_db_update_inflight = False
                     return False
                 try:
@@ -3748,8 +3586,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     print("[DB] Startup server database update failed; using cached database")
                     if getattr(self, "_startup_db_provisional", False):
                         self._startup_db_applied = True
-                        self._set_updating(False)
-                        self._apply_titlebar_counts()
+                        self._complete_startup_presentation()
                         self._server_db_update_inflight = False
                         return False
                     try:
@@ -3759,8 +3596,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     return False
                 if getattr(self, "_startup_db_provisional", False):
                     self._startup_db_applied = True
-                    self._set_updating(False)
-                    self._apply_titlebar_counts()
+                    self._complete_startup_presentation()
                     self._server_db_update_inflight = False
                     return False
                 try:
@@ -3805,7 +3641,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception as e:
                 GLib.idle_add(finish_startup, [], False, e)
 
-        self._db_executor.submit(worker)
+        try:
+            self._db_executor.submit(worker)
+        except Exception:
+            self._server_db_update_inflight = False
+            self._complete_startup_presentation()
         return False
 
     def _manual_update_server_database(self):
@@ -3994,8 +3834,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 msg = "No Servers Found (DB Fetch Failed And No Usable Local DB)."
             self.empty_label.set_text(msg)
             self.empty_label.set_visible(True)
-            self._set_updating(False)
-            self._apply_titlebar_counts()
+            self._complete_startup_presentation()
             return False
 
         self._server_companion_rows_loaded = True
@@ -4003,8 +3842,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._restore_server_companion_if_enabled()
         self._set_updating(True, "Updating The Server Database, Please Wait…")
         if not fetched_ok:
-            self._set_updating(False)
-            self._apply_titlebar_counts()
+            self._complete_startup_presentation()
             return False
         keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
         first_n = min(int(STARTUP_PING_FIRST_N), len(keys))
@@ -5096,7 +4934,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _submit_live_first_n_then_hide_band(self, n: int, ordered_keys=None, rest_keys=None):
         keys = list(ordered_keys or self._obj_by_key.keys())[:max(0, int(n))]
         if not keys:
-            self._set_updating(False)
+            self._complete_startup_presentation()
             GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
             return
 
@@ -5142,7 +4980,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             GLib.idle_add(self._apply_live_results_and_hide_band, results)
             GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
 
-        self._executor.submit(worker)
+        try:
+            self._executor.submit(worker)
+        except Exception:
+            self._complete_startup_presentation()
 
     def _submit_live_batch(self, keys, reason="batch"):
         if not keys:
@@ -5443,9 +5284,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _apply_live_results_and_hide_band(self, results):
         self._apply_live_results(results, reason="startup-first")
-        self._set_updating(False)
-        GLib.idle_add(self.update_ui.maybe_show)
-        self._apply_titlebar_counts()
+        self._complete_startup_presentation()
         return False
 
     def _apply_live_results(self, results, reason="batch"):

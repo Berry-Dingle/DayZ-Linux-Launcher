@@ -624,11 +624,6 @@ class ServerCompanionPanel(Gtk.Box):
             confidence_percent = int(summary.get("confidence_percent", 0) or 0)
         except Exception:
             confidence_percent = 0
-        if confidence_percent < 80:
-            self._stop_restart_countdown_colon()
-            self.restart_learning_box.set_visible(False)
-            return
-
         self.restart_cycle_label.set_text("Restart Cycle:")
         self.restart_next_label.set_text("Next Restart:")
         self.restart_countdown_label.set_text("Countdown:")
@@ -643,8 +638,9 @@ class ServerCompanionPanel(Gtk.Box):
         self.restart_countdown_mm_label.set_text(countdown_mm)
         self.restart_confidence_value_label.set_text(f"{confidence_percent}%")
         self.restart_cycle_row.set_visible(True)
-        self.restart_next_row.set_visible(True)
-        self.restart_countdown_row.set_visible(True)
+        prediction_usable = bool(summary.get("prediction_usable", False))
+        self.restart_next_row.set_visible(prediction_usable)
+        self.restart_countdown_row.set_visible(prediction_usable)
         self.restart_confidence_row.set_visible(True)
         for c in PING_CLASSES:
             self.restart_confidence_value_label.remove_css_class(c)
@@ -652,7 +648,10 @@ class ServerCompanionPanel(Gtk.Box):
             "ping-good" if confidence_percent >= 90 else "ping-greeny"
         )
         self.restart_learning_box.set_visible(True)
-        self._start_restart_countdown_colon()
+        if prediction_usable:
+            self._start_restart_countdown_colon()
+        else:
+            self._stop_restart_countdown_colon()
 
     def set_server_snapshot(self, snapshot: dict):
         self._stop_empty_breathe()
