@@ -617,6 +617,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
 
         overlay = Gtk.Overlay()
+        overlay.add_css_class("dzll-app-root")
         self._main_overlay = overlay
         self.set_child(overlay)
 
@@ -985,6 +986,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 print(f"[PERF] column view separators enabled: {', '.join(enabled)}", flush=True)
 
         self.scroller = Gtk.ScrolledWindow()
+        self.scroller.add_css_class("dzll-browser-surface")
         self.scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         self.scroller.set_child(self.list_view)
         self.scroller.set_vexpand(True)
@@ -1013,6 +1015,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         server_companion_show_icon = Gtk.Image.new_from_icon_name("system-shutdown-symbolic")
         server_companion_show_icon.set_pixel_size(16)
         server_companion_show_icon.add_css_class("server-companion-power-off-icon")
+        self.server_companion_show_icon = server_companion_show_icon
+        self.server_companion_redock_icon = Gtk.Label(label="↙")
         self.server_companion_show_btn = Gtk.Button()
         self.server_companion_show_btn.set_can_focus(False)
         self.server_companion_show_btn.set_child(server_companion_show_icon)
@@ -1024,7 +1028,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.server_companion_show_btn.set_valign(Gtk.Align.START)
         self.server_companion_show_btn.set_margin_top(4)
         self.server_companion_show_btn.set_margin_end(12)
-        self.server_companion_show_btn.connect("clicked", lambda *_: self.set_server_companion_enabled(True))
+        self.server_companion_show_btn.connect("clicked", self._on_server_companion_title_button_clicked)
         attach_pointer_cursor(self.server_companion_show_btn)
         self.server_list_overlay.add_overlay(self.server_companion_show_btn)
 
@@ -2318,8 +2322,34 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _refresh_server_companion_power_controls(self):
         show_btn = getattr(self, "server_companion_show_btn", None)
-        if show_btn is not None:
-            show_btn.set_visible(not bool(self.settings.get("show_server_companion", False)))
+        if show_btn is None:
+            return
+
+        enabled = bool(self.settings.get("show_server_companion", False))
+        undocked = enabled and not bool(getattr(self, "_server_companion_docked", True))
+        show_btn.set_visible((not enabled) or undocked)
+
+        icon = getattr(self, "server_companion_show_icon", None)
+        if undocked:
+            show_btn.remove_css_class("server-companion-power-off-button")
+            show_btn.set_tooltip_text("Redock Server Companion")
+            redock_icon = getattr(self, "server_companion_redock_icon", None)
+            if redock_icon is not None:
+                show_btn.set_child(redock_icon)
+        else:
+            show_btn.add_css_class("server-companion-power-off-button")
+            show_btn.set_tooltip_text("Show Server Companion")
+            if icon is not None:
+                show_btn.set_child(icon)
+
+    def _on_server_companion_title_button_clicked(self, *_args):
+        if bool(getattr(self, "_server_companion_reparenting", False)):
+            return
+        if bool(self.settings.get("show_server_companion", False)):
+            if not bool(getattr(self, "_server_companion_docked", True)):
+                self._dock_server_companion()
+            return
+        self.set_server_companion_enabled(True)
 
     def toggle_server_companion(self):
         self.set_server_companion_enabled(
@@ -2450,6 +2480,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 except Exception:
                     pass
         self._refresh_server_companion_monitor_highlight()
+        self._refresh_server_companion_power_controls()
 
     def _undock_server_companion(self):
         self._debug_server_companion_dock("starting undock")
@@ -2499,11 +2530,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._recover_server_companion_dock_after_undock_failure(panel=panel, revealer=revealer, failed_window=win, error=exc)
         finally:
             self._server_companion_reparenting = False
+            self._refresh_server_companion_power_controls()
 
     def _dock_server_companion(self):
         self._debug_server_companion_dock("docking/reattaching")
         if bool(getattr(self, "_server_companion_docked", True)):
             self._debug_server_companion_dock("dock skipped: already docked")
+            self._refresh_server_companion_power_controls()
             return
 
         panel = getattr(self, "server_companion_panel", None)
@@ -2525,12 +2558,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     self.main_browser_box.set_size_request(int(WINDOW_DEFAULT_SIZE[0]) - int(SIDEBAR_WIDTH), -1)
                 except Exception:
                     pass
-                self._start_server_companion_polling()
             else:
                 revealer.set_reveal_child(False)
                 revealer.set_visible(False)
         finally:
             self._server_companion_reparenting = False
+            self._refresh_server_companion_power_controls()
 
     def _collapse_server_companion_dock_space(self):
         try:

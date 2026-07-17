@@ -13,37 +13,616 @@ def get_app_css(
     DISCLAIMER_COLOR: str,
 ) -> bytes:
     css = f"""
+        /* ---------- DZLL semantic dark palette ---------- */
+        @define-color dzll_surface_panel #202326;
+        @define-color dzll_surface_control #2f3438;
+        @define-color dzll_surface_content #141618;
+        @define-color dzll_surface_settings #181818;
+        @define-color dzll_accent #0d686c;
+        @define-color dzll_accent_hover #118084;
+        @define-color dzll_accent_pressed #0a5558;
+
+        @define-color dzll_text_primary #f1f3f4;
+        @define-color dzll_text_secondary #c4c9cd;
+        @define-color dzll_text_muted #8e979e;
+        @define-color dzll_text_disabled #858d94;
+        @define-color dzll_text_on_accent #ffffff;
+        @define-color dzll_text_disclaimer #969da3;
+        @define-color dzll_border #565f66;
+        @define-color dzll_hover_border #68727a;
+        @define-color dzll_divider #3b4248;
+        @define-color dzll_focus #79aeb0;
+        @define-color dzll_entry_focus #b6bdc2;
+        @define-color dzll_mod_focus #4fb8b2;
+        @define-color dzll_control_hover #3a4045;
+        @define-color dzll_control_pressed #454c52;
+        @define-color dzll_control_disabled #272b2f;
+        @define-color dzll_selection #0d686c;
+        @define-color dzll_scrim rgba(0, 0, 0, 0.55);
+        @define-color dzll_popover_shadow rgba(0, 0, 0, 0.72);
+        @define-color dzll_link #6ab0ff;
+        @define-color dzll_link_hover #9dccff;
+        @define-color dzll_warning #d6a94f;
+        @define-color dzll_error #e04b4b;
+        @define-color dzll_success #4fbf67;
+
+        @define-color dzll_favourite_on #f5c542;
+        @define-color dzll_favourite_off #7a7a7a;
+        @define-color dzll_ping_good #37c871;
+        @define-color dzll_ping_greeny #9ad43a;
+        @define-color dzll_ping_yellow #e3c84a;
+        @define-color dzll_ping_orange #e19a3a;
+        @define-color dzll_ping_bad #e04b4b;
+        @define-color dzll_monitor_idle #4aa3ff;
+        @define-color dzll_monitor_active #ff4d4d;
+        @define-color dzll_badge_1p #5aa832;
+        @define-color dzll_badge_3p #1f7ad6;
+        @define-color dzll_badge_subscribed #7b3ff2;
+        @define-color dzll_badge_installed #d96b18;
+        @define-color dzll_queue #f1f3f4;
+        @define-color dzll_scrollbar_border #3fa9a5;
+        @define-color dzll_switch_knob_on #d5dadd;
+        @define-color dzll_scale_knob #c4c9cd;
+        @define-color dzll_destructive #872626;
+        @define-color dzll_destructive_hover #a53030;
+        @define-color dzll_destructive_pressed #b93737;
+        @define-color dzll_destructive_border #ff7878;
+        @define-color dzll_stop #468cff;
+        @define-color dzll_mod_status_online #4fbf67;
+        @define-color dzll_mod_status_offline #d85b5b;
+        @define-color dzll_mod_status_checking #d6a94f;
+        @define-color dzll_mod_status_issue #d9784f;
+        @define-color dzll_restart_learning #bfe84a;
+        @define-color dzll_restart_confidence_high #37c871;
+        @define-color dzll_restart_confidence_learning #9ad43a;
+        @define-color dzll_startup_overlay rgba(0, 0, 0, 0.55);
+        @define-color dzll_startup_band rgba(0, 0, 0, 0.75);
+        @define-color dzll_steamcmd_log #33ff66;
+
+        /* ---------- Explicit application-owned surfaces ---------- */
+        .dzll-app-root,
+        .dzll-app-root:backdrop {{
+          background: @dzll_surface_panel;
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root .sidebar-frame,
+        .dzll-app-root .dzll-sidebar-toolbar,
+        .dzll-app-root .dzll-search-area,
+        .server-companion-panel,
+        .server-companion-panel:backdrop {{
+          background: @dzll_surface_panel;
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root .dzll-browser-surface,
+        .dzll-app-root .dzll-browser-surface > viewport,
+        .dzll-app-root columnview.dzll-column-view,
+        .dzll-app-root columnview.dzll-column-view > listview,
+        .dzll-app-root columnview.dzll-column-view > listview > row,
+        .dzll-app-root columnview.dzll-column-view listitem {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root columnview.dzll-column-view > listview > row:hover,
+        .dzll-app-root columnview.dzll-column-view listitem:hover {{
+          background: @dzll_surface_content;
+          background-color: @dzll_surface_content;
+          background-image: none;
+          color: @dzll_text_primary;
+          border-bottom-color: @dzll_divider;
+          box-shadow: none;
+          outline: none;
+          opacity: 1;
+        }}
+
+        .dzll-app-root columnview.dzll-column-view > listview > row:hover > listitem,
+        .dzll-app-root columnview.dzll-column-view listitem:hover {{
+          background: @dzll_surface_content;
+          background-color: @dzll_surface_content;
+        }}
+
+        .dzll-app-root columnview.dzll-column-view > listview > row:hover > listitem > *,
+        .dzll-app-root columnview.dzll-column-view listitem:hover > * {{
+          background: transparent;
+          background-color: transparent;
+        }}
+
+        .dzll-app-root label,
+        .dzll-app-root label:backdrop,
+        .server-companion-panel label,
+        .server-companion-panel label:backdrop {{
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root button.flat,
+        .dzll-app-root button.flat image,
+        .dzll-app-root button.flat:backdrop,
+        .dzll-app-root button.flat:backdrop image,
+        .server-companion-panel button.flat,
+        .server-companion-panel button.flat image,
+        .server-companion-panel button.flat:backdrop,
+        .server-companion-panel button.flat:backdrop image {{
+          color: @dzll_text_secondary;
+        }}
+
+        .dzll-app-root .dim-label,
+        .dzll-app-root .dim-label:backdrop,
+        .server-companion-panel .dim-label,
+        .server-companion-panel .dim-label:backdrop {{
+          color: @dzll_text_muted;
+        }}
+
+        .dzll-app-root .dimmed-entry {{
+          color: @dzll_text_muted;
+        }}
+
+        /* ---------- Scoped native controls and transient surfaces ---------- */
+        .dzll-app-root entry,
+        .dzll-app-root searchentry,
+        .dzll-app-root spinbutton {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
+          caret-color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root entry:hover,
+        .dzll-app-root searchentry:hover,
+        .dzll-app-root spinbutton:hover {{
+          border-color: @dzll_hover_border;
+        }}
+
+        .dzll-app-root entry:focus,
+        .dzll-app-root entry:focus-within,
+        .dzll-app-root searchentry:focus,
+        .dzll-app-root searchentry:focus-within,
+        .dzll-app-root spinbutton:focus-within {{
+          border-color: @dzll_entry_focus;
+          outline-color: @dzll_entry_focus;
+        }}
+
+        .dzll-app-root entry:disabled,
+        .dzll-app-root searchentry:disabled,
+        .dzll-app-root spinbutton:disabled {{
+          background: @dzll_control_disabled;
+          color: @dzll_text_disabled;
+          border-color: @dzll_divider;
+        }}
+
+        .dzll-app-root button:not(.flat),
+        .server-companion-panel button:not(.flat) {{
+          background: @dzll_surface_control;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root button:not(.flat):hover,
+        .server-companion-panel button:not(.flat):hover {{
+          background: @dzll_control_hover;
+          background-image: none;
+          border-color: @dzll_hover_border;
+        }}
+
+        .dzll-app-root button:not(.flat):active,
+        .server-companion-panel button:not(.flat):active {{
+          background: @dzll_control_pressed;
+          background-image: none;
+          border-color: @dzll_hover_border;
+        }}
+
+        .dzll-app-root button:focus-visible,
+        .server-companion-panel button:focus-visible {{
+          outline: 2px solid @dzll_focus;
+          outline-offset: 1px;
+        }}
+
+        .dzll-app-root button:disabled,
+        .server-companion-panel button:disabled {{
+          background: @dzll_control_disabled;
+          color: @dzll_text_disabled;
+          border-color: @dzll_divider;
+        }}
+
+        .dzll-app-root button.suggested-action,
+        .server-companion-panel button.suggested-action {{
+          background: @dzll_accent;
+          color: @dzll_text_on_accent;
+          border-color: @dzll_hover_border;
+        }}
+
+        .dzll-app-root button.suggested-action:hover,
+        .server-companion-panel button.suggested-action:hover {{
+          background: @dzll_accent_hover;
+        }}
+
+        .dzll-app-root button.suggested-action:active,
+        .server-companion-panel button.suggested-action:active {{
+          background: @dzll_accent_pressed;
+        }}
+
+        .dzll-app-root dropdown > button,
+        .dzll-app-root menubutton > button,
+        .dzll-app-root dropdown.dzll-dropdown > button {{
+          background: @dzll_surface_control;
+          background-color: @dzll_surface_control;
+          background-image: none;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root dropdown > button:hover,
+        .dzll-app-root dropdown:hover > button,
+        .dzll-app-root menubutton > button:hover,
+        .dzll-app-root dropdown.dzll-dropdown > button:hover,
+        .dzll-app-root dropdown.dzll-dropdown:focus > button,
+        .dzll-app-root dropdown.dzll-dropdown:focus-within > button {{
+          background: @dzll_control_hover;
+          background-color: @dzll_control_hover;
+          background-image: none;
+          color: @dzll_text_primary;
+          border-color: @dzll_hover_border;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root dropdown > button:active,
+        .dzll-app-root dropdown:active > button,
+        .dzll-app-root dropdown:checked > button,
+        .dzll-app-root menubutton > button:active,
+        .dzll-app-root dropdown.dzll-dropdown > button:active,
+        .dzll-app-root dropdown.dzll-dropdown > button:checked,
+        .dzll-app-root dropdown.dzll-dropdown > button:selected {{
+          background: @dzll_control_pressed;
+          background-color: @dzll_control_pressed;
+          background-image: none;
+          color: @dzll_text_primary;
+          border-color: @dzll_hover_border;
+          box-shadow: none;
+        }}
+
+        /* The closed Gtk.DropDown selection is a row inside the button stack. */
+        .dzll-app-root dropdown.dzll-dropdown > button stack,
+        .dzll-app-root dropdown.dzll-dropdown > button:hover stack,
+        .dzll-app-root dropdown.dzll-dropdown > button:active stack,
+        .dzll-app-root dropdown.dzll-dropdown > button:checked stack,
+        .dzll-app-root dropdown.dzll-dropdown > button:focus stack,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:hover,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:active,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:checked,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:selected,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:focus,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row > box,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:hover > box,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row > box > label,
+        .dzll-app-root dropdown.dzll-dropdown > button stack > row:hover > box > label {{
+          background: transparent;
+          background-color: transparent;
+          background-image: none;
+          color: @dzll_text_primary;
+          border-color: transparent;
+          box-shadow: none;
+          outline: none;
+        }}
+
+        .dzll-app-root popover > contents,
+        .required-mods-popover > contents,
+        .companion-sound-popover,
+        .companion-sound-popover > contents {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
+          box-shadow: 0 8px 24px @dzll_popover_shadow;
+        }}
+
+        .dzll-app-root popover list,
+        .dzll-app-root popover listview,
+        .dzll-app-root popover viewport,
+        .required-mods-popover viewport {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root popover row:hover,
+        .dzll-app-root popover listitem:hover,
+        .dzll-dropdown popover row:hover,
+        .dzll-dropdown popover listitem:hover {{
+          background: @dzll_control_hover;
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root popover row:hover label,
+        .dzll-app-root popover listitem:hover label,
+        .dzll-dropdown popover row:hover label,
+        .dzll-dropdown popover listitem:hover label {{
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root popover row:selected,
+        .dzll-app-root popover listitem:selected,
+        .dzll-dropdown popover row:selected,
+        .dzll-dropdown popover listitem:selected {{
+          background: @dzll_selection;
+          color: @dzll_text_on_accent;
+        }}
+
+        .dzll-app-root popover row:selected label,
+        .dzll-app-root popover listitem:selected label,
+        .dzll-dropdown popover row:selected label,
+        .dzll-dropdown popover listitem:selected label {{
+          color: @dzll_text_on_accent;
+        }}
+
+        .dzll-app-root popover row:selected:hover,
+        .dzll-app-root popover listitem:selected:hover,
+        .dzll-dropdown popover row:selected:hover,
+        .dzll-dropdown popover listitem:selected:hover {{
+          background: @dzll_accent_hover;
+          color: @dzll_text_on_accent;
+        }}
+
+        .dzll-app-root switch,
+        .server-companion-panel switch {{
+          background: @dzll_surface_control;
+          border-color: @dzll_border;
+        }}
+
+        .dzll-app-root switch:checked,
+        .server-companion-panel switch:checked {{
+          background: @dzll_accent;
+          border-color: @dzll_hover_border;
+        }}
+
+        .dzll-app-root switch slider,
+        .server-companion-panel switch slider {{
+          background: @dzll_text_secondary;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+          opacity: 1;
+        }}
+
+        .dzll-app-root switch:checked slider,
+        .server-companion-panel switch:checked slider {{
+          background: @dzll_switch_knob_on;
+        }}
+
+        .dzll-app-root switch:focus-visible,
+        .server-companion-panel switch:focus-visible {{
+          outline: 2px solid @dzll_focus;
+          outline-offset: 1px;
+        }}
+
+        .dzll-app-root switch:disabled,
+        .server-companion-panel switch:disabled {{
+          background: @dzll_control_disabled;
+          color: @dzll_text_disabled;
+        }}
+
+        .dzll-app-root switch:disabled slider,
+        .server-companion-panel switch:disabled slider {{
+          background: @dzll_text_disabled;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root checkbutton,
+        .server-companion-panel checkbutton {{
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root checkbutton check,
+        .server-companion-panel checkbutton check {{
+          background: @dzll_surface_control;
+          color: @dzll_text_on_accent;
+          border-color: @dzll_border;
+        }}
+
+        .dzll-app-root checkbutton:checked check,
+        .server-companion-panel checkbutton:checked check {{
+          background: @dzll_accent;
+          border-color: @dzll_focus;
+        }}
+
+        .dzll-app-root checkbutton:disabled,
+        .server-companion-panel checkbutton:disabled {{
+          color: @dzll_text_disabled;
+        }}
+
+        .dzll-app-root scrollbar,
+        .dzll-app-root scrollbar trough,
+        .required-mods-popover scrollbar,
+        .required-mods-popover scrollbar trough {{
+          background: @dzll_surface_content;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root scrollbar.vertical,
+        .required-mods-popover scrollbar.vertical,
+        .dzll-dropdown popover scrollbar.vertical,
+        .server-companion-panel scrollbar.vertical {{
+          min-width: 6px;
+        }}
+
+        .dzll-app-root scrollbar.horizontal,
+        .required-mods-popover scrollbar.horizontal,
+        .dzll-dropdown popover scrollbar.horizontal,
+        .server-companion-panel scrollbar.horizontal {{
+          min-height: 6px;
+        }}
+
+        .dzll-app-root scrollbar slider,
+        .required-mods-popover scrollbar slider,
+        .dzll-dropdown popover scrollbar slider,
+        .server-companion-panel scrollbar slider {{
+          background: @dzll_surface_control;
+          border: 1px solid @dzll_scrollbar_border;
+          outline: none;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root scrollbar.vertical slider,
+        .required-mods-popover scrollbar.vertical slider,
+        .dzll-dropdown popover scrollbar.vertical slider,
+        .server-companion-panel scrollbar.vertical slider {{
+          margin-left: 0;
+          margin-right: 0;
+        }}
+
+        .dzll-app-root scrollbar.horizontal slider,
+        .required-mods-popover scrollbar.horizontal slider,
+        .dzll-dropdown popover scrollbar.horizontal slider,
+        .server-companion-panel scrollbar.horizontal slider {{
+          margin-top: 0;
+          margin-bottom: 0;
+        }}
+
+        .dzll-app-root scrollbar slider:hover,
+        .required-mods-popover scrollbar slider:hover,
+        .dzll-dropdown popover scrollbar slider:hover,
+        .server-companion-panel scrollbar slider:hover {{
+          background: @dzll_control_hover;
+        }}
+
+        .dzll-app-root scrollbar slider:active,
+        .required-mods-popover scrollbar slider:active,
+        .dzll-dropdown popover scrollbar slider:active,
+        .server-companion-panel scrollbar slider:active {{
+          background: @dzll_control_pressed;
+        }}
+
+        .dzll-app-root .dzll-browser-surface scrollbar,
+        .dzll-app-root .dzll-browser-surface scrollbar trough {{
+          background: transparent;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root .dzll-browser-surface scrollbar.vertical {{
+          margin-top: 3px;
+        }}
+
+        .dzll-app-root .mods-card .mods-list scrollbar,
+        .dzll-app-root .mods-card .mods-list scrollbar trough {{
+          background: transparent;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root .mods-card .mods-list scrollbar.vertical {{
+          margin-top: 3px;
+        }}
+
+        .dzll-dropdown popover scrollbar,
+        .dzll-dropdown popover scrollbar trough {{
+          background: transparent;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+        }}
+
+        .dzll-app-root spinner,
+        .server-companion-panel spinner {{
+          color: @dzll_accent;
+        }}
+
+        .dzll-app-root progressbar trough,
+        .server-companion-panel progressbar trough {{
+          background: @dzll_surface_control;
+        }}
+
+        .dzll-app-root progressbar progress,
+        .server-companion-panel progressbar progress {{
+          background: @dzll_accent;
+        }}
+
+        .dzll-app-root scale trough,
+        .server-companion-panel scale trough {{
+          background: @dzll_surface_control;
+        }}
+
+        .dzll-app-root scale highlight,
+        .server-companion-panel scale highlight {{
+          background: @dzll_accent;
+        }}
+
+        .dzll-app-root scale slider,
+        .server-companion-panel scale slider {{
+          background: @dzll_scale_knob;
+          border-color: @dzll_border;
+          outline: none;
+          box-shadow: none;
+          opacity: 1;
+        }}
+
+        .server-companion-panel scale.horizontal slider {{
+          background: @dzll_scale_knob;
+          background-color: @dzll_scale_knob;
+          background-image: none;
+          border-color: transparent;
+          border-image: none;
+          box-shadow: none;
+          outline: none;
+          text-shadow: none;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .dzll-app-root separator,
+        .server-companion-panel separator {{
+          background: @dzll_divider;
+          color: @dzll_divider;
+        }}
+
+        tooltip.background,
+        tooltip.background > box {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
+        }}
+
         /* ---------- List rows (keep transparent) ---------- */
-        listview row {{ background: transparent; }}
-        listview row:hover {{ background: transparent; }}
-        listview row:selected {{ background: transparent; }}
+        .dzll-app-root listview row {{ background: transparent; }}
+        .dzll-app-root listview row:hover {{ background: transparent; }}
+        .dzll-app-root listview row:selected {{ background: transparent; }}
         
         /* ---------- Favorites star ---------- */
         /* ON star stays yellow even when unfocused */
         button.fav-star {{ font-size: 1.8em; padding: 0; }}
         button.fav-star.fav-on,
         button.fav-star.fav-on * {{
-          color: #f5c542;
+          color: @dzll_favourite_on;
         }}
         button.fav-star.fav-on:backdrop,
         button.fav-star.fav-on:backdrop * {{
-          color: #f5c542;
+          color: @dzll_favourite_on;
         }}
         
         /* OFF star stays grey even when unfocused */
         button.fav-star.fav-off,
         button.fav-star.fav-off * {{
-          color: #7a7a7a;
+          color: @dzll_favourite_off;
         }}
         button.fav-star.fav-off:backdrop,
         button.fav-star.fav-off:backdrop * {{
-          color: #7a7a7a;
+          color: @dzll_favourite_off;
         }}
         
         /* ---------- Flat buttons (icons etc.) ---------- */
-        button.flat,
-        button.flat:hover,
-        button.flat:active {{
+        .dzll-app-root button.flat,
+        .dzll-app-root button.flat:hover,
+        .dzll-app-root button.flat:active,
+        .server-companion-panel button.flat,
+        .server-companion-panel button.flat:hover,
+        .server-companion-panel button.flat:active {{
           background: transparent;
           box-shadow: none;
           border: 0;
@@ -54,7 +633,9 @@ def get_app_css(
         button.monitor-btn image,
         button.monitor-btn:backdrop,
         button.monitor-btn:backdrop image {{
-          color: #4aa3ff;
+          color: @dzll_monitor_idle;
+          opacity: 1;
+          filter: none;
         }}
 
         button.flat.monitor-btn.monitor-btn-active,
@@ -63,7 +644,9 @@ def get_app_css(
         button.flat.monitor-btn.monitor-btn-active:backdrop,
         button.flat.monitor-btn.monitor-btn-active:backdrop image,
         button.flat.monitor-btn.monitor-btn-active:backdrop > image {{
-          color: #ff4d4d;
+          color: @dzll_monitor_active;
+          opacity: 1;
+          filter: none;
         }}
 
         image.monitor-eye-active,
@@ -71,7 +654,27 @@ def get_app_css(
         button.flat.monitor-btn image.monitor-eye-active,
         button.monitor-btn:backdrop image.monitor-eye-active,
         button.flat.monitor-btn:backdrop image.monitor-eye-active {{
-          color: #ff4d4d;
+          color: @dzll_monitor_active;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .dzll-app-root button.monitor-btn,
+        .dzll-app-root button.monitor-btn image {{
+          color: @dzll_monitor_idle;
+        }}
+
+        .dzll-app-root button.monitor-btn.monitor-btn-active,
+        .dzll-app-root button.monitor-btn.monitor-btn-active image,
+        .dzll-app-root image.monitor-eye-active {{
+          color: @dzll_monitor_active;
+        }}
+
+        .dzll-app-root .dzll-column-view button.monitor-btn:backdrop image.monitor-eye-idle {{
+          color: @dzll_monitor_idle;
+          -gtk-icon-filter: none;
+          opacity: 1;
+          filter: none;
         }}
 
         .players-cell {{
@@ -84,12 +687,13 @@ def get_app_css(
         }}
 
         entry.top-search-entry.mod-search-entry-active {{
-          border-color: #5f9295;
+          border-color: @dzll_mod_focus;
         }}
 
         entry.top-search-entry.mod-search-entry-active:focus,
         entry.top-search-entry.mod-search-entry-active:focus-within {{
-          border-color: #79aeb0;
+          border-color: @dzll_mod_focus;
+          outline-color: @dzll_mod_focus;
         }}
 
         .mod-search-control {{
@@ -97,9 +701,9 @@ def get_app_css(
         }}
 
         button.mod-search-toggle-badge {{
-          background: #2f3438;
-          color: #b6bec6;
-          border: 1px solid {DIVIDER_COLOR};
+          background: @dzll_surface_control;
+          color: @dzll_text_secondary;
+          border: 1px solid @dzll_border;
           border-radius: 4px;
           padding: 0;
           font-weight: 700;
@@ -121,21 +725,36 @@ def get_app_css(
         }}
 
         button.mod-search-toggle-badge:hover {{
-          background: #3a4045;
-          color: #d7dde3;
+          background: @dzll_control_hover;
+          color: @dzll_text_primary;
+        }}
+
+        button.mod-search-toggle-badge:active {{
+          background: @dzll_control_pressed;
         }}
 
         button.mod-search-toggle-badge.mod-search-toggle-badge-active,
         button.mod-search-toggle-badge:checked {{
-          background: #0d686c;
-          color: #ffffff;
-          border-color: #79aeb0;
+          background: @dzll_accent;
+          color: @dzll_text_on_accent;
+          border-color: @dzll_focus;
         }}
 
         button.mod-search-toggle-badge.mod-search-toggle-badge-active:hover,
         button.mod-search-toggle-badge:checked:hover {{
-          background: #17a2a5;
-          color: #ffffff;
+          background: @dzll_accent_hover;
+          color: @dzll_text_on_accent;
+        }}
+
+        button.mod-search-toggle-badge.mod-search-toggle-badge-active:active,
+        button.mod-search-toggle-badge:checked:active {{
+          background: @dzll_accent_pressed;
+        }}
+
+        button.mod-search-toggle-badge:disabled {{
+          background: @dzll_control_disabled;
+          color: @dzll_text_disabled;
+          border-color: @dzll_divider;
         }}
 
         .mod-search-chip-row {{
@@ -143,8 +762,8 @@ def get_app_css(
         }}
 
         .mod-search-chip {{
-          background: rgba(255, 255, 255, 0.055);
-          border: 1px solid {DIVIDER_COLOR};
+          background: @dzll_surface_control;
+          border: 1px solid @dzll_border;
           border-radius: 999px;
           padding: 0;
           min-width: 0;
@@ -160,7 +779,7 @@ def get_app_css(
         }}
 
         .mod-search-chip-close {{
-          border-left: 1px solid rgba(255, 255, 255, 0.16);
+          border-left: 1px solid @dzll_divider;
           border-radius: 0 999px 999px 0;
           padding: 2px 3px 2px 5px;
           min-width: 11px;
@@ -168,11 +787,11 @@ def get_app_css(
         }}
 
         .mod-search-chip-close:hover {{
-          background: rgba(120, 50, 55, 0.65);
+          background: alpha(@dzll_destructive, 0.76);
         }}
 
         .mod-search-chip-x {{
-          color: #d8d8d8;
+          color: @dzll_text_secondary;
           opacity: 0.66;
           font-weight: 600;
         }}
@@ -193,7 +812,7 @@ def get_app_css(
         }}
 
         .perspective-badge {{
-          color: #ffffff;
+          color: @dzll_text_on_accent;
           border-radius: 3px;
           padding: 0px 3px;
           font-size: 0.72em;
@@ -204,13 +823,13 @@ def get_app_css(
         }}
 
         .perspective-badge-1pp {{
-          background: #5aa832;
-          color: #ffffff;
+          background: @dzll_badge_1p;
+          color: @dzll_text_on_accent;
         }}
 
         .perspective-badge-3pp {{
-          background: #1f7ad6;
-          color: #ffffff;
+          background: @dzll_badge_3p;
+          color: @dzll_text_on_accent;
         }}
 
         .mod-state-badge {{
@@ -224,13 +843,13 @@ def get_app_css(
         }}
 
         .mod-state-badge-s {{
-          background: #7b3ff2;
-          color: #ffffff;
+          background: @dzll_badge_subscribed;
+          color: @dzll_text_on_accent;
         }}
 
         .mod-state-badge-i {{
-          background: #d96b18;
-          color: #ffffff;
+          background: @dzll_badge_installed;
+          color: @dzll_text_on_accent;
         }}
 
         .companion-flat-menu,
@@ -254,37 +873,56 @@ def get_app_css(
         }}
 
         .required-mods-popover {{
+          background: transparent;
+          color: @dzll_text_primary;
+          border: none;
+          box-shadow: none;
           padding: 0;
         }}
 
+        .required-mods-popover > contents {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border: 1px solid @dzll_border;
+          box-shadow: 0 8px 24px @dzll_popover_shadow;
+        }}
+
+        .required-mods-popover > arrow {{
+          background: @dzll_surface_content;
+          color: @dzll_surface_content;
+          border-color: @dzll_border;
+        }}
+
         .required-mods-popover-content {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
           padding: 10px 12px;
         }}
 
         .required-mods-popover-scroller,
         .required-mods-popover-scroller viewport {{
-          background: transparent;
+          background: @dzll_surface_content;
         }}
 
         .required-mods-popover-item {{
           font-size: 0.92em;
-          color: @theme_text_color;
+          color: @dzll_text_primary;
         }}
 
         .browser-toast {{
-          background: #2f3438;
-          border: 1px solid {DIVIDER_COLOR};
+          background: @dzll_surface_control;
+          border: 1px solid @dzll_border;
           border-radius: 999px;
           box-shadow: none;
           padding: 5px 10px;
-          color: @theme_text_color;
+          color: @dzll_text_primary;
           font-weight: 600;
         }}
 
         button.required-mods-popover-target {{
-          background: rgba(255, 255, 255, 0.055);
-          color: alpha(@theme_text_color, 0.82);
-          border: 1px solid {DIVIDER_COLOR};
+          background: @dzll_surface_control;
+          color: @dzll_text_secondary;
+          border: 1px solid @dzll_border;
           border-radius: 999px;
           box-shadow: none;
           outline: none;
@@ -295,19 +933,36 @@ def get_app_css(
         }}
 
         button.required-mods-popover-target:hover {{
-          background: rgba(255, 255, 255, 0.095);
-          color: @theme_text_color;
-          border-color: alpha(@theme_text_color, 0.28);
+          background: @dzll_control_hover;
+          color: @dzll_text_primary;
+          border-color: @dzll_hover_border;
+        }}
+
+        button.required-mods-popover-target:active {{
+          background: @dzll_control_pressed;
+        }}
+
+        button.required-mods-popover-target:focus-visible {{
+          outline: 2px solid @dzll_focus;
+          outline-offset: 1px;
+        }}
+
+        button.required-mods-popover-target:disabled {{
+          background: @dzll_control_disabled;
+          color: @dzll_text_disabled;
+          border-color: @dzll_divider;
         }}
 
         /* ---------- Entry placeholder (dims hint text only) ---------- */
-        entry placeholder {{
-          color: alpha(@theme_text_color, 0.45);
+        .dzll-app-root entry placeholder,
+        .dzll-app-root searchentry placeholder {{
+          color: @dzll_text_muted;
         }}
 
         .mod-suggestion-panel {{
-          background: @theme_base_color;
-          border: 1px solid {DIVIDER_COLOR};
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border: 1px solid @dzll_border;
           border-radius: 4px;
           padding: 2px;
         }}
@@ -329,12 +984,14 @@ def get_app_css(
         }}
 
         .mod-suggestion-scroller scrollbar.vertical slider {{
-          background: alpha(@theme_text_color, 0.24);
-          border: 0;
+          background: @dzll_surface_control;
+          border: 1px solid @dzll_scrollbar_border;
+          outline: none;
+          box-shadow: none;
           border-radius: 999px;
-          margin-left: 2px;
-          margin-right: 2px;
-          min-width: 8px;
+          margin-left: 0;
+          margin-right: 0;
+          min-width: 6px;
         }}
 
         /* ---------- Typography ---------- */
@@ -343,15 +1000,15 @@ def get_app_css(
         .timewarp {{ font-size: 0.85em; opacity: 0.75; }}
         
         /* ---------- Dividers / layout grid ---------- */
-        .hr {{ background-color: {DIVIDER_COLOR}; }}
+        .hr {{ background-color: @dzll_divider; }}
         
         .fav-hdr {{
-          border-right: 1px solid {DIVIDER_COLOR};
+          border-right: 1px solid @dzll_divider;
           padding-right: 12px;
         }}
         
         .rightblock {{
-          border-left: 1px solid {DIVIDER_COLOR};
+          border-left: 1px solid @dzll_divider;
           padding-left: 0px;
           margin-left: 0px;
         }}
@@ -383,8 +1040,8 @@ def get_app_css(
         .dzll-column-view .dzll-column-title-flat:checked,
         .dzll-column-view .dzll-column-title-flat:focus,
         .dzll-column-view .dzll-column-title-flat:focus-visible {{
-          background: #202326;
-          background-color: #202326;
+          background: @dzll_surface_panel;
+          background-color: @dzll_surface_panel;
           background-image: none;
           border-radius: 0;
           border-top: 0;
@@ -394,6 +1051,22 @@ def get_app_css(
           outline: none;
           text-shadow: none;
           -gtk-icon-shadow: none;
+        }}
+
+        columnview.dzll-column-view > header,
+        columnview.dzll-column-view > header:hover,
+        columnview.dzll-column-view > header.dzll-column-header-flat,
+        columnview.dzll-column-view > header.dzll-column-header-flat:hover {{
+          border-color: @dzll_divider;
+        }}
+
+        columnview.dzll-column-view > header > button,
+        columnview.dzll-column-view > header > button:hover,
+        columnview.dzll-column-view > header > button:active,
+        columnview.dzll-column-view > header > button.dzll-column-title-flat,
+        columnview.dzll-column-view > header > button.dzll-column-title-flat:hover,
+        columnview.dzll-column-view > header > button.dzll-column-title-flat:active {{
+          border-color: @dzll_border;
         }}
 
         columnview.dzll-column-view > header > button > box.horizontal,
@@ -432,6 +1105,7 @@ def get_app_css(
 
         columnview.dzll-column-view > header > button > box.horizontal > label,
         columnview.dzll-column-view .dzll-column-header-label {{
+          color: @dzll_text_secondary;
           font-weight: 600;
           font-size: 0.90em;
           opacity: 0.82;
@@ -449,38 +1123,45 @@ def get_app_css(
           border-right: 0;
         }}
 
-        columnview.dzll-column-view > header:hover,
-        columnview.dzll-column-view > header > button:hover,
-        columnview.dzll-column-view > header > button:active,
         columnview.dzll-column-view > header > button:focus,
         columnview.dzll-column-view > header > button:focus-visible,
-        columnview.dzll-column-view > header > button.dzll-column-title-flat:hover,
-        columnview.dzll-column-view > header > button.dzll-column-title-flat:active,
         columnview.dzll-column-view > header > button.dzll-column-title-flat:focus,
         columnview.dzll-column-view > header > button.dzll-column-title-flat:focus-visible {{
-          border-color: {DIVIDER_COLOR};
-          border-top-color: {DIVIDER_COLOR};
-          border-right-color: {DIVIDER_COLOR};
-          border-bottom-color: {DIVIDER_COLOR};
-          border-left-color: {DIVIDER_COLOR};
+          border-color: @dzll_divider;
+          border-top-color: @dzll_divider;
+          border-right-color: @dzll_divider;
+          border-bottom-color: @dzll_divider;
+          border-left-color: @dzll_divider;
           outline-color: transparent;
           box-shadow: none;
         }}
 
         columnview.dzll-column-view > header.server-list-header-with-top-border,
         columnview.dzll-column-view > header.server-list-header-with-top-border:hover {{
-          border-top: 1px solid {DIVIDER_COLOR};
+          border-top: 1px solid @dzll_divider;
+        }}
+
+        columnview.dzll-column-view > header > button:checked,
+        columnview.dzll-column-view > header > button.dzll-column-title-flat:checked {{
+          color: @dzll_focus;
+          border-bottom-color: @dzll_focus;
+        }}
+
+        columnview.dzll-column-view > header > button:focus-visible,
+        columnview.dzll-column-view > header > button.dzll-column-title-flat:focus-visible {{
+          outline: 2px solid @dzll_focus;
+          outline-offset: -2px;
         }}
 
         .dzll-column-view row,
         .dzll-column-view listitem {{
           padding-top: 4px;
           padding-bottom: 5px;
-          border-bottom: 1px solid {DIVIDER_COLOR};
+          border-bottom: 1px solid @dzll_divider;
         }}
 
         .dzll-column-view .dzll-column-cell-right-border {{
-          border-right: 1px solid {DIVIDER_COLOR};
+          border-right: 1px solid @dzll_divider;
         }}
 
         .dzll-column-view button.dzll-column-fav-button {{
@@ -493,18 +1174,204 @@ def get_app_css(
           line-height: 1.0;
         }}
 
+        .dzll-column-view label {{
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-column-view .dim-label {{
+          color: @dzll_text_muted;
+        }}
+
+        .dzll-column-view .dzll-queue {{
+          color: @dzll_queue;
+        }}
+
+        .dzll-column-view button.dzll-join-button,
+        .dzll-column-view button.dzll-join-button image {{
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-column-view button.dzll-join-button:hover,
+        .dzll-column-view button.dzll-join-button:hover image {{
+          color: @dzll_focus;
+        }}
+
+        .dzll-column-view button.dzll-join-button:active,
+        .dzll-column-view button.dzll-join-button:active image {{
+          color: @dzll_accent_hover;
+        }}
+
         .server-companion-panel {{
           min-width: 280px;
           max-width: 280px;
         }}
 
+        .server-companion-header,
+        .server-companion-content {{
+          background: @dzll_surface_panel;
+          color: @dzll_text_primary;
+        }}
+
+        .server-companion-panel .companion-detail-label {{
+          color: @dzll_text_secondary;
+        }}
+
+        .server-companion-panel .companion-detail-value {{
+          color: @dzll_text_primary;
+        }}
+
+        .server-companion-panel .companion-queue {{
+          color: @dzll_text_primary;
+        }}
+
+        .server-companion-panel .companion-restart-learning-value {{
+          color: @dzll_text_primary;
+        }}
+
+        .server-companion-panel .companion-alert-info-box {{
+          color: @dzll_warning;
+        }}
+
+        /* Companion is a persistent second-screen surface; keep its palette in backdrop. */
+        .server-companion-panel:backdrop,
+        .server-companion-panel:backdrop .server-companion-header,
+        .server-companion-panel:backdrop .server-companion-content {{
+          background: @dzll_surface_panel;
+          color: @dzll_text_primary;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop label {{
+          color: @dzll_text_primary;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop .companion-detail-label,
+        .server-companion-panel:backdrop .dim-label {{
+          color: @dzll_text_secondary;
+        }}
+
+        .server-companion-panel:backdrop .companion-queue {{
+          color: @dzll_text_primary;
+        }}
+
+        .server-companion-panel:backdrop .companion-restart-learning-value {{
+          color: @dzll_text_primary;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop button,
+        .server-companion-panel:backdrop button image {{
+          color: @dzll_text_primary;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop button:not(.flat) {{
+          background: @dzll_surface_control;
+          background-image: none;
+          border-color: @dzll_border;
+          box-shadow: none;
+        }}
+
+        .server-companion-panel:backdrop button.flat,
+        .server-companion-panel:backdrop button.flat image {{
+          background: transparent;
+          color: @dzll_text_secondary;
+          box-shadow: none;
+        }}
+
+        .server-companion-panel:backdrop button.suggested-action {{
+          background: @dzll_accent;
+          color: @dzll_text_on_accent;
+          border-color: @dzll_hover_border;
+        }}
+
+        .server-companion-panel:backdrop switch {{
+          background: @dzll_surface_control;
+          border-color: @dzll_border;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop switch:checked {{
+          background: @dzll_accent;
+          border-color: @dzll_hover_border;
+        }}
+
+        .server-companion-panel:backdrop switch slider {{
+          background: @dzll_text_secondary;
+          border-color: transparent;
+          outline: none;
+          box-shadow: none;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop switch:checked slider {{
+          background: @dzll_switch_knob_on;
+        }}
+
+        .server-companion-panel:backdrop separator {{
+          background: @dzll_divider;
+          color: @dzll_divider;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop scale trough {{
+          background: @dzll_surface_control;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop scale highlight {{
+          background: @dzll_accent;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop scale.horizontal slider {{
+          background: @dzll_scale_knob;
+          background-color: @dzll_scale_knob;
+          background-image: none;
+          border-color: transparent;
+          border-image: none;
+          outline: none;
+          box-shadow: none;
+          text-shadow: none;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop .ping-good {{ color: @dzll_ping_good; opacity: 1; }}
+        .server-companion-panel:backdrop .ping-greeny {{ color: @dzll_ping_greeny; opacity: 1; }}
+        .server-companion-panel:backdrop .ping-yellow {{ color: @dzll_ping_yellow; opacity: 1; }}
+        .server-companion-panel:backdrop .ping-orange {{ color: @dzll_ping_orange; opacity: 1; }}
+        .server-companion-panel:backdrop .ping-bad,
+        .server-companion-panel:backdrop .ping-offline {{ color: @dzll_ping_bad; opacity: 1; }}
+
+        .server-companion-panel:backdrop button.server-companion-power-on-button,
+        .server-companion-panel:backdrop button.server-companion-power-on-button image {{
+          background: transparent;
+          color: @dzll_restart_learning;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop button.server-companion-power-off-button,
+        .server-companion-panel:backdrop button.server-companion-power-off-button image {{
+          background: transparent;
+          color: @dzll_error;
+          opacity: 1;
+          filter: none;
+        }}
+
         .server-companion-panel-docked {{
-          border-left: 1px solid {DIVIDER_COLOR};
+          border-left: 1px solid @dzll_divider;
         }}
 
         button.server-companion-power-on-button {{
           background: transparent;
-          color: #bfe84a;
+          color: @dzll_restart_learning;
           padding: 0;
           min-height: 0;
           min-width: 0;
@@ -517,17 +1384,17 @@ def get_app_css(
         button.server-companion-power-on-button:focus,
         button.server-companion-power-on-button:focus-visible {{
           background: transparent;
-          color: #bfe84a;
+          color: @dzll_restart_learning;
           box-shadow: none;
         }}
 
         button.server-companion-power-on-button image {{
-          color: #bfe84a;
+          color: @dzll_restart_learning;
         }}
 
         button.server-companion-power-off-button {{
           background: transparent;
-          color: #ff3333;
+          color: @dzll_error;
           padding: 0;
           min-height: 0;
           min-width: 0;
@@ -541,14 +1408,24 @@ def get_app_css(
         button.server-companion-power-off-button:focus,
         button.server-companion-power-off-button:focus-visible {{
           background: transparent;
-          color: #ff3333;
+          color: @dzll_error;
           border: none;
           box-shadow: none;
           outline: none;
         }}
 
         button.server-companion-power-off-button .server-companion-power-off-icon {{
-          color: #ff3333;
+          color: @dzll_error;
+        }}
+
+        .server-companion-panel button.server-companion-power-on-button,
+        .server-companion-panel button.server-companion-power-on-button image {{
+          color: @dzll_restart_learning;
+        }}
+
+        .dzll-app-root button.server-companion-power-off-button,
+        .dzll-app-root button.server-companion-power-off-button image {{
+          color: @dzll_error;
         }}
 
         .companion-restart-learning {{
@@ -562,7 +1439,7 @@ def get_app_css(
 
         .cell {{
           padding: 0 5px;
-          border-left: 1px solid {DIVIDER_COLOR};
+          border-left: 1px solid @dzll_divider;
         }}
         .cell-first {{ border-left: none; }}
         .cell-noborder-left {{ border-left: none; }}
@@ -572,53 +1449,158 @@ def get_app_css(
           min-width: {SIDEBAR_WIDTH}px;
           max-width: {SIDEBAR_WIDTH}px;
         }}
+
+        .dzll-app-root entry.sidebar-compact-entry {{
+          padding-top: 2px;
+          padding-bottom: 2px;
+          padding-left: 6px;
+          padding-right: 8px;
+          min-height: 0;
+        }}
+
+        .dzll-app-root button.sidebar-mini-toggle,
+        .dzll-app-root button.sidebar-mini-toggle:hover,
+        .dzll-app-root button.sidebar-mini-toggle:active,
+        .dzll-app-root button.sidebar-mini-toggle:checked {{
+          background: transparent;
+          border: 0;
+          box-shadow: none;
+          outline: none;
+          padding: 0;
+          min-height: 0;
+          min-width: 0;
+        }}
+
+        .dzll-app-root box.sidebar-mini-switch {{
+          background: @dzll_surface_control;
+          border: 1px solid @dzll_border;
+          border-radius: 999px;
+          padding: 2px;
+          min-height: 0;
+          min-width: 0;
+        }}
+
+        .dzll-app-root box.sidebar-mini-switch:hover {{
+          background: @dzll_control_hover;
+        }}
+
+        .dzll-app-root box.sidebar-mini-switch.sidebar-mini-switch-on {{
+          background: @dzll_accent;
+          border-color: @dzll_focus;
+        }}
+
+        .dzll-app-root box.sidebar-mini-switch.sidebar-mini-switch-on:hover {{
+          background: @dzll_accent_hover;
+        }}
+
+        .dzll-app-root box.sidebar-mini-switch-knob {{
+          background: @dzll_text_secondary;
+          border-radius: 999px;
+          min-height: 0;
+          min-width: 0;
+        }}
+
+        .dzll-app-root box.sidebar-mini-switch.sidebar-mini-switch-on box.sidebar-mini-switch-knob {{
+          background: @dzll_text_on_accent;
+        }}
         
         /* ---------- Sidebar disclaimer ---------- */
-        .disclaimer {{
-          color: {DISCLAIMER_COLOR};
+        .dzll-app-root .disclaimer,
+        .dzll-app-root .disclaimer:backdrop {{
+          color: @dzll_text_disclaimer;
           font-style: italic;
           font-size: 0.88em;
         }}
         
         /* ---------- Startup dimmer + band ---------- */
         .startup-dim {{
-          background: rgba(0,0,0,0.55);
+          background: @dzll_startup_overlay;
         }}
         .startup-band {{
-          background: rgba(0,0,0,0.75);
-          border-top: 1px solid {DIVIDER_COLOR};
-          border-bottom: 1px solid {DIVIDER_COLOR};
+          background: @dzll_startup_band;
+          border-top: 1px solid @dzll_divider;
+          border-bottom: 1px solid @dzll_divider;
         }}
         .startup-label {{
-          color: #e6e6e6;
+          color: @dzll_text_primary;
           font-weight: 900;
           font-size: 2.2em;
         }}
+
+        .startup-spinner {{
+          min-width: 30px;
+          min-height: 30px;
+        }}
         
         /* ---------- Ping colors ---------- */
-        .ping-good    {{ color: #37c871; }}
-        .ping-greeny  {{ color: #9ad43a; }}
-        .ping-yellow  {{ color: #e3c84a; }}
-        .ping-orange  {{ color: #e19a3a; }}
-        .ping-bad     {{ color: #e04b4b; }}
-        .ping-offline {{ color: #e04b4b; }}
+        .ping-good    {{ color: @dzll_ping_good; }}
+        .ping-greeny  {{ color: @dzll_ping_greeny; }}
+        .ping-yellow  {{ color: @dzll_ping_yellow; }}
+        .ping-orange  {{ color: @dzll_ping_orange; }}
+        .ping-bad     {{ color: @dzll_ping_bad; }}
+        .ping-offline {{ color: @dzll_ping_bad; }}
         
-        .ping-good:backdrop    {{ color: #37c871; }}
-        .ping-greeny:backdrop  {{ color: #9ad43a; }}
-        .ping-yellow:backdrop  {{ color: #e3c84a; }}
-        .ping-orange:backdrop  {{ color: #e19a3a; }}
-        .ping-bad:backdrop     {{ color: #e04b4b; }}
-        .ping-offline:backdrop {{ color: #e04b4b; }}
+        .ping-good:backdrop    {{ color: @dzll_ping_good; }}
+        .ping-greeny:backdrop  {{ color: @dzll_ping_greeny; }}
+        .ping-yellow:backdrop  {{ color: @dzll_ping_yellow; }}
+        .ping-orange:backdrop  {{ color: @dzll_ping_orange; }}
+        .ping-bad:backdrop     {{ color: @dzll_ping_bad; }}
+        .ping-offline:backdrop {{ color: @dzll_ping_bad; }}
+
+        .dzll-app-root .ping-good,
+        .server-companion-panel .ping-good {{ color: @dzll_ping_good; }}
+        .dzll-app-root .ping-greeny,
+        .server-companion-panel .ping-greeny {{ color: @dzll_ping_greeny; }}
+        .dzll-app-root .ping-yellow,
+        .server-companion-panel .ping-yellow {{ color: @dzll_ping_yellow; }}
+        .dzll-app-root .ping-orange,
+        .server-companion-panel .ping-orange {{ color: @dzll_ping_orange; }}
+        .dzll-app-root .ping-bad,
+        .dzll-app-root .ping-offline,
+        .server-companion-panel .ping-bad,
+        .server-companion-panel .ping-offline {{ color: @dzll_ping_bad; }}
+
+        .server-companion-panel .companion-restart-confidence-value.ping-good {{
+          color: @dzll_restart_confidence_high;
+        }}
+        .server-companion-panel .companion-restart-confidence-value.ping-greeny {{
+          color: @dzll_restart_confidence_learning;
+        }}
+        .server-companion-panel:backdrop .companion-restart-confidence-value.ping-good {{
+          color: @dzll_restart_confidence_high;
+          opacity: 1;
+        }}
+        .server-companion-panel:backdrop .companion-restart-confidence-value.ping-greeny {{
+          color: @dzll_restart_confidence_learning;
+          opacity: 1;
+        }}
         
         /* ---------- Settings scrim / panel ---------- */
         .settings-scrim {{
-          background: rgba(0,0,0,0.35);
+          background: @dzll_scrim;
         }}
         
         .settings-panel {{
-          background: rgba(24,24,24,0.97);
-          border: 1px solid {DIVIDER_COLOR};
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_primary;
+          border: 1px solid @dzll_border;
           border-radius: 10px;
+        }}
+
+        .settings-panel .settings-content,
+        .settings-panel .settings-content scrolledwindow,
+        .settings-panel .settings-content viewport {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+        }}
+
+        .settings-panel label {{
+          color: @dzll_text_primary;
+        }}
+
+        .settings-panel .dim-label,
+        .settings-panel .dimmed-entry {{
+          color: @dzll_text_muted;
         }}
         
         .settings-section-title {{
@@ -626,13 +1608,14 @@ def get_app_css(
           font-size: 1.05em;
         }}
 
-        .settings-warning-label {{
-          color: #d89452;
+        .dzll-app-root .settings-warning-label {{
+          color: @dzll_warning;
         }}
         
         /* Settings nav: match panel background + remove right border line */
         .settings-nav {{
-          background: rgba(24,24,24,0.97);
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_primary;
           border-right: 0;
           border: 0;
           box-shadow: none;
@@ -642,7 +1625,8 @@ def get_app_css(
         .settings-nav listview,
         .settings-nav scrolledwindow,
         .settings-nav viewport {{
-          background: rgba(24,24,24,0.97);
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_primary;
           border-right: 0;
           border: 0;
           box-shadow: none;
@@ -650,36 +1634,77 @@ def get_app_css(
         }}
         /* Settings nav row background */
         .settings-nav row {{
-          background: rgba(24,24,24,0.97);
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_secondary;
         }}
         .settings-nav row:hover {{
-          background: rgba(24,24,24,0.97);
+          background: @dzll_control_hover;
+          border-radius: 7px;
+        }}
+        .settings-nav row:hover > * {{
+          background: transparent;
+          border-radius: 7px;
         }}
         .settings-nav row:selected {{
-          background: rgba(115,115,115,1);
+          background: @dzll_accent;
+          color: @dzll_text_on_accent;
+          border-radius: 7px;
+        }}
+        .settings-nav row:selected:hover,
+        .settings-nav row:selected:backdrop {{
+          background: @dzll_accent;
+          color: @dzll_text_on_accent;
+          border-radius: 7px;
+        }}
+        .settings-nav row:selected > * {{
+          background: transparent;
+          border-radius: 7px;
+        }}
+        .settings-nav row:selected label {{
+          color: @dzll_text_on_accent;
         }}
         
         /* ---------- Update card ---------- */
         .update-card {{
-          background: rgba(24,24,24,0.97);
-          border: 1px solid {DIVIDER_COLOR};
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_primary;
+          border: 1px solid @dzll_border;
           border-radius: 10px;
           padding: 50px 20px;
         }}
         .update-title {{
+          color: @dzll_text_primary;
           font-weight: 700;
           font-size: 1.05em;
         }}
+
+        .restart-learning-notice-card.restart-notice-reset .update-title {{
+          color: @dzll_restart_learning;
+        }}
+
+        .restart-learning-notice-card.restart-notice-recovery .update-title {{
+          color: @dzll_warning;
+        }}
+
+        .restart-learning-notice-card.restart-notice-error .update-title {{
+          color: @dzll_error;
+        }}
+
+        .restart-learning-notice-card .dim-label {{
+          color: @dzll_text_muted;
+        }}
         .update-subtitle {{
-          opacity: 0.85;
+          color: @dzll_text_secondary;
+          opacity: 1;
         }}
         
         .issues-emoji {{ font-size: 24px; }}
         
         /* ---------- SteamCMD auth overlay ---------- */
         .steamcmd-auth-card {{
-          background: rgba(24, 24, 24, 0.97);
-          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_primary;
+          border: 1px solid @dzll_border;
           border-radius: 14px;
           padding: 80px;
         }}
@@ -689,7 +1714,7 @@ def get_app_css(
         }}
         .steamcmd-log {{
           font-size: 12px;
-          color: #33ff66;
+          color: @dzll_steamcmd_log;
         }}
         .steamcmd-hr {{
           margin-top: 6px;
@@ -699,17 +1724,20 @@ def get_app_css(
         
         /* ---------- Warning / confirm overlay ---------- */
         .warning-card {{
-          background: rgba(24,24,24,0.97);
+          background: alpha(@dzll_surface_settings, 0.97);
+          color: @dzll_text_primary;
           border-radius: 8px;
-          border: 1px solid rgba(255,255,255,0.10);
+          border: 1px solid @dzll_border;
           font-size: 14px;
           padding: 40px;
         }}
-        .warning-title {{
+        .dzll-app-root .warning-title {{
+          color: @dzll_warning;
           font-weight: 800;
           font-size: 28px;
         }}
-        .warning-icon {{
+        .dzll-app-root .warning-icon {{
+          color: @dzll_warning;
           font-size: 48px;
         }}
         .warning-btn {{
@@ -724,17 +1752,50 @@ def get_app_css(
         
         /* ---------- Mods overlay ---------- */
         .mods-card {{
-          background: #181818;
-          border: 1px solid rgba(255,255,255,0.10);
+          background: @dzll_surface_settings;
+          color: @dzll_text_primary;
+          border: 1px solid @dzll_border;
           border-radius: 4px;
           padding: 56px;
         }}
 
+        .mods-card .mods-header,
+        .mods-card .mods-column-header {{
+          background: @dzll_surface_settings;
+          color: @dzll_text_primary;
+        }}
+
+        .mods-card .mods-search {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
+        }}
+
+        .mods-card .mods-name {{
+          color: @dzll_text_primary;
+        }}
+
+        .mods-card .dim-label {{
+          color: @dzll_text_muted;
+        }}
+
+        .mods-card .mods-operation-status {{
+          color: @dzll_text_secondary;
+        }}
+
+        .warning-card .confirmation-title {{
+          color: @dzll_text_primary;
+        }}
+
+        .warning-card .confirmation-body {{
+          color: @dzll_text_secondary;
+        }}
+
         .mods-card .steam-status-pill {{
-          border: 1px solid rgba(255,255,255,0.18);
+          border: 1px solid @dzll_border;
           border-radius: 999px;
           padding: 6px 8px;
-          background: rgba(255,255,255,0.035);
+          background: @dzll_surface_control;
         }}
 
         .mods-card .steam-status-dot {{
@@ -744,39 +1805,39 @@ def get_app_css(
         .mods-card .steam-status-text {{
           font-size: 0.82em;
           font-weight: 600;
-          color: rgba(255,255,255,0.82);
+          color: @dzll_text_secondary;
         }}
 
         .mods-card .steam-status-online {{
-          color: #4fbf67;
+          color: @dzll_mod_status_online;
         }}
 
         .mods-card .steam-status-offline {{
-          color: #d85b5b;
+          color: @dzll_mod_status_offline;
         }}
 
         .mods-card .steam-status-checking {{
-          color: #d6a94f;
+          color: @dzll_mod_status_checking;
         }}
 
         .mods-card .steam-status-issue {{
-          color: #d9784f;
+          color: @dzll_mod_status_issue;
         }}
 
         .mods-card button.mods-danger-action {{
-          background: rgba(135, 38, 38, 0.52);
-          color: #ffffff;
-          border: 1px solid rgba(255, 120, 120, 0.46);
+          background: alpha(@dzll_destructive, 0.78);
+          color: @dzll_text_on_accent;
+          border: 1px solid alpha(@dzll_destructive_border, 0.62);
         }}
 
         .mods-card button.mods-danger-action:hover {{
-          background: rgba(165, 48, 48, 0.68);
-          border-color: rgba(255, 145, 145, 0.68);
+          background: alpha(@dzll_destructive_hover, 0.88);
+          border-color: @dzll_destructive_border;
         }}
 
         .mods-card button.mods-danger-action:active {{
-          background: rgba(185, 55, 55, 0.78);
-          border-color: rgba(255, 160, 160, 0.78);
+          background: @dzll_destructive_pressed;
+          border-color: @dzll_destructive_border;
         }}
 
         .mods-card button.mods-danger-action:disabled {{
@@ -784,41 +1845,93 @@ def get_app_css(
         }}
 
         .mods-card button.mods-stop-action {{
-          background: rgba(70, 140, 255, 0.18);
-          color: #dfeaff;
-          border: 1px solid rgba(110, 170, 255, 0.50);
+          background: alpha(@dzll_stop, 0.18);
+          color: @dzll_text_primary;
+          border: 1px solid alpha(@dzll_stop, 0.72);
         }}
 
         .mods-card button.mods-stop-action:hover {{
-          background: rgba(70, 140, 255, 0.28);
-          border-color: rgba(140, 190, 255, 0.70);
+          background: alpha(@dzll_stop, 0.28);
+          border-color: @dzll_link_hover;
         }}
 
         .mods-card button.mods-stop-action:active {{
-          background: rgba(70, 140, 255, 0.36);
-          border-color: rgba(140, 190, 255, 0.78);
+          background: alpha(@dzll_stop, 0.36);
+          border-color: @dzll_link_hover;
+        }}
+
+        .mods-card button:disabled,
+        .mods-card button:disabled:hover,
+        .mods-card button:disabled:active,
+        .mods-card button.mods-danger-action:disabled,
+        .mods-card button.mods-danger-action:disabled:hover,
+        .mods-card button.mods-stop-action:disabled,
+        .mods-card button.mods-stop-action:disabled:hover {{
+          background: @dzll_control_disabled;
+          background-image: none;
+          color: @dzll_text_disabled;
+          border-color: @dzll_divider;
+          box-shadow: none;
+          opacity: 1;
+        }}
+
+        .mods-card button:disabled label,
+        .mods-card button:disabled image {{
+          color: @dzll_text_disabled;
+          opacity: 1;
         }}
 
         .mods-card .mods-clear-selection-link {{
-          color: #6ab0ff;
+          color: @dzll_link;
           font-size: 0.9em;
           font-weight: 600;
         }}
 
         .mods-card .mods-clear-selection-link:hover {{
-          color: #9dccff;
+          color: @dzll_link_hover;
           text-decoration: underline;
         }}
 
         .mods-card .mods-column-separator {{
-          background: rgba(255,255,255,0.10);
+          background: @dzll_divider;
         }}
         
-        .mod-workshop-link-btn image {{ color: #2f9bff; }}
-        .mod-workshop-link-btn:backdrop image {{ color: #2f9bff; }}
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn,
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn image {{
+          background: transparent;
+          background-image: none;
+          color: @dzll_link;
+        }}
+
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:hover,
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:hover image,
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:active,
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:active image {{
+          background: transparent;
+          background-image: none;
+          color: @dzll_link_hover;
+        }}
+
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:backdrop,
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:backdrop image {{
+          background: transparent;
+          background-image: none;
+          color: @dzll_link;
+          -gtk-icon-filter: none;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:disabled,
+        .dzll-app-root .mods-card button.flat.mod-workshop-link-btn:disabled image {{
+          background: transparent;
+          background-image: none;
+          color: @dzll_text_disabled;
+          opacity: 1;
+        }}
 
         .mods-empty-state {{
-          color: rgba(255,255,255,0.70);
+          color: @dzll_text_muted;
           font-size: 15px;
           font-weight: 500;
         }}
@@ -830,21 +1943,35 @@ def get_app_css(
         .mods-card listview {{
           background: transparent;
         }}
+
+        .mods-card .mods-list,
+        .mods-card .mods-list viewport,
+        .mods-card .mods-list list,
+        .mods-card .mods-list listview {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+        }}
         
         /* Force each row background to match the card */
         .mods-card row,
         .mods-card row > * {{
-          background: #181818;
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+        }}
+
+        .dzll-app-root .mods-card row.mods-row:hover,
+        .dzll-app-root .mods-card row.mods-row:hover > * {{
+          background: @dzll_surface_content;
         }}
         
         /* Keep the separator line visible */
         .mods-card row separator {{
-          background: rgba(255,255,255,0.15);
+          background: @dzll_divider;
         }}
         
         .mods-card .mods-list {{
-          background: #181818;
-          border: 1px solid rgba(255,255,255,0.20);
+          background: @dzll_surface_content;
+          border: 1px solid @dzll_border;
           border-radius: 4px;
         }}
         
@@ -852,7 +1979,7 @@ def get_app_css(
         .mods-card .mods-list viewport,
         .mods-card .mods-list list,
         .mods-card .mods-list listview {{
-          background: transparent;
+          background: @dzll_surface_content;
         }}
         """.encode("utf-8")
 

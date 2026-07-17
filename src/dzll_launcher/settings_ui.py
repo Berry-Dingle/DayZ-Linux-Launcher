@@ -85,6 +85,7 @@ class SettingsUI:
         body.set_vexpand(True)
 
         self._win.settings_stack = Gtk.Stack()
+        self._win.settings_stack.add_css_class("settings-content")
         self._win.settings_stack.set_vexpand(True)
         self._win.settings_stack.set_hexpand(True)
         self._win.settings_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
@@ -476,6 +477,7 @@ class SettingsUI:
 
         model = Gtk.StringList.new([label for _val, label in options])
         dd = Gtk.DropDown.new(model, None)
+        dd.add_css_class("dzll-dropdown")
         attach_pointer_cursor(dd)
 
         cur = str(self._win.settings.get(key, default_val) or default_val)
@@ -577,6 +579,10 @@ class SettingsUI:
         attach_pointer_cursor(update_db_btn)
         update_db_btn.connect("clicked", lambda _b: self._win._manual_update_server_database())
         box.append(update_db_btn)
+
+        self._general_action_button_size_group = Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL)
+        self._general_action_button_size_group.add_widget(btn)
+        self._general_action_button_size_group.add_widget(update_db_btn)
         return box
 
     def _settings_page_launch(self) -> Gtk.Widget:

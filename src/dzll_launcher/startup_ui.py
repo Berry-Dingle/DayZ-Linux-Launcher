@@ -47,6 +47,7 @@ def build_startup_overlay(window, overlay: Gtk.Overlay) -> Gtk.Widget:
     band_inner.set_hexpand(False)
 
     window.startup_spinner = Gtk.Spinner()
+    window.startup_spinner.add_css_class("startup-spinner")
     window.startup_spinner.set_spinning(True)
     band_inner.append(window.startup_spinner)
 

@@ -60,6 +60,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.add_css_class("server-companion-panel-docked")
 
         inner = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        inner.add_css_class("server-companion-content")
         inner.set_margin_top(12)
         inner.set_margin_bottom(12)
         inner.set_margin_start(12)
@@ -69,6 +70,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.append(inner)
 
         heading_row = Gtk.CenterBox()
+        heading_row.add_css_class("server-companion-header")
         heading_row.set_hexpand(True)
 
         heading_label = Gtk.Label(label="DZLL Server Companion")
@@ -136,6 +138,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.server_box.append(self.name_label)
 
         self.server_details_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        self.server_details_box.add_css_class("companion-details")
         self.server_box.append(self.server_details_box)
 
         self.map_label = Gtk.Label()
@@ -146,10 +149,12 @@ class ServerCompanionPanel(Gtk.Box):
         self.server_details_box.append(status_row)
 
         self.status_label = Gtk.Label(label="Status:")
+        self.status_label.add_css_class("companion-detail-label")
         self.status_label.set_xalign(0.0)
         status_row.append(self.status_label)
 
         self.status_value_label = Gtk.Label()
+        self.status_value_label.add_css_class("companion-detail-value")
         self.status_value_label.set_xalign(0.0)
         status_row.append(self.status_value_label)
 
@@ -157,10 +162,12 @@ class ServerCompanionPanel(Gtk.Box):
         self.server_details_box.append(ping_row)
 
         self.ping_label = Gtk.Label(label="Ping:")
+        self.ping_label.add_css_class("companion-detail-label")
         self.ping_label.set_xalign(0.0)
         ping_row.append(self.ping_label)
 
         self.ping_value_label = Gtk.Label()
+        self.ping_value_label.add_css_class("companion-detail-value")
         self.ping_value_label.set_xalign(0.0)
         ping_row.append(self.ping_value_label)
 
@@ -169,6 +176,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.server_details_box.append(self.players_label)
 
         self.queue_label = Gtk.Label()
+        self.queue_label.add_css_class("companion-queue")
         self.queue_label.set_xalign(0.0)
         self.queue_label.set_visible(False)
         self.server_details_box.append(self.queue_label)
@@ -228,6 +236,7 @@ class ServerCompanionPanel(Gtk.Box):
             self.restart_confidence_label,
             self.restart_confidence_value_label,
         ) = append_restart_learning_row("Confidence:")
+        self.restart_confidence_value_label.add_css_class("companion-restart-confidence-value")
 
         self.server_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
@@ -265,8 +274,9 @@ class ServerCompanionPanel(Gtk.Box):
         self.alert_sound_button.set_child(self.alert_sound_label)
 
         self.alert_sound_popover = Gtk.Popover()
+        self.alert_sound_popover.add_css_class("companion-sound-popover")
         sound_menu = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        sound_menu.add_css_class("companion-sound-popover")
+        sound_menu.add_css_class("companion-sound-popover-content")
         for value, label in ALERT_SOUND_OPTIONS:
             option_btn = Gtk.Button(label=label)
             option_btn.add_css_class("flat")
@@ -349,18 +359,21 @@ class ServerCompanionPanel(Gtk.Box):
         self.server_box.append(actions)
 
         self.play_pause_btn = Gtk.Button(label="Pause")
+        self.play_pause_btn.add_css_class("companion-neutral-action")
         self.play_pause_btn.set_size_request(80, 34)
         self.play_pause_btn.set_sensitive(False)
         self.play_pause_btn.connect("clicked", self._on_play_pause_clicked)
         actions.append(self.play_pause_btn)
 
         self.join_btn = Gtk.Button(label="Join")
+        self.join_btn.add_css_class("suggested-action")
         self.join_btn.set_size_request(80, 34)
         self.join_btn.set_sensitive(False)
         self.join_btn.connect("clicked", self._on_join_clicked)
         actions.append(self.join_btn)
 
         clear_btn = Gtk.Button(label="CLEAR")
+        clear_btn.add_css_class("companion-neutral-action")
         clear_btn.set_size_request(80, 34)
         clear_btn.connect("clicked", self._on_clear_clicked)
         actions.append(clear_btn)

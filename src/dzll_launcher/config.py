@@ -127,11 +127,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(BASE_DIR, "images")
 
 DISCLAIMER_TEXT = (
-    "DayZ® is a registered trademark of\n"
-    "Bohemia Interactive.\n"
-    "DZLL is an unofficial community-made\n"
-    "launcher and is not affiliated with or\n"
-    "endorsed by Bohemia Interactive."
+    "DayZ® is a registered trademark of Bohemia Interactive.\n"
+    "DZLL is an unofficial community-made launcher and is not affiliated with or endorsed by Bohemia Interactive."
 )
 
 # Test server identification

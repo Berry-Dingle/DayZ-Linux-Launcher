@@ -112,6 +112,7 @@ def connect_mutually_exclusive_checkbuttons(cb_a, cb_b, on_change):
 
 def build_search_area(window) -> Gtk.Widget:
     search_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+    search_frame.add_css_class("dzll-search-area")
     search_frame.set_hexpand(True)
     search_frame.set_vexpand(False)
 
@@ -946,6 +947,7 @@ def build_search_area(window) -> Gtk.Widget:
 
 def build_sidebar_toolbar(window) -> Gtk.Widget:
     toolbar_cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+    toolbar_cell.add_css_class("dzll-sidebar-toolbar")
     toolbar_cell.set_size_request(SIDEBAR_WIDTH, -1)
     toolbar_cell.set_hexpand(False)
     toolbar_cell.set_halign(Gtk.Align.START)
@@ -1090,6 +1092,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     window.map_model = Gtk.StringList.new(["All Maps"])
     window.map_dropdown = Gtk.DropDown.new(window.map_model, None)
+    window.map_dropdown.add_css_class("dzll-dropdown")
     window.map_dropdown.connect("notify::selected", lambda *_: timed_filter_callback("map", "map"))
     sidebar.append(window.map_dropdown)
 
@@ -1131,75 +1134,6 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     if not hasattr(window, "_sidebar_settings_widgets"):
         window._sidebar_settings_widgets = {}
-
-    if not getattr(window, "_sidebar_compact_entry_css_loaded", False):
-        provider = Gtk.CssProvider()
-        provider.load_from_data(
-            b"""
-            entry.sidebar-compact-entry {
-                padding-top: 2px;
-                padding-bottom: 2px;
-                padding-left: 6px;
-                padding-right: 8px;
-                min-height: 0;
-            }
-
-            button.sidebar-mini-toggle,
-            button.sidebar-mini-toggle:hover,
-            button.sidebar-mini-toggle:active,
-            button.sidebar-mini-toggle:checked {
-                background: transparent;
-                border: 0;
-                box-shadow: none;
-                outline: none;
-                padding: 0;
-                min-height: 0;
-                min-width: 0;
-            }
-
-            box.sidebar-mini-switch {
-                background: #2f3438;
-                border: 1px solid alpha(@theme_text_color, 0.22);
-                border-radius: 999px;
-                padding: 2px;
-                min-height: 0;
-                min-width: 0;
-            }
-
-            box.sidebar-mini-switch:hover {
-                background: #3a4045;
-            }
-
-            box.sidebar-mini-switch.sidebar-mini-switch-on {
-                background: #0d686c;
-                border-color: #79aeb0;
-            }
-
-            box.sidebar-mini-switch.sidebar-mini-switch-on:hover {
-                background: #118084;
-            }
-
-            box.sidebar-mini-switch-knob {
-                background: alpha(@theme_text_color, 0.72);
-                border-radius: 999px;
-                min-height: 0;
-                min-width: 0;
-            }
-
-            box.sidebar-mini-switch.sidebar-mini-switch-on box.sidebar-mini-switch-knob {
-                background: #ffffff;
-            }
-            """
-        )
-        display = Gdk.Display.get_default()
-        if display is not None:
-            Gtk.StyleContext.add_provider_for_display(
-                display,
-                provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
-            )
-            window._sidebar_compact_entry_css_provider = provider
-            window._sidebar_compact_entry_css_loaded = True
 
     def entry_has_focus(entry):
         try:
@@ -1461,10 +1395,12 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     disclaimer = Gtk.Label(label=DISCLAIMER_TEXT)
     disclaimer.set_wrap(True)
-    disclaimer.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+    disclaimer.set_wrap_mode(Pango.WrapMode.WORD)
     disclaimer.set_xalign(0)
     disclaimer.set_halign(Gtk.Align.FILL)
-    disclaimer.set_hexpand(True)
+    disclaimer.set_hexpand(False)
+    disclaimer.set_width_chars(1)
+    disclaimer.set_max_width_chars(1)
     effective = SIDEBAR_WIDTH - (SIDEBAR_INNER_PADDING * 2)
     disclaimer.set_size_request(effective, -1)
     disclaimer.add_css_class("disclaimer")

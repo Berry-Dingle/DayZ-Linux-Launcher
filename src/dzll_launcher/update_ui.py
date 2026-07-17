@@ -103,6 +103,7 @@ class UpdateUI:
         btn_row.set_valign(Gtk.Align.CENTER)
 
         dl_btn = Gtk.Button(label="UPDATE")
+        dl_btn.add_css_class("suggested-action")
         dl_btn.set_can_focus(False)
         attach_pointer_cursor(dl_btn)
         dl_btn.connect("clicked", self.open_update_url)

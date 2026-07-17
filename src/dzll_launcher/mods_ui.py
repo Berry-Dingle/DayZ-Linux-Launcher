@@ -429,9 +429,11 @@ class ModsManagerOverlay:
         self.confirm_title.set_wrap(True)
         self.confirm_title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         self.confirm_title.add_css_class("steamcmd-heading")
+        self.confirm_title.add_css_class("confirmation-title")
         self.confirm_box.append(self.confirm_title)
 
         self.confirm_text = Gtk.Label(label="")
+        self.confirm_text.add_css_class("confirmation-body")
         self.confirm_text.set_xalign(0.0)
         self.confirm_text.set_wrap(True)
         self.confirm_text.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
@@ -1051,6 +1053,7 @@ class ModsManagerOverlay:
 
     def _build(self):
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header.add_css_class("mods-header")
         header.set_hexpand(True)
 
         heading = Gtk.Label(label="Manage Installed Mods")
@@ -1089,6 +1092,7 @@ class ModsManagerOverlay:
         self.card.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
         self.search = Gtk.SearchEntry()
+        self.search.add_css_class("mods-search")
         self.search.set_placeholder_text("Search mods by name or ID…")
         self.search.set_hexpand(True)
         self.card.append(self.search)
@@ -1165,6 +1169,7 @@ class ModsManagerOverlay:
         selection_status_row.append(self.clear_selection_link)
 
         self.operation_status_label = Gtk.Label(label="")
+        self.operation_status_label.add_css_class("mods-operation-status")
         self.operation_status_label.set_xalign(0.0)
         self.operation_status_label.set_halign(Gtk.Align.FILL)
         self.operation_status_label.set_hexpand(True)
@@ -1698,6 +1703,7 @@ class ModsManagerOverlay:
         workshop_status: str | None = None,
     ) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
+        row.add_css_class("mods-row")
 
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         outer.set_margin_top(6)
@@ -1724,6 +1730,7 @@ class ModsManagerOverlay:
         name_box.set_hexpand(True)
 
         lbl = Gtk.Label(label=str(mod_name or clean_display_mod_name("", mod_id)))
+        lbl.add_css_class("mods-name")
         lbl.set_xalign(0.0)
         lbl.set_hexpand(True)
         lbl.set_ellipsize(Pango.EllipsizeMode.END)

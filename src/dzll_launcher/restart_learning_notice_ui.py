@@ -18,6 +18,7 @@ class RestartLearningNoticeUI:
         self.body_label = None
         self.path_label = None
         self.copy_button = None
+        self.card = None
 
     def build(self, overlay: Gtk.Overlay) -> Gtk.Revealer:
         self.scrim = Gtk.Box()
@@ -42,6 +43,8 @@ class RestartLearningNoticeUI:
     def _build_card(self):
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
         card.add_css_class("update-card")
+        card.add_css_class("restart-learning-notice-card")
+        self.card = card
         card.set_size_request(620, -1)
         card.set_margin_start(10)
         card.set_margin_end(10)
@@ -86,6 +89,20 @@ class RestartLearningNoticeUI:
     def show(self, notice: RuntimeNotice) -> bool:
         if not isinstance(notice, RuntimeNotice):
             return False
+        if self.card is not None:
+            for css_class in (
+                "restart-notice-reset",
+                "restart-notice-recovery",
+                "restart-notice-error",
+            ):
+                self.card.remove_css_class(css_class)
+            kind = str(notice.kind or "")
+            if kind == "legacy_reset":
+                self.card.add_css_class("restart-notice-reset")
+            elif kind == "corrupt_state_recovered":
+                self.card.add_css_class("restart-notice-recovery")
+            elif kind == "initialization_failed":
+                self.card.add_css_class("restart-notice-error")
         self.title_label.set_text(notice.title)
         self.body_label.set_text(notice.body)
         path = str(notice.backup_path or "")

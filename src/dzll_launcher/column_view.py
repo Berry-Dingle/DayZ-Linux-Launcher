@@ -620,12 +620,14 @@ def _make_players_factory():
         content.set_hexpand(True)
 
         players_label = Gtk.Label(xalign=1.0)
+        players_label.add_css_class("dzll-players")
         players_label.set_halign(Gtk.Align.END)
         players_label.set_single_line_mode(True)
         players_label.set_width_chars(7)
         players_label.set_max_width_chars(7)
 
         queue_label = Gtk.Label(xalign=1.0)
+        queue_label.add_css_class("dzll-queue")
         queue_label.set_halign(Gtk.Align.END)
         queue_label.set_single_line_mode(True)
         queue_label.set_width_chars(5)
@@ -1248,11 +1250,13 @@ def _make_action_factory(
         if active:
             button.add_css_class(active_css_class)
             if isinstance(image, Gtk.Image):
+                image.remove_css_class("monitor-eye-idle")
                 image.add_css_class("monitor-eye-active")
         else:
             button.remove_css_class(active_css_class)
             if isinstance(image, Gtk.Image):
                 image.remove_css_class("monitor-eye-active")
+                image.add_css_class("monitor-eye-idle")
         if tooltip_text or active_tooltip_text:
             button.set_tooltip_text(active_tooltip_text if active and active_tooltip_text else tooltip_text)
 
@@ -1438,6 +1442,7 @@ def build_server_column_view(
         _make_action_factory(
             "media-playback-start-symbolic",
             on_join,
+            "dzll-join-button",
             margin_end=4,
             tooltip_text="Join this server",
         ),
