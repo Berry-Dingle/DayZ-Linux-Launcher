@@ -1753,6 +1753,7 @@ class ModsManagerOverlay:
             workshop_tooltip = "Steam must be running and logged in so DZLL can check this mod."
         workshop_lbl.set_tooltip_text(workshop_tooltip)
         workshop_lbl.add_css_class("dim-label")
+        workshop_lbl.add_css_class("mods-metadata")
         line.append(workshop_lbl)
 
         line.append(self._make_column_separator())
@@ -1764,6 +1765,7 @@ class ModsManagerOverlay:
         id_lbl.set_xalign(0.0)
         id_lbl.set_width_chars(MOD_ID_COLUMN_CHARS)
         id_lbl.add_css_class("dim-label")
+        id_lbl.add_css_class("mods-metadata")
         id_box.append(id_lbl)
         id_box.append(self._make_workshop_link_button(mod_id))
         line.append(id_box)
@@ -1774,6 +1776,7 @@ class ModsManagerOverlay:
         size_lbl.set_xalign(1.0)
         size_lbl.set_width_chars(MOD_SIZE_COLUMN_CHARS)
         size_lbl.add_css_class("dim-label")
+        size_lbl.add_css_class("mods-metadata")
         line.append(size_lbl)
 
         line.append(self._make_column_separator())
@@ -1782,6 +1785,7 @@ class ModsManagerOverlay:
         used_lbl.set_xalign(0.0)
         used_lbl.set_width_chars(MOD_LAST_USED_COLUMN_CHARS)
         used_lbl.add_css_class("dim-label")
+        used_lbl.add_css_class("mods-metadata")
         line.append(used_lbl)
 
         outer.append(line)

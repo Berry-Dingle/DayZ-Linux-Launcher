@@ -21,6 +21,7 @@ def test_required_semantic_palette_tokens_are_defined():
         "dzll_text_primary": "#f1f3f4",
         "dzll_text_secondary": "#c4c9cd",
         "dzll_text_muted": "#8e979e",
+        "dzll_mod_metadata": "#e2e5e7",
         "dzll_text_disabled": "#858d94",
         "dzll_focus": "#79aeb0",
         "dzll_border": "#565f66",
@@ -386,6 +387,27 @@ def test_mod_manager_workshop_link_states_target_symbolic_image():
     assert "-gtk-icon-filter: none;" in backdrop
     assert "color: @dzll_text_disabled;" in disabled
     assert ".dzll-app-root button.flat.mod-workshop-link-btn" not in css
+
+
+def test_mod_manager_metadata_is_brighter_without_changing_primary_or_link_roles():
+    css = app_css()
+    source = (ROOT / "src/dzll_launcher/mods_ui.py").read_text(encoding="utf-8")
+    metadata = css.split(".mods-card .mods-row .mods-metadata {", 1)[1].split("}", 1)[0]
+    disabled = css.split(
+        ".mods-card .mods-row:disabled .mods-metadata,", 1
+    )[1].split("}", 1)[0]
+    names = css.split(".mods-card .mods-name {", 1)[1].split("}", 1)[0]
+    workshop_link = css.split(
+        ".dzll-app-root .mods-card button.flat.mod-workshop-link-btn,", 1
+    )[1].split("}", 1)[0]
+
+    assert "@define-color dzll_text_muted #8e979e;" in css
+    assert "@define-color dzll_mod_metadata #e2e5e7;" in css
+    assert "color: @dzll_mod_metadata;" in metadata
+    assert "color: @dzll_text_disabled;" in disabled
+    assert source.count('add_css_class("mods-metadata")') == 4
+    assert "color: @dzll_text_primary;" in names
+    assert "color: @dzll_link;" in workshop_link
 
 
 def test_server_browser_column_header_hover_and_press_match_normal_paint():

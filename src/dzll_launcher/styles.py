@@ -25,6 +25,7 @@ def get_app_css(
         @define-color dzll_text_primary #f1f3f4;
         @define-color dzll_text_secondary #c4c9cd;
         @define-color dzll_text_muted #8e979e;
+        @define-color dzll_mod_metadata #e2e5e7;
         @define-color dzll_text_disabled #858d94;
         @define-color dzll_text_on_accent #ffffff;
         @define-color dzll_text_disclaimer #969da3;
@@ -1777,6 +1778,15 @@ def get_app_css(
 
         .mods-card .dim-label {{
           color: @dzll_text_muted;
+        }}
+
+        .mods-card .mods-row .mods-metadata {{
+          color: @dzll_mod_metadata;
+        }}
+
+        .mods-card .mods-row:disabled .mods-metadata,
+        .mods-card .mods-row .mods-metadata:disabled {{
+          color: @dzll_text_disabled;
         }}
 
         .mods-card .mods-operation-status {{
