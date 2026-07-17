@@ -101,7 +101,7 @@ from .settings import (
     autodetect_workshop_dir,
 )
 
-from .styles import get_app_css
+from .styles import add_platform_css_classes, get_app_css
 from .update_ui import UpdateUI
 from .restart_learning_notice_ui import RestartLearningNoticeUI
 from .startup_presentation import StartupPresentationCoordinator
@@ -181,6 +181,7 @@ INCREMENTAL_MODELS_ENABLED = not INCREMENTAL_MODELS_DISABLED
 PERF_STALL_INTERVAL_MS = 250
 PERF_STALL_LATE_MS = 250
 BROWSER_LIVE_SCROLL_PAUSE_SECONDS = 1.0
+SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS = 200
 
 
 def enable_incremental_model_if_available(model, label: str) -> None:
@@ -619,6 +620,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         overlay = Gtk.Overlay()
         overlay.add_css_class("dzll-app-root")
         self._main_overlay = overlay
+        self._ubuntu_geometry = add_platform_css_classes(overlay)
         self.set_child(overlay)
 
         self.content_root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -974,6 +976,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._join_server_for_obj,
             self._on_column_view_sort_header_clicked,
             self._is_server_companion_monitoring_obj,
+            ubuntu_geometry=self._ubuntu_geometry,
         )
         refresh_column_view_sort_header_handlers(self.list_view)
         if PERF_LOG_ENABLED:
@@ -1026,7 +1029,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.server_companion_show_btn.set_size_request(28, 28)
         self.server_companion_show_btn.set_halign(Gtk.Align.END)
         self.server_companion_show_btn.set_valign(Gtk.Align.START)
-        self.server_companion_show_btn.set_margin_top(4)
+        self.server_companion_show_btn.set_margin_top(5 if self._ubuntu_geometry else 4)
         self.server_companion_show_btn.set_margin_end(12)
         self.server_companion_show_btn.connect("clicked", self._on_server_companion_title_button_clicked)
         attach_pointer_cursor(self.server_companion_show_btn)
@@ -1062,6 +1065,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_undocked_window = None
         self._server_companion_undocked_close_handler_id = 0
         self._server_companion_reparenting = False
+        self._server_companion_undock_shrink_source_id = 0
         self._server_companion_restart_alert_enabled = bool(
             self.settings.get("server_companion_restart_alert_enabled", False)
         )
@@ -2310,6 +2314,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._restore_server_companion_if_enabled()
             self._start_server_companion_polling()
         else:
+            self._cancel_server_companion_post_undock_shrink()
             if not bool(getattr(self, "_server_companion_docked", True)):
                 self._destroy_server_companion_undocked_window(reattach=True)
             self.server_companion_revealer.set_reveal_child(False)
@@ -2521,9 +2526,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._server_companion_docked = False
             panel.set_docked(False)
             self._update_server_companion_undocked_size()
-            self._collapse_server_companion_dock_space()
             win.present()
             self._debug_server_companion_dock("present called")
+            self._schedule_server_companion_post_undock_shrink()
             self._start_server_companion_polling()
         except Exception as exc:
             self._debug_server_companion_dock(f"undock exception/fallback: {exc!r}")
@@ -2534,6 +2539,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _dock_server_companion(self):
         self._debug_server_companion_dock("docking/reattaching")
+        self._cancel_server_companion_post_undock_shrink()
         if bool(getattr(self, "_server_companion_docked", True)):
             self._debug_server_companion_dock("dock skipped: already docked")
             self._refresh_server_companion_power_controls()
@@ -2564,6 +2570,37 @@ class DZLLWindow(Gtk.ApplicationWindow):
         finally:
             self._server_companion_reparenting = False
             self._refresh_server_companion_power_controls()
+
+    def _cancel_server_companion_post_undock_shrink(self) -> None:
+        source_id = int(getattr(self, "_server_companion_undock_shrink_source_id", 0) or 0)
+        self._server_companion_undock_shrink_source_id = 0
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+
+    def _schedule_server_companion_post_undock_shrink(self) -> None:
+        if int(getattr(self, "_server_companion_undock_shrink_source_id", 0) or 0):
+            return
+        try:
+            self._server_companion_undock_shrink_source_id = GLib.timeout_add(
+                SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS,
+                self._apply_server_companion_post_undock_shrink,
+            )
+        except Exception:
+            self._server_companion_undock_shrink_source_id = 0
+
+    def _apply_server_companion_post_undock_shrink(self) -> bool:
+        self._server_companion_undock_shrink_source_id = 0
+        if bool(getattr(self, "_server_companion_docked", True)):
+            return False
+        if not bool(getattr(self, "settings", {}).get("show_server_companion", False)):
+            return False
+        if getattr(self, "_server_companion_undocked_window", None) is None:
+            return False
+        self._collapse_server_companion_dock_space()
+        return False
 
     def _collapse_server_companion_dock_space(self):
         try:
@@ -7134,6 +7171,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
             save_favorites(self.favorites)
         except Exception:
             pass
+        pin_favorites = bool(self.settings.get("pin_favorite_servers", False))
+        favorites_filter = False
+        try:
+            favorites_filter = bool(self.cb_show_fav.get_active())
+        except Exception:
+            favorites_filter = False
+
+        # The star cell already observes notify::fav. Rebuild only when the
+        # explicit pinning or favourites-only filter semantics require it.
+        if not pin_favorites and not favorites_filter:
+            return
+
         self._on_filter_changed(reason="favourites")
         if scroll_value is not None:
             def restore_favourite_scroll(value=scroll_value):

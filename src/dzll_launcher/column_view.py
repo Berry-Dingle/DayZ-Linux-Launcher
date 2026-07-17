@@ -602,7 +602,7 @@ def _bind_players_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
     queue_label.set_text(queue_text or "--")
 
 
-def _make_players_factory():
+def _make_players_factory(*, ubuntu_geometry: bool = False):
     factory = Gtk.SignalListItemFactory()
     notify_props = ("players", "max_players", "queue")
 
@@ -617,7 +617,7 @@ def _make_players_factory():
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         content.set_halign(Gtk.Align.CENTER)
         content.set_valign(Gtk.Align.CENTER)
-        content.set_hexpand(True)
+        content.set_hexpand(not ubuntu_geometry)
 
         players_label = Gtk.Label(xalign=1.0)
         players_label.add_css_class("dzll-players")
@@ -636,7 +636,16 @@ def _make_players_factory():
 
         content.append(players_label)
         content.append(queue_label)
-        outer.append(content)
+        if ubuntu_geometry:
+            start_spacer = Gtk.Box()
+            start_spacer.set_hexpand(True)
+            end_spacer = Gtk.Box()
+            end_spacer.set_hexpand(True)
+            outer.append(start_spacer)
+            outer.append(content)
+            outer.append(end_spacer)
+        else:
+            outer.append(content)
         outer._dzll_players_label = players_label
         outer._dzll_queue_label = queue_label
         list_item.set_child(outer)
@@ -1348,6 +1357,7 @@ def build_server_column_view(
     on_join,
     on_header_sort=None,
     is_monitored=None,
+    ubuntu_geometry: bool = False,
 ) -> tuple[Gtk.ColumnView, dict[str, bool]]:
     view = Gtk.ColumnView.new(selection_model)
     view._dzll_on_sort_header_clicked = on_header_sort
@@ -1408,7 +1418,7 @@ def build_server_column_view(
     _append_column(
         view,
         "PLAYERS",
-        _make_players_factory(),
+        _make_players_factory(ubuntu_geometry=ubuntu_geometry),
         _META_WIDTHS["players"],
     )
     _append_column(

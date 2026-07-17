@@ -431,6 +431,39 @@ def test_server_browser_column_header_hover_and_press_match_normal_paint():
     assert ".mods-column-header" not in borders
 
 
+def test_server_browser_column_geometry_is_explicit_and_state_stable():
+    css = app_css()
+    header = css.split(
+        ".dzll-platform-ubuntu columnview.dzll-column-view > header > button {", 1
+    )[1].split("}", 1)[0]
+    dividers = css.split(
+        ".dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7),", 1
+    )[1].split("}", 1)[0]
+    cells = css.split(
+        ".dzll-platform-ubuntu columnview.dzll-column-view > listview > row > cell {", 1
+    )[1].split("}", 1)[0]
+
+    assert "min-height: 38px;" in header
+    assert "button:nth-child(-n+7):hover" in dividers
+    assert "button:nth-child(-n+7):active" in dividers
+    assert "button:nth-child(-n+7):checked" in dividers
+    assert "border-right: 1px solid @dzll_divider;" in dividers
+    assert "padding-left: 0;" in cells
+    assert "padding-right: 0;" in cells
+
+    source = (ROOT / "src/dzll_launcher/column_view.py").read_text(encoding="utf-8")
+    players_setup = source.split("def _make_players_factory(", 1)[1].split(
+        "def bind(_factory, list_item):", 1
+    )[0]
+    assert "content.set_halign(Gtk.Align.CENTER)" in players_setup
+    assert "content.set_hexpand(not ubuntu_geometry)" in players_setup
+    assert "if ubuntu_geometry:" in players_setup
+    assert "else:\n            outer.append(content)" in players_setup
+    assert "start_spacer.set_hexpand(True)" in players_setup
+    assert "end_spacer.set_hexpand(True)" in players_setup
+    assert "outer.append(start_spacer)" in players_setup
+    assert "outer.append(end_spacer)" in players_setup
+
 def test_server_browser_row_hover_matches_normal_without_targeting_controls():
     css = app_css()
     hover = css.split(

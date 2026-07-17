@@ -7,6 +7,29 @@
 from __future__ import annotations
 
 
+def is_ubuntu_platform(os_release_path: str = "/etc/os-release") -> bool:
+    try:
+        with open(os_release_path, "r", encoding="utf-8") as handle:
+            values = {}
+            for raw_line in handle:
+                key, separator, raw_value = raw_line.partition("=")
+                if separator:
+                    values[key.strip()] = raw_value.strip().strip('"').strip("'")
+    except OSError:
+        return False
+
+    distro_id = values.get("ID", "").casefold()
+    distro_like = values.get("ID_LIKE", "").casefold().split()
+    return distro_id == "ubuntu" or "ubuntu" in distro_like
+
+
+def add_platform_css_classes(widget, os_release_path: str = "/etc/os-release") -> bool:
+    ubuntu = is_ubuntu_platform(os_release_path)
+    if ubuntu:
+        widget.add_css_class("dzll-platform-ubuntu")
+    return ubuntu
+
+
 def get_app_css(
     DIVIDER_COLOR: str,
     SIDEBAR_WIDTH: int,
@@ -508,6 +531,24 @@ def get_app_css(
 
         .dzll-app-root .dzll-browser-surface scrollbar.vertical {{
           margin-top: 3px;
+        }}
+
+        .dzll-platform-ubuntu .dzll-browser-surface scrollbar.vertical > range > trough > slider,
+        .dzll-platform-ubuntu .mods-card .mods-list scrollbar.vertical > range > trough > slider {{
+          margin-top: 2px;
+          margin-bottom: 2px;
+        }}
+
+        .dzll-platform-ubuntu .dzll-browser-surface scrollbar.vertical.overlay-indicator.hovering > range > trough > slider,
+        .dzll-platform-ubuntu .dzll-browser-surface scrollbar.vertical.overlay-indicator.dragging > range > trough > slider,
+        .dzll-platform-ubuntu .dzll-browser-surface scrollbar.vertical > range > trough > slider:hover,
+        .dzll-platform-ubuntu .dzll-browser-surface scrollbar.vertical > range > trough > slider:active,
+        .dzll-platform-ubuntu .mods-card .mods-list scrollbar.vertical.overlay-indicator.hovering > range > trough > slider,
+        .dzll-platform-ubuntu .mods-card .mods-list scrollbar.vertical.overlay-indicator.dragging > range > trough > slider,
+        .dzll-platform-ubuntu .mods-card .mods-list scrollbar.vertical > range > trough > slider:hover,
+        .dzll-platform-ubuntu .mods-card .mods-list scrollbar.vertical > range > trough > slider:active {{
+          margin-top: 1px;
+          margin-bottom: 3px;
         }}
 
         .dzll-app-root .mods-card .mods-list scrollbar,
@@ -1070,6 +1111,19 @@ def get_app_css(
           border-color: @dzll_border;
         }}
 
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button {{
+          min-height: 38px;
+        }}
+
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7),
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7):hover,
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7):active,
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7):checked,
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7):focus,
+        .dzll-platform-ubuntu columnview.dzll-column-view > header > button:nth-child(-n+7):focus-visible {{
+          border-right: 1px solid @dzll_divider;
+        }}
+
         columnview.dzll-column-view > header > button > box.horizontal,
         columnview.dzll-column-view > header > button:hover > box.horizontal,
         columnview.dzll-column-view > header > button:active > box.horizontal,
@@ -1161,6 +1215,16 @@ def get_app_css(
           border-bottom: 1px solid @dzll_divider;
         }}
 
+        .dzll-platform-ubuntu columnview.dzll-column-view > listview > row {{
+          padding-top: 2px;
+          padding-bottom: 3px;
+        }}
+
+        .dzll-platform-ubuntu columnview.dzll-column-view > listview > row > cell {{
+          padding-left: 0;
+          padding-right: 0;
+        }}
+
         .dzll-column-view .dzll-column-cell-right-border {{
           border-right: 1px solid @dzll_divider;
         }}
@@ -1204,7 +1268,6 @@ def get_app_css(
 
         .server-companion-panel {{
           min-width: 280px;
-          max-width: 280px;
         }}
 
         .server-companion-header,
@@ -1448,7 +1511,6 @@ def get_app_css(
         /* ---------- Sidebar sizing ---------- */
         .sidebar-frame {{
           min-width: {SIDEBAR_WIDTH}px;
-          max-width: {SIDEBAR_WIDTH}px;
         }}
 
         .dzll-app-root entry.sidebar-compact-entry {{
