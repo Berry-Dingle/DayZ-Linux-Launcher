@@ -1,19 +1,52 @@
 #!/usr/bin/env python3
 import subprocess
 import shlex
+from dataclasses import dataclass
 
 from .launcher_user_config import set_launcher_shutdown_mode
 from .maps import standardize_map
 
 
-def launch_direct_steam_url(win, obj, mod_win_paths=None):
+@dataclass(frozen=True)
+class SteamLaunchResult:
+    submitted: bool
+    pid: int | None = None
+    error_kind: str = ""
+    error: str = ""
+    sanitized_command: tuple[str, ...] = ()
+
+
+def _sanitize_launch_command(cmd) -> tuple[str, ...]:
+    safe = []
+    for index, arg in enumerate(cmd or []):
+        value = str(arg)
+        if value.startswith("-name="):
+            safe.append("-name=<redacted>")
+        elif value.startswith("-mod="):
+            count = len([part for part in value[5:].split(";") if part])
+            safe.append(f"-mod=<{count} paths>")
+        elif value.startswith("-connect=") or value in {
+            "-applaunch", "221100", "--", "-nolauncher", "-window", "-fullscreen", "-nosplash"
+        } or index == 0:
+            safe.append(value)
+        else:
+            safe.append("<extra-arg>")
+    return tuple(safe)
+
+
+def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
+                            skip_dayz_launcher=None):
     ip_port = f"{obj.ip}:{int(obj.gport)}"
+    popen = popen_factory or subprocess.Popen
     try:
         set_launcher_shutdown_mode(win.settings.get("minimize_dayz_launcher", False))
 
         cmd = win._steam_launch_prefix()
 
-        skip_dayz_launcher = bool(win.settings.get("skip_dayz_launcher", True))
+        if skip_dayz_launcher is None:
+            skip_dayz_launcher = bool(win.settings.get("skip_dayz_launcher", True))
+        else:
+            skip_dayz_launcher = bool(skip_dayz_launcher)
         if skip_dayz_launcher:
             cmd.append("-nolauncher")
             if mod_win_paths:
@@ -38,7 +71,7 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None):
                 cmd.extend(shlex.split(extra))
             except ValueError as e:
                 print(f"[JOIN] Failed To Parse Additional Launch Params: {e}")
-                return False
+                return SteamLaunchResult(False, error_kind="command_construction", error=str(e))
 
         cmd.append(f"-connect={ip_port}")
 
@@ -61,8 +94,20 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None):
             win._discord_last_join = None
 
         # Launch DayZ via Steam
-        subprocess.Popen(cmd)
-        return True
+        sanitized = _sanitize_launch_command(cmd)
+        try:
+            proc = popen(cmd)
+        except Exception as e:
+            print(f"[JOIN] Failed To Submit Steam Launch Request: {e}")
+            try:
+                if getattr(win, "_discord", None):
+                    win._discord.set_menu()
+            except Exception:
+                pass
+            return SteamLaunchResult(False, error_kind="popen", error=str(e), sanitized_command=sanitized)
+        return SteamLaunchResult(True,
+                                 pid=int(proc.pid) if getattr(proc, "pid", None) is not None else None,
+                                 sanitized_command=sanitized)
 
     except Exception as e:
         print(f"[JOIN] Failed To Launch Steam/DayZ: {e}")
@@ -73,4 +118,4 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None):
                 win._discord.set_menu()
         except Exception:
             pass
-        return False
+        return SteamLaunchResult(False, error_kind="command_construction", error=str(e))

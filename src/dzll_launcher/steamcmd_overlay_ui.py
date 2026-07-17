@@ -964,6 +964,18 @@ class SteamCMDOverlayUI:
             parts = s.split()
             mod_id = parts[2] if len(parts) >= 3 else "?"
 
+            # Presentation-only lifecycle evidence.  This is emitted by the
+            # established active-transfer output path, not by queue/request setup.
+            try:
+                if str(mod_id).isdigit():
+                    attempt_id = int(self.win._join_popup_attempt_id() or 0)
+                    if attempt_id > 0:
+                        self.win._join_popup_note_genuine_transfer(
+                            attempt_id, int(mod_id), backend="steamcmd"
+                        )
+            except Exception:
+                pass
+
             # Mark this as the active download for bar
             try:
                 if str(mod_id).isdigit():
@@ -1031,6 +1043,8 @@ class SteamCMDOverlayUI:
         Re-render L2 for the currently active mod so the total size appears
         even if the SteamCMD 'Downloading item ...' line arrived before sizes did.
         """
+        if getattr(self.win, "_mod_download_backend_active", "") != "steamcmd":
+            return False
         try:
             mid = getattr(self.win, "_steamcmd_active_mid", None)
             if not mid:

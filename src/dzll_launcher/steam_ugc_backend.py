@@ -44,8 +44,17 @@ class UGCModSession:
     downloading: bool = False
     download_pending: bool = False
     install_folder: str | None = None
+    event_source: str = "initial"
+    request_attempted: bool = False
+    request_accepted: bool = False
+    filesystem_normalized_missing: bool = False
 
-    def update_from_item(self, event: dict) -> None:
+    def update_from_item(self, event: dict, *, source: str | None = None) -> None:
+        raw_source = str(source or event.get("event_source") or event.get("type") or "poll")
+        self.event_source = raw_source if raw_source in ("initial", "request", "poll", "refresh", "final") else "poll"
+        if self.event_source == "request":
+            self.request_attempted = True
+            self.request_accepted = bool(event.get("download_requested", False))
         self.installed_now = bool(event.get("installed", False))
         self.needs_update = bool(event.get("needs_update", False))
         self.last_state_names = list(event.get("state_names") or [])
@@ -65,6 +74,7 @@ class UGCModSession:
             self.size_on_disk = 0
         folder = event.get("install_folder")
         self.install_folder = str(folder) if folder else None
+        self.filesystem_normalized_missing = bool(event.get("filesystem_normalized_missing", False))
 
     def event(self) -> dict:
         data = asdict(self)
@@ -410,6 +420,7 @@ def _run_ugc_native_steam_preflight(
 
 def _normalize_ugc_snapshot(event: dict) -> dict:
     normalized = dict(event or {})
+    normalized.setdefault("filesystem_normalized_missing", False)
     if not bool(normalized.get("installed", False)):
         return normalized
 
@@ -428,6 +439,7 @@ def _normalize_ugc_snapshot(event: dict) -> dict:
         return normalized
 
     normalized["installed"] = False
+    normalized["filesystem_normalized_missing"] = True
     normalized["install_folder"] = None
     normalized["size_on_disk"] = 0
     try:
@@ -495,7 +507,7 @@ def _refresh_current_state(sessions: dict[int, UGCModSession], *, appid: int, pr
         session = sessions.get(mid)
         if session is None:
             return
-        session.update_from_item(event)
+        session.update_from_item(event, source="refresh")
         _cache_ugc_state({mid: event}, names_by_id=names_by_id)
         _progress(progress_cb, session.event())
 
@@ -1456,7 +1468,7 @@ def run_ugc_install(
             return
         session.was_subscribed_before = bool(event.get("subscribed", False))
         session.was_installed_before = bool(event.get("installed", False))
-        session.update_from_item(event)
+        session.update_from_item(event, source="initial")
         _cache_ugc_state({mid: event}, names_by_id=names_by_id)
         _progress(progress_cb, session.event())
 
@@ -1527,7 +1539,10 @@ def run_ugc_install(
                     mid = 0
                 session = sessions.get(mid)
                 if session is not None:
-                    session.update_from_item(event)
+                    source = "request" if event_type == "request" else (
+                        "poll" if session.request_attempted else "initial"
+                    )
+                    session.update_from_item(event, source=source)
                     _cache_ugc_state({mid: event}, names_by_id=names_by_id)
                     _progress(progress_cb, session.event())
                 _progress(progress_cb, {"type": "helper_event", "event": event})

@@ -56,6 +56,7 @@ def run_steam_client_install(
         if event.get("type") != "session":
             forwarded = dict(event or {})
             forwarded["backend"] = "steam_ugc"
+            forwarded["backend_owner"] = "steam_client"
             if forwarded.get("type") == "preflight":
                 message = str(forwarded.get("message") or "").strip()
                 should_log = bool(message) and (
@@ -95,8 +96,12 @@ def run_steam_client_install(
             ready_seen.add(mid)
             completed_count = max(completed_count, len(ready_seen))
         index = int(index_by_id.get(mid) or max(1, len(ready_seen)))
+        event_source = str(event.get("event_source") or "ambiguous")
+        if ready and event_source == "poll":
+            event_source = "final"
         rich_event = {
             "backend": "steam_ugc",
+            "backend_owner": "steam_client",
             "id": mid,
             "download_bytes": int(event.get("download_bytes") or 0),
             "total_bytes": int(event.get("total_bytes") or 0),
@@ -109,6 +114,11 @@ def run_steam_client_install(
             "index": index,
             "total": total,
             "completed_count": completed_count,
+            "event_source": event_source,
+            "request_attempted": bool(event.get("request_attempted", False)),
+            "request_accepted": bool(event.get("request_accepted", False)),
+            "was_installed_before": bool(event.get("was_installed_before", False)),
+            "filesystem_normalized_missing": bool(event.get("filesystem_normalized_missing", False)),
         }
         if callable(progress_cb):
             try:

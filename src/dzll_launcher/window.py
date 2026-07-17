@@ -126,6 +126,13 @@ from .blocklist_utils import bl_normalize_key, bl_load_local, bl_status
 from .join_prepare import join_prepare_and_launch
 from .server_companion_ui import ServerCompanionPanel
 from .launch_utils import launch_direct_steam_url
+from .join_attempt import JoinAttemptTracker
+from .join_popup_presentation import (
+    JoinPopupActivityTracker,
+    JoinPopupPhase,
+    JoinPopupPresentation,
+    JoinPopupPresentationController,
+)
 from .mod_metadata import mark_mods_used
 from .mod_search import (
     build_server_mod_index,
@@ -492,6 +499,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._pending_last_played_obj = None
         self._pending_join_mod_ids = []
         self._pending_join_mod_names_by_id = {}
+        self._pending_join_attempt_id = 0
+        self._join_attempts = JoinAttemptTracker()
+        self._join_popup_presentation = JoinPopupPresentationController(
+            schedule=lambda callback: GLib.idle_add(callback),
+            commit=self._commit_join_popup_presentation,
+            is_current_attempt=self._join_popup_attempt_is_current,
+        )
+        self._join_popup_item_activity = JoinPopupActivityTracker()
 
         self.dead = load_dead_cache()
         self._prune_expired_dead()
@@ -1295,9 +1310,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return self._steamcmd_overlay_ui._on_steamcmd_show_password_toggled(btn)
 
     def _steamcmd_overlay_render(self, heading: str, line1: str, line2: str, spinning: bool):
+        try:
+            self._join_popup_presentation.invalidate_pending()
+        except Exception:
+            pass
         return self._steamcmd_overlay_ui._steamcmd_overlay_render(heading, line1, line2, spinning)
 
     def _steamcmd_set_state(self, heading: str, line1: str, line2: str, spinning: bool):
+        try:
+            self._join_popup_presentation.invalidate_pending()
+        except Exception:
+            pass
         return self._steamcmd_overlay_ui._steamcmd_set_state(heading, line1, line2, spinning)
 
     def _steamcmd_install_line_from_worker(self, line: str):
@@ -1328,10 +1351,194 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steam_client_stop_waiting_event = threading.Event()
         self._steam_client_set_cancel_buttons(safe_cancel=False)
         self._set_server_companion_join_status("Checking/Updating Required Mods", flash=True)
-        return self._show_steam_ugc_download_overlay()
+        return self._show_steam_ugc_download_overlay(status)
+
+    def _join_popup_attempt_id(self) -> int:
+        pending_id = int(getattr(self, "_pending_join_attempt_id", 0) or 0)
+        if pending_id:
+            return pending_id
+        active = getattr(getattr(self, "_join_attempts", None), "active", None)
+        return int(getattr(active, "attempt_id", 0) or 0)
+
+    def _join_popup_attempt_is_current(self, attempt_id: int) -> bool:
+        current_id = self._join_popup_attempt_id()
+        return int(attempt_id) == current_id
+
+    def _commit_join_popup_presentation(self, state: JoinPopupPresentation) -> None:
+        if state.phase in (JoinPopupPhase.DOWNLOADING, JoinPopupPhase.UPDATING):
+            self._steam_ugc_render_active_text(state.text)
+        else:
+            self._steam_ugc_render_status(state.text)
+
+    def _join_popup_enter_checking(self, attempt_id: int) -> bool:
+        if not self._join_attempt_is_active(attempt_id):
+            print(f"[join:{attempt_id}] stale popup callback rejected state='checking'", flush=True)
+            return False
+        self._join_attempts.set_popup_state(attempt_id, "checking")
+        self._join_log(attempt_id, "popup entered checking state")
+        self._show_join_progress_overlay("Checking & Preparing Mods for Join...")
+        return True
+
+    def _join_popup_initialize_download_counter(self, attempt_id: int, mod_ids, *,
+                                                backend: str) -> bool:
+        initialized, total = self._join_attempts.initialize_download_counter(attempt_id, mod_ids)
+        if not initialized:
+            if not self._join_attempt_is_active(attempt_id):
+                print(f"[join:{attempt_id}] stale download counter initialization rejected", flush=True)
+            return False
+        self._join_log(
+            attempt_id,
+            "download presentation counter initialized",
+            backend=backend,
+            total=total,
+        )
+        self._join_log(attempt_id, "fixed download work total", backend=backend, total=total)
+        return True
+
+    def _join_popup_note_genuine_transfer(self, attempt_id: int, mod_id: int, *,
+                                          backend: str):
+        result = self._join_attempts.note_genuine_mod_work(attempt_id, mod_id)
+        if result.status == "stale":
+            print(
+                f"[join:{attempt_id}] stale download counter callback rejected mod_id={int(mod_id)}",
+                flush=True,
+            )
+            return result
+        if result.status in ("uninitialized", "not-in-work-set", "overflow"):
+            self._join_log(
+                attempt_id,
+                "download display counter event rejected",
+                backend=backend,
+                mod_id=int(mod_id),
+                reason=result.status,
+                total=result.total,
+            )
+            return result
+        if result.status == "assigned":
+            self._join_log(
+                attempt_id,
+                "download display ordinal assigned",
+                backend=backend,
+                mod_id=int(mod_id),
+                ordinal=result.assigned_ordinal,
+                total=result.total,
+            )
+        elif result.status == "reused":
+            self._join_log(
+                attempt_id,
+                "download display ordinal reused",
+                backend=backend,
+                mod_id=int(mod_id),
+                ordinal=result.assigned_ordinal,
+                displayed=result.display_ordinal,
+                total=result.total,
+            )
+        elif result.status == "duplicate" and result.should_log_duplicate:
+            self._join_log(
+                attempt_id,
+                "duplicate download display event suppressed",
+                backend=backend,
+                mod_id=int(mod_id),
+                ordinal=result.display_ordinal,
+                total=result.total,
+            )
+        if result.transition == "first":
+            self._join_log(attempt_id, "genuine active-download display entered", backend=backend)
+            self._join_log(attempt_id, "first genuine active mod", backend=backend, mod_id=int(mod_id))
+        elif result.transition == "changed":
+            self._join_log(attempt_id, "active mod changed", backend=backend, mod_id=int(mod_id))
+        return result
+
+    def _join_popup_show_launching(self, attempt_id: int) -> bool:
+        active = self._join_attempts.active
+        if active is None or active.attempt_id != int(attempt_id):
+            print(f"[join:{attempt_id}] stale popup callback rejected state='launching'", flush=True)
+            return False
+        if active.genuine_mod_work:
+            state = "launching-downloaded"
+            text = "All Mods Downloaded, Launching DayZ, Please Wait..."
+            self._join_log(attempt_id, "all mod work completed")
+            selection = "all downloaded"
+        else:
+            state = "launching-ready"
+            text = "All Mods Ready, Launching DayZ, Please Wait..."
+            self._join_log(attempt_id, "all mods ready without download")
+            selection = "all ready"
+        self._join_attempts.set_popup_state(attempt_id, state)
+        self._join_log(attempt_id, "launching message selected", selection=selection)
+        self._show_join_progress_overlay(text)
+        return True
+
+    def _join_popup_process_detected(self, attempt_id: int, process: str) -> bool:
+        active = self._join_attempts.active
+        if active is None or active.attempt_id != int(attempt_id):
+            print(f"[join:{attempt_id}] stale popup callback rejected process={process!r}", flush=True)
+            return False
+        process = str(process)
+        valid = process == "DayZ" or (process == "DayZ Launcher" and not active.skip_dayz_launcher)
+        if not valid:
+            return False
+        if not self._join_attempts.close_popup(attempt_id, process):
+            return False
+        self._join_log(attempt_id, "popup closed with process reason", process=process)
+        self._hide_steamcmd_auth_overlay()
+        return True
+
+    def _join_popup_watcher_failure(self, attempt_id: int, reason: str) -> bool:
+        if not self._join_attempt_is_active(attempt_id):
+            print(f"[join:{attempt_id}] stale popup callback rejected state='watcher-error'", flush=True)
+            return False
+        detail = str(reason or "DZLL did not detect DayZ starting.")
+        self._join_attempts.set_popup_state(attempt_id, "error")
+        self._join_log(attempt_id, "watcher terminal failure", reason=detail)
+        self._steam_ugc_render_status(detail, error=True)
+        try:
+            self.steamcmd_cancel_btn.set_label("Close")
+            self.steamcmd_cancel_btn.set_visible(True)
+        except Exception:
+            pass
+        self._cleanup_join_attempt(attempt_id, "watcher terminal failure")
+        return True
+
+    def _join_popup_active_download_text(self, event: dict, *, current: int, total: int) -> str:
+        name = str(event.get("name") or event.get("id") or "").strip()
+        size = self._steam_ugc_format_size(event.get("total_bytes"))
+        suffix = f" ({int(current)}/{int(total)})" if int(current) > 0 and int(total) > 0 else ""
+        return f"Downloading Mod: {name} - {size}{suffix}"
+
+    def _join_popup_request(self, phase: JoinPopupPhase, text: str, *,
+                            backend: str | None = None, item_key=None,
+                            immediate: bool = False, attempt_id: int | None = None) -> bool:
+        owner_attempt_id = self._join_popup_attempt_id() if attempt_id is None else int(attempt_id or 0)
+        state = JoinPopupPresentation(
+            attempt_id=owner_attempt_id,
+            backend=str(backend or getattr(self, "_mod_download_backend_active", "") or "join"),
+            phase=phase,
+            text=str(text or "").strip(),
+            item_key=item_key,
+        )
+        if immediate:
+            return self._join_popup_presentation.render_immediate(state)
+        return self._join_popup_presentation.request(state)
 
     def _show_join_progress_overlay(self, status: str = ""):
-        text = str(status or "").strip() or "Preparing required mods..."
+        raw_text = str(status or "").strip()
+        if raw_text.startswith("Waiting for Steam"):
+            phase = JoinPopupPhase.WAITING_STEAM
+            text = "Waiting for Steam…"
+            immediate = True
+        elif raw_text.startswith("All Mods Downloaded"):
+            phase = JoinPopupPhase.LAUNCHING
+            text = "All Mods Downloaded, Launching DayZ, Please Wait..."
+            immediate = True
+        elif raw_text.startswith("All Mods Ready"):
+            phase = JoinPopupPhase.LAUNCHING
+            text = "All Mods Ready, Launching DayZ, Please Wait..."
+            immediate = True
+        else:
+            phase = JoinPopupPhase.CHECKING
+            text = "Checking & Preparing Mods for Join..."
+            immediate = True
         try:
             self._set_updating(False)
         except Exception:
@@ -1349,7 +1556,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
-            self._steam_ugc_render_status(text)
+            self._join_popup_request(phase, text, backend="join", immediate=immediate)
         except Exception:
             pass
         return False
@@ -1476,6 +1683,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._hide_steamcmd_auth_overlay()
         except Exception:
             pass
+        self._cleanup_active_join_attempt("stop waiting/cancel")
         return None
 
     def _steam_ugc_format_size(self, byte_count) -> str:
@@ -1494,7 +1702,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _steam_ugc_title(self) -> str:
         return "Checking/updating the required mods for this server"
 
-    def _show_steam_ugc_download_overlay(self):
+    def _show_steam_ugc_download_overlay(self, status: str = ""):
         try:
             for widget in getattr(self, "_steamcmd_form_widgets", []):
                 try:
@@ -1507,7 +1715,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.steamcmd_auth_box.set_visible(True)
         except Exception:
             pass
-        return self._steam_ugc_render_preparing()
+        return self._steam_ugc_render_preparing(status)
 
     def _steam_ugc_get_percent_label(self):
         label = getattr(self, "_steam_ugc_percent_label", None)
@@ -1557,12 +1765,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
 
-    def _steam_ugc_render_preparing(self):
+    def _steam_ugc_render_preparing(self, status: str = ""):
         try:
             self._steam_ugc_set_layout_active(True)
             self.steamcmd_task_heading.set_text(self._steam_ugc_title())
             self.steamcmd_line1.set_text("")
-            self.steamcmd_line2.set_text("Steam is checking the required mods...")
         except Exception:
             pass
         try:
@@ -1584,9 +1791,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
         self._steam_ugc_start_progress_timer()
+        total = int(getattr(self, "_steamcmd_total_missing", 0) or 0)
+        match = re.search(r"\b(\d+)\b", str(status or ""))
+        if match:
+            total = int(match.group(1))
+        self._join_popup_request(
+            JoinPopupPhase.CHECKING,
+            "Checking & Preparing Mods for Join...",
+            backend="steam_client",
+        )
         return False
 
     def _steam_ugc_render_cancelling(self):
+        try:
+            attempt_id = self._join_popup_attempt_id()
+            if attempt_id:
+                self._join_attempts.set_popup_state(attempt_id, "error")
+        except Exception:
+            pass
+        try:
+            self._join_popup_presentation.invalidate_pending()
+        except Exception:
+            pass
         try:
             self._steam_ugc_set_layout_active(True)
             self.steamcmd_task_heading.set_text(self._steam_ugc_title())
@@ -1612,6 +1838,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
         if error:
             self._steam_ugc_last_error = text
+            try:
+                attempt_id = self._join_popup_attempt_id()
+                if attempt_id:
+                    self._join_attempts.set_popup_state(attempt_id, "error")
+            except Exception:
+                pass
+            try:
+                self._join_popup_presentation.invalidate_pending()
+            except Exception:
+                pass
         try:
             self._steam_ugc_set_layout_active(True)
             self.steamcmd_task_heading.set_text(self._steam_ugc_title())
@@ -1643,6 +1879,22 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
         try:
             self._set_server_companion_join_status(text, flash=bool(error))
+        except Exception:
+            pass
+        return False
+
+    def _steam_ugc_render_active_text(self, text: str):
+        """Update only the established active-transfer text, never its progress."""
+        try:
+            self._steam_ugc_set_layout_active(True)
+            self.steamcmd_task_heading.set_text(self._steam_ugc_title())
+            self.steamcmd_line1.set_text("")
+            self.steamcmd_line2.set_text(str(text or ""))
+        except Exception:
+            pass
+        try:
+            self.steamcmd_spinner.set_visible(True)
+            self.steamcmd_spinner.set_spinning(True)
         except Exception:
             pass
         return False
@@ -1700,6 +1952,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not isinstance(event, dict) or event.get("backend") != "steam_ugc":
             return False
 
+        try:
+            origin_attempt_id = int(event.get("join_attempt_id") or 0)
+        except Exception:
+            origin_attempt_id = 0
+        if origin_attempt_id > 0 and not self._join_attempt_is_active(origin_attempt_id):
+            print(
+                f"[join:{origin_attempt_id}] stale download counter callback rejected",
+                flush=True,
+            )
+            return False
+
         event_type = str(event.get("type") or "")
         message = str(event.get("message") or "").strip()
         if event_type == "status" and message == "Checking/Updating Required Mods":
@@ -1709,7 +1972,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
             return False
         if event_type in ("preflight", "status", "error") and message:
-            return self._steam_ugc_render_status(message, error=bool(event.get("error")) or event_type == "error")
+            is_error = bool(event.get("error")) or event_type == "error"
+            if is_error:
+                return self._steam_ugc_render_status(message, error=True)
+            if "waiting" in message.lower() or "starting steam" in message.lower():
+                self._join_popup_request(
+                    JoinPopupPhase.WAITING_STEAM,
+                    "Waiting for Steam…",
+                    backend="steam_client",
+                    immediate=True,
+                    attempt_id=origin_attempt_id or None,
+                )
+            else:
+                self._join_popup_request(
+                    JoinPopupPhase.CHECKING,
+                    "Checking & Preparing Mods for Join...",
+                    backend="steam_client",
+                    attempt_id=origin_attempt_id or None,
+                )
+            return False
 
         try:
             mid = int(event.get("id") or 0)
@@ -1718,10 +1999,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if mid <= 0:
             return False
 
-        try:
-            total_mods = int(event.get("total") or 0)
-        except Exception:
-            total_mods = 0
+        backend_owner = str(event.get("backend_owner") or "")
+        if (
+            origin_attempt_id <= 0
+            or backend_owner != "steam_client"
+            or not self._join_attempt_is_active(origin_attempt_id)
+        ):
+            return False
 
         installed = bool(event.get("installed", False))
         ready = bool(
@@ -1753,71 +2037,51 @@ class DZLLWindow(Gtk.ApplicationWindow):
             set_completed,
         )
 
+        event = dict(event)
+        event["name"] = str(event.get("name") or "").strip() or str(mid)
+        event["ready"] = ready
+        outcome = self._join_popup_item_activity.observe(event)
+        activity = self._join_popup_item_activity.get(origin_attempt_id, mid)
+        if outcome.should_log:
+            fields = {
+                "mod_id": mid,
+                "source": str(event.get("event_source") or "ambiguous"),
+                "request_attempted": bool(event.get("request_attempted", False)),
+                "request_accepted": bool(event.get("request_accepted", False)),
+                "installed_before": getattr(activity, "initial_classification", "ambiguous"),
+                "bytes_advanced": bool(outcome.bytes_advanced),
+            }
+            if outcome.presentation is None:
+                fields["reason"] = outcome.suppressed_reason
+                self._join_log(origin_attempt_id, "popup item presentation suppressed", **fields)
+            else:
+                fields["reason"] = outcome.authorised_reason
+                self._join_log(origin_attempt_id, "popup item presentation authorised", **fields)
+
+        presentation = outcome.presentation
+        if presentation is None:
+            return False
+
+        counter = self._join_popup_note_genuine_transfer(
+            origin_attempt_id, mid, backend="steam_client"
+        )
+        if counter.status not in ("assigned", "reused", "duplicate"):
+            return False
+        presentation = JoinPopupPresentation(
+            attempt_id=presentation.attempt_id,
+            backend=presentation.backend,
+            phase=JoinPopupPhase.DOWNLOADING,
+            text=self._join_popup_active_download_text(
+                event,
+                current=counter.display_ordinal,
+                total=counter.total,
+            ),
+            item_key=presentation.item_key,
+        )
+        self._steam_ugc_active_event = dict(event)
+        self._join_popup_presentation.request(presentation)
         download_bytes = int(event.get("download_bytes") or 0)
         total_bytes = int(event.get("total_bytes") or 0)
-        is_active = (
-            bool(event.get("downloading", False))
-            or bool(event.get("download_pending", False))
-            or (download_bytes > 0 and not ready)
-        )
-        current_active = getattr(self, "_steam_ugc_active_event", None)
-        try:
-            current_active_mid = int(current_active.get("id") or 0) if isinstance(current_active, dict) else 0
-        except Exception:
-            current_active_mid = 0
-        if is_active or current_active is None or current_active_mid == mid:
-            self._steam_ugc_active_event = dict(event)
-
-        active = getattr(self, "_steam_ugc_active_event", None) or event
-        try:
-            mid = int(active.get("id") or mid)
-            download_bytes = int(active.get("download_bytes") or 0)
-            total_bytes = int(active.get("total_bytes") or 0)
-        except Exception:
-            pass
-        active_installed = bool(active.get("installed", False))
-        active_ready = bool(
-            active.get(
-                "ready",
-                active_installed
-                and not bool(active.get("needs_update", False))
-                and not bool(active.get("downloading", False))
-                and not bool(active.get("download_pending", False)),
-            )
-        )
-        if active_ready and total_bytes > 0:
-            download_bytes = total_bytes
-        active_is_current = (
-            bool(active.get("downloading", False))
-            or bool(active.get("download_pending", False))
-            or (download_bytes > 0 and not active_ready)
-        )
-        completed_count = int(getattr(self, "_steam_ugc_completed_count", 0) or 0)
-        if active_is_current:
-            display_index = min(completed_count + 1, total_mods) if total_mods > 0 else completed_count + 1
-        else:
-            display_index = min(completed_count, total_mods) if total_mods > 0 else completed_count
-
-        raw_name = str(active.get("name") or "").strip()
-        name = raw_name if raw_name else str(mid)
-        size_text = self._steam_ugc_format_size(total_bytes)
-        if active_ready:
-            action_label = "Checking Mod"
-        elif active_installed and bool(active.get("needs_update", False)):
-            action_label = "Updating Mod"
-        elif active_installed:
-            action_label = "Checking Mod"
-        else:
-            action_label = "Downloading Mod"
-        mod_line = f"{action_label}: {name} - {size_text} ({display_index}/{total_mods})"
-
-        try:
-            self._steam_ugc_set_layout_active(True)
-            self.steamcmd_task_heading.set_text(self._steam_ugc_title())
-            self.steamcmd_line1.set_text("")
-            self.steamcmd_line2.set_text(mod_line)
-        except Exception:
-            pass
 
         try:
             self.steamcmd_spinner.set_visible(True)
@@ -2214,6 +2478,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
         self._shutdown_cleanup_done = True
+
+        try:
+            active = self._join_attempts.close("application shutdown")
+            if active is not None:
+                self._join_popup_item_activity.clear_attempt(active.attempt_id)
+                self._clear_join_pending_state(active.attempt_id)
+        except Exception:
+            pass
 
         try:
             self._startup_presentation.begin_shutdown()
@@ -7274,13 +7546,90 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _get_dzll_watch_folder_linux(self) -> str:
         return os.path.join(self._get_dayz_proton_prefix(), "drive_c", "users", "steamuser", "DZLLMods")
 
-    def _launch_direct_steam_url(self, obj: ServerObject, mod_win_paths=None):
-        result = launch_direct_steam_url(self, obj, mod_win_paths=mod_win_paths)
-        if result is False:
-            if getattr(self, "_pending_server_companion_obj", None) is obj:
-                self._pending_server_companion_obj = None
+    def _join_log(self, attempt_id: int, event: str, **fields) -> bool:
+        return self._join_attempts.log(attempt_id, event, **fields)
+
+    def _join_attempt_is_active(self, attempt_id: int) -> bool:
+        return self._join_attempts.matches(attempt_id)
+
+    def _clear_join_pending_state(self, attempt_id: int) -> bool:
+        if int(getattr(self, "_pending_join_attempt_id", 0) or 0) != int(attempt_id):
+            return False
+        self._pending_server_companion_obj = None
+        self._pending_last_played_obj = None
+        self._pending_join_mod_ids = []
+        self._pending_join_mod_names_by_id = {}
+        self._pending_join_attempt_id = 0
+        return True
+
+    def _cleanup_join_attempt(self, attempt_id: int, reason: str, *, clear_pending: bool = True) -> bool:
+        cleaned = self._join_attempts.cleanup(attempt_id, reason)
+        if cleaned:
+            self._join_popup_item_activity.clear_attempt(attempt_id)
+        if cleaned and clear_pending:
+            self._clear_join_pending_state(attempt_id)
+        if cleaned:
+            self._steamcmd_cancel_event = threading.Event()
+            self._steam_client_stop_waiting_event = threading.Event()
+            self._steam_client_safe_cancel_requested = False
+            self._steamcmd_install_in_progress = False
+            self._mod_download_backend_active = ""
+        return cleaned
+
+    def _cleanup_active_join_attempt(self, reason: str) -> bool:
+        active = self._join_attempts.active
+        if active is None:
+            return False
+        return self._cleanup_join_attempt(active.attempt_id, reason)
+
+    def _show_join_launch_error(self, attempt_id: int, reason: str) -> None:
+        message = "DZLL could not submit the launch request to Steam."
+        detail = str(reason or "Unknown launch-command error.").strip()
+        self._join_log(attempt_id, "launch-command exception", reason=detail)
+        try:
+            self._show_join_progress_overlay(message)
+            self._steam_ugc_render_status(f"{message} {detail}", error=True)
+            self._mod_download_backend_active = ""
+            self.steamcmd_cancel_btn.set_label("Close")
+            self.steamcmd_cancel_btn.set_visible(True)
+        except Exception:
+            self._set_updating(False, message)
+
+    def _show_join_preparation_error(self, attempt_id: int, reason: str) -> None:
+        detail = str(reason or "Join preparation failed.").strip()
+        self._join_log(attempt_id, "preparation exception", reason=detail)
+        try:
+            self._show_join_progress_overlay(detail)
+            self._steam_ugc_render_status(detail, error=True)
+            self.steamcmd_cancel_btn.set_label("Close")
+            self.steamcmd_cancel_btn.set_visible(True)
+        except Exception:
+            self._set_updating(False, detail)
+
+    def _launch_direct_steam_url(self, obj: ServerObject, mod_win_paths=None, *, attempt_id: int = 0):
+        active = self._join_attempts.active
+        captured_skip_launcher = (
+            bool(active.skip_dayz_launcher)
+            if active is not None and active.attempt_id == int(attempt_id)
+            else bool(self.settings.get("skip_dayz_launcher", True))
+        )
+        result = launch_direct_steam_url(
+            self,
+            obj,
+            mod_win_paths=mod_win_paths,
+            skip_dayz_launcher=captured_skip_launcher,
+        )
+        if not result.submitted:
+            if attempt_id:
+                self._show_join_launch_error(attempt_id, result.error)
+                self._cleanup_join_attempt(attempt_id, f"launch {result.error_kind or 'construction'} failure")
             return result
-        self._start_dayz_session_watch()
+        if attempt_id:
+            self._join_log(attempt_id, "sanitized Steam launch command submitted",
+                           command=" ".join(result.sanitized_command))
+            self._join_log(attempt_id, "Steam handoff submitted", pid=result.pid)
+            self._join_attempts.set_phase(attempt_id, "watching")
+        self._start_dayz_session_watch(attempt_id=attempt_id)
         return result
 
     def _start_native_steam_for_join(self) -> tuple[bool, str]:
@@ -7334,13 +7683,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-    def _ensure_join_steam_start_consent(self) -> bool:
+    def _ensure_join_steam_start_consent(self, attempt_id: int = 0) -> bool:
         self._join_steam_start_allowed = False
         try:
             if is_native_steam_running():
+                if attempt_id:
+                    self._join_log(attempt_id, "Steam-running detection", running=True)
                 return True
-        except Exception:
-            pass
+            if attempt_id:
+                self._join_log(attempt_id, "Steam-running detection", running=False)
+        except Exception as exc:
+            if attempt_id:
+                self._join_log(attempt_id, "Steam-running detection", running=False, error=str(exc))
 
         if bool(self.settings.get("start_steam_on_join", False)):
             self._join_steam_start_allowed = True
@@ -7349,6 +7703,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 print(f"[JOIN] Could not start Steam: {error}")
                 self._set_updating(False, "Steam could not be started.")
                 return False
+            if attempt_id:
+                self._join_log(attempt_id, "native Steam start submitted")
             return True
 
         start_now, always = self._show_start_steam_join_consent_blocking()
@@ -7371,12 +7727,64 @@ class DZLLWindow(Gtk.ApplicationWindow):
             print(f"[JOIN] Could not start Steam: {error}")
             self._set_updating(False, "Steam could not be started.")
             return False
+        if attempt_id:
+            self._join_log(attempt_id, "native Steam start submitted")
         return True
 
     # ----------------------------
     # Watch Steam Game State
     # ----------------------------
-    def _start_dayz_session_watch(self) -> None:
+    def _dayz_game_running(self) -> bool:
+        try:
+            for pattern in ("DayZ_x64.exe", "DayZ.exe"):
+                result = subprocess.run(
+                    ["pgrep", "-fa", pattern],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _dayz_launcher_running(self) -> bool:
+        try:
+            # Deliberately exclude generic "Launcher" and Proton/Steam helpers.
+            for pattern in ("DayZ Launcher", "DayZLauncher", "DayZLauncher.exe"):
+                result = subprocess.run(
+                    ["pgrep", "-fa", pattern],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _join_watcher_ui_call(self, callback, *args):
+        """Run a watcher UI transition on GTK and wait briefly for ordering."""
+        completed = threading.Event()
+        result = {"value": False}
+
+        def apply():
+            try:
+                result["value"] = bool(callback(*args))
+            finally:
+                completed.set()
+            return False
+
+        try:
+            GLib.idle_add(apply)
+            completed.wait(timeout=2.0)
+        except Exception:
+            completed.set()
+        return bool(result["value"])
+
+    def _start_dayz_session_watch(self, *, attempt_id: int = 0) -> None:
         try:
             with self._discord_watch_lock:
                 if self._discord_watch_active:
@@ -7384,14 +7792,27 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
-            threading.Thread(target=self._watch_dayz_session_until_exit, daemon=True).start()
+            if attempt_id:
+                self._join_log(attempt_id, "DayZ watcher started")
+                active = self._join_attempts.active
+                skip_launcher = bool(active.skip_dayz_launcher) if active is not None else True
+                self._join_log(
+                    attempt_id,
+                    "watcher mode",
+                    mode="DayZ only" if skip_launcher else "DayZ Launcher or DayZ",
+                )
+            threading.Thread(target=self._watch_dayz_session_until_exit, args=(attempt_id,), daemon=True).start()
         except Exception:
-            pass
+            if attempt_id:
+                self._join_popup_watcher_failure(
+                    attempt_id,
+                    "DZLL could not start the DayZ launch process watcher.",
+                )
 
     def _discord_watch_dayz_until_exit(self) -> None:
         self._watch_dayz_session_until_exit()
 
-    def _watch_dayz_session_until_exit(self) -> None:
+    def _watch_dayz_session_until_exit(self, attempt_id: int = 0) -> None:
         """
         Watch for actual DayZ game process (launcher may remain open).
         When the game starts, activate Companion and update Discord if available.
@@ -7406,6 +7827,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         # Prevent multiple watcher threads
         try:
+            if attempt_id and not self._join_attempt_is_active(attempt_id):
+                return
+            if attempt_id:
+                try:
+                    self._join_log(attempt_id, "watcher Steam process observation",
+                                   running=bool(is_native_steam_running()))
+                except Exception as exc:
+                    self._join_log(attempt_id, "watcher Steam process observation", error=str(exc))
+
             with self._discord_watch_lock:
                 if self._discord_watch_active:
                     return
@@ -7415,81 +7845,77 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
-            def _game_running() -> bool:
-                try:
-                    for pat in ("DayZ_x64.exe", "DayZ.exe"):
-                        r = subprocess.run(
-                            ["pgrep", "-fa", pat],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            check=False,
-                        )
-                        if r.returncode == 0:
-                            return True
-                    return False
-                except Exception:
-                    return False
-
-            def _launcher_running() -> bool:
-                try:
-                    # Match practical launcher name variants under Wine/Proton
-                    for pat in ("DayZ Launcher", "DayZLauncher", "Launcher"):
-                        r = subprocess.run(
-                            ["pgrep", "-fa", pat],
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            check=False,
-                        )
-                        if r.returncode == 0:
-                            return True
-                    return False
-                except Exception:
-                    return False
-
+            active = self._join_attempts.active
+            skip_launcher = bool(active.skip_dayz_launcher) if active is not None else True
             saw_launcher = False
             saw_game = False
 
-            # Wait up to 120s for the game to appear, while also tracking launcher presence.
+            # Wait up to 120s for the expected success process.  With the launcher
+            # enabled, a detected launcher is success for popup ownership, while
+            # this same watcher remains alive to consume metadata if DayZ follows.
             t0 = time.time()
-            while (time.time() - t0) < 120.0:
-                if _launcher_running():
+            while True:
+                if attempt_id and not self._join_attempt_is_active(attempt_id):
+                    return
+                launcher_running = self._dayz_launcher_running()
+                if launcher_running:
+                    if not saw_launcher and attempt_id:
+                        self._join_log(attempt_id, "first relevant process observation", process="DayZ Launcher")
+                        self._join_log(attempt_id, "DayZ Launcher detected")
                     saw_launcher = True
+                    if not skip_launcher and attempt_id:
+                        self._join_watcher_ui_call(
+                            self._join_popup_process_detected, attempt_id, "DayZ Launcher"
+                        )
 
-                if _game_running():
+                if self._dayz_game_running():
                     saw_game = True
+                    if attempt_id:
+                        self._join_log(attempt_id, "DayZ detected")
+                        self._join_watcher_ui_call(
+                            self._join_popup_process_detected, attempt_id, "DayZ"
+                        )
                     break
 
                 # Launcher was opened, game never started, and launcher is now gone
-                if saw_launcher and not _launcher_running():
+                if saw_launcher and not skip_launcher and not launcher_running:
                     try:
                         if getattr(self, "_discord", None):
                             GLib.idle_add(self._discord.set_menu)
                     except Exception:
                         pass
-                    self._pending_server_companion_obj = None
-                    self._pending_join_mod_ids = []
-                    self._pending_join_mod_names_by_id = {}
+                    if attempt_id:
+                        self._join_log(attempt_id, "watcher terminal condition", reason="launcher exited before DayZ")
+                        self._cleanup_join_attempt(attempt_id, "launcher exited before DayZ")
+                    return
+
+                elapsed = time.time() - t0
+                if elapsed >= 120.0 and not (saw_launcher and not skip_launcher):
+                    try:
+                        if getattr(self, "_discord", None):
+                            GLib.idle_add(self._discord.set_menu)
+                    except Exception:
+                        pass
+                    if attempt_id:
+                        self._join_log(attempt_id, "watcher timeout", timeout_seconds=120)
+                        self._join_watcher_ui_call(
+                            self._join_popup_watcher_failure,
+                            attempt_id,
+                            "DZLL could not detect the expected DayZ process before the launch wait timed out.",
+                        )
                     return
 
                 time.sleep(1.0)
 
-            # If the game never appeared, reset presence back to menus
-            if not _game_running():
-                try:
-                    if getattr(self, "_discord", None):
-                        GLib.idle_add(self._discord.set_menu)
-                except Exception:
-                    pass
-                self._pending_server_companion_obj = None
-                self._pending_join_mod_ids = []
-                self._pending_join_mod_names_by_id = {}
+            if attempt_id and not self._join_attempt_is_active(attempt_id):
                 return
 
             # GAME STARTED -> now count it as "played"
             try:
                 obj = getattr(self, "_pending_last_played_obj", None)
-                if obj is not None:
+                if obj is not None and int(getattr(self, "_pending_join_attempt_id", 0) or 0) == int(attempt_id):
                     ts = int(time.time())
+                    self._pending_last_played_obj = None
 
                     def _mark_last_played(played_obj=obj, played_ts=ts):
                         try:
@@ -7501,8 +7927,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                                 save_last_played(self.last_played)
                             except Exception:
                                 pass
-                            if getattr(self, "_pending_last_played_obj", None) is played_obj:
-                                self._pending_last_played_obj = None
                         except Exception:
                             pass
                         return False
@@ -7513,26 +7937,34 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
             # GAME STARTED -> mark this join's required mods as used.
             try:
-                mod_ids = list(getattr(self, "_pending_join_mod_ids", []) or [])
-                names_by_id = dict(getattr(self, "_pending_join_mod_names_by_id", {}) or {})
+                matching_attempt = int(getattr(self, "_pending_join_attempt_id", 0) or 0) == int(attempt_id)
+                mod_ids = list(getattr(self, "_pending_join_mod_ids", []) or []) if matching_attempt else []
+                names_by_id = dict(getattr(self, "_pending_join_mod_names_by_id", {}) or {}) if matching_attempt else {}
                 if mod_ids:
                     try:
                         mark_mods_used(mod_ids, names_by_id=names_by_id)
                     except Exception as exc:
                         print(f"[MOD METADATA] Failed to mark joined mods used: {exc}")
-                self._pending_join_mod_ids = []
-                self._pending_join_mod_names_by_id = {}
+                if matching_attempt:
+                    self._pending_join_mod_ids = []
+                    self._pending_join_mod_names_by_id = {}
             except Exception:
                 pass
 
             # GAME STARTED -> activate Companion for the pending join target
             try:
                 obj = getattr(self, "_pending_server_companion_obj", None)
-                if obj is not None:
+                if obj is not None and int(getattr(self, "_pending_join_attempt_id", 0) or 0) == int(attempt_id):
                     self._pending_server_companion_obj = None
                     GLib.idle_add(self.set_server_companion_server, obj)
             except Exception:
-                self._pending_server_companion_obj = None
+                if int(getattr(self, "_pending_join_attempt_id", 0) or 0) == int(attempt_id):
+                    self._pending_server_companion_obj = None
+
+            if attempt_id:
+                self._join_log(attempt_id, "pending Join state consumed")
+                self._pending_join_attempt_id = 0
+                self._cleanup_join_attempt(attempt_id, "DayZ detected", clear_pending=False)
 
             # GAME STARTED -> set Discord "playing" state according to user setting
             try:
@@ -7573,7 +8005,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
 
             # Wait until the actual game exits
-            while _game_running():
+            while self._dayz_game_running():
                 time.sleep(5.0)
 
             # GAME EXITED -> reset presence
@@ -7649,17 +8081,41 @@ class DZLLWindow(Gtk.ApplicationWindow):
         }
 
     def _join_server_for_obj(self, obj: ServerObject):
+        active = self._join_attempts.active
+        if active is not None:
+            self._join_log(active.attempt_id, "duplicate Join click blocked",
+                           requested_server=f"{obj.ip}:{int(obj.gport)}")
+            self._set_server_companion_join_status("Join already in progress…", flash=True)
+            return
+
+        attempt = self._join_attempts.begin(
+            ip=obj.ip,
+            game_port=int(obj.gport),
+            query_port=int(getattr(obj, "qport", 0) or 0),
+            name=str(getattr(obj, "name", "") or ""),
+            skip_dayz_launcher=bool(self.settings.get("skip_dayz_launcher", True)),
+        )
+        if attempt is None:
+            return
+        attempt_id = attempt.attempt_id
+        self._join_popup_enter_checking(attempt_id)
+
         # --- Preflight hard-block warning (MUST run before SteamCMD/mods) ---
         # Run on GTK main thread and block until the user decides.
         if not self._preflight_block_warning_ui_blocking(obj):
             self._join_steam_start_allowed = False
+            self._hide_steamcmd_auth_overlay()
+            self._cleanup_join_attempt(attempt_id, "preflight declined")
             self._on_filter_changed(reason="join")
             return
 
-        if not self._ensure_join_steam_start_consent():
+        if not self._ensure_join_steam_start_consent(attempt_id):
+            self._hide_steamcmd_auth_overlay()
+            self._cleanup_join_attempt(attempt_id, "Steam start declined or failed")
             self._on_filter_changed(reason="join")
             return
 
+        self._pending_join_attempt_id = attempt_id
         self._pending_server_companion_obj = obj
 
         # Defer "last played" until DayZ process is actually detected.
@@ -7668,13 +8124,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             self._pending_last_played_obj = None
 
-        raw_mods_json = getattr(obj, "mods_json", "") or ""
-        server_mods = parse_mods_from_db(raw_mods_json)
-        print(f"[JOIN] server mods parsed: {len(server_mods)}")
+        try:
+            raw_mods_json = getattr(obj, "mods_json", "") or ""
+            server_mods = parse_mods_from_db(raw_mods_json)
+            print(f"[JOIN] server mods parsed: {len(server_mods)}")
 
-        extra_ids = parse_additional_mod_ids(str(self.settings.get("additional_mod_ids") or ""))
-        mods = merge_mod_lists_with_additional(server_mods, extra_ids)
-        print(f"[JOIN] total mods after extras: {len(mods)}")
+            extra_ids = parse_additional_mod_ids(str(self.settings.get("additional_mod_ids") or ""))
+            mods = merge_mod_lists_with_additional(server_mods, extra_ids)
+            print(f"[JOIN] total mods after extras: {len(mods)}")
+            self._join_log(attempt_id, "required mods resolved", count=len(mods))
+        except Exception as exc:
+            self._show_join_preparation_error(attempt_id, f"Could not prepare required mod list: {exc}")
+            self._cleanup_join_attempt(attempt_id, "required mod resolution failure")
+            return
 
         try:
             self._pending_join_mod_ids = [int(mid) for mid, _name in (mods or []) if int(mid) > 0]
@@ -7688,6 +8150,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._pending_join_mod_names_by_id = {}
 
         if not mods:
+            self._join_log(attempt_id, "chosen backend", backend="no mods")
             self._pending_join_mod_ids = []
             self._pending_join_mod_names_by_id = {}
             try:
@@ -7705,11 +8168,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 print(f"[JOIN] launcher state cleared for no-mod server: {paths}")
             except Exception as e:
                 print(f"[JOIN] failed to clear launcher state for no-mod server: {e}")
-                if getattr(self, "_pending_server_companion_obj", None) is obj:
-                    self._pending_server_companion_obj = None
+                self._show_join_preparation_error(
+                    attempt_id,
+                    f"Could not prepare the DayZ launcher state: {e}",
+                )
+                self._cleanup_join_attempt(attempt_id, "no-mod preset preparation failure")
                 return
 
-            self._launch_direct_steam_url(obj)
+            self._join_log(attempt_id, "preset/launcher-state preparation completed")
+            self._join_log(attempt_id, "continuation scheduled", success=True)
+            self._join_log(attempt_id, "continuation executed")
+            self._join_popup_show_launching(attempt_id)
+            result = self._launch_direct_steam_url(obj, attempt_id=attempt_id)
             self._on_filter_changed(reason="join")
             return
 
@@ -7741,6 +8211,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             auto_update_required = legacy
 
         def do_prepare_and_launch():
+            self._join_log(attempt_id, "worker started")
             return join_prepare_and_launch(
                 self,
                 obj,
@@ -7756,10 +8227,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 mod_download_backend,
                 auto_install_missing,
                 auto_update_required,
+                attempt_id=attempt_id,
             )
 
-        self._show_join_progress_overlay("Preparing required mods...")
-        self._hi_executor.submit(do_prepare_and_launch)
+        self._show_join_progress_overlay("Checking & Preparing Mods for Join...")
+        try:
+            self._hi_executor.submit(do_prepare_and_launch)
+            self._join_log(attempt_id, "worker submitted")
+        except Exception as exc:
+            self._show_join_preparation_error(attempt_id, f"Could not start Join preparation: {exc}")
+            self._cleanup_join_attempt(attempt_id, "worker submission failure")
 
     # ----------------------------
     # Preflight Hard Block Warning Queue Jump (kept; not used currently)
