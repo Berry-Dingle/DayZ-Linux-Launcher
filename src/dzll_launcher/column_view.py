@@ -47,6 +47,8 @@ _IPPORT_MIN_WIDTH_CHARS = 18
 _MODS_BUTTON_WIDTH_CHARS = len("Mods: 999")
 _OPEN_REQUIRED_MODS_WIDGET = None
 _OPEN_REQUIRED_MODS_POPOVER = None
+_REQUIRED_MODS_POPUP_SUPPRESSED = False
+_REQUIRED_MODS_POPUP_SUPPRESSION_COUNT = 0
 
 
 def _monitor_icon_name() -> str:
@@ -76,17 +78,68 @@ def _record_sort_debug_bind(kind: str) -> None:
         pass
 
 
-def _disconnect_notify_handlers(widget) -> None:
+def _disconnect_notify_handlers(widget, perf_metrics=None, factory_name: str = "") -> None:
     obj = getattr(widget, "_dzll_notify_obj", None)
     hids = list(getattr(widget, "_dzll_notify_ids", ()) or ())
     if obj is not None:
         for hid in hids:
             try:
                 obj.disconnect(hid)
+                if perf_metrics is not None:
+                    perf_metrics.count("notify_disconnects")
+                    perf_metrics.count(f"{factory_name}_notify_disconnects")
             except Exception:
                 pass
     widget._dzll_notify_obj = None
     widget._dzll_notify_ids = []
+
+
+def _notify_is_current(widget, obj) -> bool:
+    return getattr(widget, "_dzll_notify_obj", None) is obj
+
+
+def _drag_light_active(drag_light) -> bool:
+    return bool(drag_light is not None and drag_light.is_active())
+
+
+def _register_bound_cell(drag_light, factory_name, cell, list_item, full_refresh) -> None:
+    if drag_light is not None and cell is not None:
+        drag_light.register(
+            factory_name,
+            cell,
+            list_item,
+            list_item.get_item(),
+            full_refresh,
+        )
+
+
+def _unregister_bound_cell(drag_light, cell, list_item=None) -> None:
+    if drag_light is not None and cell is not None:
+        drag_light.unregister(cell, list_item)
+
+
+def _set_text_if_changed(widget, text: str, perf_metrics=None) -> bool:
+    try:
+        if widget.get_text() == text:
+            if perf_metrics is not None:
+                perf_metrics.count("drag_skipped_text_writes")
+            return False
+    except Exception:
+        pass
+    widget.set_text(text)
+    return True
+
+
+def _set_visible_if_changed(widget, visible: bool, perf_metrics=None) -> bool:
+    try:
+        if bool(widget.get_visible()) == bool(visible):
+            if perf_metrics is not None:
+                perf_metrics.count("drag_skipped_visibility_writes")
+            return False
+    except Exception:
+        pass
+    widget.set_visible(bool(visible))
+    return True
 
 
 def _add_css_classes(widget, css_classes) -> None:
@@ -526,10 +579,22 @@ def _bind_center_label(label: Gtk.Label, obj: ServerObject, binder) -> None:
         label.set_text("")
 
 
-def _make_label_factory(binder, notify_props=(), max_chars: int | None = None, cell_css_classes=None):
+def _make_label_factory(
+    binder,
+    *,
+    factory_name: str,
+    perf_metrics=None,
+    drag_light=None,
+    light_binder=None,
+    notify_props=(),
+    max_chars: int | None = None,
+    cell_css_classes=None,
+):
     factory = Gtk.SignalListItemFactory()
 
     def setup(_factory, list_item):
+        if perf_metrics is not None:
+            perf_metrics.record_setup(factory_name)
         label = _center_label(max_chars=max_chars)
         if cell_css_classes:
             wrapper = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -544,30 +609,102 @@ def _make_label_factory(binder, notify_props=(), max_chars: int | None = None, c
         else:
             list_item.set_child(label)
 
-    def bind(_factory, list_item):
-        _record_sort_debug_bind("label")
+    def render_full(list_item, known_cell=None):
         child = list_item.get_child()
         label = _cell_label(child)
-        if label is None:
+        if label is None or (known_cell is not None and child is not known_cell):
             return
-        _disconnect_notify_handlers(label)
+        _disconnect_notify_handlers(label, perf_metrics, factory_name)
         obj = list_item.get_item()
+        label._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
         _bind_center_label(label, obj, binder)
+        if perf_metrics is not None and factory_name == "ping":
+            perf_metrics.count("ping_label_writes")
+            if isinstance(obj, ServerObject):
+                perf_metrics.count("ping_format_calls")
         if not isinstance(obj, ServerObject) or not notify_props:
             return
         hids = []
+
+        def notify(changed_obj, _pspec, cell=label):
+            if not _notify_is_current(cell, changed_obj):
+                return
+            binder(cell, changed_obj)
+            if perf_metrics is not None and factory_name == "ping":
+                perf_metrics.count("ping_format_calls")
+                perf_metrics.count("ping_label_writes")
+
         for prop in notify_props:
             try:
-                hids.append(obj.connect(f"notify::{prop}", lambda changed_obj, _pspec, cell=label: binder(cell, changed_obj)))
+                hids.append(obj.connect(f"notify::{prop}", notify))
+                if perf_metrics is not None:
+                    perf_metrics.count("notify_connects")
+                    perf_metrics.count(f"{factory_name}_notify_connects")
             except Exception:
                 pass
         label._dzll_notify_obj = obj
         label._dzll_notify_ids = hids
 
+    def render_light(list_item, known_cell=None):
+        child = list_item.get_child()
+        label = _cell_label(child)
+        if label is None or (known_cell is not None and child is not known_cell):
+            return
+        _disconnect_notify_handlers(label, perf_metrics, factory_name)
+        obj = list_item.get_item()
+        label._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+        if isinstance(obj, ServerObject):
+            if light_binder is not None:
+                light_binder(label, obj, perf_metrics)
+            else:
+                binder(label, obj)
+        else:
+            _set_text_if_changed(label, "", perf_metrics)
+        if perf_metrics is not None and notify_props:
+            perf_metrics.count("drag_skipped_notify_connects", len(notify_props))
+
+    def bind(_factory, list_item):
+        light = _drag_light_active(drag_light)
+        token = (
+            perf_metrics.start(
+                factory_name,
+                "bind",
+                bind_mode="light" if light else "full",
+            )
+            if perf_metrics is not None
+            else None
+        )
+        try:
+            _record_sort_debug_bind("label")
+            child = list_item.get_child()
+            if child is None:
+                return
+            if light:
+                render_light(list_item, child)
+            else:
+                render_full(list_item, child)
+            _register_bound_cell(
+                drag_light,
+                factory_name,
+                child,
+                list_item,
+                render_full,
+            )
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
+
     def unbind(_factory, list_item):
-        label = _cell_label(list_item.get_child())
-        if label is not None:
-            _disconnect_notify_handlers(label)
+        token = perf_metrics.start(factory_name, "unbind") if perf_metrics is not None else None
+        try:
+            label = _cell_label(list_item.get_child())
+            if label is not None:
+                _unregister_bound_cell(drag_light, list_item.get_child(), list_item)
+                _disconnect_notify_handlers(label, perf_metrics, factory_name)
+                label._dzll_bound_obj = None
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     factory.connect("setup", setup)
     factory.connect("bind", bind)
@@ -580,15 +717,28 @@ def _bind_time(label: Gtk.Label, obj: ServerObject) -> None:
     label.set_text(f"{time_text} {timewarp_text}".strip())
 
 
+def _bind_time_light(label: Gtk.Label, obj: ServerObject, perf_metrics=None) -> None:
+    time_text, timewarp_text = row_time_display(obj)
+    _set_text_if_changed(label, f"{time_text} {timewarp_text}".strip(), perf_metrics)
+
+
 def _bind_played(label: Gtk.Label, obj: ServerObject) -> None:
     label.set_text((getattr(obj, "played", "") or "").strip())
+
+
+def _bind_played_light(label: Gtk.Label, obj: ServerObject, perf_metrics=None) -> None:
+    _set_text_if_changed(label, (getattr(obj, "played", "") or "").strip(), perf_metrics)
 
 
 def _bind_map(label: Gtk.Label, obj: ServerObject) -> None:
     label.set_text((getattr(obj, "map_name", "") or "").strip())
 
 
-def _bind_players_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
+def _bind_map_light(label: Gtk.Label, obj: ServerObject, perf_metrics=None) -> None:
+    _set_text_if_changed(label, (getattr(obj, "map_name", "") or "").strip(), perf_metrics)
+
+
+def _bind_players_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) -> None:
     players_label = getattr(cell, "_dzll_players_label", None)
     queue_label = getattr(cell, "_dzll_queue_label", None)
     if not isinstance(players_label, Gtk.Label) or not isinstance(queue_label, Gtk.Label):
@@ -596,17 +746,49 @@ def _bind_players_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
     if not isinstance(obj, ServerObject):
         players_label.set_text("")
         queue_label.set_text("")
+        if perf_metrics is not None:
+            perf_metrics.count("players_label_writes", 2)
         return
     players_text, queue_text = row_players_display(obj)
     players_label.set_text(players_text)
     queue_label.set_text(queue_text or "--")
+    if perf_metrics is not None:
+        perf_metrics.count("players_format_calls")
+        perf_metrics.count("players_label_writes", 2)
 
 
-def _make_players_factory(*, ubuntu_geometry: bool = False):
+def _bind_players_cell_light(
+    cell: Gtk.Box,
+    obj: ServerObject | None,
+    perf_metrics=None,
+) -> None:
+    players_label = getattr(cell, "_dzll_players_label", None)
+    queue_label = getattr(cell, "_dzll_queue_label", None)
+    if not isinstance(players_label, Gtk.Label) or not isinstance(queue_label, Gtk.Label):
+        return
+    if isinstance(obj, ServerObject):
+        players_text, queue_text = row_players_display(obj)
+        _set_text_if_changed(players_label, players_text, perf_metrics)
+        _set_text_if_changed(queue_label, queue_text or "--", perf_metrics)
+        if perf_metrics is not None:
+            perf_metrics.count("players_format_calls")
+    else:
+        _set_text_if_changed(players_label, "", perf_metrics)
+        _set_text_if_changed(queue_label, "", perf_metrics)
+
+
+def _make_players_factory(
+    *,
+    ubuntu_geometry: bool = False,
+    perf_metrics=None,
+    drag_light=None,
+):
     factory = Gtk.SignalListItemFactory()
     notify_props = ("players", "max_players", "queue")
 
     def setup(_factory, list_item):
+        if perf_metrics is not None:
+            perf_metrics.record_setup("players")
         outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         outer.set_halign(Gtk.Align.FILL)
         outer.set_valign(Gtk.Align.FILL)
@@ -650,30 +832,99 @@ def _make_players_factory(*, ubuntu_geometry: bool = False):
         outer._dzll_queue_label = queue_label
         list_item.set_child(outer)
 
-    def bind(_factory, list_item):
-        _record_sort_debug_bind("players")
+    def render_full(list_item, known_cell=None):
         cell = list_item.get_child()
-        if cell is None:
+        if cell is None or (known_cell is not None and cell is not known_cell):
             return
-        _disconnect_notify_handlers(cell)
+        _disconnect_notify_handlers(cell, perf_metrics, "players")
         obj = list_item.get_item()
-        _bind_players_cell(cell, obj if isinstance(obj, ServerObject) else None)
+        cell._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+        _bind_players_cell(
+            cell,
+            obj if isinstance(obj, ServerObject) else None,
+            perf_metrics,
+        )
         if not isinstance(obj, ServerObject):
             return
         hids = []
+
+        def notify(changed_obj, _pspec, widget=cell):
+            if not _notify_is_current(widget, changed_obj):
+                return
+            _bind_players_cell(widget, changed_obj, perf_metrics)
+
         for prop in notify_props:
             try:
-                hids.append(obj.connect(f"notify::{prop}", lambda changed_obj, _pspec, widget=cell: _bind_players_cell(widget, changed_obj)))
+                hids.append(obj.connect(f"notify::{prop}", notify))
+                if perf_metrics is not None:
+                    perf_metrics.count("notify_connects")
+                    perf_metrics.count("players_notify_connects")
             except Exception:
                 pass
         cell._dzll_notify_obj = obj
         cell._dzll_notify_ids = hids
 
-    def unbind(_factory, list_item):
+    def render_light(list_item, known_cell=None):
         cell = list_item.get_child()
-        if cell is not None:
-            _disconnect_notify_handlers(cell)
-            _bind_players_cell(cell, None)
+        if cell is None or (known_cell is not None and cell is not known_cell):
+            return
+        _disconnect_notify_handlers(cell, perf_metrics, "players")
+        obj = list_item.get_item()
+        cell._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+        _bind_players_cell_light(
+            cell,
+            obj if isinstance(obj, ServerObject) else None,
+            perf_metrics,
+        )
+        if perf_metrics is not None:
+            perf_metrics.count("drag_skipped_notify_connects", len(notify_props))
+
+    def bind(_factory, list_item):
+        light = _drag_light_active(drag_light)
+        token = (
+            perf_metrics.start(
+                "players",
+                "bind",
+                bind_mode="light" if light else "full",
+            )
+            if perf_metrics is not None
+            else None
+        )
+        try:
+            _record_sort_debug_bind("players")
+            cell = list_item.get_child()
+            if cell is None:
+                return
+            if light:
+                render_light(list_item, cell)
+            else:
+                render_full(list_item, cell)
+            _register_bound_cell(
+                drag_light,
+                "players",
+                cell,
+                list_item,
+                render_full,
+            )
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
+
+    def unbind(_factory, list_item):
+        token = perf_metrics.start("players", "unbind") if perf_metrics is not None else None
+        try:
+            cell = list_item.get_child()
+            if cell is not None:
+                _unregister_bound_cell(drag_light, cell, list_item)
+                _disconnect_notify_handlers(cell, perf_metrics, "players")
+                if _drag_light_active(drag_light):
+                    _bind_players_cell_light(cell, None, perf_metrics)
+                else:
+                    _bind_players_cell(cell, None, perf_metrics)
+                cell._dzll_bound_obj = None
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     factory.connect("setup", setup)
     factory.connect("bind", bind)
@@ -690,18 +941,77 @@ def _bind_ping(label: Gtk.Label, obj: ServerObject) -> None:
         label.set_text(text)
 
 
-def _bind_fav_button(button: Gtk.Button, obj: ServerObject | None) -> None:
+def _bind_ping_light(label: Gtk.Label, obj: ServerObject, perf_metrics=None) -> None:
+    text, css_class = row_ping_display(obj)
+    color = PING_MARKUP_COLORS.get(css_class)
+    display_key = (text, css_class)
+    current_text = None
+    try:
+        current_text = label.get_text()
+    except Exception:
+        pass
+    if (
+        current_text == text
+        and getattr(label, "_dzll_ping_light_display", None) == display_key
+    ):
+        if perf_metrics is not None:
+            perf_metrics.count("drag_skipped_text_writes")
+    else:
+        if color:
+            label.set_markup(f'<span foreground="{color}">{text}</span>')
+        else:
+            label.set_text(text)
+        label._dzll_ping_light_display = display_key
+        if perf_metrics is not None:
+            perf_metrics.count("light_ping_colour_updates")
+    if perf_metrics is not None:
+        perf_metrics.count("ping_format_calls")
+
+
+def _bind_fav_button(button: Gtk.Button, obj: ServerObject | None, perf_metrics=None) -> None:
     button._dzll_bound_obj = obj
+    if perf_metrics is not None:
+        perf_metrics.count("fav_bound_assignments")
     fav = bool(getattr(obj, "fav", False)) if isinstance(obj, ServerObject) else False
+    button._dzll_fav_state = fav
     label = getattr(button, "_dzll_label", None)
     if label is not None:
         label.set_markup('<span foreground="#f5c542">★</span>' if fav else '<span foreground="#7a7a7a">☆</span>')
+        if perf_metrics is not None:
+            perf_metrics.count("fav_label_writes")
 
 
-def _make_fav_factory(on_toggle_fav):
+def _bind_fav_button_light(
+    button: Gtk.Button,
+    obj: ServerObject | None,
+    perf_metrics=None,
+) -> None:
+    button._dzll_bound_obj = obj
+    if perf_metrics is not None:
+        perf_metrics.count("fav_bound_assignments")
+    fav = bool(getattr(obj, "fav", False)) if isinstance(obj, ServerObject) else False
+    if getattr(button, "_dzll_fav_state", None) is fav:
+        if perf_metrics is not None:
+            perf_metrics.count("drag_skipped_text_writes")
+        return
+    label = getattr(button, "_dzll_label", None)
+    if label is not None:
+        label.set_markup(
+            '<span foreground="#f5c542">★</span>'
+            if fav
+            else '<span foreground="#7a7a7a">☆</span>'
+        )
+        if perf_metrics is not None:
+            perf_metrics.count("fav_label_writes")
+    button._dzll_fav_state = fav
+
+
+def _make_fav_factory(on_toggle_fav, perf_metrics=None, drag_light=None):
     factory = Gtk.SignalListItemFactory()
 
     def setup(_factory, list_item):
+        if perf_metrics is not None:
+            perf_metrics.record_setup("fav")
         button = Gtk.Button()
         button.set_can_focus(False)
         button.set_halign(Gtk.Align.CENTER)
@@ -711,6 +1021,8 @@ def _make_fav_factory(on_toggle_fav):
         button.set_size_request(_META_WIDTHS["fav"], -1)
         label = Gtk.Label()
         label.add_css_class("dzll-column-fav-star")
+        if perf_metrics is not None:
+            perf_metrics.count("fav_css_changes", 3)
         button._dzll_label = label
         button.set_child(label)
         attach_pointer_cursor(button)
@@ -723,26 +1035,93 @@ def _make_fav_factory(on_toggle_fav):
         button.connect("clicked", clicked)
         list_item.set_child(button)
 
-    def bind(_factory, list_item):
-        _record_sort_debug_bind("fav")
+    def render_full(list_item, known_cell=None):
         button = list_item.get_child()
-        _disconnect_notify_handlers(button)
+        if button is None or (known_cell is not None and button is not known_cell):
+            return
+        _disconnect_notify_handlers(button, perf_metrics, "fav")
         obj = list_item.get_item()
-        _bind_fav_button(button, obj if isinstance(obj, ServerObject) else None)
+        _bind_fav_button(
+            button,
+            obj if isinstance(obj, ServerObject) else None,
+            perf_metrics,
+        )
         if not isinstance(obj, ServerObject):
             return
+
+        def notify(changed_obj, _pspec, btn=button):
+            if not _notify_is_current(btn, changed_obj):
+                return
+            _bind_fav_button(btn, changed_obj, perf_metrics)
+
         try:
-            hid = obj.connect("notify::fav", lambda changed_obj, _pspec, btn=button: _bind_fav_button(btn, changed_obj))
+            hid = obj.connect("notify::fav", notify)
             button._dzll_notify_obj = obj
             button._dzll_notify_ids = [hid]
+            if perf_metrics is not None:
+                perf_metrics.count("notify_connects")
+                perf_metrics.count("fav_notify_connects")
         except Exception:
             pass
 
-    def unbind(_factory, list_item):
+    def render_light(list_item, known_cell=None):
         button = list_item.get_child()
-        if button is not None:
-            _disconnect_notify_handlers(button)
-            button._dzll_bound_obj = None
+        if button is None or (known_cell is not None and button is not known_cell):
+            return
+        _disconnect_notify_handlers(button, perf_metrics, "fav")
+        obj = list_item.get_item()
+        _bind_fav_button_light(
+            button,
+            obj if isinstance(obj, ServerObject) else None,
+            perf_metrics,
+        )
+        if perf_metrics is not None:
+            perf_metrics.count("drag_skipped_notify_connects")
+
+    def bind(_factory, list_item):
+        light = _drag_light_active(drag_light)
+        token = (
+            perf_metrics.start(
+                "fav",
+                "bind",
+                bind_mode="light" if light else "full",
+            )
+            if perf_metrics is not None
+            else None
+        )
+        try:
+            _record_sort_debug_bind("fav")
+            button = list_item.get_child()
+            if button is None:
+                return
+            if light:
+                render_light(list_item, button)
+            else:
+                render_full(list_item, button)
+            _register_bound_cell(
+                drag_light,
+                "fav",
+                button,
+                list_item,
+                render_full,
+            )
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
+
+    def unbind(_factory, list_item):
+        token = perf_metrics.start("fav", "unbind") if perf_metrics is not None else None
+        try:
+            button = list_item.get_child()
+            if button is not None:
+                _unregister_bound_cell(drag_light, button, list_item)
+                _disconnect_notify_handlers(button, perf_metrics, "fav")
+                button._dzll_bound_obj = None
+                if perf_metrics is not None:
+                    perf_metrics.count("fav_bound_assignments")
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     factory.connect("setup", setup)
     factory.connect("bind", bind)
@@ -750,16 +1129,20 @@ def _make_fav_factory(on_toggle_fav):
     return factory
 
 
-def _set_perspective_class(label: Gtk.Label, css_class: str) -> None:
+def _set_perspective_class(label: Gtk.Label, css_class: str, perf_metrics=None) -> None:
     previous = getattr(label, "_dzll_perspective_class", None)
     if previous == css_class:
         return
     for cls in ("perspective-badge-1pp", "perspective-badge-3pp"):
         try:
             label.remove_css_class(cls)
+            if perf_metrics is not None:
+                perf_metrics.count("name_css_changes")
         except Exception:
             pass
     label.add_css_class(css_class)
+    if perf_metrics is not None:
+        perf_metrics.count("name_css_changes")
     label._dzll_perspective_class = css_class
 
 
@@ -905,6 +1288,23 @@ def _close_open_required_mods_popover() -> None:
         _clear_open_required_mods_popover()
 
 
+def set_required_mods_popup_suppressed(suppressed: bool) -> bool:
+    """Gate popup presentation without touching the Mods pill itself."""
+    global _REQUIRED_MODS_POPUP_SUPPRESSED
+    suppressed = bool(suppressed)
+    if _REQUIRED_MODS_POPUP_SUPPRESSED == suppressed:
+        return False
+    had_open_popover = _OPEN_REQUIRED_MODS_WIDGET is not None
+    _REQUIRED_MODS_POPUP_SUPPRESSED = suppressed
+    if suppressed:
+        _close_open_required_mods_popover()
+    return had_open_popover
+
+
+def required_mods_popup_suppression_count() -> int:
+    return int(_REQUIRED_MODS_POPUP_SUPPRESSION_COUNT)
+
+
 def _on_required_mods_root_active_notify(root, _pspec) -> None:
     try:
         active = bool(root.get_property("is-active"))
@@ -1020,6 +1420,10 @@ def _on_ipport_label_pressed(gesture, _n_press, _x, _y, label) -> None:
 
 def _show_required_mods_popover(widget) -> None:
     global _OPEN_REQUIRED_MODS_WIDGET, _OPEN_REQUIRED_MODS_POPOVER
+    global _REQUIRED_MODS_POPUP_SUPPRESSION_COUNT
+    if _REQUIRED_MODS_POPUP_SUPPRESSED:
+        _REQUIRED_MODS_POPUP_SUPPRESSION_COUNT += 1
+        return
     names = getattr(widget, "_dzll_required_mod_names", None) or []
     if not names:
         _popdown_required_mods_popover(widget)
@@ -1051,6 +1455,9 @@ def _show_required_mods_popover(widget) -> None:
         except Exception:
             pass
     if getattr(popover, "_dzll_required_mods_key", None) != content_key:
+        perf_metrics = getattr(widget, "_dzll_factory_perf_metrics", None)
+        if perf_metrics is not None:
+            perf_metrics.count("name_popover_content_work")
         popover.set_child(_make_required_mods_popover_content(list(names)))
         popover._dzll_required_mods_key = content_key
 
@@ -1065,7 +1472,14 @@ def _show_required_mods_popover(widget) -> None:
         pass
 
 
-def _bind_required_mods_popover_target(widget, obj: ServerObject | None) -> None:
+def _bind_required_mods_popover_target(
+    widget,
+    obj: ServerObject | None,
+    perf_metrics=None,
+) -> None:
+    if perf_metrics is not None:
+        perf_metrics.count("name_mod_prepare_calls")
+        perf_metrics.count("name_popover_owner_checks")
     names = _required_mod_names_from_json(getattr(obj, "mods_json", "") or "") if isinstance(obj, ServerObject) else []
     previous_names = tuple(getattr(widget, "_dzll_required_mod_names", None) or [])
     widget._dzll_required_mod_names = names
@@ -1073,15 +1487,23 @@ def _bind_required_mods_popover_target(widget, obj: ServerObject | None) -> None
     _set_required_mods_pointer_cursor(widget, has_mods)
     try:
         widget.set_tooltip_text("View required mods" if has_mods else None)
+        if perf_metrics is not None:
+            perf_metrics.count("name_tooltip_writes")
     except Exception:
         pass
+    if _REQUIRED_MODS_POPUP_SUPPRESSED:
+        return
     if tuple(names) != previous_names:
+        if perf_metrics is not None:
+            perf_metrics.count("name_popover_popdowns")
         _popdown_required_mods_popover(widget)
     if not names:
+        if perf_metrics is not None:
+            perf_metrics.count("name_popover_popdowns")
         _popdown_required_mods_popover(widget)
 
 
-def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
+def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) -> None:
     lock_label = cell._dzll_lock_label
     name_label = cell._dzll_name_label
     perspective_label = cell._dzll_perspective_label
@@ -1090,6 +1512,9 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
     mods_label = cell._dzll_mods_label
     mods_button = cell._dzll_mods_button
     mods_button_label = cell._dzll_mods_button_label
+    cell._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+    mods_button._dzll_bound_obj = cell._dzll_bound_obj
+    cell._dzll_drag_tooltips_cleared = False
 
     if not isinstance(obj, ServerObject):
         lock_label.set_text("")
@@ -1104,7 +1529,11 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
         mods_label.set_visible(False)
         mods_button_label.set_text("")
         mods_button.set_visible(False)
-        _bind_required_mods_popover_target(mods_button, None)
+        _bind_required_mods_popover_target(mods_button, None, perf_metrics)
+        if perf_metrics is not None:
+            perf_metrics.count("name_text_writes", 7)
+            perf_metrics.count("name_tooltip_writes", 2)
+            perf_metrics.count("name_visibility_changes", 2)
         return
 
     lock_label.set_text("🔒" if bool(getattr(obj, "password", False)) else "")
@@ -1114,7 +1543,11 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
 
     is_3p = bool(getattr(obj, "third_person", False))
     perspective_label.set_text("3P" if is_3p else "1P")
-    _set_perspective_class(perspective_label, "perspective-badge-3pp" if is_3p else "perspective-badge-1pp")
+    _set_perspective_class(
+        perspective_label,
+        "perspective-badge-3pp" if is_3p else "perspective-badge-1pp",
+        perf_metrics,
+    )
 
     country = (getattr(obj, "country", "") or "").strip().upper()
     flag_label.set_text(flag_for(country) if len(country) == 2 else "")
@@ -1130,13 +1563,114 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None) -> None:
     has_mods = mod_count > 0
     mods_label.set_visible(not has_mods)
     mods_button.set_visible(has_mods)
-    _bind_required_mods_popover_target(mods_button, obj)
+    _bind_required_mods_popover_target(mods_button, obj, perf_metrics)
+    if perf_metrics is not None:
+        perf_metrics.count("name_text_writes", 7)
+        perf_metrics.count("name_tooltip_writes", 2)
+        perf_metrics.count("name_visibility_changes", 2)
+        perf_metrics.count(
+            "name_flag_address_format_calls",
+            1 + int(len(country) == 2),
+        )
 
 
-def _make_name_factory():
+def _bind_name_cell_light(
+    cell: Gtk.Box,
+    obj: ServerObject | None,
+    perf_metrics=None,
+) -> None:
+    lock_label = cell._dzll_lock_label
+    name_label = cell._dzll_name_label
+    perspective_label = cell._dzll_perspective_label
+    flag_label = cell._dzll_flag_label
+    ipport_label = cell._dzll_ipport_label
+    mods_label = cell._dzll_mods_label
+    mods_button = cell._dzll_mods_button
+    mods_button_label = cell._dzll_mods_button_label
+
+    current_obj = obj if isinstance(obj, ServerObject) else None
+    cell._dzll_bound_obj = current_obj
+    mods_button._dzll_bound_obj = current_obj
+    # Never retain popup data from a recycled server while presentation is
+    # suppressed. The normal settle refresh prepares the current names once.
+    mods_button._dzll_required_mod_names = []
+    _set_required_mods_pointer_cursor(mods_button, False)
+
+    if not getattr(cell, "_dzll_drag_tooltips_cleared", False):
+        for widget in (name_label, ipport_label, mods_button):
+            try:
+                widget.set_tooltip_text(None)
+            except Exception:
+                pass
+        cell._dzll_drag_tooltips_cleared = True
+
+    if current_obj is None:
+        values = ("", "", "", "", "", "", "")
+        has_mods = False
+        ipport = ""
+    else:
+        mod_count = int(getattr(current_obj, "mod_count", 0) or 0)
+        mods_text = f"Mods: {mod_count}"
+        raw_country = getattr(current_obj, "country", "") or ""
+        country = raw_country.strip().upper()
+        flag_text = ""
+        if len(country) == 2:
+            stable_key = getattr(current_obj, "_row_stable_cache_key", None)
+            cached_flag = getattr(current_obj, "_row_flag_text", None)
+            cache_matches = (
+                isinstance(stable_key, tuple)
+                and bool(stable_key)
+                and stable_key[0] == raw_country
+                and raw_country.upper() == country
+                and cached_flag is not None
+            )
+            flag_text = cached_flag if cache_matches else flag_for(country)
+        ipport = getattr(current_obj, "_row_ipport_plain", None)
+        if ipport is None:
+            stable_flag, _country_name, ipport, _meta = row_stable_display(current_obj)
+            if len(country) == 2 and raw_country.upper() == country:
+                flag_text = stable_flag
+        values = (
+            "🔒" if bool(getattr(current_obj, "password", False)) else "",
+            (getattr(current_obj, "name", "") or "").strip(),
+            "3P" if bool(getattr(current_obj, "third_person", False)) else "1P",
+            flag_text,
+            ipport,
+            mods_text,
+            mods_text,
+        )
+        has_mods = mod_count > 0
+
+    for index, (widget, value) in enumerate(zip(
+        (
+            lock_label,
+            name_label,
+            perspective_label,
+            flag_label,
+            ipport_label,
+            mods_label,
+            mods_button_label,
+        ),
+        values,
+    )):
+        changed = _set_text_if_changed(widget, value, perf_metrics)
+        if changed and index == 3 and perf_metrics is not None:
+            perf_metrics.count("light_flag_updates")
+    ipport_label._dzll_ipport_plain = ipport
+    _set_visible_if_changed(mods_label, not has_mods, perf_metrics)
+    _set_visible_if_changed(mods_button, has_mods, perf_metrics)
+    if perf_metrics is not None:
+        perf_metrics.count("drag_skipped_tooltip_writes", 3)
+        perf_metrics.count("drag_skipped_css_writes", 3)
+        perf_metrics.count("drag_skipped_popup_preparation")
+
+
+def _make_name_factory(perf_metrics=None, drag_light=None):
     factory = Gtk.SignalListItemFactory()
 
     def setup(_factory, list_item):
+        if perf_metrics is not None:
+            perf_metrics.record_setup("name")
         outer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         outer.set_hexpand(True)
         outer.set_vexpand(True)
@@ -1244,19 +1778,94 @@ def _make_name_factory():
         outer._dzll_mods_label = mods_label
         outer._dzll_mods_button = mods_button
         outer._dzll_mods_button_label = mods_button_label
+        mods_button._dzll_factory_perf_metrics = perf_metrics
+        if perf_metrics is not None:
+            perf_metrics.count("name_css_changes", 5)
         list_item.set_child(outer)
 
+    def render_full(list_item, known_cell=None):
+        cell = list_item.get_child()
+        if cell is None or (known_cell is not None and cell is not known_cell):
+            return
+        _bind_name_cell(cell, list_item.get_item(), perf_metrics)
+
+    def render_light(list_item, known_cell=None):
+        cell = list_item.get_child()
+        if cell is None or (known_cell is not None and cell is not known_cell):
+            return
+        _bind_name_cell_light(cell, list_item.get_item(), perf_metrics)
+
     def bind(_factory, list_item):
-        _record_sort_debug_bind("name")
-        _bind_name_cell(list_item.get_child(), list_item.get_item())
+        light = _drag_light_active(drag_light)
+        token = (
+            perf_metrics.start(
+                "name",
+                "bind",
+                bind_mode="light" if light else "full",
+            )
+            if perf_metrics is not None
+            else None
+        )
+        try:
+            _record_sort_debug_bind("name")
+            cell = list_item.get_child()
+            if cell is None:
+                return
+            if light:
+                render_light(list_item, cell)
+            else:
+                render_full(list_item, cell)
+            _register_bound_cell(
+                drag_light,
+                "name",
+                cell,
+                list_item,
+                render_full,
+            )
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     def unbind(_factory, list_item):
-        _bind_name_cell(list_item.get_child(), None)
+        token = perf_metrics.start("name", "unbind") if perf_metrics is not None else None
+        try:
+            cell = list_item.get_child()
+            _unregister_bound_cell(drag_light, cell, list_item)
+            if _drag_light_active(drag_light):
+                _bind_name_cell_light(cell, None, perf_metrics)
+            else:
+                _bind_name_cell(cell, None, perf_metrics)
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     factory.connect("setup", setup)
     factory.connect("bind", bind)
     factory.connect("unbind", unbind)
     return factory
+
+
+def _bind_action_button_light(
+    button,
+    obj,
+    *,
+    factory_name: str,
+    active_css_class: str | None,
+    tooltip_text: str | None,
+    perf_metrics=None,
+) -> None:
+    button._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+    if perf_metrics is not None:
+        perf_metrics.count(f"{factory_name}_bound_assignments")
+    if not active_css_class:
+        return
+    if not getattr(button, "_dzll_drag_action_light", False) and tooltip_text:
+        button.set_tooltip_text(tooltip_text)
+    button._dzll_drag_action_light = True
+    if perf_metrics is not None:
+        perf_metrics.count("drag_skipped_tooltip_writes")
+        perf_metrics.count("drag_skipped_css_writes")
+        perf_metrics.count("drag_skipped_image_writes", 2)
 
 
 def _make_action_factory(
@@ -1270,11 +1879,15 @@ def _make_action_factory(
     is_active=None,
     tooltip_text: str | None = None,
     active_tooltip_text: str | None = None,
+    factory_name: str,
+    perf_metrics=None,
+    drag_light=None,
 ):
     factory = Gtk.SignalListItemFactory()
     buttons = []
 
     def update_active_state(button, obj) -> None:
+        button._dzll_drag_action_light = False
         if not active_css_class:
             return
         image = button.get_child()
@@ -1286,33 +1899,53 @@ def _make_action_factory(
                 active = False
         if active:
             button.add_css_class(active_css_class)
+            if perf_metrics is not None:
+                perf_metrics.count(f"{factory_name}_css_changes")
             if isinstance(image, Gtk.Image):
                 image.remove_css_class("monitor-eye-idle")
                 image.add_css_class("monitor-eye-active")
+                if perf_metrics is not None:
+                    perf_metrics.count(f"{factory_name}_image_state_changes", 2)
         else:
             button.remove_css_class(active_css_class)
+            if perf_metrics is not None:
+                perf_metrics.count(f"{factory_name}_css_changes")
             if isinstance(image, Gtk.Image):
                 image.remove_css_class("monitor-eye-active")
                 image.add_css_class("monitor-eye-idle")
+                if perf_metrics is not None:
+                    perf_metrics.count(f"{factory_name}_image_state_changes", 2)
         if tooltip_text or active_tooltip_text:
             button.set_tooltip_text(active_tooltip_text if active and active_tooltip_text else tooltip_text)
+            if perf_metrics is not None:
+                perf_metrics.count(f"{factory_name}_tooltip_writes")
 
     def setup(_factory, list_item):
+        if perf_metrics is not None:
+            perf_metrics.record_setup(factory_name)
         button = Gtk.Button()
         buttons.append(button)
         button.set_can_focus(False)
         button.set_halign(Gtk.Align.CENTER)
         button.set_valign(Gtk.Align.CENTER)
         button.add_css_class("flat")
+        if perf_metrics is not None:
+            perf_metrics.count(f"{factory_name}_css_changes")
         if css_class:
             button.add_css_class(css_class)
+            if perf_metrics is not None:
+                perf_metrics.count(f"{factory_name}_css_changes")
         if margin_start:
             button.set_margin_start(margin_start)
         if margin_end:
             button.set_margin_end(margin_end)
         button.set_child(Gtk.Image.new_from_icon_name(icon_name))
+        if perf_metrics is not None:
+            perf_metrics.count(f"{factory_name}_image_state_changes")
         if tooltip_text:
             button.set_tooltip_text(tooltip_text)
+            if perf_metrics is not None:
+                perf_metrics.count(f"{factory_name}_tooltip_writes")
         button.set_size_request(34, -1)
         attach_pointer_cursor(button)
 
@@ -1324,18 +1957,79 @@ def _make_action_factory(
         button.connect("clicked", clicked)
         list_item.set_child(button)
 
-    def bind(_factory, list_item):
-        _record_sort_debug_bind("action")
+    def render_full(list_item, known_cell=None):
         button = list_item.get_child()
+        if button is None or (known_cell is not None and button is not known_cell):
+            return
         obj = list_item.get_item()
-        button._dzll_bound_obj = obj
-        update_active_state(button, obj)
+        button._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+        if perf_metrics is not None:
+            perf_metrics.count(f"{factory_name}_bound_assignments")
+        update_active_state(button, button._dzll_bound_obj)
+
+    def render_light(list_item, known_cell=None):
+        button = list_item.get_child()
+        if button is None or (known_cell is not None and button is not known_cell):
+            return
+        _bind_action_button_light(
+            button,
+            list_item.get_item(),
+            factory_name=factory_name,
+            active_css_class=active_css_class,
+            tooltip_text=tooltip_text,
+            perf_metrics=perf_metrics,
+        )
+
+    def bind(_factory, list_item):
+        light = _drag_light_active(drag_light)
+        token = (
+            perf_metrics.start(
+                factory_name,
+                "bind",
+                bind_mode="light" if light else "full",
+            )
+            if perf_metrics is not None
+            else None
+        )
+        try:
+            _record_sort_debug_bind("action")
+            button = list_item.get_child()
+            if button is None:
+                return
+            if light:
+                render_light(list_item, button)
+            else:
+                render_full(list_item, button)
+            _register_bound_cell(
+                drag_light,
+                factory_name,
+                button,
+                list_item,
+                render_full,
+            )
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     def unbind(_factory, list_item):
-        button = list_item.get_child()
-        if button is not None:
-            button._dzll_bound_obj = None
-            update_active_state(button, None)
+        token = perf_metrics.start(factory_name, "unbind") if perf_metrics is not None else None
+        try:
+            button = list_item.get_child()
+            if button is not None:
+                _unregister_bound_cell(drag_light, button, list_item)
+                button._dzll_bound_obj = None
+                if perf_metrics is not None:
+                    perf_metrics.count(f"{factory_name}_bound_assignments")
+                if _drag_light_active(drag_light):
+                    if perf_metrics is not None and active_css_class:
+                        perf_metrics.count("drag_skipped_tooltip_writes")
+                        perf_metrics.count("drag_skipped_css_writes")
+                        perf_metrics.count("drag_skipped_image_writes", 2)
+                else:
+                    update_active_state(button, None)
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
 
     factory.connect("setup", setup)
     factory.connect("bind", bind)
@@ -1386,6 +2080,8 @@ def build_server_column_view(
     on_header_sort=None,
     is_monitored=None,
     ubuntu_geometry: bool = False,
+    perf_metrics=None,
+    drag_light=None,
 ) -> tuple[Gtk.ColumnView, dict[str, bool]]:
     view = Gtk.ColumnView.new(selection_model)
     view._dzll_on_sort_header_clicked = on_header_sort
@@ -1411,11 +2107,16 @@ def build_server_column_view(
     except Exception:
         pass
 
-    _append_column(view, "FAV", _make_fav_factory(on_toggle_fav), _META_WIDTHS["fav"])
+    _append_column(
+        view,
+        "FAV",
+        _make_fav_factory(on_toggle_fav, perf_metrics, drag_light),
+        _META_WIDTHS["fav"],
+    )
     name_column = _append_column(
         view,
         "NAME / IP / MODS",
-        _make_name_factory(),
+        _make_name_factory(perf_metrics, drag_light),
         320,
         expand=True,
         header_xalign=0.0,
@@ -1428,31 +2129,64 @@ def build_server_column_view(
     _append_column(
         view,
         "TIME",
-        _make_label_factory(_bind_time, max_chars=11, cell_css_classes=right_border),
+        _make_label_factory(_bind_time,
+            factory_name="time",
+            perf_metrics=perf_metrics,
+            drag_light=drag_light,
+            light_binder=_bind_time_light,
+            max_chars=11,
+            cell_css_classes=right_border,
+        ),
         _META_WIDTHS["time"],
     )
     _append_column(
         view,
         "PLAYED",
-        _make_label_factory(_bind_played, max_chars=12, cell_css_classes=right_border),
+        _make_label_factory(_bind_played,
+            factory_name="played",
+            perf_metrics=perf_metrics,
+            drag_light=drag_light,
+            light_binder=_bind_played_light,
+            max_chars=12,
+            cell_css_classes=right_border,
+        ),
         _META_WIDTHS["played"],
     )
     _append_column(
         view,
         "MAP",
-        _make_label_factory(_bind_map, max_chars=18, cell_css_classes=right_border),
+        _make_label_factory(_bind_map,
+            factory_name="map",
+            perf_metrics=perf_metrics,
+            drag_light=drag_light,
+            light_binder=_bind_map_light,
+            max_chars=18,
+            cell_css_classes=right_border,
+        ),
         _META_WIDTHS["map"],
     )
     _append_column(
         view,
         "PLAYERS",
-        _make_players_factory(ubuntu_geometry=ubuntu_geometry),
+        _make_players_factory(
+            ubuntu_geometry=ubuntu_geometry,
+            perf_metrics=perf_metrics,
+            drag_light=drag_light,
+        ),
         _META_WIDTHS["players"],
     )
     _append_column(
         view,
         "PING",
-        _make_label_factory(_bind_ping, notify_props=("ping",), max_chars=8, cell_css_classes=right_border),
+        _make_label_factory(_bind_ping,
+            factory_name="ping",
+            perf_metrics=perf_metrics,
+            drag_light=drag_light,
+            light_binder=_bind_ping_light,
+            notify_props=("ping",),
+            max_chars=8,
+            cell_css_classes=right_border,
+        ),
         _META_WIDTHS["ping"],
     )
     monitor_factory = _make_action_factory(
@@ -1464,6 +2198,9 @@ def build_server_column_view(
         is_active=is_monitored,
         tooltip_text="Monitor this server in\nthe Server Companion",
         active_tooltip_text="Currently monitoring this server",
+        factory_name="monitor",
+        perf_metrics=perf_metrics,
+        drag_light=drag_light,
     )
     _append_column(
         view,
@@ -1483,6 +2220,9 @@ def build_server_column_view(
             "dzll-join-button",
             margin_end=4,
             tooltip_text="Join this server",
+            factory_name="join",
+            perf_metrics=perf_metrics,
+            drag_light=drag_light,
         ),
         _META_WIDTHS["join"],
         header_title="",

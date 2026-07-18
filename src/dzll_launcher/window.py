@@ -88,9 +88,18 @@ from .maps import standardize_map, map_choices_from_db_rows
 from .ui_row import ServerObject, hr, attach_pointer_cursor
 from .column_view import (
     build_server_column_view,
+    required_mods_popup_suppression_count,
     refresh_column_view_sort_header_handlers,
     refresh_column_view_sort_indicators,
+    set_required_mods_popup_suppressed,
     set_sort_debug_bind_hook,
+)
+from .scrollbar_interaction import (
+    SCROLLBAR_FACTORY_NAMES,
+    ScrollbarDragLightController,
+    ScrollbarFactoryMetrics,
+    ScrollbarInteractionState,
+    drag_light_enabled_from_env,
 )
 
 from .settings import (
@@ -183,11 +192,16 @@ DEBUG_SC_DOCK = os.environ.get("DZLL_DEBUG_SC_DOCK") == "1"
 DEBUG_SC_ALERTS = os.environ.get("DZLL_DEBUG_SC_ALERTS") == "1"
 DEBUG_STARTUP_LIVE = os.environ.get("DZLL_DEBUG_STARTUP_LIVE") == "1"
 FAST_SCROLL_RENDER_ENABLED = os.environ.get("DZLL_FAST_SCROLL_RENDER") == "1"
+SCROLL_DRAG_PERF_ENABLED = os.environ.get("DZLL_SCROLL_DRAG_PERF") == "1"
+SCROLL_DRAG_LIGHT_BIND_ENABLED = drag_light_enabled_from_env(
+    os.environ.get("DZLL_SCROLL_DRAG_LIGHT_BIND")
+)
 INCREMENTAL_MODELS_DISABLED = os.environ.get("DZLL_DISABLE_INCREMENTAL_MODELS") == "1"
 INCREMENTAL_MODELS_ENABLED = not INCREMENTAL_MODELS_DISABLED
 PERF_STALL_INTERVAL_MS = 250
 PERF_STALL_LATE_MS = 250
 BROWSER_LIVE_SCROLL_PAUSE_SECONDS = 1.0
+SCROLLBAR_INTERACTION_WATCHDOG_MS = 15000
 SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS = 200
 
 
@@ -425,6 +439,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._shutdown_cleanup_done = False
         self.connect("close-request", self._on_close_request)
+        self.connect("unmap", self._on_browser_scrollbar_unmap)
         self._perf_row_binds = 0
         self._perf_sort_calls = 0
         self._perf_sort_total = 0.0
@@ -434,6 +449,21 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._perf_scroll_max = 0.0
         self._row_widgets = weakref.WeakSet()
         self._fast_scroll_render_refresh_id = 0
+        self._scrollbar_interaction = ScrollbarInteractionState()
+        self._scroll_drag_factory_metrics = ScrollbarFactoryMetrics(
+            SCROLL_DRAG_PERF_ENABLED
+        )
+        self._scroll_drag_light = ScrollbarDragLightController(
+            SCROLL_DRAG_LIGHT_BIND_ENABLED
+        )
+        self._scroll_drag_factory_snapshot = None
+        self._scrollbar_interaction_controller = None
+        self._scrollbar_interaction_watchdog_id = 0
+        self._scroll_drag_adjustment_total = 0.0
+        self._scroll_drag_adjustment_max = 0.0
+        self._scroll_drag_popup_closed = 0
+        self._scroll_drag_popup_suppression_start = 0
+        self._scroll_drag_deferred_applied = {}
         self._perf_stall_last = time.perf_counter()
         self._filter_timing_enabled = DEBUG_FILTER_TIMING
         if PERF_LOG_ENABLED:
@@ -992,6 +1022,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._on_column_view_sort_header_clicked,
             self._is_server_companion_monitoring_obj,
             ubuntu_geometry=self._ubuntu_geometry,
+            perf_metrics=(
+                self._scroll_drag_factory_metrics
+                if SCROLL_DRAG_PERF_ENABLED
+                else None
+            ),
+            drag_light=(
+                self._scroll_drag_light
+                if SCROLL_DRAG_LIGHT_BIND_ENABLED
+                else None
+            ),
         )
         refresh_column_view_sort_header_handlers(self.list_view)
         if PERF_LOG_ENABLED:
@@ -1057,6 +1097,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 vadj.connect("value-changed", self._on_browser_scroll_value_changed)
         except Exception:
             pass
+        self._install_browser_scrollbar_interaction_controller()
 
         self._server_companion_snapshot = None
         self._server_companion_obj = None
@@ -2275,9 +2316,365 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         self._browser_toast_timeout_id = GLib.timeout_add(int(timeout_ms), self._hide_browser_toast)
 
-    def _on_browser_scroll_value_changed(self, *_args):
-        start = time.perf_counter() if PERF_LOG_ENABLED else None
+    def _browser_vadjustment_value(self) -> float | None:
         try:
+            vadj = self.scroller.get_vadjustment()
+            if vadj is not None:
+                return float(vadj.get_value())
+        except Exception:
+            pass
+        return None
+
+    def _install_browser_scrollbar_interaction_controller(self) -> bool:
+        """Observe the native GTK4 scrollbar without claiming its events."""
+        try:
+            get_vscrollbar = getattr(self.scroller, "get_vscrollbar", None)
+            scrollbar = get_vscrollbar() if callable(get_vscrollbar) else None
+        except Exception:
+            scrollbar = None
+        if scrollbar is None:
+            return False
+        try:
+            click_new = getattr(Gtk.GestureClick, "new", None)
+            click = click_new() if callable(click_new) else Gtk.GestureClick()
+        except Exception:
+            return False
+        try:
+            click.set_button(1)
+        except Exception:
+            pass
+        try:
+            phase = getattr(getattr(Gtk, "PropagationPhase", None), "CAPTURE", None)
+            set_phase = getattr(click, "set_propagation_phase", None)
+            if phase is not None and callable(set_phase):
+                set_phase(phase)
+        except Exception:
+            pass
+
+        def connect_if_available(signal_name, callback):
+            try:
+                click.connect(signal_name, callback)
+                return True
+            except Exception:
+                return False
+
+        pressed_connected = connect_if_available(
+            "pressed", self._on_browser_scrollbar_pressed
+        )
+        released_connected = connect_if_available(
+            "released", self._on_browser_scrollbar_released
+        )
+        if not (pressed_connected and released_connected):
+            return False
+        connect_if_available("cancel", self._on_browser_scrollbar_cancelled)
+        connect_if_available("stopped", self._on_browser_scrollbar_stopped)
+        connect_if_available("unpaired-release", self._on_browser_scrollbar_unpaired_release)
+        try:
+            scrollbar.add_controller(click)
+        except Exception:
+            return False
+        self._scrollbar_interaction_controller = click
+        self._scrollbar_interaction_widget = scrollbar
+        return True
+
+    def _on_browser_scrollbar_pressed(self, *_args):
+        state = self._scrollbar_interaction
+        generation, began = state.begin(
+            now=time.perf_counter(),
+            adjustment_value=self._browser_vadjustment_value(),
+        )
+        if not began:
+            return
+        factory_metrics = getattr(self, "_scroll_drag_factory_metrics", None)
+        if factory_metrics is not None:
+            factory_metrics.begin(generation)
+        drag_light = getattr(self, "_scroll_drag_light", None)
+        if drag_light is not None:
+            drag_light.begin(generation)
+        self._scroll_drag_factory_snapshot = None
+        self._browser_live_scroll_active_until = (
+            time.monotonic() + BROWSER_LIVE_SCROLL_PAUSE_SECONDS
+        )
+        self._scroll_drag_adjustment_total = 0.0
+        self._scroll_drag_adjustment_max = 0.0
+        self._scroll_drag_deferred_applied = {}
+        self._scroll_drag_popup_suppression_start = required_mods_popup_suppression_count()
+        self._scroll_drag_popup_closed = int(set_required_mods_popup_suppressed(True))
+        self._cancel_browser_scrollbar_watchdog()
+        try:
+            self._scrollbar_interaction_watchdog_id = GLib.timeout_add(
+                SCROLLBAR_INTERACTION_WATCHDOG_MS,
+                self._on_browser_scrollbar_watchdog,
+                generation,
+            )
+        except Exception:
+            self._scrollbar_interaction_watchdog_id = 0
+
+    def _on_browser_scrollbar_released(self, *_args):
+        self._settle_browser_scrollbar_interaction("release")
+
+    def _on_browser_scrollbar_cancelled(self, *_args):
+        self._settle_browser_scrollbar_interaction("cancel")
+
+    def _on_browser_scrollbar_stopped(self, *_args):
+        # GtkGestureClick::stopped means its time/distance threshold was
+        # exceeded, which is expected during a real thumb drag. The release,
+        # cancel, unpaired-release, unmap or watchdog remains authoritative.
+        return None
+
+    def _on_browser_scrollbar_unpaired_release(self, *_args):
+        self._settle_browser_scrollbar_interaction("unpaired-release")
+
+    def _on_browser_scrollbar_unmap(self, *_args):
+        self._settle_browser_scrollbar_interaction("unmap")
+
+    def _on_browser_scrollbar_watchdog(self, generation: int):
+        self._scrollbar_interaction_watchdog_id = 0
+        self._settle_browser_scrollbar_interaction("watchdog", generation=generation)
+        return False
+
+    def _cancel_browser_scrollbar_watchdog(self) -> None:
+        source_id = int(getattr(self, "_scrollbar_interaction_watchdog_id", 0) or 0)
+        self._scrollbar_interaction_watchdog_id = 0
+        if not source_id:
+            return
+        try:
+            GLib.source_remove(source_id)
+        except Exception:
+            pass
+
+    def _defer_browser_scrollbar_work(self, category: str, work) -> bool:
+        state = getattr(self, "_scrollbar_interaction", None)
+        if state is None or not state.active:
+            return False
+        return state.defer(category, work, generation=state.generation)
+
+    def _drain_browser_scrollbar_work(self, settlement) -> None:
+        for category, work in settlement.deferred_work.items():
+            applied = False
+            try:
+                if category == "browser-live-results":
+                    token, target_keys, results = work
+                    self._apply_browser_live_results(
+                        token,
+                        target_keys,
+                        results,
+                        _from_scroll_settle=True,
+                    )
+                    applied = True
+            except Exception:
+                applied = False
+            if applied:
+                counts = self._scroll_drag_deferred_applied
+                counts[category] = int(counts.get(category, 0) or 0) + 1
+
+    @staticmethod
+    def _scroll_drag_value_text(value) -> str:
+        return "-" if value is None else f"{float(value):.1f}"
+
+    def _print_scroll_drag_summary(self, settlement, final_value, settle_latency) -> None:
+        if not SCROLL_DRAG_PERF_ENABLED:
+            return
+        suppressed = max(
+            0,
+            required_mods_popup_suppression_count()
+            - int(getattr(self, "_scroll_drag_popup_suppression_start", 0) or 0),
+        )
+        applied = sum(self._scroll_drag_deferred_applied.values())
+        watchdog = int(settlement.reason == "watchdog")
+        last_event_gap = settlement.last_adjustment_to_settle
+        last_event_gap_ms = -1.0 if last_event_gap is None else last_event_gap * 1000.0
+        print(
+            "[SCROLL-DRAG] "
+            f"id={settlement.generation} duration_ms={settlement.duration * 1000.0:.1f} "
+            f"reason={settlement.reason} events={settlement.adjustment_events} "
+            f"first={self._scroll_drag_value_text(settlement.first_adjustment_value)} "
+            f"latest={self._scroll_drag_value_text(settlement.latest_adjustment_value)} "
+            f"final={self._scroll_drag_value_text(final_value)} "
+            f"deferred={settlement.deferred_requests} coalesced={settlement.coalesced_requests} "
+            f"deferred_categories={len(settlement.deferred_work)} applied={applied} "
+            "model_rebuild_deferred=0 model_rebuild_applied=0 "
+            "model_reconcile_deferred=0 model_reconcile_applied=0 "
+            f"popup_closed={self._scroll_drag_popup_closed} popup_suppressed={suppressed} "
+            f"adjustment_total_ms={self._scroll_drag_adjustment_total * 1000.0:.3f} "
+            f"adjustment_max_ms={self._scroll_drag_adjustment_max * 1000.0:.3f} "
+            f"settle_latency_ms={settle_latency * 1000.0:.3f} watchdog={watchdog}",
+            f"last_adjustment_to_settle_ms={last_event_gap_ms:.1f} "
+            f"release_observed={int(settlement.reason == 'release')} "
+            f"cancel_observed={int(settlement.reason == 'cancel')} "
+            f"unpaired_release_observed={int(settlement.reason == 'unpaired-release')}",
+            flush=True,
+        )
+        factory_line = self._format_scroll_drag_factory_summary(
+            getattr(self, "_scroll_drag_factory_snapshot", None)
+        )
+        if factory_line:
+            print(factory_line, flush=True)
+
+    @staticmethod
+    def _format_scroll_drag_factory_summary(snapshot) -> str:
+        if snapshot is None:
+            return ""
+        factories = snapshot.factories
+        total_setup = sum(item.setup_count for item in factories.values())
+        total_bind = sum(item.bind_count for item in factories.values())
+        total_unbind = sum(item.unbind_count for item in factories.values())
+        total_bind_ns = sum(item.bind_total_ns for item in factories.values())
+        total_unbind_ns = sum(item.unbind_total_ns for item in factories.values())
+        max_bind_name, max_bind = max(
+            factories.items(), key=lambda item: item[1].bind_max_ns
+        )
+        max_unbind_name, max_unbind = max(
+            factories.items(), key=lambda item: item[1].unbind_max_ns
+        )
+        factory_parts = []
+        for name in SCROLLBAR_FACTORY_NAMES:
+            item = factories[name]
+            factory_parts.append(
+                f"{name}=s{item.setup_count}/b{item.bind_count}:"
+                f"{item.bind_total_ns / 1_000_000.0:.3f}:"
+                f"{item.bind_max_ns / 1_000_000.0:.3f}/u{item.unbind_count}:"
+                f"{item.unbind_total_ns / 1_000_000.0:.3f}:"
+                f"{item.unbind_max_ns / 1_000_000.0:.3f}/"
+                f"l{item.light_bind_count}/f{item.full_bind_count}"
+            )
+        operations = snapshot.operations
+        name_ops = (
+            f"text:{operations.get('name_text_writes', 0)},"
+            f"tip:{operations.get('name_tooltip_writes', 0)},"
+            f"css:{operations.get('name_css_changes', 0)},"
+            f"vis:{operations.get('name_visibility_changes', 0)},"
+            f"owner:{operations.get('name_popover_owner_checks', 0)},"
+            f"popdown:{operations.get('name_popover_popdowns', 0)},"
+            f"prep:{operations.get('name_mod_prepare_calls', 0)},"
+            f"content:{operations.get('name_popover_content_work', 0)},"
+            f"format:{operations.get('name_flag_address_format_calls', 0)}"
+        )
+        action_bound = sum(
+            operations.get(f"{name}_bound_assignments", 0)
+            for name in ("fav", "monitor", "join")
+        )
+        action_tip = sum(
+            operations.get(f"{name}_tooltip_writes", 0)
+            for name in ("fav", "monitor", "join")
+        )
+        action_css = sum(
+            operations.get(f"{name}_css_changes", 0)
+            for name in ("fav", "monitor", "join")
+        )
+        action_image = sum(
+            operations.get(f"{name}_image_state_changes", 0)
+            for name in ("fav", "monitor", "join")
+        )
+        action_label = operations.get("fav_label_writes", 0)
+        light_bind_total_ns = sum(
+            item.light_bind_total_ns for item in factories.values()
+        )
+        settle_cells = ",".join(
+            f"{name}:{operations.get(f'{name}_settle_cells_refreshed', 0)}"
+            for name in SCROLLBAR_FACTORY_NAMES
+        )
+        skipped = (
+            f"text:{operations.get('drag_skipped_text_writes', 0)},"
+            f"tip:{operations.get('drag_skipped_tooltip_writes', 0)},"
+            f"css:{operations.get('drag_skipped_css_writes', 0)},"
+            f"vis:{operations.get('drag_skipped_visibility_writes', 0)},"
+            f"notify_c:{operations.get('drag_skipped_notify_connects', 0)},"
+            f"notify_d:{operations.get('drag_skipped_notify_disconnects', 0)},"
+            f"popup:{operations.get('drag_skipped_popup_preparation', 0)}"
+        )
+        return (
+            f"[SCROLL-DRAG-FACTORIES] id={snapshot.generation} "
+            f"light_enabled={int(SCROLL_DRAG_LIGHT_BIND_ENABLED)} "
+            f"totals=s{total_setup}/b{total_bind}/u{total_unbind} "
+            f"bind_ms={total_bind_ns / 1_000_000.0:.3f} "
+            f"unbind_ms={total_unbind_ns / 1_000_000.0:.3f} "
+            f"max_bind={max_bind_name}:{max_bind.bind_max_ns / 1_000_000.0:.3f} "
+            f"max_unbind={max_unbind_name}:{max_unbind.unbind_max_ns / 1_000_000.0:.3f} "
+            f"light_bind_ms={light_bind_total_ns / 1_000_000.0:.3f} "
+            f"settle_passes={operations.get('settle_full_refresh_passes', 0)} "
+            f"settle_refresh={snapshot.settle_refresh_count}:"
+            f"{snapshot.settle_refresh_total_ns / 1_000_000.0:.3f}:"
+            f"{snapshot.settle_refresh_max_factory}:"
+            f"{snapshot.settle_refresh_max_ns / 1_000_000.0:.3f} "
+            f"registry_before_settle={operations.get('registry_before_settle', 0)} "
+            f"registry_live={operations.get('registry_live', 0)} "
+            f"registry_stale={operations.get('registry_stale', 0)} "
+            f"registry_after_settle={operations.get('registry_after_settle', 0)} "
+            + " ".join(factory_parts)
+            + f" name_ops=({name_ops}) "
+            f"notify={operations.get('notify_connects', 0)}/"
+            f"{operations.get('notify_disconnects', 0)} "
+            f"players_ops=format:{operations.get('players_format_calls', 0)},"
+            f"write:{operations.get('players_label_writes', 0)} "
+            f"ping_ops=format:{operations.get('ping_format_calls', 0)},"
+            f"write:{operations.get('ping_label_writes', 0)} "
+            f"light_visuals=flag:{operations.get('light_flag_updates', 0)},"
+            f"ping_color:{operations.get('light_ping_colour_updates', 0)} "
+            f"action_ops=bound:{action_bound},tip:{action_tip},css:{action_css},"
+            f"image:{action_image},label:{action_label} "
+            f"settle_cells=({settle_cells}) skipped=({skipped})"
+        )
+
+    def _settle_browser_scrollbar_interaction(
+        self,
+        reason: str,
+        *,
+        generation: int | None = None,
+    ) -> bool:
+        state = getattr(self, "_scrollbar_interaction", None)
+        if state is None or not state.active:
+            return False
+        current_generation = state.generation if generation is None else int(generation)
+        if not state.request_settle(generation=current_generation):
+            return False
+        settle_started = time.perf_counter()
+        settlement = state.settle(
+            reason=reason,
+            now=settle_started,
+            generation=current_generation,
+        )
+        if settlement is None:
+            return False
+        # State is inactive before popup restoration or deferred work is drained.
+        self._cancel_browser_scrollbar_watchdog()
+        drag_light = getattr(self, "_scroll_drag_light", None)
+        if drag_light is not None:
+            drag_light.deactivate(settlement.generation)
+        set_required_mods_popup_suppressed(False)
+        factory_metrics = getattr(self, "_scroll_drag_factory_metrics", None)
+        if drag_light is not None:
+            drag_light.refresh_bound_cells(
+                factory_metrics if SCROLL_DRAG_PERF_ENABLED else None
+            )
+        self._scroll_drag_factory_snapshot = (
+            factory_metrics.settle(settlement.generation)
+            if factory_metrics is not None
+            else None
+        )
+        final_value = self._browser_vadjustment_value()
+        if settlement.reason != "shutdown":
+            self._drain_browser_scrollbar_work(settlement)
+        self._print_scroll_drag_summary(
+            settlement,
+            final_value,
+            time.perf_counter() - settle_started,
+        )
+        return True
+
+    def _on_browser_scroll_value_changed(self, *_args):
+        drag_state = getattr(self, "_scrollbar_interaction", None)
+        drag_active = bool(drag_state is not None and drag_state.active)
+        start = time.perf_counter() if (PERF_LOG_ENABLED or (SCROLL_DRAG_PERF_ENABLED and drag_active)) else None
+        try:
+            if drag_active:
+                value = self._browser_vadjustment_value()
+                if value is not None:
+                    drag_state.record_adjustment(
+                        value,
+                        generation=drag_state.generation,
+                        now=(start if SCROLL_DRAG_PERF_ENABLED else None),
+                    )
             if time.monotonic() < float(getattr(self, "_programmatic_scroll_to_top_active_until", 0.0) or 0.0):
                 if DEBUG_COLUMN_SORT:
                     print("[COLUMN-SORT] ignore adjustment during programmatic top-scroll", flush=True)
@@ -2296,6 +2693,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         finally:
             if start is not None:
                 duration = time.perf_counter() - start
+                if SCROLL_DRAG_PERF_ENABLED and drag_active:
+                    self._scroll_drag_adjustment_total += duration
+                    self._scroll_drag_adjustment_max = max(
+                        self._scroll_drag_adjustment_max,
+                        duration,
+                    )
                 self._perf_scroll_events = int(getattr(self, "_perf_scroll_events", 0) or 0) + 1
                 self._perf_scroll_total = float(getattr(self, "_perf_scroll_total", 0.0) or 0.0) + duration
                 if duration > float(getattr(self, "_perf_scroll_max", 0.0) or 0.0):
@@ -2478,6 +2881,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
         self._shutdown_cleanup_done = True
+        self._settle_browser_scrollbar_interaction("shutdown")
+        drag_light = getattr(self, "_scroll_drag_light", None)
+        if drag_light is not None:
+            drag_light.clear()
 
         try:
             active = self._join_attempts.close("application shutdown")
@@ -5374,6 +5781,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _browser_live_should_pause(self) -> bool:
         if bool(getattr(self, "_shutdown_cleanup_done", False)):
             return True
+        interaction = getattr(self, "_scrollbar_interaction", None)
+        if interaction is not None and interaction.active:
+            return True
         try:
             now = time.monotonic()
             if now < float(getattr(self, "_browser_live_filter_cooldown_until", 0.0) or 0.0):
@@ -5539,13 +5949,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._browser_live_inflight = False
         return True
 
-    def _apply_browser_live_results(self, token, target_keys, results):
+    def _apply_browser_live_results(
+        self,
+        token,
+        target_keys,
+        results,
+        *,
+        _from_scroll_settle: bool = False,
+    ):
         start = time.perf_counter() if PERF_LOG_ENABLED else None
         applied_rows = 0
         try:
+            if not _from_scroll_settle and self._defer_browser_scrollbar_work(
+                "browser-live-results",
+                (token, set(target_keys or set()), list(results or [])),
+            ):
+                return False
             try:
                 now = time.monotonic()
-                if now < float(getattr(self, "_browser_live_scroll_active_until", 0.0) or 0.0):
+                if (
+                    not _from_scroll_settle
+                    and now < float(getattr(self, "_browser_live_scroll_active_until", 0.0) or 0.0)
+                ):
                     if PERF_LOG_ENABLED and now >= float(getattr(self, "_browser_live_apply_skip_logged_until", 0.0) or 0.0):
                         print("[PERF] browser-live apply skipped: scrolling", flush=True)
                         self._browser_live_apply_skip_logged_until = now + 1.0
