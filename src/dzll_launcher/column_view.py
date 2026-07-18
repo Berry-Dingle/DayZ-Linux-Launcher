@@ -786,6 +786,34 @@ def _required_mod_names_from_json(mods_json: str) -> list[str]:
     return names
 
 
+def _format_required_mod_display_name(name: str) -> str:
+    """Capitalise word starts without changing any other characters."""
+    formatted: list[str] = []
+    capitalise_next = True
+    for character in name:
+        if character.isalpha():
+            formatted.append(character.upper() if capitalise_next else character)
+            capitalise_next = False
+        else:
+            formatted.append(character)
+            if not character.isdigit():
+                capitalise_next = True
+    return "".join(formatted)
+
+
+def _prepare_required_mod_display_names(names: list[str]) -> list[str]:
+    formatted = [_format_required_mod_display_name(name) for name in names]
+    return sorted(formatted, key=lambda name: (name.casefold(), name))
+
+
+def _split_required_mod_display_names(names: list[str]) -> list[list[str]]:
+    prepared = _prepare_required_mod_display_names(names)
+    if len(prepared) <= _REQUIRED_MODS_TWO_COLUMN_THRESHOLD:
+        return [prepared]
+    split_at = (len(prepared) + 1) // 2
+    return [prepared[:split_at], prepared[split_at:]]
+
+
 def _make_required_mods_column(names: list[str]) -> Gtk.Box:
     column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
     column.set_valign(Gtk.Align.START)
@@ -808,15 +836,15 @@ def _make_required_mods_column(names: list[str]) -> Gtk.Box:
 
 
 def _make_required_mods_popover_content(names: list[str]) -> Gtk.Widget:
-    if len(names) <= _REQUIRED_MODS_TWO_COLUMN_THRESHOLD:
-        content = _make_required_mods_column(names)
+    columns = _split_required_mod_display_names(names)
+    if len(columns) == 1:
+        content = _make_required_mods_column(columns[0])
     else:
-        split_at = (len(names) + 1) // 2
         content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
         content.set_halign(Gtk.Align.FILL)
         content.set_valign(Gtk.Align.START)
-        content.append(_make_required_mods_column(names[:split_at]))
-        content.append(_make_required_mods_column(names[split_at:]))
+        content.append(_make_required_mods_column(columns[0]))
+        content.append(_make_required_mods_column(columns[1]))
 
     content.add_css_class("required-mods-popover-content")
 
