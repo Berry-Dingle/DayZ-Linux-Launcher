@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 from dzll_launcher import column_view
@@ -242,19 +243,28 @@ def test_required_mod_popup_closes_once_suppresses_and_recovers(monkeypatch):
 
     column_view.set_required_mods_popup_suppressed(False)
     monkeypatch.setattr(column_view, "_ensure_required_mods_root_click_controller", lambda widget: None)
+    content = object()
+    installed = []
+    monkeypatch.setattr(
+        column_view,
+        "_make_required_mods_popover_content",
+        lambda names: content,
+    )
     fake = SimpleNamespace(
         get_visible=lambda: False,
         popup=lambda: shown.append(True),
-        set_child=lambda _child: None,
+        set_child=installed.append,
     )
     target._dzll_required_mods_popover = fake
     column_view._show_required_mods_popover(target)
+    assert installed == [content]
     assert shown == [True]
+    assert closed == [target]
     column_view._clear_open_required_mods_popover()
 
 
 def test_explicit_sort_and_filter_paths_are_not_gated_by_interaction_state():
-    source = open(window_module.__file__, encoding="utf-8").read()
+    source = Path(window_module.__file__).read_text(encoding="utf-8")
     set_sort = source.split("    def _set_sort(", 1)[1].split(
         "    def _on_column_view_sort_header_clicked", 1
     )[0]
