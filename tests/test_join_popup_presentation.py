@@ -284,7 +284,17 @@ class JoinPopupPresentationTests(unittest.TestCase):
         self.assertIn("ok = win.run_steamcmd_install(", JOIN_SOURCE)
         self.assertIn("win.GLib.idle_add(after)", JOIN_SOURCE)
         self.assertNotIn("sleep(", JOIN_SOURCE)
-        self.assertNotIn("retry", JOIN_SOURCE.lower())
+        shared = JOIN_SOURCE.split("def prepare_required_mods", 1)[1].split(
+            "def join_prepare_and_launch", 1
+        )[0]
+        self.assertEqual(shared.count("retry_ok = win.run_steam_client_install("), 1)
+        self.assertIn("mod_ids=unresolved_ids", shared)
+        self.assertNotIn("prepare_required_mods(", shared)
+        self.assertNotIn("while ", shared)
+        self.assertNotIn("ensure_watch_symlinks", shared)
+        self.assertNotIn("bootstrap_launcher_state", shared)
+        self.assertNotIn("_launch_direct_steam_url", shared)
+        self.assertEqual(JOIN_SOURCE.count("win._launch_direct_steam_url("), 1)
 
 
 if __name__ == "__main__":

@@ -612,9 +612,14 @@ def test_background_ugc_readiness_receives_cancel_event_and_visible_progress(mon
     monkeypatch.setattr(join_prepare, "_choose_initial_workshop_dir", lambda *_a: "/workshop")
     monkeypatch.setattr(join_prepare, "_refresh_effective_workshop_dir_after_backend", lambda *_a: "/workshop")
     monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
-    monkeypatch.setattr(join_prepare, "query_ugc_state", lambda _ids: {
-        101: {"installed": True, "subscribed": True, "needs_update": False},
-    })
+    state = {101: {
+        "installed": True, "subscribed": True, "needs_update": False,
+        "downloading": False, "download_pending": False,
+    }}
+    monkeypatch.setattr(
+        join_prepare, "query_ugc_state_checked",
+        lambda _ids: (True, state),
+    )
 
     def readiness(_ids, **kwargs):
         seen.update(kwargs)

@@ -14,7 +14,7 @@ from .preparation_contracts import (
     PreparationStatus,
 )
 from .steam_native import dayz_paths_summary, dayz_workshop_content_dir
-from .steam_ugc_backend import query_ugc_state, ugc_item_ready, wait_for_ugc_ready
+from .steam_ugc_backend import query_ugc_state_checked, ugc_item_ready, wait_for_ugc_ready
 
 
 def _resolve_path(path):
@@ -140,7 +140,16 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
 
     try:
         # Decide what the selected Workshop backend should do for this join.
-        required_ids = [mid for (mid, _name) in (mods or [])]
+        required_ids = []
+        required_ids_seen = set()
+        for mid, _name in (mods or []):
+            try:
+                mid_i = int(mid)
+            except Exception:
+                continue
+            if mid_i > 0 and mid_i not in required_ids_seen:
+                required_ids.append(mid_i)
+                required_ids_seen.add(mid_i)
         if attempt_id:
             win._join_log(attempt_id, "chosen backend", backend="Steam client UGC" if backend == "steam_client" else "SteamCMD")
         configured_workshop_dir = _resolve_path(workshop_dir)
@@ -242,9 +251,15 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     win.GLib.idle_add(win._show_join_progress_overlay, "Checking & Preparing Mods for Join...")
 
                 print(f"[JOIN] Steam UGC checking required mod readiness: {len(required_ids)} ids")
-                ugc_state = query_ugc_state(required_ids)
+                initial_query_ok, ugc_state = query_ugc_state_checked(required_ids)
+                ugc_state = ugc_state if isinstance(ugc_state, dict) else {}
                 if attempt_id:
-                    win._join_log(attempt_id, "UGC state helper shutdown completed", count=len(ugc_state))
+                    win._join_log(
+                        attempt_id,
+                        "UGC state helper shutdown completed",
+                        success=bool(initial_query_ok),
+                        count=len(ugc_state),
+                    )
                 blocked_missing = []
                 blocked_unknown = []
                 steam_client_work_ids = []
@@ -580,26 +595,189 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             effective_workshop_dir = _refresh_effective_workshop_dir_after_backend(effective_workshop_dir, mods, backend)
             print(f"[JOIN] effective workshop path used for symlinks: {effective_workshop_dir!r}")
 
-            missing_after = win.compute_missing_mods(effective_workshop_dir, mods)
-            if attempt_id:
-                win._join_log(attempt_id, "post-download filesystem verification completed",
-                              missing=[int(mid) for mid, _name in (missing_after or [])])
-
-            if missing_after:
-                denied_ids = (
-                    set(getattr(steamcmd_mods, "LAST_ACCESS_DENIED_IDS", set()))
-                    if backend == "steamcmd"
-                    else set()
+            if use_steamcmd and backend == "steam_client":
+                terminal_failure_message = (
+                    "Required mod updates could not be completed. Steam still reports "
+                    "one or more required mods as outdated or unfinished. Open Steam "
+                    "Downloads, allow the updates to finish, then try Join again."
                 )
 
-                unresolved = [pair for pair in missing_after if int(pair[0]) not in denied_ids]
+                def validate_terminal_ugc(phase):
+                    reasons = {}
+                    try:
+                        query_ok, states = query_ugc_state_checked(required_ids)
+                    except Exception as exc:
+                        query_ok, states = False, {}
+                        print(f"[JOIN] {phase} Steam UGC validation failed: {exc}")
+                    states = states if isinstance(states, dict) else {}
+                    if not query_ok:
+                        reasons = {mid: "query failure" for mid in required_ids}
+                    else:
+                        for mid in required_ids:
+                            state = states.get(mid)
+                            if not isinstance(state, dict):
+                                reasons[mid] = "missing state" if state is None else "unknown"
+                                continue
+                            required_fields = {
+                                "installed", "needs_update", "downloading", "download_pending",
+                            }
+                            if not required_fields.issubset(state):
+                                reasons[mid] = "unknown"
+                            elif not bool(state.get("installed", False)):
+                                reasons[mid] = "not installed"
+                            elif bool(state.get("needs_update", False)):
+                                reasons[mid] = "needs update"
+                            elif bool(state.get("downloading", False)):
+                                reasons[mid] = "downloading"
+                            elif bool(state.get("download_pending", False)):
+                                reasons[mid] = "pending"
+                            elif not ugc_item_ready(state):
+                                reasons[mid] = "unknown"
+                    unresolved = [mid for mid in required_ids if mid in reasons]
+                    print(
+                        f"[JOIN] {phase} Steam UGC validation "
+                        f"success={bool(query_ok and not unresolved)} "
+                        f"unresolved={unresolved} reasons={reasons}"
+                    )
+                    if attempt_id:
+                        win._join_log(
+                            attempt_id,
+                            f"{phase} UGC validation",
+                            success=bool(query_ok and not unresolved),
+                            unresolved=unresolved,
+                            reasons=reasons,
+                        )
+                    return bool(query_ok and not unresolved), unresolved
 
-                if unresolved:
-                    ok = False
-                    err_msg = f"Required mods still missing after install: {[mid for mid, _ in unresolved]}"
-                else:
-                    mods_for_launch = [pair for pair in mods if int(pair[0]) not in denied_ids]
-                    print(f"[JOIN] Skipping inaccessible mods: {sorted(denied_ids)}")
+                terminal_current, unresolved_ids = validate_terminal_ugc(
+                    "first terminal",
+                )
+                if not terminal_current:
+                    retry_message = (
+                        "Required mod update did not complete. Retrying once, please wait…"
+                    )
+                    retry_event = PreparationProgressEvent.from_authoritative_payload({
+                        "type": "status",
+                        "join_attempt_id": int(attempt_id or 0),
+                        "backend": "steam_ugc",
+                        "backend_owner": "steam_client",
+                        "message": retry_message,
+                    })
+                    win.GLib.idle_add(deliver_event, retry_event)
+                    if manage_join_presentation:
+                        win.GLib.idle_add(win._show_join_progress_overlay, retry_message)
+                    if attempt_id:
+                        win._join_log(
+                            attempt_id,
+                            "terminal UGC retry starting",
+                            unresolved=list(unresolved_ids),
+                        )
+
+                    retry_names_by_id = {
+                        int(mid): str(name or "").strip()
+                        for mid, name in (mods or [])
+                        if int(mid) > 0 and str(name or "").strip()
+                    }
+
+                    def _retry_state(mid, _index, _total):
+                        win._steamcmd_active_mid = int(mid)
+                        win._steamcmd_last_progress_bytes = 0
+
+                    def _retry_progress(event):
+                        event = dict(event or {})
+                        event["join_attempt_id"] = int(attempt_id or 0)
+                        event["backend_owner"] = "steam_client"
+                        try:
+                            event_mid = int(event.get("id") or 0)
+                        except Exception:
+                            event_mid = 0
+                        event_name = retry_names_by_id.get(event_mid, "")
+                        if event_name:
+                            event["name"] = event_name
+                        win.GLib.idle_add(
+                            deliver_event,
+                            PreparationProgressEvent.from_authoritative_payload(event),
+                        )
+
+                    did_work = True
+                    win._steamcmd_install_in_progress = True
+                    win._mod_download_backend_active = "steam_client"
+                    try:
+                        retry_ok = win.run_steam_client_install(
+                            workshop_dir=effective_workshop_dir,
+                            mod_ids=unresolved_ids,
+                            cancel_event=win._steamcmd_cancel_event,
+                            state_cb=_retry_state,
+                            progress_cb=_retry_progress,
+                            handoff_cb=None,
+                            allow_start_steam=bool(
+                                getattr(win, "_join_steam_start_allowed", False)
+                            ),
+                            log_fn=(
+                                lambda message: win._join_log(
+                                    attempt_id, "UGC retry backend", message=message,
+                                )
+                            ) if attempt_id else None,
+                        )
+                    finally:
+                        win._steamcmd_install_in_progress = False
+                        win._mod_download_backend_active = ""
+
+                    if not retry_ok:
+                        ok = False
+                        if win._steamcmd_cancel_event.is_set():
+                            err_msg = "Mod download cancelled"
+                        else:
+                            err_msg = terminal_failure_message
+                        if attempt_id:
+                            win._join_log(
+                                attempt_id,
+                                "terminal UGC retry backend failed",
+                                cancelled=bool(win._steamcmd_cancel_event.is_set()),
+                                unresolved=list(unresolved_ids),
+                            )
+                    else:
+                        effective_workshop_dir = _refresh_effective_workshop_dir_after_backend(
+                            effective_workshop_dir, mods, backend,
+                        )
+                        print(
+                            "[JOIN] effective workshop path refreshed after terminal "
+                            f"retry: {effective_workshop_dir!r}"
+                        )
+                        final_current, final_unresolved = validate_terminal_ugc(
+                            "final terminal",
+                        )
+                        if not final_current:
+                            ok = False
+                            err_msg = terminal_failure_message
+                            if attempt_id:
+                                win._join_log(
+                                    attempt_id,
+                                    "terminal UGC validation failed closed",
+                                    unresolved=list(final_unresolved),
+                                )
+
+            if ok:
+                missing_after = win.compute_missing_mods(effective_workshop_dir, mods)
+                if attempt_id:
+                    win._join_log(attempt_id, "post-download filesystem verification completed",
+                                  missing=[int(mid) for mid, _name in (missing_after or [])])
+
+                if missing_after:
+                    denied_ids = (
+                        set(getattr(steamcmd_mods, "LAST_ACCESS_DENIED_IDS", set()))
+                        if backend == "steamcmd"
+                        else set()
+                    )
+
+                    unresolved = [pair for pair in missing_after if int(pair[0]) not in denied_ids]
+
+                    if unresolved:
+                        ok = False
+                        err_msg = f"Required mods still missing after install: {[mid for mid, _ in unresolved]}"
+                    else:
+                        mods_for_launch = [pair for pair in mods if int(pair[0]) not in denied_ids]
+                        print(f"[JOIN] Skipping inaccessible mods: {sorted(denied_ids)}")
 
     except Exception as e:
         if not manage_join_presentation:

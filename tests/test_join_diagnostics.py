@@ -183,7 +183,21 @@ def run_join_route(monkeypatch, states):
     monkeypatch.setattr(join_prepare, "_refresh_effective_workshop_dir_after_backend", lambda *args: args[0])
     monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
     monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(join_prepare, "query_ugc_state", lambda *_args, **_kwargs: states)
+    terminal_states = {
+        mid: {
+            "installed": True,
+            "subscribed": True,
+            "needs_update": False,
+            "downloading": False,
+            "download_pending": False,
+        }
+        for mid in ids
+    }
+    state_results = iter(((True, states), (True, terminal_states)))
+    monkeypatch.setattr(
+        join_prepare, "query_ugc_state_checked",
+        lambda *_args, **_kwargs: next(state_results),
+    )
     monkeypatch.setattr(join_prepare.steamcmd_mods, "validate_selected_watch_symlinks", lambda **_kwargs: [])
 
     def install(**kwargs):

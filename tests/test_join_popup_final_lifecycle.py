@@ -243,9 +243,24 @@ def test_watcher_process_matchers_exclude_generic_proton_and_launcher():
     assert '"Proton"' not in launcher
 
 
-def test_no_retry_or_second_handoff_added():
+def test_one_bounded_mod_retry_cannot_add_a_second_launch_handoff():
     assert JOIN_SOURCE.count("win._launch_direct_steam_url(") == 1
-    assert "retry" not in JOIN_SOURCE.lower()
+    shared = JOIN_SOURCE.split("def prepare_required_mods", 1)[1].split(
+        "def join_prepare_and_launch", 1
+    )[0]
+    assert shared.count("retry_ok = win.run_steam_client_install(") == 1
+    assert "mod_ids=unresolved_ids" in shared
+    assert "prepare_required_mods(" not in shared
+    assert "while " not in shared
+    assert "ensure_watch_symlinks" not in shared
+    assert "bootstrap_launcher_state" not in shared
+    assert "_launch_direct_steam_url" not in shared
+    after = JOIN_SOURCE.split("def after():", 1)[1].split(
+        "win.GLib.idle_add(after)", 1
+    )[0]
+    assert after.index("_join_attempt_is_active") < after.index(
+        "_launch_direct_steam_url"
+    )
 
 
 @pytest.mark.parametrize("skip_launcher,process,expected", [

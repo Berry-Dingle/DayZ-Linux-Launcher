@@ -185,11 +185,27 @@ def run_characterized(monkeypatch, *, backend="steam_client", backend_ok=True,
     monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
     monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", lambda *_args, **_kwargs: True)
     state = (
-        {101: {"installed": True, "subscribed": True, "needs_update": False}}
+        {101: {
+            "installed": True, "subscribed": True, "needs_update": False,
+            "downloading": False, "download_pending": False,
+        }}
         if initially_ready else
-        {101: {"installed": False, "subscribed": False, "needs_update": False}}
+        {101: {
+            "installed": False, "subscribed": False, "needs_update": False,
+            "downloading": False, "download_pending": False,
+        }}
     )
-    monkeypatch.setattr(join_prepare, "query_ugc_state", lambda *_args, **_kwargs: state)
+    terminal_state = {
+        101: {
+            "installed": True, "subscribed": True, "needs_update": False,
+            "downloading": False, "download_pending": False,
+        },
+    }
+    state_results = iter(((True, state), (True, terminal_state)))
+    monkeypatch.setattr(
+        join_prepare, "query_ugc_state_checked",
+        lambda *_args, **_kwargs: next(state_results),
+    )
     monkeypatch.setattr(
         join_prepare.steamcmd_mods, "validate_selected_watch_symlinks",
         lambda **_kwargs: win.events.append(("validate_symlinks",)) or [],
@@ -226,10 +242,26 @@ def prepare_characterized(monkeypatch, *, mods=None, backend="steam_client",
             "installed": bool(initially_ready),
             "subscribed": bool(initially_ready),
             "needs_update": False,
+            "downloading": False,
+            "download_pending": False,
         }
         for mid, _name in mod_list
     }
-    monkeypatch.setattr(join_prepare, "query_ugc_state", lambda *_args, **_kwargs: state)
+    terminal_state = {
+        int(mid): {
+            "installed": True,
+            "subscribed": True,
+            "needs_update": False,
+            "downloading": False,
+            "download_pending": False,
+        }
+        for mid, _name in mod_list
+    }
+    state_results = iter(((True, state), (True, terminal_state)))
+    monkeypatch.setattr(
+        join_prepare, "query_ugc_state_checked",
+        lambda *_args, **_kwargs: next(state_results),
+    )
     outcome = join_prepare.prepare_required_mods(
         win, mod_list, "/configured", "/steamcmd", "", False, False,
         True, backend, True, False, operation_id=1,
@@ -435,3 +467,321 @@ def test_join_wrapper_calls_shared_operation_before_symlinks_and_launch():
     assert wrapper.index("prepare_required_mods(") < wrapper.index("ensure_watch_symlinks(")
     assert wrapper.index("ensure_watch_symlinks(") < wrapper.index("bootstrap_launcher_state(")
     assert wrapper.index("bootstrap_launcher_state(") < wrapper.index("_launch_direct_steam_url(")
+
+
+def ugc_state(*, installed=True, needs_update=False, downloading=False, pending=False):
+    return {
+        "installed": installed,
+        "subscribed": installed,
+        "needs_update": needs_update,
+        "downloading": downloading,
+        "download_pending": pending,
+    }
+
+
+def run_terminal_validation_route(
+        monkeypatch, *, mods, initial_states, terminal_results,
+        backend_results=(), final_missing=None, background=False):
+    win = CharacterizationHarness(
+        initial_missing=[],
+        final_missing=list(final_missing or []),
+    )
+    obj = SimpleNamespace(name="Terminal Validation", ip="127.0.0.1", gport=2302)
+    trace = []
+    backend_results = list(backend_results)
+    checked_results = [(True, dict(initial_states)), *list(terminal_results)]
+    checked_call_count = 0
+
+    monkeypatch.setattr(join_prepare, "_choose_initial_workshop_dir", lambda *_args: "/workshop")
+    monkeypatch.setattr(
+        join_prepare, "_refresh_effective_workshop_dir_after_backend",
+        lambda *_args: "/workshop",
+    )
+    monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
+    monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", lambda *_args, **_kwargs: True)
+
+    def checked_query(ids):
+        nonlocal checked_call_count
+        phase = "initial_query" if checked_call_count == 0 else "terminal_query"
+        checked_call_count += 1
+        trace.append((phase, tuple(ids)))
+        assert checked_results
+        return checked_results.pop(0)
+
+    def install(**kwargs):
+        trace.append(("backend", tuple(kwargs["mod_ids"])))
+        assert backend_results
+        result = backend_results.pop(0)
+        if result == "cancel":
+            win._steamcmd_cancel_event.set()
+            return False
+        return bool(result)
+
+    monkeypatch.setattr(join_prepare, "query_ugc_state_checked", checked_query)
+    monkeypatch.setattr(
+        join_prepare.steamcmd_mods, "validate_selected_watch_symlinks",
+        lambda **_kwargs: trace.append(("validate_symlinks",)) or [],
+    )
+    win.run_steam_client_install = install
+
+    original_symlinks = win.ensure_watch_symlinks
+    original_preset = win.bootstrap_launcher_state
+    original_launch = win._launch_direct_steam_url
+
+    def symlinks(**kwargs):
+        trace.append(("symlinks",))
+        return original_symlinks(**kwargs)
+
+    def preset(**kwargs):
+        trace.append(("preset",))
+        return original_preset(**kwargs)
+
+    def launch(*args, **kwargs):
+        trace.append(("launch",))
+        return original_launch(*args, **kwargs)
+
+    win.ensure_watch_symlinks = symlinks
+    win.bootstrap_launcher_state = preset
+    win._launch_direct_steam_url = launch
+
+    if background:
+        presenter = JoinPopupPreparationPresenter(consume_event=win._steam_ugc_progress_to_overlay)
+        outcome = join_prepare.prepare_required_mods(
+            win, mods, "/workshop", "/steamcmd", "", False, False,
+            True, "steam_client", True, False,
+            presenter=presenter,
+            server_name="Terminal Validation",
+            manage_join_presence=False,
+            manage_join_presentation=False,
+        )
+    else:
+        join_prepare.join_prepare_and_launch(
+            win, obj, mods, "/workshop", "/steamcmd", "", False, False,
+            "/prefix", "/watch", True, "steam_client", True, False,
+            attempt_id=1,
+        )
+        outcome = None
+    assert not backend_results
+    assert not checked_results
+    return win, trace, outcome
+
+
+def test_outdated_mod_requires_fresh_terminal_currentness_before_launch(monkeypatch):
+    mod = (101, "Outdated")
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[mod],
+        initial_states={101: ugc_state(needs_update=True)},
+        backend_results=[True],
+        terminal_results=[(True, {101: ugc_state()})],
+    )
+    assert trace == [
+        ("initial_query", (101,)),
+        ("backend", (101,)),
+        ("terminal_query", (101,)),
+        ("symlinks",),
+        ("validate_symlinks",),
+        ("preset",),
+        ("launch",),
+    ]
+    assert win.launches == 1
+
+
+def test_single_retry_uses_only_unresolved_ids_then_validates_every_original_id(
+        monkeypatch):
+    mods = [
+        (1, "Current"), (2, "Missing"), (3, "Outdated"), (4, "Pending"),
+    ]
+    first_terminal = {
+        1: ugc_state(),
+        2: ugc_state(),
+        3: ugc_state(needs_update=True),
+        4: ugc_state(pending=True),
+    }
+    final_terminal = {mid: ugc_state() for mid in range(1, 5)}
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=mods,
+        initial_states={
+            1: ugc_state(),
+            2: ugc_state(installed=False),
+            3: ugc_state(needs_update=True),
+            4: ugc_state(pending=True),
+        },
+        backend_results=[True, True],
+        terminal_results=[(True, first_terminal), (True, final_terminal)],
+    )
+    assert trace[:5] == [
+        ("initial_query", (1, 2, 3, 4)),
+        ("backend", (2, 3, 4)),
+        ("terminal_query", (1, 2, 3, 4)),
+        ("backend", (3, 4)),
+        ("terminal_query", (1, 2, 3, 4)),
+    ]
+    assert trace[5:] == [
+        ("symlinks",), ("validate_symlinks",), ("preset",), ("launch",),
+    ]
+    retry_events = [
+        event[1] for event in win.events
+        if (
+            len(event) == 2
+            and event[0] == "ugc_event"
+            and "Retrying once" in str(event[1].get("message") or "")
+        )
+    ]
+    assert len(retry_events) == 1
+    assert win.launches == 1
+
+
+@pytest.mark.parametrize(
+    ("final_ok", "final_states"),
+    [
+        (True, {101: ugc_state(needs_update=True)}),
+        (True, {101: ugc_state(downloading=True)}),
+        (True, {101: ugc_state(pending=True)}),
+        (True, {}),
+        (False, {}),
+        (True, {101: {"installed": True}}),
+    ],
+    ids=[
+        "needs-update", "downloading", "pending", "missing-state",
+        "query-failure", "malformed-state",
+    ],
+)
+def test_single_retry_final_noncurrent_state_fails_closed(
+        monkeypatch, final_ok, final_states):
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Required")],
+        initial_states={101: ugc_state()},
+        backend_results=[True],
+        terminal_results=[
+            (True, {101: ugc_state(needs_update=True)}),
+            (final_ok, final_states),
+        ],
+    )
+    assert [item for item in trace if item[0] == "backend"] == [("backend", (101,))]
+    assert len([item for item in trace if item[0] == "terminal_query"]) == 2
+    assert not {"symlinks", "preset", "launch"} & {item[0] for item in trace}
+    assert win.launches == 0
+    assert any("Steam still reports" in error for error in win.errors)
+
+
+@pytest.mark.parametrize(
+    ("retry_result", "expected_message"),
+    [(False, "Steam still reports"), ("cancel", "cancelled")],
+)
+def test_single_retry_backend_failure_or_cancellation_never_continues(
+        monkeypatch, retry_result, expected_message):
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Required")],
+        initial_states={101: ugc_state()},
+        backend_results=[retry_result],
+        terminal_results=[(True, {101: ugc_state(needs_update=True)})],
+    )
+    assert [item for item in trace if item[0] == "backend"] == [("backend", (101,))]
+    assert len([item for item in trace if item[0] == "terminal_query"]) == 1
+    assert not {"symlinks", "preset", "launch"} & {item[0] for item in trace}
+    assert win.launches == 0
+    assert any(expected_message.lower() in error.lower() for error in win.errors)
+
+
+def test_initially_ready_mods_are_revalidated_before_ready(monkeypatch):
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Current")],
+        initial_states={101: ugc_state()},
+        terminal_results=[(True, {101: ugc_state()})],
+    )
+    assert trace == [
+        ("initial_query", (101,)),
+        ("terminal_query", (101,)),
+        ("symlinks",),
+        ("validate_symlinks",),
+        ("preset",),
+        ("launch",),
+    ]
+    assert win.launches == 1
+
+
+def test_initially_ready_snapshot_cannot_launch_after_terminal_state_changes(
+        monkeypatch):
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Changed")],
+        initial_states={101: ugc_state()},
+        backend_results=[True],
+        terminal_results=[
+            (True, {101: ugc_state(downloading=True)}),
+            (True, {101: ugc_state()}),
+        ],
+    )
+    assert trace[:4] == [
+        ("initial_query", (101,)),
+        ("terminal_query", (101,)),
+        ("backend", (101,)),
+        ("terminal_query", (101,)),
+    ]
+    assert trace[-1] == ("launch",)
+    assert win.launches == 1
+
+
+def test_current_ugc_state_still_requires_filesystem_presence(monkeypatch):
+    mod = (101, "Missing Directory")
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[mod],
+        initial_states={101: ugc_state()},
+        terminal_results=[(True, {101: ugc_state()})],
+        final_missing=[mod],
+    )
+    assert trace == [
+        ("initial_query", (101,)),
+        ("terminal_query", (101,)),
+    ]
+    assert win.launches == 0
+    assert any("still missing after install" in error for error in win.errors)
+
+
+@pytest.mark.parametrize(
+    ("final_state", "expected_status"),
+    [
+        (ugc_state(), PreparationStatus.READY),
+        (ugc_state(needs_update=True), PreparationStatus.FAILED),
+    ],
+)
+def test_background_shared_engine_applies_bounded_terminal_gate(
+        monkeypatch, final_state, expected_status):
+    terminal_results = [
+        (True, {101: ugc_state(needs_update=True)}),
+        (True, {101: final_state}),
+    ]
+    win, trace, outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Background")],
+        initial_states={101: ugc_state()},
+        backend_results=[True],
+        terminal_results=terminal_results,
+        background=True,
+    )
+    assert outcome.status is expected_status
+    assert [item for item in trace if item[0] == "backend"] == [("backend", (101,))]
+    assert len([item for item in trace if item[0] == "terminal_query"]) == 2
+    assert "launch" not in {item[0] for item in trace}
+    assert win.launches == 0
+
+
+def test_background_shared_engine_retry_cancellation_is_cancelled(monkeypatch):
+    win, trace, outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Background")],
+        initial_states={101: ugc_state()},
+        backend_results=["cancel"],
+        terminal_results=[(True, {101: ugc_state(pending=True)})],
+        background=True,
+    )
+    assert outcome.status is PreparationStatus.CANCELLED
+    assert [item for item in trace if item[0] == "backend"] == [("backend", (101,))]
+    assert "launch" not in {item[0] for item in trace}
+    assert win.launches == 0
