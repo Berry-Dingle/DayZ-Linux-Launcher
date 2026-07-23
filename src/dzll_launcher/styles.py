@@ -1266,6 +1266,11 @@ def get_app_css(
           color: @dzll_accent_hover;
         }}
 
+        .dzll-column-view button.dzll-join-button.dzll-join-blocked,
+        .dzll-column-view button.dzll-join-button.dzll-join-blocked image {{
+          color: #ff5c5c;
+        }}
+
         .server-companion-panel {{
           min-width: 280px;
         }}

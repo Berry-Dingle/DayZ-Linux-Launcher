@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 import os
+import sys
+import time
+import traceback
 
 from . import steamcmd_mods
 from .launcher_state import linux_to_win_path_under_prefix
+from .preparation_contracts import (
+    JoinPopupPreparationPresenter,
+    NoOpPreparationPresenter,
+    PreparationOutcome,
+    PreparationProgressEvent,
+    PreparationStatus,
+)
 from .steam_native import dayz_paths_summary, dayz_workshop_content_dir
 from .steam_ugc_backend import query_ugc_state, ugc_item_ready, wait_for_ugc_ready
 
@@ -97,17 +107,40 @@ def _refresh_effective_workshop_dir_after_backend(current_workshop_dir, mods, ba
     return current
 
 
-def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_user, validate, dry,
-                            proton_prefix, watch_folder_linux, use_steamcmd, mod_download_backend,
-                            auto_install_missing, auto_update_required, *, attempt_id=0):
+def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, validate, dry,
+                          use_steamcmd, mod_download_backend, auto_install_missing,
+                          auto_update_required, *, operation_id=0, presenter=None,
+                          server_name="", server_identity="", is_operation_current=None,
+                          manage_join_presence=True, manage_join_presentation=True):
+    """Run the existing Join preparation and stop before Join-only continuation."""
+    attempt_id = int(operation_id or 0)
+    presenter = presenter or NoOpPreparationPresenter()
+    is_operation_current = is_operation_current or (lambda: True)
+
+    def deliver_event(event):
+        if is_operation_current():
+            presenter.on_event(event)
+        return False
     ok = True
     err_msg = None
-    selected_mod_win_paths_for_launch = []
+    backend = mod_download_backend if mod_download_backend in ("steam_client", "steamcmd") else "steam_client"
+    effective_workshop_dir = _resolve_path(workshop_dir)
+    mods_for_launch = list(mods or [])
+    did_work = False
+
+    if not mods:
+        outcome = PreparationOutcome(
+            PreparationStatus.NO_REQUIRED_MODS,
+            reason="no_required_mods",
+            backend=backend,
+            effective_workshop_path=effective_workshop_dir,
+        )
+        presenter.on_terminal(outcome)
+        return outcome
 
     try:
         # Decide what the selected Workshop backend should do for this join.
         required_ids = [mid for (mid, _name) in (mods or [])]
-        backend = mod_download_backend if mod_download_backend in ("steam_client", "steamcmd") else "steam_client"
         if attempt_id:
             win._join_log(attempt_id, "chosen backend", backend="Steam client UGC" if backend == "steam_client" else "SteamCMD")
         configured_workshop_dir = _resolve_path(workshop_dir)
@@ -124,7 +157,6 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             print(f"[JOIN] DayZ Steam library not detected; using configured/default paths ({exc})")
         print(f"[JOIN] configured workshop path: {configured_workshop_dir!r}")
         print(f"[JOIN] effective workshop path used for checks/downloads: {effective_workshop_dir!r}")
-        print(f"[JOIN] resolved Proton prefix: {_resolve_path(proton_prefix)!r}")
 
         missing = win.compute_missing_mods(effective_workshop_dir, mods)
         missing_ids = [mid for (mid, _name) in (missing or [])]
@@ -134,8 +166,13 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
 
         if use_steamcmd:
             if backend == "steam_client":
-                show_readiness_card = bool(getattr(win, "_join_steam_start_allowed", False))
+                report_readiness = bool(
+                    not manage_join_presentation
+                    or getattr(win, "_join_steam_start_allowed", False)
+                )
+                show_readiness_card = bool(manage_join_presentation and report_readiness)
                 readiness_overlay_shown = win.threading.Event()
+                readiness_last_message = [""]
 
                 def _ui_show_steam_ready_overlay():
                     win._show_join_progress_overlay("Waiting for Steam…")
@@ -147,21 +184,44 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                         return
                     message = str(event.get("message") or "").strip()
                     if message:
+                        readiness_last_message[0] = message
                         owned_event = dict(event)
                         owned_event["join_attempt_id"] = int(attempt_id or 0)
                         owned_event["backend_owner"] = "steam_client"
-                        win._steam_ugc_progress_from_worker(owned_event)
+                        progress_event = PreparationProgressEvent.from_authoritative_payload(owned_event)
+                        win.GLib.idle_add(deliver_event, progress_event)
 
                 if show_readiness_card:
                     win.GLib.idle_add(_ui_show_steam_ready_overlay)
                     readiness_overlay_shown.wait(timeout=2.0)
 
-                if not wait_for_ugc_ready(
+                readiness_started = time.monotonic()
+                readiness_ok = wait_for_ugc_ready(
                     required_ids,
-                    progress_cb=_steam_ready_progress if show_readiness_card else None,
+                    cancel_event=win._steamcmd_cancel_event,
+                    progress_cb=_steam_ready_progress if report_readiness else None,
                     allow_start_steam=bool(getattr(win, "_join_steam_start_allowed", False)),
-                ):
-                    err_msg = "DZLL could not check mods with Steam."
+                )
+                readiness_elapsed = time.monotonic() - readiness_started
+                print(
+                    "[BACKGROUND PREPARE] Steam UGC readiness "
+                    f"server={server_identity or server_name or '<unknown>'} "
+                    f"elapsed={readiness_elapsed:.3f}s success={bool(readiness_ok)}"
+                )
+                if not readiness_ok:
+                    if win._steamcmd_cancel_event.is_set():
+                        err_msg = (
+                            "Steam readiness check cancelled for "
+                            f"{server_name or server_identity or 'server'}."
+                        )
+                    else:
+                        detail = readiness_last_message[0]
+                        err_msg = (
+                            "DZLL could not check mods with Steam for "
+                            f"{server_name or server_identity or 'this server'}."
+                        )
+                        if detail:
+                            err_msg = f"{err_msg} {detail}"
                     print(f"[JOIN] Steam UGC readiness failed before required mod state query: {err_msg}")
                     if show_readiness_card:
                         def _ui_show_steam_ready_error():
@@ -174,7 +234,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                             return False
 
                         win.GLib.idle_add(_ui_show_steam_ready_error)
-                    else:
+                    elif manage_join_presentation:
                         win.GLib.idle_add(win._set_updating, False, err_msg)
                     raise RuntimeError(err_msg)
 
@@ -299,9 +359,19 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             status_msg = "Mod download handling disabled."
 
         if ok and use_steamcmd and download_ids:
+            did_work = True
             print(f"[JOIN] {backend} download ids: {download_ids}")
 
-            if attempt_id:
+            work_set_event = PreparationProgressEvent.from_authoritative_payload({
+                "type": "presentation_work_set",
+                "join_attempt_id": int(attempt_id or 0),
+                "backend": "steam_ugc" if backend == "steam_client" else "steamcmd",
+                "backend_owner": backend,
+                "work_ids": list(download_ids),
+            })
+            win.GLib.idle_add(deliver_event, work_set_event)
+
+            if attempt_id and manage_join_presentation:
                 win._join_popup_initialize_download_counter(
                     attempt_id,
                     download_ids,
@@ -330,10 +400,11 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             win.GLib.idle_add(_ui_reset_steamcmd_state)
             reset_done.wait(timeout=2.0)
 
-            try:
-                win.GLib.idle_add(win.steamcmd_spinner.set_spinning, False)
-            except Exception:
-                pass
+            if manage_join_presentation:
+                try:
+                    win.GLib.idle_add(win.steamcmd_spinner.set_spinning, False)
+                except Exception:
+                    pass
 
             creds = {"ok": True, "username": "", "password": ""}
             if backend == "steamcmd":
@@ -341,7 +412,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     username_prefill=steam_user,
                     status=status_msg,
                 )
-            else:
+            elif manage_join_presentation:
                 overlay_shown = win.threading.Event()
 
                 def _ui_show_steam_client():
@@ -360,7 +431,8 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                 steam_user_run = str(creds.get("username") or "").strip()
                 steam_pass_run = str(creds.get("password") or "")
 
-                win.GLib.idle_add(win._set_updating, False)
+                if manage_join_presentation:
+                    win.GLib.idle_add(win._set_updating, False)
 
                 free_b = win._free_bytes_for_path(effective_workshop_dir)
                 if free_b > 0:
@@ -368,13 +440,14 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     if free_gb < 5.0:
                         ok = False
                         err_msg = f"Not enough free disk space in workshop drive ({free_gb:.1f} GB free)."
-                        win.GLib.idle_add(
-                            win._steamcmd_overlay_render,
-                            "Checking/Updating Required Mods…",
-                            "Not enough disk space.",
-                            f"{free_gb:.1f} GB free in workshop location.",
-                            False,
-                        )
+                        if manage_join_presentation:
+                            win.GLib.idle_add(
+                                win._steamcmd_overlay_render,
+                                "Checking/Updating Required Mods…",
+                                "Not enough disk space.",
+                                f"{free_gb:.1f} GB free in workshop location.",
+                                False,
+                            )
 
                 if ok:
                     win.GLib.idle_add(lambda: setattr(win, "_steamcmd_total_sizes", {}) or False)
@@ -396,8 +469,8 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     win.GLib.idle_add(_ui_set_sizes)
 
                     try:
-                        if getattr(win, "_discord", None):
-                            win._discord.set_installing_mods(server_name=str(obj.name or ""))
+                        if manage_join_presence and getattr(win, "_discord", None):
+                            win._discord.set_installing_mods(server_name=str(server_name or ""))
                     except Exception:
                         pass
 
@@ -457,7 +530,8 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                                         win._join_log(attempt_id, "UGC final item ready", mod_id=mid)
                                 except Exception:
                                     pass
-                                win._steam_ugc_progress_from_worker(event)
+                                progress_event = PreparationProgressEvent.from_authoritative_payload(event)
+                                win.GLib.idle_add(deliver_event, progress_event)
 
                             if attempt_id:
                                 win._join_log(attempt_id, "UGC helper start", ids=list(download_ids))
@@ -478,7 +552,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                         win._steamcmd_install_in_progress = False
                         win._mod_download_backend_active = ""
 
-                if not ok:
+                if not ok and manage_join_presentation:
                     win.GLib.idle_add(win._hide_steamcmd_auth_overlay)
                 win._mod_download_backend_active = ""
 
@@ -489,7 +563,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                         err_msg = "Mod download failed"
 
                     try:
-                        if getattr(win, "_discord", None):
+                        if manage_join_presence and getattr(win, "_discord", None):
                             win._discord.set_menu()
                     except Exception:
                         pass
@@ -499,8 +573,6 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                 print("[JOIN] Mod download not needed for this join; proceeding with local mods only")
             else:
                 print("[JOIN] Mod download handling disabled; proceeding with local mods only")
-
-        mods_for_launch = mods
 
         if ok:
             if attempt_id and backend == "steam_client":
@@ -529,8 +601,62 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     mods_for_launch = [pair for pair in mods if int(pair[0]) not in denied_ids]
                     print(f"[JOIN] Skipping inaccessible mods: {sorted(denied_ids)}")
 
-        link_info = None
-        if ok:
+    except Exception as e:
+        if not manage_join_presentation:
+            print(
+                "[BACKGROUND PREPARE] Shared preparation exception "
+                f"server={server_identity or server_name or '<unknown>'}: {e}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+        ok = False
+        err_msg = str(e)
+
+    if ok:
+        outcome = PreparationOutcome(
+            PreparationStatus.READY,
+            reason="ready",
+            backend=backend,
+            effective_workshop_path=effective_workshop_dir,
+            verified_mods=mods_for_launch,
+            did_work=did_work,
+        )
+    else:
+        cancelled = bool(win._steamcmd_cancel_event.is_set())
+        outcome = PreparationOutcome(
+            PreparationStatus.CANCELLED if cancelled else PreparationStatus.FAILED,
+            reason="cancelled" if cancelled else "failed",
+            error=str(err_msg or ""),
+            backend=backend,
+            effective_workshop_path=effective_workshop_dir,
+            did_work=did_work,
+        )
+    presenter.on_terminal(outcome)
+    return outcome
+
+
+def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_user, validate, dry,
+                            proton_prefix, watch_folder_linux, use_steamcmd, mod_download_backend,
+                            auto_install_missing, auto_update_required, *, attempt_id=0):
+    consume_event = getattr(win, "_steam_ugc_progress_to_overlay", None)
+    if consume_event is None:
+        consume_event = win._steam_ugc_progress_from_worker
+    join_presenter = JoinPopupPreparationPresenter(consume_event=consume_event)
+    outcome = prepare_required_mods(
+        win, mods, workshop_dir, steamcmd_path, steam_user, validate, dry,
+        use_steamcmd, mod_download_backend, auto_install_missing, auto_update_required,
+        operation_id=attempt_id,
+        presenter=join_presenter,
+        server_name=str(getattr(obj, "name", "") or ""),
+    )
+    ok = outcome.status in (PreparationStatus.READY, PreparationStatus.NO_REQUIRED_MODS)
+    err_msg = outcome.error or None
+    selected_mod_win_paths_for_launch = []
+
+    try:
+        if outcome.status is PreparationStatus.READY:
+            mods_for_launch = list(outcome.verified_mods)
+            effective_workshop_dir = outcome.effective_workshop_path
             link_info = win.ensure_watch_symlinks(
                 workshop_dir=effective_workshop_dir,
                 mods=mods_for_launch,
@@ -555,39 +681,49 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                 else:
                     print(f"[JOIN] Symlink warnings: {link_info.get('errors')}")
 
-        if ok:
-            validation_errors = steamcmd_mods.validate_selected_watch_symlinks(
-                selected_paths=(link_info or {}).get("selected_paths", []),
-                mods=mods_for_launch,
-            )
-            if validation_errors:
-                for line in validation_errors:
-                    print(f"[JOIN] Invalid mod path before launch: {line}")
-                ok = False
-                err_msg = "Invalid required mod path(s) before launch: " + "; ".join(validation_errors)
+            if ok:
+                validation_errors = steamcmd_mods.validate_selected_watch_symlinks(
+                    selected_paths=(link_info or {}).get("selected_paths", []),
+                    mods=mods_for_launch,
+                )
+                if validation_errors:
+                    for line in validation_errors:
+                        print(f"[JOIN] Invalid mod path before launch: {line}")
+                    ok = False
+                    err_msg = "Invalid required mod path(s) before launch: " + "; ".join(validation_errors)
 
-        if ok:
+            if ok:
+                installed_mods_for_local = win.scan_installed_mods_in_watch_folder(watch_folder_linux)
+                selected_mods_for_preset = (link_info or {}).get("selected_paths", [])
+                paths = win.bootstrap_launcher_state(
+                    proton_prefix=proton_prefix,
+                    watch_folder_linux=watch_folder_linux,
+                    installed_mod_linux_paths=installed_mods_for_local,
+                    selected_mod_linux_paths=selected_mods_for_preset,
+                )
+                print(f"[JOIN] launcher state written: {paths}")
+                if attempt_id:
+                    win._join_log(attempt_id, "preset/launcher-state preparation completed")
+
+                selected_mod_win_paths_for_launch = [
+                    wp
+                    for wp in (
+                        linux_to_win_path_under_prefix(p, proton_prefix=proton_prefix)
+                        for p in selected_mods_for_preset
+                    )
+                    if wp
+                ]
+        elif outcome.status is PreparationStatus.NO_REQUIRED_MODS:
             installed_mods_for_local = win.scan_installed_mods_in_watch_folder(watch_folder_linux)
-            selected_mods_for_preset = (link_info or {}).get("selected_paths", [])
             paths = win.bootstrap_launcher_state(
                 proton_prefix=proton_prefix,
                 watch_folder_linux=watch_folder_linux,
                 installed_mod_linux_paths=installed_mods_for_local,
-                selected_mod_linux_paths=selected_mods_for_preset,
+                selected_mod_linux_paths=[],
             )
-            print(f"[JOIN] launcher state written: {paths}")
+            print(f"[JOIN] launcher state cleared for no-mod server: {paths}")
             if attempt_id:
                 win._join_log(attempt_id, "preset/launcher-state preparation completed")
-
-            selected_mod_win_paths_for_launch = [
-                wp
-                for wp in (
-                    linux_to_win_path_under_prefix(p, proton_prefix=proton_prefix)
-                    for p in selected_mods_for_preset
-                )
-                if wp
-            ]
-
     except Exception as e:
         ok = False
         err_msg = str(e)

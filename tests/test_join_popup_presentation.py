@@ -272,11 +272,12 @@ class JoinPopupPresentationTests(unittest.TestCase):
         self.assertEqual(len(harness.commits), 3)
 
     def test_real_work_progress_percentage_path_remains(self):
-        function = WINDOW_SOURCE.split("def _steam_ugc_progress_to_overlay", 1)[1]
-        function = function.split("def _open_steam_downloads", 1)[0]
-        self.assertIn("float(download_bytes) / float(total_bytes)", function)
-        self.assertIn("steamcmd_prog_bar.set_fraction(frac)", function)
-        self.assertIn('percent_label.set_text(f"{pct}%")', function)
+        reducer = (ROOT / "src/dzll_launcher/preparation_presentation.py").read_text()
+        renderer = WINDOW_SOURCE.split("def _render_join_preparation_snapshot", 1)[1]
+        renderer = renderer.split("def _open_steam_downloads", 1)[0]
+        self.assertIn("float(download_bytes) / float(total_bytes)", reducer)
+        self.assertIn("steamcmd_prog_bar.set_fraction(fraction)", renderer)
+        self.assertIn('percent_label.set_text(f"{int(fraction * 100)}%")', renderer)
 
     def test_backend_work_and_join_continuation_are_unchanged(self):
         self.assertIn("ok = win.run_steam_client_install(", JOIN_SOURCE)

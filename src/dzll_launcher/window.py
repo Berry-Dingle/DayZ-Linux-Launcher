@@ -12,6 +12,7 @@ import threading
 import re
 import gi
 import shutil
+import traceback
 import weakref
 from pathlib import Path
 import sys
@@ -136,6 +137,26 @@ from .steamcmd_overlay_ui import SteamCMDOverlayUI
 from .launcher_state import bootstrap_launcher_state
 from .blocklist_utils import bl_normalize_key, bl_load_local, bl_status
 from .join_prepare import join_prepare_and_launch
+from .background_prepare import (
+    BackgroundConsentResult,
+    BackgroundConsentStatus,
+    BackgroundPreparationRuntime,
+    BackgroundServerPreparationSnapshot,
+    SingleServerBackgroundPreparation,
+    preparation_operation_busy,
+    prepare_server_mods_without_joining,
+)
+from .background_prepare_queue import (
+    BackgroundBatchEntry,
+    BackgroundPreparationQueue,
+    BackgroundPreparationRequest,
+    BackgroundQueueSnapshot,
+    BackgroundQueueTransition,
+    BackgroundRetryItem,
+    BackgroundRetrySetupFailure,
+    BackgroundServerState,
+)
+from .background_prepare_browser import BrowserPreparationPresenter
 from .server_companion_ui import ServerCompanionPanel
 from .launch_utils import launch_direct_steam_url
 from .join_attempt import JoinAttemptTracker
@@ -144,6 +165,17 @@ from .join_popup_presentation import (
     JoinPopupPhase,
     JoinPopupPresentation,
     JoinPopupPresentationController,
+)
+from .preparation_contracts import (
+    JoinPopupPreparationPresenter,
+    PreparationEventKind,
+    PreparationOutcome,
+    PreparationProgressEvent,
+    PreparationStatus,
+)
+from .preparation_presentation import (
+    PreparationPresentationReducer,
+    PreparationProgressMode,
 )
 from .mod_metadata import mark_mods_used
 from .mod_search import (
@@ -551,6 +583,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             is_current_attempt=self._join_popup_attempt_is_current,
         )
         self._join_popup_item_activity = JoinPopupActivityTracker()
+        self._join_preparation_presenter = JoinPopupPreparationPresenter(
+            consume_event=self._steam_ugc_progress_to_overlay,
+        )
 
         self.dead = load_dead_cache()
         self._prune_expired_dead()
@@ -663,6 +698,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._steamcmd_install_in_progress = False
         self._mod_download_backend_active = ""
         self._join_steam_start_allowed = False
+        self._background_prepare_ui_generation = 0
+        self._background_prepare_active = False
+        self._background_prepare_cancel_requested = False
+        self._background_prepare_terminal_handled = False
+        self._background_prepare_controller = None
+        self._background_prepare_snapshot = None
+        self._background_prepare_pulse_id = 0
+        self._background_prepare_queue = BackgroundPreparationQueue()
 
         css = get_app_css(
             DIVIDER_COLOR=DIVIDER_COLOR,
@@ -982,6 +1025,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._search_area_overlay_margin_start = SIDEBAR_WIDTH + 1
         browser_stack.append(build_search_area(self))
 
+        self.background_prepare_status = self._build_background_prepare_status_block()
+        browser_stack.append(self.background_prepare_status)
+
         main_shell = Gtk.Overlay()
         main_shell.set_hexpand(True)
         main_shell.set_vexpand(True)
@@ -1032,9 +1078,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.column_view_selection,
             self._toggle_favorite_for_obj,
             self._monitor_server_companion_for_obj,
+            self._background_prepare_for_obj,
             self._join_server_for_obj,
             self._on_column_view_sort_header_clicked,
             self._is_server_companion_monitoring_obj,
+            self._background_prepare_download_available,
+            self._background_prepare_join_available,
+            self._background_prepare_download_presentation,
+            self._background_prepare_join_presentation,
             ubuntu_geometry=self._ubuntu_geometry,
             perf_metrics=(
                 self._scroll_drag_factory_metrics
@@ -1377,7 +1428,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._join_popup_presentation.invalidate_pending()
         except Exception:
             pass
-        return self._steamcmd_overlay_ui._steamcmd_set_state(heading, line1, line2, spinning)
+        result = self._steamcmd_overlay_ui._steamcmd_set_state(
+            heading, line1, line2, spinning,
+        )
+        presenter = getattr(self, "_background_prepare_presenter", None)
+        if self._background_prepare_active and presenter is not None:
+            presenter.on_steamcmd_state(
+                heading=heading, line1=line1, line2=line2, spinning=spinning,
+            )
+        return result
 
     def _steamcmd_install_line_from_worker(self, line: str):
         return self._steamcmd_overlay_ui._steamcmd_install_line_from_worker(line)
@@ -1998,14 +2057,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _steam_ugc_progress_from_worker(self, event: dict):
         try:
-            GLib.idle_add(self._steam_ugc_progress_to_overlay, dict(event or {}))
+            presenter = getattr(self, "_join_preparation_presenter", None)
+            if presenter is None:
+                GLib.idle_add(self._steam_ugc_progress_to_overlay, dict(event or {}))
+            else:
+                progress_event = PreparationProgressEvent.from_authoritative_payload(event)
+                GLib.idle_add(presenter.on_event, progress_event)
         except Exception:
             pass
 
     def _steam_ugc_progress_to_overlay(self, event: dict):
         if bool(getattr(self, "_steam_client_safe_cancel_requested", False)):
             return False
-        if not isinstance(event, dict) or event.get("backend") != "steam_ugc":
+        if not isinstance(event, dict):
             return False
 
         try:
@@ -2018,87 +2082,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 flush=True,
             )
             return False
-
-        event_type = str(event.get("type") or "")
-        message = str(event.get("message") or "").strip()
-        if event_type == "status" and message == "Checking/Updating Required Mods":
-            try:
-                self._set_server_companion_join_status(message, flash=False)
-            except Exception:
-                pass
-            return False
-        if event_type in ("preflight", "status", "error") and message:
-            is_error = bool(event.get("error")) or event_type == "error"
-            if is_error:
-                return self._steam_ugc_render_status(message, error=True)
-            if "waiting" in message.lower() or "starting steam" in message.lower():
-                self._join_popup_request(
-                    JoinPopupPhase.WAITING_STEAM,
-                    "Waiting for Steam…",
-                    backend="steam_client",
-                    immediate=True,
-                    attempt_id=origin_attempt_id or None,
-                )
-            else:
-                self._join_popup_request(
-                    JoinPopupPhase.CHECKING,
-                    "Checking & Preparing Mods for Join...",
-                    backend="steam_client",
-                    attempt_id=origin_attempt_id or None,
-                )
-            return False
-
-        try:
-            mid = int(event.get("id") or 0)
-        except Exception:
-            mid = 0
-        if mid <= 0:
-            return False
-
-        backend_owner = str(event.get("backend_owner") or "")
-        if (
-            origin_attempt_id <= 0
-            or backend_owner != "steam_client"
-            or not self._join_attempt_is_active(origin_attempt_id)
-        ):
-            return False
-
-        installed = bool(event.get("installed", False))
-        ready = bool(
-            event.get(
-                "ready",
-                installed
-                and not bool(event.get("needs_update", False))
-                and not bool(event.get("downloading", False))
-                and not bool(event.get("download_pending", False)),
+        reducer = getattr(self, "_join_preparation_reducer", None)
+        if reducer is None or reducer.operation_id != origin_attempt_id:
+            reducer = PreparationPresentationReducer(
+                operation_id=origin_attempt_id,
+                is_current=self._join_attempt_is_active,
+                initialise_counter=lambda ids: self._join_attempts.initialize_download_counter(
+                    origin_attempt_id, ids,
+                ),
+                note_transfer=lambda mid: self._join_popup_note_genuine_transfer(
+                    origin_attempt_id, mid, backend="steam_client",
+                ),
+                activity_tracker=self._join_popup_item_activity,
             )
-        )
-
-        if ready:
-            try:
-                self._steam_ugc_installed_ids.add(mid)
-            except Exception:
-                pass
-        try:
-            event_completed = int(event.get("completed_count") or 0)
-        except Exception:
-            event_completed = 0
-        try:
-            set_completed = len(getattr(self, "_steam_ugc_installed_ids", set()) or set())
-        except Exception:
-            set_completed = 0
-        self._steam_ugc_completed_count = max(
-            int(getattr(self, "_steam_ugc_completed_count", 0) or 0),
-            event_completed,
-            set_completed,
-        )
-
-        event = dict(event)
-        event["name"] = str(event.get("name") or "").strip() or str(mid)
-        event["ready"] = ready
-        outcome = self._join_popup_item_activity.observe(event)
-        activity = self._join_popup_item_activity.get(origin_attempt_id, mid)
-        if outcome.should_log:
+            self._join_preparation_reducer = reducer
+        progress_event = PreparationProgressEvent.from_authoritative_payload(event)
+        reduction = reducer.apply(progress_event)
+        outcome = reduction.activity
+        if outcome is not None and outcome.should_log:
+            mid = int(progress_event.item_id or 0)
+            activity = self._join_popup_item_activity.get(origin_attempt_id, mid)
             fields = {
                 "mod_id": mid,
                 "source": str(event.get("event_source") or "ambiguous"),
@@ -2106,78 +2109,71 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 "request_accepted": bool(event.get("request_accepted", False)),
                 "installed_before": getattr(activity, "initial_classification", "ambiguous"),
                 "bytes_advanced": bool(outcome.bytes_advanced),
+                "reason": outcome.authorised_reason if outcome.presentation else outcome.suppressed_reason,
             }
-            if outcome.presentation is None:
-                fields["reason"] = outcome.suppressed_reason
-                self._join_log(origin_attempt_id, "popup item presentation suppressed", **fields)
-            else:
-                fields["reason"] = outcome.authorised_reason
-                self._join_log(origin_attempt_id, "popup item presentation authorised", **fields)
+            self._join_log(
+                origin_attempt_id,
+                "popup item presentation authorised" if outcome.presentation else "popup item presentation suppressed",
+                **fields,
+            )
+        snapshot = reduction.snapshot
+        if snapshot is not None:
+            self._render_join_preparation_snapshot(snapshot)
+        return False
 
-        presentation = outcome.presentation
-        if presentation is None:
-            return False
-
-        counter = self._join_popup_note_genuine_transfer(
-            origin_attempt_id, mid, backend="steam_client"
-        )
-        if counter.status not in ("assigned", "reused", "duplicate"):
-            return False
-        presentation = JoinPopupPresentation(
-            attempt_id=presentation.attempt_id,
-            backend=presentation.backend,
-            phase=JoinPopupPhase.DOWNLOADING,
-            text=self._join_popup_active_download_text(
-                event,
-                current=counter.display_ordinal,
-                total=counter.total,
-            ),
-            item_key=presentation.item_key,
-        )
-        self._steam_ugc_active_event = dict(event)
-        self._join_popup_presentation.request(presentation)
-        download_bytes = int(event.get("download_bytes") or 0)
-        total_bytes = int(event.get("total_bytes") or 0)
-
+    def _render_join_preparation_snapshot(self, snapshot):
+        if snapshot.phase is JoinPopupPhase.ERROR:
+            self._join_popup_presentation.invalidate_pending()
+            self._steam_ugc_render_status(snapshot.stage_text, error=True)
+            return
+        if snapshot.current_item_id:
+            size = self._steam_ugc_format_size(snapshot.item_total_bytes)
+            suffix = (
+                f" ({snapshot.current}/{snapshot.total})"
+                if snapshot.current > 0 and snapshot.total > 0 else ""
+            )
+            text = f"Downloading Mod: {snapshot.current_mod_name} - {size}{suffix}"
+            self._join_popup_presentation.request(JoinPopupPresentation(
+                snapshot.operation_id, snapshot.backend, snapshot.phase, text,
+                snapshot.current_item_id,
+            ))
+            self._steam_ugc_active_event = {
+                "id": snapshot.current_item_id,
+                "name": snapshot.current_mod_name,
+                "total_bytes": snapshot.item_total_bytes,
+            }
+        else:
+            self._join_popup_request(
+                snapshot.phase, snapshot.stage_text, backend=snapshot.backend,
+                immediate=snapshot.phase in (JoinPopupPhase.WAITING_STEAM, JoinPopupPhase.ERROR),
+                attempt_id=snapshot.operation_id,
+            )
         try:
             self.steamcmd_spinner.set_visible(True)
             self.steamcmd_spinner.set_spinning(True)
         except Exception:
             pass
-
         percent_label = self._steam_ugc_get_percent_label()
-        if total_bytes > 0:
-            frac = max(0.0, min(1.0, float(download_bytes) / float(total_bytes)))
-            pct = int(frac * 100)
+        if snapshot.progress_mode is PreparationProgressMode.DETERMINATE:
             self._steam_ugc_stop_progress_timer()
+            fraction = float(snapshot.fraction or 0.0)
             try:
                 self.steamcmd_prog_bar.set_visible(True)
                 self.steamcmd_prog_bar.set_show_text(False)
-                self.steamcmd_prog_bar.set_fraction(frac)
+                self.steamcmd_prog_bar.set_fraction(fraction)
             except Exception:
                 pass
             if percent_label is not None:
-                try:
-                    percent_label.set_text(f"{pct}%")
-                    percent_label.set_visible(True)
-                except Exception:
-                    pass
-        else:
+                percent_label.set_text(f"{int(fraction * 100)}%")
+                percent_label.set_visible(True)
+        elif snapshot.progress_mode is PreparationProgressMode.INDETERMINATE:
             try:
                 self.steamcmd_prog_bar.set_visible(True)
                 self.steamcmd_prog_bar.set_show_text(False)
                 self.steamcmd_prog_bar.set_fraction(0.0)
             except Exception:
                 pass
-            if percent_label is not None:
-                try:
-                    percent_label.set_text("0%")
-                    percent_label.set_visible(True)
-                except Exception:
-                    pass
             self._steam_ugc_start_progress_timer()
-
-        return False
 
     def _open_steam_downloads(self):
         try:
@@ -2896,6 +2892,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
         self._shutdown_cleanup_done = True
+        self._background_prepare_ui_generation = int(
+            getattr(self, "_background_prepare_ui_generation", 0) or 0
+        ) + 1
+        queue = getattr(self, "_background_prepare_queue", None)
+        transition = queue.shutdown() if queue is not None else None
+        controller = (
+            transition.controller_to_cancel
+            if transition is not None and transition.controller_to_cancel is not None
+            else getattr(self, "_background_prepare_controller", None)
+        )
+        if controller is not None:
+            try:
+                controller.cancel()
+            except Exception:
+                pass
+        try:
+            self._background_prepare_stop_pulse()
+        except Exception:
+            pass
         self._settle_browser_scrollbar_interaction("shutdown")
         drag_light = getattr(self, "_scroll_drag_light", None)
         if drag_light is not None:
@@ -8138,11 +8153,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if cleaned and clear_pending:
             self._clear_join_pending_state(attempt_id)
         if cleaned:
+            reducer = getattr(self, "_join_preparation_reducer", None)
+            if reducer is not None and reducer.operation_id == int(attempt_id):
+                self._join_preparation_reducer = None
             self._steamcmd_cancel_event = threading.Event()
             self._steam_client_stop_waiting_event = threading.Event()
             self._steam_client_safe_cancel_requested = False
             self._steamcmd_install_in_progress = False
             self._mod_download_backend_active = ""
+            self._refresh_background_prepare_action_states()
         return cleaned
 
     def _cleanup_active_join_attempt(self, reason: str) -> bool:
@@ -8595,6 +8614,794 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     # Join server
     # ----------------------------
+    def _build_background_prepare_status_block(self):
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        root.set_hexpand(True)
+        root.set_visible(False)
+        root.add_css_class("dzll-background-prepare-status")
+
+        info = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        info.set_margin_start(8)
+        info.set_margin_end(8)
+        info.set_margin_top(4)
+        root.append(info)
+
+        self.background_prepare_server_label = Gtk.Label(xalign=0.0)
+        self.background_prepare_server_label.set_ellipsize(Pango.EllipsizeMode.END)
+        info.append(self.background_prepare_server_label)
+
+        self.background_prepare_detail_label = Gtk.Label(xalign=0.0)
+        self.background_prepare_detail_label.set_hexpand(True)
+        self.background_prepare_detail_label.set_ellipsize(Pango.EllipsizeMode.END)
+        info.append(self.background_prepare_detail_label)
+
+        self.background_prepare_count_label = Gtk.Label(xalign=1.0)
+        self.background_prepare_count_label.set_visible(False)
+        info.append(self.background_prepare_count_label)
+
+        self.background_prepare_retry_btn = Gtk.Button(label="Retry Failed")
+        self.background_prepare_retry_btn.add_css_class("flat")
+        self.background_prepare_retry_btn.set_visible(False)
+        self.background_prepare_retry_btn.connect(
+            "clicked", self._background_prepare_retry_failed_clicked,
+        )
+        attach_pointer_cursor(self.background_prepare_retry_btn)
+        info.append(self.background_prepare_retry_btn)
+
+        self.background_prepare_action_btn = Gtk.Button(label="Cancel")
+        self.background_prepare_action_btn.add_css_class("flat")
+        self.background_prepare_action_btn.connect(
+            "clicked", self._background_prepare_action_clicked,
+        )
+        attach_pointer_cursor(self.background_prepare_action_btn)
+        info.append(self.background_prepare_action_btn)
+
+        self.background_prepare_failed_label = Gtk.Label(xalign=0.0)
+        self.background_prepare_failed_label.set_hexpand(True)
+        self.background_prepare_failed_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.background_prepare_failed_label.set_margin_start(8)
+        self.background_prepare_failed_label.set_margin_end(8)
+        self.background_prepare_failed_label.set_visible(False)
+        root.append(self.background_prepare_failed_label)
+
+        self.background_prepare_progress = Gtk.ProgressBar()
+        self.background_prepare_progress.set_show_text(False)
+        self.background_prepare_progress.set_margin_start(8)
+        self.background_prepare_progress.set_margin_end(8)
+        self.background_prepare_progress.set_margin_bottom(4)
+        root.append(self.background_prepare_progress)
+        return root
+
+    def _background_prepare_download_available(self, obj=None) -> bool:
+        queue = self._background_prepare_queue
+        if (
+            not queue.accepting
+            or getattr(self._join_attempts, "active", None) is not None
+        ):
+            return False
+        if not isinstance(obj, ServerObject):
+            return True
+        record = queue.record_for(fav_key(obj.ip, obj.gport))
+        return record.state not in {
+            BackgroundServerState.QUEUED,
+            BackgroundServerState.PREPARING,
+        }
+
+    def _background_prepare_join_available(self, _obj=None) -> bool:
+        return not self._background_prepare_queue.busy
+
+    def _background_prepare_download_presentation(self, obj=None) -> dict:
+        if not isinstance(obj, ServerObject):
+            return {}
+        state = self._background_prepare_queue.record_for(
+            fav_key(obj.ip, obj.gport)
+        ).state
+        return {
+            BackgroundServerState.QUEUED: {
+                "icon_name": "appointment-soon-symbolic",
+                "tooltip": "Required mods queued for background preparation",
+            },
+            BackgroundServerState.PREPARING: {
+                "icon_name": "emblem-synchronizing-symbolic",
+                "tooltip": "Preparing required mods",
+            },
+            BackgroundServerState.READY: {
+                "icon_name": "emblem-ok-symbolic",
+                "tooltip": "Required mods are ready; click to revalidate",
+            },
+            BackgroundServerState.FAILED: {
+                "icon_name": "dialog-error-symbolic",
+                "tooltip": "Background preparation failed; click to retry",
+            },
+            BackgroundServerState.CANCELLED: {
+                "icon_name": "process-stop-symbolic",
+                "tooltip": "Background preparation was cancelled; click to retry",
+            },
+        }.get(state, {})
+
+    def _background_prepare_join_presentation(self, _obj=None) -> dict:
+        if not self._background_prepare_queue.busy:
+            return {}
+        return {
+            "icon_name": "action-unavailable-symbolic",
+            "tooltip": "Join unavailable while background\nmod preparation is running",
+            "css_class": "dzll-join-blocked",
+        }
+
+    def _refresh_background_prepare_action_states(self) -> None:
+        view = getattr(self, "list_view", None)
+        for name in ("refresh_download_mods_states", "refresh_join_states"):
+            refresh = getattr(view, name, None)
+            if callable(refresh):
+                refresh()
+
+    def _background_prepare_is_current(self, generation: int) -> bool:
+        return bool(
+            not getattr(self, "_shutdown_cleanup_done", False)
+            and int(generation) == int(self._background_prepare_ui_generation)
+        )
+
+    def _background_prepare_request_is_current(
+            self, request: BackgroundPreparationRequest, generation: int) -> bool:
+        return bool(
+            self._background_prepare_is_current(generation)
+            and self._background_prepare_queue.is_current(request)
+        )
+
+    def _background_prepare_resolve_frozen(self, obj: ServerObject):
+        mods = self._resolve_join_mods(obj)
+        snapshot = BackgroundServerPreparationSnapshot.from_server(obj, mods)
+        resolved = self._resolve_join_runtime(mods)
+        runtime = BackgroundPreparationRuntime(
+            workshop_dir=str(resolved["workshop_dir"] or ""),
+            steamcmd_path=str(resolved["steamcmd_path"] or ""),
+            steam_user=str(resolved["steam_user"] or ""),
+            validate=bool(resolved["validate"]),
+            dry_run=bool(resolved["dry"]),
+            use_steamcmd=bool(resolved["use_steamcmd"]),
+            mod_download_backend=str(
+                resolved["mod_download_backend"] or "steam_client"
+            ),
+            auto_install_missing=bool(resolved["auto_install_missing"]),
+            auto_update_required=bool(resolved["auto_update_required"]),
+        )
+        return snapshot, runtime
+
+    @staticmethod
+    def _background_prepare_log_request(
+            request: BackgroundPreparationRequest, stage: str, **fields) -> None:
+        details = " ".join(
+            f"{key}={value!r}" for key, value in fields.items()
+        )
+        print(
+            "[BACKGROUND PREPARE] "
+            f"request={request.request_id} batch={request.batch_id} "
+            f"epoch={request.epoch} identity={request.identity} "
+            f"server={request.display_name!r} stage={stage}"
+            + (f" {details}" if details else ""),
+            flush=True,
+        )
+
+    def _background_prepare_for_obj(self, obj: ServerObject) -> None:
+        if not self._background_prepare_download_available(obj):
+            return
+        try:
+            snapshot, runtime = self._background_prepare_resolve_frozen(obj)
+        except Exception as exc:
+            print(f"[BACKGROUND PREPARE] Could not build server snapshot: {exc}")
+            traceback.print_exc()
+            return
+
+        transition = self._background_prepare_queue.enqueue(snapshot, runtime)
+        if not transition.accepted:
+            return
+        self._background_prepare_apply_queue_snapshot(transition.snapshot)
+        if transition.dispatch is not None:
+            self._background_prepare_start_frozen_request(transition.dispatch)
+
+    def _background_prepare_apply_queue_snapshot(
+            self, snapshot: BackgroundQueueSnapshot | None = None) -> None:
+        current = self._background_prepare_queue.snapshot()
+        if snapshot is not None and snapshot.epoch != current.epoch:
+            snapshot = current
+        else:
+            snapshot = current
+        self._background_prepare_active = snapshot.busy
+        if snapshot.cancelling:
+            self._background_prepare_stop_pulse()
+            self.background_prepare_server_label.set_text(
+                "Cancelling background mod preparation…"
+            )
+            self.background_prepare_detail_label.set_text(
+                "Waiting for active Steam cleanup to finish."
+            )
+            self.background_prepare_count_label.set_text("")
+            self.background_prepare_count_label.set_visible(False)
+            self.background_prepare_retry_btn.set_visible(False)
+            self.background_prepare_failed_label.set_visible(False)
+            self.background_prepare_action_btn.set_label("Cancelling…")
+            self.background_prepare_action_btn.set_sensitive(False)
+            self.background_prepare_status.set_visible(True)
+        elif snapshot.active is not None:
+            pending_count = len(snapshot.pending)
+            suffix = f" ({pending_count} queued)" if pending_count else ""
+            self.background_prepare_server_label.set_text(
+                f"Downloading Required Mods: {snapshot.active.display_name}{suffix}"
+            )
+            self.background_prepare_retry_btn.set_visible(False)
+            self.background_prepare_failed_label.set_visible(False)
+            self.background_prepare_action_btn.set_label("Cancel")
+            self.background_prepare_action_btn.set_sensitive(True)
+            self.background_prepare_status.set_visible(True)
+        elif snapshot.completed_batch is not None:
+            self._background_prepare_render_batch_summary(snapshot.completed_batch)
+        elif not snapshot.busy:
+            self.background_prepare_status.set_visible(False)
+        self._refresh_background_prepare_action_states()
+
+    def _background_prepare_start_frozen_request(
+            self, request: BackgroundPreparationRequest,
+            previous: BackgroundBatchEntry | None = None) -> bool:
+        queue = self._background_prepare_queue
+        if not queue.is_current(request):
+            return False
+        try:
+            self._background_prepare_ui_generation += 1
+            generation = self._background_prepare_ui_generation
+            self._background_prepare_active = True
+            self._background_prepare_cancel_requested = False
+            self._background_prepare_terminal_handled = False
+            self._background_prepare_snapshot = request.snapshot
+            controller = SingleServerBackgroundPreparation(self)
+            self._background_prepare_controller = controller
+            if not queue.attach_controller(request, controller):
+                return False
+
+            presenter = BrowserPreparationPresenter(
+                generation=generation,
+                schedule=lambda callback: GLib.idle_add(callback),
+                is_current=lambda token: self._background_prepare_request_is_current(
+                    request, token,
+                ),
+                reducer_factory=lambda operation_id: PreparationPresentationReducer(
+                    operation_id=operation_id,
+                    is_current=lambda _operation_id: (
+                        self._background_prepare_request_is_current(request, generation)
+                    ),
+                ),
+                render_snapshot=lambda progress: self._background_prepare_render_request_snapshot(
+                    request, generation, progress,
+                ),
+                render_cancelling=lambda operation_id: self._background_prepare_render_cancelling(
+                    generation, operation_id,
+                ),
+                render_terminal=lambda outcome: self._background_prepare_observe_terminal(
+                    request, generation, outcome,
+                ),
+            )
+            self._background_prepare_presenter = presenter
+
+            self._background_prepare_stop_pulse()
+            if previous is not None and previous.state is BackgroundServerState.FAILED:
+                self.background_prepare_detail_label.set_text(
+                    f"{previous.display_name} failed: "
+                    f"{previous.error or previous.outcome.reason}"
+                )
+            else:
+                self.background_prepare_detail_label.set_text("Preparing…")
+            self.background_prepare_count_label.set_text("")
+            self.background_prepare_count_label.set_visible(False)
+            self.background_prepare_progress.set_fraction(0.0)
+            self.background_prepare_progress.set_visible(True)
+            self._background_prepare_apply_queue_snapshot(queue.snapshot())
+            self._background_prepare_log_request(request, "worker-submit")
+
+            def worker():
+                started = time.monotonic()
+                self._background_prepare_log_request(request, "worker-enter")
+                try:
+                    outcome = prepare_server_mods_without_joining(
+                        self,
+                        request.snapshot,
+                        request.runtime,
+                        presenter,
+                        ensure_steam_consent=lambda: self._background_prepare_steam_consent_blocking(
+                            generation,
+                        ),
+                        controller=controller,
+                    )
+                except Exception as exc:
+                    print(
+                        "[BACKGROUND PREPARE] Worker exception "
+                        f"request={request.request_id} identity={request.identity}: {exc}",
+                        file=sys.stderr,
+                    )
+                    traceback.print_exc()
+                    outcome = PreparationOutcome(
+                        PreparationStatus.FAILED,
+                        reason="background_prepare_exception",
+                        error=(
+                            f"Background preparation failed for "
+                            f"{request.display_name or request.identity}: {exc}"
+                        ),
+                        backend=request.runtime.mod_download_backend,
+                    )
+                elapsed = time.monotonic() - started
+                transition = queue.finish(request, outcome)
+                self._background_prepare_log_request(
+                    request,
+                    "worker-return",
+                    elapsed=f"{elapsed:.3f}s",
+                    outcome=outcome.status.value,
+                    reason=outcome.reason,
+                    advance=(
+                        transition.dispatch.identity
+                        if transition.dispatch is not None else "batch-finished"
+                    ),
+                )
+                GLib.idle_add(
+                    self._background_prepare_worker_returned,
+                    request,
+                    outcome,
+                    transition,
+                )
+                return outcome
+
+            try:
+                self._hi_executor.submit(worker)
+            except Exception as exc:
+                print(
+                    "[BACKGROUND PREPARE] Worker submission failed "
+                    f"request={request.request_id} identity={request.identity}: {exc}",
+                    file=sys.stderr,
+                )
+                traceback.print_exc()
+                transition = queue.submission_failed(request, exc)
+                self._background_prepare_worker_returned(
+                    request,
+                    transition.completed.outcome if transition.completed else PreparationOutcome(
+                        PreparationStatus.FAILED,
+                        reason="worker_submission_failed",
+                        error=str(exc),
+                    ),
+                    transition,
+                )
+        except Exception as exc:
+            print(
+                "[BACKGROUND PREPARE] Request setup failed "
+                f"request={request.request_id} identity={request.identity}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+            transition = queue.submission_failed(request, exc)
+            self._background_prepare_worker_returned(
+                request,
+                transition.completed.outcome if transition.completed else PreparationOutcome(
+                    PreparationStatus.FAILED,
+                    reason="request_setup_failed",
+                    error=str(exc),
+                ),
+                transition,
+            )
+        return False
+
+    def _background_prepare_render_request_snapshot(
+            self, request: BackgroundPreparationRequest, generation: int,
+            snapshot) -> None:
+        if not self._background_prepare_request_is_current(request, generation):
+            return
+        self._background_prepare_queue.update_progress(request, snapshot)
+        self._background_prepare_render_snapshot(generation, snapshot)
+
+    def _background_prepare_observe_terminal(
+            self, request: BackgroundPreparationRequest, generation: int,
+            outcome: PreparationOutcome) -> None:
+        if not self._background_prepare_request_is_current(request, generation):
+            return
+        if self._background_prepare_queue.observe_terminal(request, outcome):
+            self._background_prepare_log_request(
+                request,
+                "terminal-observed",
+                outcome=outcome.status.value,
+                reason=outcome.reason,
+            )
+
+    def _background_prepare_worker_returned(
+            self, request: BackgroundPreparationRequest,
+            _outcome: PreparationOutcome,
+            transition: BackgroundQueueTransition) -> bool:
+        if not transition.accepted or getattr(self, "_shutdown_cleanup_done", False):
+            return False
+        self._background_prepare_controller = None
+        self._background_prepare_apply_queue_snapshot(transition.snapshot)
+        if transition.dispatch is not None:
+            self._background_prepare_start_frozen_request(
+                transition.dispatch,
+                previous=transition.completed,
+            )
+        return False
+
+        self._background_prepare_ui_generation += 1
+        generation = self._background_prepare_ui_generation
+        self._background_prepare_active = True
+        self._background_prepare_cancel_requested = False
+        self._background_prepare_terminal_handled = False
+        self._background_prepare_snapshot = snapshot
+        self._background_prepare_controller = SingleServerBackgroundPreparation(self)
+        presenter = BrowserPreparationPresenter(
+            generation=generation,
+            schedule=lambda callback: GLib.idle_add(callback),
+            is_current=self._background_prepare_is_current,
+            reducer_factory=lambda operation_id: PreparationPresentationReducer(
+                operation_id=operation_id,
+                is_current=lambda _operation_id: self._background_prepare_is_current(generation),
+            ),
+            render_snapshot=lambda snapshot: self._background_prepare_render_snapshot(
+                generation, snapshot,
+            ),
+            render_cancelling=lambda operation_id: self._background_prepare_render_cancelling(
+                generation, operation_id,
+            ),
+            render_terminal=lambda outcome: self._background_prepare_render_terminal(
+                generation, outcome,
+            ),
+        )
+        self._background_prepare_presenter = presenter
+
+        self._background_prepare_stop_pulse()
+        self.background_prepare_server_label.set_text(
+            f"Downloading Required Mods: {snapshot.name}"
+        )
+        self.background_prepare_detail_label.set_text("Preparing…")
+        self.background_prepare_count_label.set_text("")
+        self.background_prepare_count_label.set_visible(False)
+        self.background_prepare_progress.set_fraction(0.0)
+        self.background_prepare_progress.set_visible(True)
+        self.background_prepare_action_btn.set_label("Cancel")
+        self.background_prepare_action_btn.set_sensitive(True)
+        self.background_prepare_status.set_visible(True)
+        self._refresh_background_prepare_action_states()
+
+        controller = self._background_prepare_controller
+
+        def worker():
+            return prepare_server_mods_without_joining(
+                self,
+                snapshot,
+                runtime,
+                presenter,
+                ensure_steam_consent=lambda: self._background_prepare_steam_consent_blocking(
+                    generation,
+                ),
+                controller=controller,
+            )
+
+        try:
+            self._hi_executor.submit(worker)
+        except Exception as exc:
+            presenter.on_terminal(PreparationOutcome(
+                PreparationStatus.FAILED,
+                reason="worker_submission_failed",
+                error=f"Could not start mod preparation: {exc}",
+            ))
+
+    def _background_prepare_steam_consent_blocking(
+            self, generation: int) -> BackgroundConsentResult:
+        consent_started = time.monotonic()
+        completed = threading.Event()
+        result_lock = threading.Lock()
+        result = {"value": None}
+        snapshot = getattr(self, "_background_prepare_snapshot", None)
+        server_label = str(
+            getattr(snapshot, "name", "")
+            or getattr(snapshot, "identity", "")
+            or "this server"
+        )
+
+        def settle(value: BackgroundConsentResult) -> bool:
+            with result_lock:
+                if result["value"] is not None:
+                    return False
+                result["value"] = value
+                completed.set()
+                return True
+
+        def ask_on_main():
+            try:
+                if completed.is_set():
+                    return False
+                if self._steamcmd_cancel_event.is_set():
+                    settle(BackgroundConsentResult(
+                        BackgroundConsentStatus.CANCELLED,
+                        f"Steam start permission cancelled for {server_label}.",
+                    ))
+                elif not self._background_prepare_is_current(generation):
+                    settle(BackgroundConsentResult(
+                        BackgroundConsentStatus.STALE,
+                        f"Steam start permission expired for {server_label}.",
+                    ))
+                else:
+                    allowed = bool(self._ensure_join_steam_start_consent(0))
+                    if self._steamcmd_cancel_event.is_set():
+                        settle(BackgroundConsentResult(
+                            BackgroundConsentStatus.CANCELLED,
+                            f"Steam start permission cancelled for {server_label}.",
+                        ))
+                    else:
+                        status = (
+                            BackgroundConsentStatus.ALLOWED
+                            if allowed else BackgroundConsentStatus.DECLINED
+                        )
+                        settle(BackgroundConsentResult(status))
+            except Exception as exc:
+                print(
+                    "[BACKGROUND PREPARE] Steam consent callback failed "
+                    f"server={server_label}: {exc}",
+                    file=sys.stderr,
+                )
+                traceback.print_exc()
+                settle(BackgroundConsentResult(
+                    BackgroundConsentStatus.ERROR,
+                    f"Could not obtain Steam start permission for {server_label}: {exc}",
+                ))
+            finally:
+                if not completed.is_set():
+                    settle(BackgroundConsentResult(
+                        BackgroundConsentStatus.ERROR,
+                        f"Steam start permission did not complete for {server_label}.",
+                    ))
+            return False
+
+        try:
+            GLib.idle_add(ask_on_main)
+        except Exception as exc:
+            print(
+                "[BACKGROUND PREPARE] Could not schedule Steam consent callback "
+                f"server={server_label}: {exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+            settle(BackgroundConsentResult(
+                BackgroundConsentStatus.ERROR,
+                f"Could not schedule Steam start permission for {server_label}: {exc}",
+            ))
+
+        timeout_s = max(
+            0.01,
+            float(getattr(self, "_background_prepare_consent_timeout_s", 300.0)),
+        )
+        deadline = time.monotonic() + timeout_s
+        while not completed.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
+            if self._steamcmd_cancel_event.is_set():
+                settle(BackgroundConsentResult(
+                    BackgroundConsentStatus.CANCELLED,
+                    f"Steam start permission cancelled for {server_label}.",
+                ))
+                break
+            if time.monotonic() >= deadline:
+                settle(BackgroundConsentResult(
+                    BackgroundConsentStatus.TIMEOUT,
+                    f"Timed out waiting for Steam start permission for {server_label}.",
+                ))
+                break
+        with result_lock:
+            value = result["value"]
+        value = value or BackgroundConsentResult(
+            BackgroundConsentStatus.ERROR,
+            f"Steam start permission did not complete for {server_label}.",
+        )
+        queue = getattr(self, "_background_prepare_queue", None)
+        request = queue.snapshot().active if queue is not None else None
+        elapsed = time.monotonic() - consent_started
+        log_request = getattr(self, "_background_prepare_log_request", None)
+        if request is not None and callable(log_request):
+            log_request(
+                request,
+                "consent-return",
+                elapsed=f"{elapsed:.3f}s",
+                result=value.status.value,
+                error=value.error,
+            )
+        else:
+            print(
+                "[BACKGROUND PREPARE] Steam consent returned "
+                f"server={server_label!r} elapsed={elapsed:.3f}s "
+                f"result={value.status.value}",
+                flush=True,
+            )
+        return value
+
+    def _background_prepare_cancel_consent_ui(self) -> None:
+        loop = getattr(self, "_start_steam_join_loop", None)
+        if loop is None:
+            return
+        self._start_steam_join_decision = (False, False)
+        try:
+            self.start_steam_join_box.set_visible(False)
+            self.start_steam_join_scrim.set_visible(False)
+        except Exception:
+            pass
+        try:
+            loop.quit()
+        except Exception:
+            traceback.print_exc()
+
+    def _background_prepare_render_snapshot(self, generation: int, snapshot) -> None:
+        if not self._background_prepare_is_current(generation):
+            return
+        detail = snapshot.current_mod_name or snapshot.stage_text
+        if detail:
+            self.background_prepare_detail_label.set_text(detail)
+
+        if snapshot.current > 0 and snapshot.total > 0:
+            self.background_prepare_count_label.set_text(
+                f"{snapshot.current}/{snapshot.total}"
+            )
+            self.background_prepare_count_label.set_visible(True)
+        else:
+            self.background_prepare_count_label.set_text("")
+            self.background_prepare_count_label.set_visible(False)
+
+        if snapshot.progress_mode is PreparationProgressMode.INDETERMINATE:
+            self._background_prepare_start_pulse()
+        elif snapshot.progress_mode is PreparationProgressMode.DETERMINATE:
+            self._background_prepare_stop_pulse()
+            self.background_prepare_progress.set_visible(True)
+            self.background_prepare_progress.set_fraction(snapshot.fraction or 0.0)
+
+    def _background_prepare_start_pulse(self) -> None:
+        if self._background_prepare_pulse_id:
+            return
+
+        def pulse():
+            if not self._background_prepare_active:
+                self._background_prepare_pulse_id = 0
+                return False
+            self.background_prepare_progress.pulse()
+            return True
+
+        self._background_prepare_pulse_id = GLib.timeout_add(100, pulse)
+
+    def _background_prepare_stop_pulse(self) -> None:
+        pulse_id = int(getattr(self, "_background_prepare_pulse_id", 0) or 0)
+        if pulse_id:
+            try:
+                GLib.source_remove(pulse_id)
+            except Exception:
+                pass
+        self._background_prepare_pulse_id = 0
+
+    def _background_prepare_render_cancelling(
+            self, generation: int, _operation_id: int) -> None:
+        if not self._background_prepare_is_current(generation):
+            return
+        self.background_prepare_action_btn.set_label("Cancelling…")
+        self.background_prepare_action_btn.set_sensitive(False)
+
+    def _background_prepare_render_batch_summary(self, batch) -> None:
+        self._background_prepare_active = False
+        self._background_prepare_stop_pulse()
+        self.background_prepare_server_label.set_text(
+            "Background mod preparation finished"
+        )
+        parts = [
+            f"{batch.ready_count} ready",
+            f"{batch.failed_count} failed",
+        ]
+        if batch.cancelled_count:
+            parts.append(f"{batch.cancelled_count} cancelled")
+        self.background_prepare_detail_label.set_text(" · ".join(parts))
+        self.background_prepare_count_label.set_text("")
+        self.background_prepare_count_label.set_visible(False)
+        self.background_prepare_progress.set_fraction(0.0)
+        self.background_prepare_progress.set_visible(False)
+        failed = batch.failed_entries
+        if failed:
+            prefix = "Failed server" if len(failed) == 1 else "Failed servers"
+            names = ", ".join(entry.display_name or entry.identity for entry in failed)
+            self.background_prepare_failed_label.set_text(f"{prefix}: {names}")
+            self.background_prepare_failed_label.set_tooltip_text("\n".join(
+                f"{entry.display_name or entry.identity}: "
+                f"{entry.error or entry.outcome.reason or 'Preparation failed.'}"
+                for entry in failed
+            ))
+            self.background_prepare_failed_label.set_visible(True)
+            self.background_prepare_retry_btn.set_visible(True)
+        else:
+            self.background_prepare_failed_label.set_text("")
+            self.background_prepare_failed_label.set_tooltip_text(None)
+            self.background_prepare_failed_label.set_visible(False)
+            self.background_prepare_retry_btn.set_visible(False)
+        self.background_prepare_action_btn.set_label("Close")
+        self.background_prepare_action_btn.set_sensitive(True)
+        self.background_prepare_status.set_visible(True)
+        self._background_prepare_controller = None
+
+    def _background_prepare_action_clicked(self, _button) -> None:
+        queue = self._background_prepare_queue
+        if not queue.busy:
+            self._background_prepare_close()
+            return
+        transition = queue.cancel_all()
+        if not transition.accepted:
+            return
+        self._background_prepare_cancel_requested = True
+        self._background_prepare_apply_queue_snapshot(transition.snapshot)
+        controller = transition.controller_to_cancel
+        if controller is not None:
+            controller.cancel()
+        self._background_prepare_cancel_consent_ui()
+
+    def _background_prepare_close(self) -> None:
+        if self._background_prepare_queue.busy:
+            return
+        self._background_prepare_queue.clear_completed_batch()
+        self._background_prepare_ui_generation += 1
+        self._background_prepare_stop_pulse()
+        self._background_prepare_snapshot = None
+        self._background_prepare_controller = None
+        self._background_prepare_cancel_requested = False
+        self._background_prepare_terminal_handled = False
+        self.background_prepare_failed_label.set_text("")
+        self.background_prepare_failed_label.set_tooltip_text(None)
+        self.background_prepare_failed_label.set_visible(False)
+        self.background_prepare_retry_btn.set_visible(False)
+        self.background_prepare_progress.set_visible(True)
+        self.background_prepare_status.set_visible(False)
+        self._refresh_background_prepare_action_states()
+
+    def _background_prepare_retry_failed_clicked(self, _button) -> None:
+        completed = self._background_prepare_queue.snapshot().completed_batch
+        if completed is None or not completed.failed_entries:
+            return
+        failed_entries = tuple(completed.failed_entries)
+        items = []
+        setup_failures = []
+        for entry in failed_entries:
+            obj = getattr(self, "_obj_by_key", {}).get(entry.identity)
+            if not isinstance(obj, ServerObject):
+                setup_failures.append(BackgroundRetrySetupFailure(
+                    batch_order=entry.batch_order,
+                    identity=entry.identity,
+                    display_name=entry.display_name,
+                    error=(
+                        f"Could not retry {entry.display_name or entry.identity}: "
+                        "the server is no longer available in the current list."
+                    ),
+                ))
+                continue
+            try:
+                snapshot, runtime = self._background_prepare_resolve_frozen(obj)
+            except Exception as exc:
+                print(
+                    "[BACKGROUND PREPARE] Retry snapshot failed "
+                    f"identity={entry.identity}: {exc}",
+                    file=sys.stderr,
+                )
+                traceback.print_exc()
+                setup_failures.append(BackgroundRetrySetupFailure(
+                    batch_order=entry.batch_order,
+                    identity=entry.identity,
+                    display_name=entry.display_name,
+                    error=f"Could not resolve retry request: {exc}",
+                ))
+                continue
+            items.append(BackgroundRetryItem(
+                batch_order=entry.batch_order,
+                snapshot=snapshot,
+                runtime=runtime,
+            ))
+
+        transition = self._background_prepare_queue.enqueue_retry_batch(
+            tuple(items), tuple(setup_failures),
+        )
+        if not transition.accepted:
+            return
+        self._background_prepare_ui_generation += 1
+        self._background_prepare_apply_queue_snapshot(transition.snapshot)
+        if transition.dispatch is not None:
+            self._background_prepare_start_frozen_request(transition.dispatch)
+
     def _resolve_join_mods(self, obj: ServerObject):
         raw_mods_json = getattr(obj, "mods_json", "") or ""
         server_mods = parse_mods_from_db(raw_mods_json)
@@ -8650,6 +9457,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         }
 
     def _join_server_for_obj(self, obj: ServerObject):
+        if preparation_operation_busy(self):
+            self._set_server_companion_join_status(
+                "Mod preparation already in progress…", flash=True,
+            )
+            return
         active = self._join_attempts.active
         if active is not None:
             self._join_log(active.attempt_id, "duplicate Join click blocked",
@@ -8666,6 +9478,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         if attempt is None:
             return
+        self._refresh_background_prepare_action_states()
         attempt_id = attempt.attempt_id
         self._join_popup_enter_checking(attempt_id)
 
@@ -8717,40 +9530,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             self._pending_join_mod_ids = []
             self._pending_join_mod_names_by_id = {}
-
-        if not mods:
-            self._join_log(attempt_id, "chosen backend", backend="no mods")
-            self._pending_join_mod_ids = []
-            self._pending_join_mod_names_by_id = {}
-            try:
-                proton_prefix = self._get_dayz_proton_prefix()
-                watch_folder_linux = self._get_dzll_watch_folder_linux()
-                self._log_join_resolved_dayz_paths(workshop_dir=self._get_dayz_workshop_root() or str(self.settings.get("workshop_dir") or "").strip(), proton_prefix=proton_prefix)
-
-                installed_mods_for_local = scan_installed_mods_in_watch_folder(watch_folder_linux)
-                paths = bootstrap_launcher_state(
-                    proton_prefix=proton_prefix,
-                    watch_folder_linux=watch_folder_linux,
-                    installed_mod_linux_paths=installed_mods_for_local,
-                    selected_mod_linux_paths=[],
-                )
-                print(f"[JOIN] launcher state cleared for no-mod server: {paths}")
-            except Exception as e:
-                print(f"[JOIN] failed to clear launcher state for no-mod server: {e}")
-                self._show_join_preparation_error(
-                    attempt_id,
-                    f"Could not prepare the DayZ launcher state: {e}",
-                )
-                self._cleanup_join_attempt(attempt_id, "no-mod preset preparation failure")
-                return
-
-            self._join_log(attempt_id, "preset/launcher-state preparation completed")
-            self._join_log(attempt_id, "continuation scheduled", success=True)
-            self._join_log(attempt_id, "continuation executed")
-            self._join_popup_show_launching(attempt_id)
-            result = self._launch_direct_steam_url(obj, attempt_id=attempt_id)
-            self._on_filter_changed(reason="join")
-            return
 
         workshop_dir = self._get_dayz_workshop_root() or str(self.settings.get("workshop_dir") or "").strip()
         if not workshop_dir:

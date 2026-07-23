@@ -29,6 +29,7 @@ _META_WIDTHS = {
     "players": 132,
     "ping": 90,
     "watch": 40,
+    "download": 40,
     "join": 50,
 }
 
@@ -61,6 +62,20 @@ def _monitor_icon_name() -> str:
     except Exception:
         pass
     return "view-reveal-symbolic"
+
+
+def _download_icon_name() -> str:
+    candidates = ("folder-download-symbolic", "document-save-symbolic", "go-down-symbolic")
+    try:
+        display = Gdk.Display.get_default()
+        if display is not None:
+            icon_theme = Gtk.IconTheme.get_for_display(display)
+            for candidate in candidates:
+                if icon_theme.has_icon(candidate):
+                    return candidate
+    except Exception:
+        pass
+    return candidates[-1]
 
 
 def set_sort_debug_bind_hook(hook) -> None:
@@ -1879,6 +1894,9 @@ def _make_action_factory(
     is_active=None,
     tooltip_text: str | None = None,
     active_tooltip_text: str | None = None,
+    accessible_label: str | None = None,
+    is_sensitive=None,
+    presentation=None,
     factory_name: str,
     perf_metrics=None,
     drag_light=None,
@@ -1888,9 +1906,45 @@ def _make_action_factory(
 
     def update_active_state(button, obj) -> None:
         button._dzll_drag_action_light = False
+        sensitive = True
+        if callable(is_sensitive):
+            try:
+                sensitive = bool(is_sensitive(obj)) if isinstance(obj, ServerObject) else False
+            except Exception:
+                sensitive = False
+        button.set_sensitive(sensitive)
+        dynamic = {}
+        if isinstance(obj, ServerObject) and callable(presentation):
+            try:
+                dynamic = dict(presentation(obj) or {})
+            except Exception:
+                dynamic = {}
+        dynamic_css = str(dynamic.get("css_class") or "")
+        previous_css = str(getattr(button, "_dzll_dynamic_css_class", "") or "")
+        if previous_css and previous_css != dynamic_css:
+            button.remove_css_class(previous_css)
+        if dynamic_css and dynamic_css != previous_css:
+            button.add_css_class(dynamic_css)
+        button._dzll_dynamic_css_class = dynamic_css
+        image = button.get_child()
+        dynamic_icon = str(dynamic.get("icon_name") or icon_name)
+        if isinstance(image, Gtk.Image):
+            image.set_from_icon_name(dynamic_icon)
+        dynamic_tooltip = dynamic.get("tooltip")
+        if dynamic_tooltip is not None:
+            button.set_tooltip_text(str(dynamic_tooltip))
+        elif tooltip_text:
+            button.set_tooltip_text(tooltip_text)
+        dynamic_accessible = dynamic.get("accessible_label")
+        if dynamic_accessible is not None:
+            try:
+                button.update_property(
+                    [Gtk.AccessibleProperty.LABEL], [str(dynamic_accessible)],
+                )
+            except Exception:
+                pass
         if not active_css_class:
             return
-        image = button.get_child()
         active = False
         if isinstance(obj, ServerObject) and callable(is_active):
             try:
@@ -1915,7 +1969,7 @@ def _make_action_factory(
                 image.add_css_class("monitor-eye-idle")
                 if perf_metrics is not None:
                     perf_metrics.count(f"{factory_name}_image_state_changes", 2)
-        if tooltip_text or active_tooltip_text:
+        if dynamic_tooltip is None and (tooltip_text or active_tooltip_text):
             button.set_tooltip_text(active_tooltip_text if active and active_tooltip_text else tooltip_text)
             if perf_metrics is not None:
                 perf_metrics.count(f"{factory_name}_tooltip_writes")
@@ -1946,6 +2000,13 @@ def _make_action_factory(
             button.set_tooltip_text(tooltip_text)
             if perf_metrics is not None:
                 perf_metrics.count(f"{factory_name}_tooltip_writes")
+        if accessible_label:
+            try:
+                button.update_property(
+                    [Gtk.AccessibleProperty.LABEL], [str(accessible_label)],
+                )
+            except Exception:
+                pass
         button.set_size_request(34, -1)
         attach_pointer_cursor(button)
 
@@ -1996,7 +2057,7 @@ def _make_action_factory(
             button = list_item.get_child()
             if button is None:
                 return
-            if light:
+            if light and not callable(presentation):
                 render_light(list_item, button)
             else:
                 render_full(list_item, button)
@@ -2076,9 +2137,14 @@ def build_server_column_view(
     selection_model,
     on_toggle_fav,
     on_monitor,
+    on_download_mods,
     on_join,
     on_header_sort=None,
     is_monitored=None,
+    can_download_mods=None,
+    can_join=None,
+    download_presentation=None,
+    join_presentation=None,
     ubuntu_geometry: bool = False,
     perf_metrics=None,
     drag_light=None,
@@ -2211,21 +2277,51 @@ def build_server_column_view(
         header_css_classes="dzll-column-header-action",
     )
     view.refresh_monitor_highlights = getattr(monitor_factory, "_dzll_refresh_active_states", lambda: None)
+    download_factory = _make_action_factory(
+        _download_icon_name(),
+        on_download_mods,
+        "dzll-download-mods-button",
+        tooltip_text="Subscribe to and download required mods\nwithout joining",
+        accessible_label="Subscribe to and download required mods without joining",
+        is_sensitive=can_download_mods,
+        presentation=download_presentation,
+        factory_name="download_mods",
+        perf_metrics=perf_metrics,
+        drag_light=drag_light,
+    )
     _append_column(
         view,
         "",
-        _make_action_factory(
-            "media-playback-start-symbolic",
-            on_join,
-            "dzll-join-button",
-            margin_end=4,
-            tooltip_text="Join this server",
-            factory_name="join",
-            perf_metrics=perf_metrics,
-            drag_light=drag_light,
-        ),
+        download_factory,
+        _META_WIDTHS["download"],
+        header_title="",
+        header_css_classes="dzll-column-header-action",
+    )
+    view.refresh_download_mods_states = getattr(
+        download_factory, "_dzll_refresh_active_states", lambda: None,
+    )
+    join_factory = _make_action_factory(
+        "media-playback-start-symbolic",
+        on_join,
+        "dzll-join-button",
+        margin_end=4,
+        tooltip_text="Join this server",
+        accessible_label="Join this server",
+        is_sensitive=can_join,
+        presentation=join_presentation,
+        factory_name="join",
+        perf_metrics=perf_metrics,
+        drag_light=drag_light,
+    )
+    _append_column(
+        view,
+        "",
+        join_factory,
         _META_WIDTHS["join"],
         header_title="",
         header_css_classes="dzll-column-header-action",
+    )
+    view.refresh_join_states = getattr(
+        join_factory, "_dzll_refresh_active_states", lambda: None,
     )
     return view, features

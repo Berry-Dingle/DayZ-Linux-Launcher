@@ -126,6 +126,7 @@ class RendererHarness:
 for _method_name in (
     "_steam_ugc_progress_from_worker",
     "_steam_ugc_progress_to_overlay",
+    "_render_join_preparation_snapshot",
     "_join_popup_request",
     "_commit_join_popup_presentation",
     "_steam_ugc_render_status",
@@ -512,7 +513,8 @@ def test_steamcmd_guard_and_urgent_paths_remain_in_source():
                      / "src/dzll_launcher/window.py").read_text()
     assert '_mod_download_backend_active", "") != "steamcmd"' in steamcmd_source
     assert "Steam Guard" in steamcmd_source
-    assert "_steam_ugc_render_status(message, error=True)" in window_source
+    assert "PreparationPresentationReducer(" in window_source
+    assert "JoinPopupPhase.ERROR" in window_source
     assert "_steam_ugc_render_cancelling()" in window_source
 
 
