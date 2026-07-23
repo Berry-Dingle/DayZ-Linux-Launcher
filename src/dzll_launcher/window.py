@@ -66,6 +66,9 @@ from .config import (
     COMPANION_ALERT_REARM_OFFLINE_SECONDS,
     COMPANION_RESTART_LEARNING_PATH,
     COMPANION_RESTART_LEARNING_PHASE2_PATH,
+    AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED,
+    SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED,
+    SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED,
     TEST_SERVER_MARKERS,
 )
 
@@ -159,9 +162,11 @@ from .mod_suggestions import (
     suggest_mods,
 )
 from .companion_restart_phase2_consumers import AlertKeyKind, RecoveryAction
-from .companion_restart_phase2_detection import LifecycleMarker
+from .companion_restart_phase2_detection import LifecycleMarker, pending_strike_is_recent
 from .companion_restart_phase2_runtime import (
+    LiveResultDisposition,
     Phase2RestartRuntime,
+    live_result_disposition,
     phase2_alert_usability,
     phase2_learning_summary,
 )
@@ -525,6 +530,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._companion_restart_phase2 = Phase2RestartRuntime.initialize(
             active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
             legacy_path=COMPANION_RESTART_LEARNING_PATH,
+            authoritative_schema4_runtime_enabled=(
+                AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED
+            ),
+            schema4_authority_consumer_shadow_enabled=(
+                SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED
+            ),
+            schema4_authority_production_cutover_enabled=(
+                SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
+            ),
         )
         self._pending_last_played_obj = None
         self._pending_join_mod_ids = []
@@ -1113,6 +1127,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_last_online = None
         self._server_companion_monitor_last_saved_at = {}
         self._server_companion_consecutive_offline_polls = 0
+        self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = None
         self._server_companion_observation_samples = deque(maxlen=5000)
         self._server_companion_visible_zero_state = None
@@ -3605,8 +3620,59 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 server_online_healthy=bool((getattr(self, "_server_companion_snapshot", None) or {}).get("online", False)),
                 restart_alert_enabled=bool(getattr(self, "_server_companion_restart_alert_enabled", False)),
             )
-            return phase2_learning_summary(decision, now=time.time())
-        except Exception:
+            summary = phase2_learning_summary(decision, now=time.time())
+            summary_source = "schema3"
+            if SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
+                authority_summary = (
+                    self._companion_restart_phase2.authority_consumer_cutover_summary(
+                        key, now=time.time()
+                    )
+                )
+                if authority_summary is not None:
+                    summary = authority_summary
+                    summary_source = "schema4"
+            snapshot = getattr(self, "_server_companion_snapshot", None) or {}
+            confirmed_offline = (
+                summary is not None
+                and not bool(snapshot.get("online", False))
+                and int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) >= 2
+            )
+            if confirmed_offline and summary_source == "schema3":
+                summary = {
+                    **summary,
+                    "countdown_text": "00:00",
+                    "prediction_usable": True,
+                }
+            elif (
+                confirmed_offline
+                and bool(summary.get("countdown_safe", False))
+                and bool(summary.get("countdown_visible", False))
+                and bool(summary.get("prediction_usable", False))
+            ):
+                reason_codes = tuple(summary.get("reason_codes") or ())
+                hold_reason = "confirmed_offline_countdown_held_at_zero"
+                summary = {
+                    **summary,
+                    "countdown_text": "00:00",
+                    "reason_codes": (
+                        reason_codes
+                        if hold_reason in reason_codes
+                        else (*reason_codes, hold_reason)
+                    ),
+                }
+            return summary
+        except Exception as exc:
+            debug = getattr(self, "_debug_server_companion_alert", None)
+            if callable(debug):
+                try:
+                    debug(
+                        "restart-learning summary unavailable: "
+                        f"server={key!r} "
+                        f"schema4_cutover={bool(SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED)} "
+                        f"error={exc!r}"
+                    )
+                except Exception:
+                    pass
             return None
 
     def _server_companion_restart_alert_usability_summary(self):
@@ -3711,6 +3777,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_poll_paused = False
         self._server_companion_last_online = None
         self._server_companion_consecutive_offline_polls = 0
+        self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = dict(snapshot)
         self._server_companion_observation_samples.clear()
         self._reset_server_companion_visible_zero_state()
@@ -3744,6 +3811,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._last_server_companion_saved = {}
         self._server_companion_last_online = None
         self._server_companion_consecutive_offline_polls = 0
+        self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = None
         self._server_companion_observation_samples.clear()
         self._reset_server_companion_visible_zero_state()
@@ -3831,6 +3899,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         ) + 1
         self._server_companion_poll_inflight = False
         self._server_companion_consecutive_offline_polls = 0
+        self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = None
         timer_id = int(getattr(self, "_server_companion_poll_timer_id", 0) or 0)
         if timer_id:
@@ -3891,7 +3960,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
             except Exception as exc:
                 self._debug_server_companion_alert(f"Phase 2 poll mapping failed safely: {exc!r}")
-        if bool((info or {}).get("ok", False)):
+        disposition = live_result_disposition(info)
+        if disposition in {
+            LiveResultDisposition.NEUTRAL,
+            LiveResultDisposition.PROTOCOL_FAILURE,
+        }:
+            if (
+                int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) == 1
+                and not pending_strike_is_recent(
+                    getattr(self, "_server_companion_first_offline_strike_mono", None),
+                    now,
+                    COMPANION_POLL_ONLINE_SECONDS,
+                )
+            ):
+                self._server_companion_consecutive_offline_polls = 0
+                self._server_companion_first_offline_strike_mono = None
+            self._debug_server_companion_alert(
+                f"poll result preserved: disposition={disposition.value} "
+                f"consecutive={int(getattr(self, '_server_companion_consecutive_offline_polls', 0) or 0)}"
+            )
+        elif disposition is LiveResultDisposition.HEALTHY:
             self._debug_server_companion_alert(
                 f"poll result: online name={str(snapshot.get('name') or '')!r} alert_enabled={bool(getattr(self, '_server_companion_restart_alert_enabled', False))}"
             )
@@ -3936,7 +4024,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 or scheduled_restart_long_enough
             ) and bool(
                 getattr(self, "_server_companion_restart_alert_enabled", False)
-            ):
+            ) and not SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
                 self._debug_server_companion_alert(
                     "back-online alert emitted: "
                     f"armed={bool(getattr(self, '_server_companion_alert_armed', False))} "
@@ -3966,26 +4054,48 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._server_companion_offline_since = None
             self._server_companion_offline_since_wall = None
             self._server_companion_consecutive_offline_polls = 0
+            self._server_companion_first_offline_strike_mono = None
             self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
         else:
-            snapshot["ping"] = -1
-            snapshot["online"] = False
-            self._server_companion_consecutive_offline_polls = (
-                int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) + 1
+            prior_failures = int(
+                getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0
             )
-            offline_since = getattr(self, "_server_companion_offline_since", None)
-            if offline_since is None:
-                offline_since = now
-                self._server_companion_offline_since = offline_since
-                self._server_companion_offline_since_wall = time.time()
-            self._set_server_companion_poll_interval(COMPANION_POLL_OFFLINE_SECONDS)
-            if now - float(offline_since) >= COMPANION_ALERT_REARM_OFFLINE_SECONDS:
-                self._server_companion_alert_armed = True
-            self._debug_server_companion_alert(
-                f"poll result: offline consecutive={int(getattr(self, '_server_companion_consecutive_offline_polls', 0) or 0)} "
-                f"offline_seconds={now - float(offline_since):.1f} "
-                f"armed={bool(getattr(self, '_server_companion_alert_armed', False))}"
+            first_strike_mono = getattr(
+                self, "_server_companion_first_offline_strike_mono", None
             )
+            if prior_failures >= 2:
+                self._server_companion_consecutive_offline_polls = prior_failures + 1
+            elif prior_failures == 1 and pending_strike_is_recent(
+                first_strike_mono,
+                now,
+                COMPANION_POLL_ONLINE_SECONDS,
+            ):
+                self._server_companion_consecutive_offline_polls = 2
+            else:
+                self._server_companion_consecutive_offline_polls = 1
+                self._server_companion_first_offline_strike_mono = now
+            failure_count = int(self._server_companion_consecutive_offline_polls)
+            if failure_count < 2:
+                self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
+                self._debug_server_companion_alert(
+                    "poll result: qualifying failure strike 1; visible online state preserved"
+                )
+            else:
+                snapshot["ping"] = -1
+                snapshot["online"] = False
+                offline_since = getattr(self, "_server_companion_offline_since", None)
+                if offline_since is None:
+                    offline_since = now
+                    self._server_companion_offline_since = offline_since
+                    self._server_companion_offline_since_wall = time.time()
+                self._set_server_companion_poll_interval(COMPANION_POLL_OFFLINE_SECONDS)
+                if now - float(offline_since) >= COMPANION_ALERT_REARM_OFFLINE_SECONDS:
+                    self._server_companion_alert_armed = True
+                self._debug_server_companion_alert(
+                    f"poll result: offline consecutive={failure_count} "
+                    f"offline_seconds={now - float(offline_since):.1f} "
+                    f"armed={bool(getattr(self, '_server_companion_alert_armed', False))}"
+                )
 
         new_online = bool(snapshot.get("online", False))
         self._server_companion_last_online = new_online
@@ -3998,7 +4108,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             visible_snapshot = snapshot
             if (
                 not new_online
-                and int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) < 3
+                and int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) < 2
             ):
                 visible_snapshot = dict(getattr(self, "_server_companion_visible_snapshot", None) or snapshot)
             self._server_companion_visible_snapshot = dict(visible_snapshot)
@@ -4031,6 +4141,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception as exc:
                 self._debug_server_companion_alert(f"Phase 2 event policy failed safely: {exc!r}")
                 continue
+            if SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
+                result = self._companion_restart_phase2.dispatch_authority_consumer_action(
+                    key,
+                    kind="generic_recovery",
+                    now=time.time(),
+                    action=lambda: (
+                        self._server_companion_alert_back_online(
+                            snapshot, alert_type="back online"
+                        )
+                        is None
+                    ),
+                )
+                if result.source == "schema4":
+                    continue
             action = decision.preferred_recovery_action
             key_to_record = None
             alert_type = "back online"
@@ -4062,6 +4186,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             self._debug_server_companion_alert(f"restart-warning policy unavailable: {exc!r}")
             return
+        if SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
+            action_result: dict[str, object] = {}
+
+            def play_schema4_warning() -> bool:
+                ok, message = self._play_server_companion_restart_warning_sound()
+                action_result["message"] = message
+                return bool(ok)
+
+            result = self._companion_restart_phase2.dispatch_authority_consumer_action(
+                key,
+                kind="scheduled_warning",
+                now=time.time(),
+                action=play_schema4_warning,
+            )
+            if result.source == "schema4":
+                message = action_result.get("message")
+                self._set_server_companion_alert_audio_status(
+                    None if result.emitted else (str(message) if message else None)
+                )
+                return
         if not decision.warning_eligible or decision.warning_key is None:
             self._debug_server_companion_alert(
                 "restart-warning skipped: "

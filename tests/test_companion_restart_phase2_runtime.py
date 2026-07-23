@@ -59,9 +59,12 @@ def poll(value, at, *, ok=True, players=12, queue_marker=False, generation=1, er
 
 
 def crowbar(value):
-    for at, players in ((0, 12), (10, 12), (20, 12), (30, 0), (60, 0), (90, 0), (200, 2), (210, 4)):
+    for at, players in ((0, 12), (10, 12), (20, 12), (30, 0), (60, 0)):
         poll(value, at, players=players)
-    return value.tick(SERVER, wall_at=BASE + 240, monotonic_at=240)
+    poll(value, 90, ok=False)
+    poll(value, 100, ok=False)
+    poll(value, 103, players=0)
+    return value.tick(SERVER, wall_at=BASE + 133, monotonic_at=133)
 
 
 def conventional(value):
@@ -166,6 +169,8 @@ def test_migration_failure_disables_learning_and_has_distinct_notice(tmp_path, m
         ({"ok": True}, detection.InfoStatus.HEALTHY, detection.FieldStatus.MISSING, None, detection.FieldStatus.MISSING, None),
         ({"ok": True, "players": "bad", "queue": -1}, detection.InfoStatus.HEALTHY, detection.FieldStatus.INVALID, None, detection.FieldStatus.INVALID, None),
         ({"ok": False, "err": "timed out"}, detection.InfoStatus.TIMEOUT, detection.FieldStatus.MISSING, None, detection.FieldStatus.MISSING, None),
+        ({"ok": False, "err": "refused", "a2s_classification": "socket-error"}, detection.InfoStatus.NETWORK_ERROR, detection.FieldStatus.MISSING, None, detection.FieldStatus.MISSING, None),
+        ({"ok": False, "neutral": True}, detection.InfoStatus.NEUTRAL, detection.FieldStatus.MISSING, None, detection.FieldStatus.MISSING, None),
         ({"ok": False, "err": "bad packet"}, detection.InfoStatus.ERROR, detection.FieldStatus.MISSING, None, detection.FieldStatus.MISSING, None),
     ],
 )
@@ -209,18 +214,18 @@ def test_conventional_signals_route_one_correlated_physical_event(tmp_path):
     assert {item["event_id"] for item in saved["servers"][SERVER]["events"]} == {event.event_id}
 
 
-def test_crowbar_visible_drain_routes_one_strong_event_without_outage(tmp_path):
+def test_drain_without_outage_routes_no_event(tmp_path):
     value, active, _ = make_runtime(tmp_path)
     begin(value)
-    update = crowbar(value)
-    assert len(update.finalized_events) == 1
-    event = update.finalized_events[0]
-    assert event.outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
-    assert detection.SignalSource.INFO_OUTAGE not in event.sources
-    assert len(json.loads(active.read_text())["servers"][SERVER]["events"]) == 1
+    for at, players in ((0, 12), (10, 12), (20, 12), (30, 0), (40, 0), (50, 0)):
+        update = poll(value, at, players=players)
+    assert update.finalized_events == ()
+    assert value._servers[SERVER].engine.active_episode is None
+    assert value._servers[SERVER].engine.provisional_drain is not None
+    assert len(json.loads(active.read_text())["servers"][SERVER]["events"]) == 0
 
 
-def test_false_timeout_is_uncertain_and_does_not_create_exact_period(tmp_path):
+def test_false_timeout_is_discarded_and_does_not_create_exact_period(tmp_path):
     value, *_ = make_runtime(tmp_path)
     begin(value)
     for at in (0, 10, 20):
@@ -228,9 +233,155 @@ def test_false_timeout_is_uncertain_and_does_not_create_exact_period(tmp_path):
     poll(value, 30, ok=False)
     poll(value, 40, players=15)
     update = value.tick(SERVER, wall_at=BASE + 70, monotonic_at=70)
-    assert len(update.finalized_events) == 1
-    assert update.finalized_events[0].outcome is detection.EventOutcome.UNCERTAIN_A2S_INTERRUPTION
+    assert update.finalized_events == ()
+    assert value._servers[SERVER].engine.active_episode is None
     assert all(item.strict_direct_interval_count == 0 for item in value._servers[SERVER].score.candidates)
+
+
+def test_two_strikes_gate_learner_and_healthy_resets_pending_strike(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    poll(value, 0, players=12)
+    poll(value, 10, ok=False)
+    assert value._servers[SERVER].engine.active_episode is None
+    poll(value, 20, players=12)
+    poll(value, 30, ok=False)
+    assert value._servers[SERVER].engine.active_episode is None
+    poll(value, 40, ok=False)
+    assert value._servers[SERVER].engine.state is detection.EpisodeState.OFFLINE
+    assert value._servers[SERVER].engine.active_episode.first_failure_mono == 30
+
+
+def test_neutral_and_protocol_results_are_not_offline_strikes(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    poll(value, 0, players=12)
+    value.ingest_live_result(
+        SERVER,
+        poll_generation=1,
+        info={"ok": False, "neutral": True, "outcome": "alive-but-info-unavailable"},
+        wall_at=BASE + 10,
+        monotonic_at=10,
+    )
+    poll(value, 20, ok=False, err="bad packet")
+    poll(value, 30, ok=False, err="bad packet")
+    assert value._servers[SERVER].engine.active_episode is None
+    poll(value, 40, ok=False)
+    assert value._servers[SERVER].engine.active_episode is None
+    poll(value, 50, ok=False)
+    assert value._servers[SERVER].engine.state is detection.EpisodeState.OFFLINE
+
+
+def test_pending_strike_expires_during_long_neutral_protocol_sequence(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    poll(value, 0, players=12)
+    poll(value, 10, ok=False)
+    value.ingest_live_result(
+        SERVER,
+        poll_generation=1,
+        info={"ok": False, "neutral": True},
+        wall_at=BASE + 20,
+        monotonic_at=20,
+    )
+    poll(value, 30, ok=False, err="bad packet")
+    poll(value, 40, ok=False)
+
+    engine = value._servers[SERVER].engine
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    poll(value, 50, ok=False)
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.first_failure_mono == 40
+
+
+@pytest.mark.parametrize("gap", [10, 15, 17])
+def test_realistic_jittered_consecutive_failures_confirm_learner(tmp_path, gap):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    poll(value, 0, players=12)
+    poll(value, 10, ok=False)
+    poll(value, 10 + gap, ok=False)
+
+    engine = value._servers[SERVER].engine
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.first_failure_mono == 10
+    assert engine.active_episode.confirmed_offline_mono == 10 + gap
+
+
+def test_weak_recovery_then_independent_outage_uses_new_failure_clock(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    for at in (0, 10, 20):
+        poll(value, at, players=12)
+    poll(value, 30, players=0)
+    poll(value, 60, ok=False)
+    for at in (70, 80, 90):
+        poll(value, at, players=12)
+    weak = poll(value, 100, players=12).finalized_events
+    assert weak == ()
+    assert value._servers[SERVER].engine.active_episode is None
+
+    poll(value, 200, ok=False)
+    poll(value, 210, ok=False)
+    episode = value._servers[SERVER].engine.active_episode
+    assert episode.first_failure_mono == 200
+    assert episode.confirmed_offline_mono == 210
+
+
+def test_cooldown_suppresses_duplicate_drain_but_not_new_two_strike_outage(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    update = conventional(value)
+    assert update.finalized_events[0].schedule_weight_suggestion > 0
+    poll(value, 160, players=0)
+    assert value._servers[SERVER].engine.active_episode is None
+    poll(value, 200, ok=False)
+    poll(value, 210, ok=False)
+    assert value._servers[SERVER].engine.state is detection.EpisodeState.OFFLINE
+    assert value._servers[SERVER].engine.active_episode.first_failure_mono == 200
+
+
+def test_confirmed_outage_without_player_drain_has_positive_schedule_weight(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    for at in (0, 10, 20):
+        poll(value, at, players=12)
+    poll(value, 30, ok=False)
+    poll(value, 40, ok=False)
+    poll(value, 100, players=None)
+    event = value.tick(SERVER, wall_at=BASE + 130, monotonic_at=130).finalized_events[0]
+    assert event.outcome is detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
+    assert event.outage.first_failure_at == BASE + 30
+    assert event.outage.confirmed_offline_at == BASE + 40
+    assert event.schedule_weight_suggestion > 0
+
+
+def test_bobs_three_restart_shape_produces_three_distinct_weighted_events(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    finalized = []
+    for index, restart_at in enumerate((7_200, 18_000, 28_800)):
+        weak_at = restart_at - (4_100 if index == 0 else 6_800 if index == 1 else 5_400)
+        poll(value, weak_at, ok=False)
+        poll(value, weak_at + 10, players=12 + index)
+        for offset, players in ((-50, 12 + index), (-40, 12 + index), (-30, 8), (-20, 0), (-10, 0)):
+            poll(value, restart_at + offset, players=players)
+        poll(value, restart_at, ok=False)
+        poll(value, restart_at + 10, ok=False)
+        poll(value, restart_at + 70, players=0)
+        finalized.extend(poll(value, restart_at + 100, players=0).finalized_events)
+
+    weighted = [event for event in finalized if event.schedule_weight_suggestion > 0]
+    assert len(weighted) == 3
+    assert len({event.event_id for event in weighted}) == 3
+    assert [event.outage.first_failure_at for event in weighted] == [
+        BASE + 7_200,
+        BASE + 18_000,
+        BASE + 28_800,
+    ]
+    assert all(event.drain.zero_reached for event in weighted)
+    assert all(detection.SignalSource.PLAYER_DRAIN in event.sources for event in weighted)
 
 
 def test_replayed_fingerprint_is_not_routed_twice(tmp_path):
@@ -245,15 +396,15 @@ def test_replayed_fingerprint_is_not_routed_twice(tmp_path):
 def test_lifecycle_closes_active_episode_and_breaks_coverage(tmp_path):
     value, active, _ = make_runtime(tmp_path)
     begin(value)
-    for at, players in ((0, 12), (10, 12), (20, 12), (30, 0)):
+    for at, players in ((0, 12), (10, 12), (20, 12), (30, 0), (34, 0)):
         poll(value, at, players=players)
     update = value.end_monitoring(
         SERVER, marker=detection.LifecycleMarker.PAUSE, wall_at=BASE + 35, monotonic_at=35
     )
-    assert update.finalized_events[0].outcome is detection.EventOutcome.AMBIGUOUS_DRAIN
+    assert update.finalized_events == ()
     record = json.loads(active.read_text())["servers"][SERVER]
     assert record["active_episode"] is None
-    assert record["incomplete_episodes"]
+    assert record["incomplete_episodes"] == []
     assert record["monitoring_sessions"][-1]["reason"] == detection.LifecycleMarker.PAUSE.value
 
 
@@ -265,6 +416,101 @@ def test_poll_coverage_is_dense_and_large_callback_gap_is_explicit(tmp_path):
     poll(value, 50, players=10)
     kinds = [item.kind for item in value._servers[SERVER].coverage]
     assert kinds == [runtime.CoverageKind.ONLINE_HEALTHY, runtime.CoverageKind.SLEEP_GAP]
+
+
+@pytest.mark.parametrize(
+    "payloads",
+    [
+        (
+            {"ok": False, "neutral": True},
+            {"ok": False, "neutral": True},
+        ),
+        (
+            {"ok": False, "err": "bad packet", "a2s_classification": "malformed"},
+            {"ok": False, "err": "invalid opcode", "a2s_classification": "malformed"},
+        ),
+        (
+            {"ok": False, "err": "timed out", "a2s_classification": "timeout"},
+            {"ok": False, "err": "truncated", "a2s_classification": "malformed"},
+        ),
+    ],
+)
+def test_neutral_protocol_and_mixed_failures_create_query_health_gap_not_offline(
+    tmp_path, payloads
+):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    for index, payload in enumerate(payloads):
+        value.ingest_live_result(
+            SERVER,
+            poll_generation=1,
+            info=payload,
+            wall_at=BASE + index * 10,
+            monotonic_at=index * 10,
+        )
+
+    coverage = value._servers[SERVER].coverage
+    assert [item.kind for item in coverage] == [runtime.CoverageKind.QUERY_HEALTH_GAP]
+    assert all(item.kind is not runtime.CoverageKind.OFFLINE_OBSERVED for item in coverage)
+    assert value._servers[SERVER].engine.state is detection.EpisodeState.IDLE
+
+
+def test_confirmed_offline_coverage_begins_after_second_qualifying_failure(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    poll(value, 0, players=10)
+    poll(value, 10, ok=False)
+    poll(value, 27, ok=False)
+    assert all(
+        item.kind is not runtime.CoverageKind.OFFLINE_OBSERVED
+        for item in value._servers[SERVER].coverage
+    )
+
+    poll(value, 30, ok=False)
+    coverage = value._servers[SERVER].coverage
+    assert coverage[-1].kind is runtime.CoverageKind.OFFLINE_OBSERVED
+    assert coverage[-1].start_at == BASE + 27
+    assert coverage[-1].end_at == BASE + 30
+    assert scoring.CoverageTimeline(tuple(coverage)).assess(BASE + 27, BASE + 30).fully_covered
+
+
+def test_query_limited_expected_window_cannot_be_recorded_as_covered_miss(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(hour, index + 1)
+        for index, hour in enumerate((0, 3, 6, 9, 12))
+    ]
+    tolerance = scoring.candidate_phase_tolerance(3 * scoring.HOUR)
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 12 * scoring.HOUR,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    ]
+    value.decision(SERVER, now=BASE + 12 * scoring.HOUR + 60)
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 15 * scoring.HOUR - tolerance,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        ),
+        scoring.CoverageSegment(
+            BASE + 15 * scoring.HOUR - tolerance,
+            BASE + 15 * scoring.HOUR + tolerance,
+            scoring.CoverageKind.QUERY_HEALTH_GAP,
+        ),
+    ]
+
+    value._evaluate_expected_windows(
+        server, now=BASE + 15 * scoring.HOUR + tolerance
+    )
+    assert not any(
+        item.period_seconds == 3 * scoring.HOUR
+        and item.expected_at == BASE + 15 * scoring.HOUR
+        for item in server.expected_misses
+    )
 
 
 def test_missing_players_and_query_transition_do_not_claim_healthy_coverage(tmp_path):
@@ -287,7 +533,8 @@ def test_no_atomic_save_on_every_healthy_poll_but_transition_saves(tmp_path, mon
     poll(value, 1, players=12)
     poll(value, 10, players=12)
     assert calls == []
-    poll(value, 20, players=0)
+    poll(value, 20, ok=False)
+    poll(value, 30, ok=False)
     assert calls
 
 
@@ -296,8 +543,8 @@ def test_atomic_save_failure_disables_future_persistence_without_corrupting_prev
     begin(value)
     before = active.read_bytes()
     monkeypatch.setattr(runtime, "atomic_write_json", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk")))
-    poll(value, 0, players=12)
-    poll(value, 10, players=0)
+    poll(value, 0, ok=False)
+    poll(value, 10, ok=False)
     assert value.persistence_status is runtime.RuntimePersistenceStatus.DISABLED_WRITE_FAILED
     assert active.read_bytes() == before
 
@@ -455,6 +702,83 @@ def test_persisted_and_recomputed_expected_miss_cannot_double_penalize():
     assert result.candidate(3 * scoring.HOUR).covered_miss_count == 2
     # One at 03:00 was supplied twice, while 09:00 is a distinct internally
     # derived covered midpoint miss.
+
+
+def test_multiple_learned_candidate_records_later_fully_covered_expected_miss(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(hour, index + 1)
+        for index, hour in enumerate((0, 6, 12, 18, 24))
+    ]
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 24 * scoring.HOUR,
+            scoring.CoverageKind.UNMONITORED,
+        )
+    ]
+    value.decision(SERVER, now=BASE + 24 * scoring.HOUR)
+    candidate = server.score.candidate(3 * scoring.HOUR)
+    assert candidate.strict_direct_interval_count == 0
+    assert candidate.compatible_multiple_interval_count == 4
+
+    tolerance = scoring.candidate_phase_tolerance(3 * scoring.HOUR)
+    server.coverage.append(
+        scoring.CoverageSegment(
+            BASE + 27 * scoring.HOUR - tolerance,
+            BASE + 27 * scoring.HOUR + tolerance,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    )
+    value._evaluate_expected_windows(
+        server,
+        now=BASE + 27 * scoring.HOUR + tolerance,
+    )
+    assert sum(
+        item.period_seconds == 3 * scoring.HOUR
+        and item.expected_at == BASE + 27 * scoring.HOUR
+        for item in server.expected_misses
+    ) == 1
+
+
+def test_multiple_scoring_is_recomputed_identically_after_store_reload(tmp_path):
+    value, active, legacy = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(hour, index + 1)
+        for index, hour in enumerate(range(0, 48, 6))
+    ]
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 42 * scoring.HOUR,
+            scoring.CoverageKind.UNMONITORED,
+        )
+    ]
+    value.decision(SERVER, now=BASE + 42 * scoring.HOUR)
+    before = server.score.candidate(3 * scoring.HOUR)
+    server.dirty = True
+    assert value._persist_server(server, force=True, now=BASE + 42 * scoring.HOUR)
+    stored = json.loads(active.read_text())
+    diagnostics = stored["servers"][SERVER]["candidate_diagnostics"]["candidates"]
+    stored_three = next(
+        item for item in diagnostics if item["period_seconds"] == 3 * scoring.HOUR
+    )
+    assert stored_three["compatible_multiple_interval_count"] == 7
+
+    again = runtime.Phase2RestartRuntime.initialize(
+        active_path=active,
+        legacy_path=legacy,
+        now=BASE + 42 * scoring.HOUR,
+        app_session_id="phase3-reload",
+    )
+    after = again._servers[SERVER].score.candidate(3 * scoring.HOUR)
+    assert after.compatible_multiple_support == before.compatible_multiple_support
+    assert after.compatible_multiple_interval_count == before.compatible_multiple_interval_count
+    assert after.fundamental_period_confidence == before.fundamental_period_confidence
+    assert after.establishment_gates_passed == before.establishment_gates_passed
+    assert again._servers[SERVER].score.selected_period_seconds == 3 * scoring.HOUR
 
 
 def test_shutdown_is_idempotent_and_flushes_active_episode(tmp_path):

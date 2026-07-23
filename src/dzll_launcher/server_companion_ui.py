@@ -2,6 +2,7 @@
 # server_companion_ui.py
 
 import math
+import re
 import time
 import gi
 gi.require_version("Gtk", "4.0")
@@ -22,6 +23,124 @@ ALERT_SOUND_OPTIONS = (
     ("male", "Male Voice"),
     ("beep", "Beep Alarm"),
 )
+RESTART_CONFIDENCE_STYLE_CLASSES = {
+    "low": "ping-orange",
+    "moderate": "ping-yellow",
+    "improving": "ping-greeny",
+    "strong": "ping-good",
+}
+RESTART_PRESENTATION_TOOLTIPS = {
+    "pattern_only": "Recurring timing is visible, but its duration is not established yet.",
+    "likely_cycle": "A repeated cycle is likely; exact restart prediction remains withheld.",
+    "confirmed_cycle": "Repeated restart timing established this cycle and phase.",
+    "schedule_change_suspected": "DZLL is checking contradictory timing before changing the learned cycle.",
+    "likely_new_cycle": "A possible replacement cycle is being verified; prediction is paused.",
+    "confirmed_new_cycle": "A newer repeated cadence has replaced the previous cycle.",
+    "prediction_temporarily_suspended": "The learned schedule is temporarily unsafe to predict.",
+}
+_WHOLE_HOUR_CYCLE_RE = re.compile(
+    r"^Every\s+(?P<hours>\d+(?:\.0+)?)\s+hours?$",
+    re.IGNORECASE,
+)
+
+
+def format_restart_cycle_text(value: object) -> str:
+    """Format an already-resolved cycle label without selecting a model."""
+
+    text = str(value or "").strip()
+    confirmed_prefix = "Confirmed:"
+    if text.startswith(confirmed_prefix):
+        text = text[len(confirmed_prefix):].strip()
+    match = _WHOLE_HOUR_CYCLE_RE.fullmatch(text)
+    if match is None:
+        return text or "--"
+    try:
+        hours = float(match.group("hours"))
+    except (TypeError, ValueError, OverflowError):
+        return text or "--"
+    if not math.isfinite(hours) or not hours.is_integer():
+        return text or "--"
+    whole_hours = int(hours)
+    unit = "Hour" if whole_hours == 1 else "Hours"
+    return f"Every {whole_hours} {unit}"
+
+
+def format_restart_local_time(value: object) -> str | None:
+    """Return a Unix occurrence as local ``HH:MM`` without changing the value."""
+
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        timestamp = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(timestamp):
+        return None
+    try:
+        return time.strftime("%H:%M", time.localtime(timestamp))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def restart_learning_presentation(summary: dict | None) -> dict | None:
+    """Normalize Phase 2 summaries while accepting the older dictionary shape."""
+
+    if summary is None:
+        return None
+    try:
+        confidence_percent = max(
+            0,
+            min(100, int(summary.get("confidence_percent", 0) or 0)),
+        )
+    except Exception:
+        confidence_percent = 0
+    confidence_kind = str(summary.get("confidence_kind") or "period")
+    confidence_visible = bool(summary.get("confidence_visible", confidence_kind != "none"))
+    severity = str(summary.get("confidence_severity") or "")
+    if severity not in RESTART_CONFIDENCE_STYLE_CLASSES:
+        if confidence_percent < 50:
+            severity = "low"
+        elif confidence_percent < 75:
+            severity = "moderate"
+        elif confidence_percent < 90:
+            severity = "improving"
+        else:
+            severity = "strong"
+    default_label = "Pattern Confidence:" if confidence_kind == "pattern" else "Confidence:"
+    prediction_usable = bool(summary.get("prediction_usable", False))
+    has_explicit_next_occurrence = "next_restart_at" in summary
+    raw_next_occurrence = (
+        summary.get("next_restart_at")
+        if has_explicit_next_occurrence
+        else summary.get("next_text")
+    )
+    formatted_next = format_restart_local_time(raw_next_occurrence)
+    next_text = str(summary.get("next_text") or "--")
+    next_visible = bool(summary.get("next_visible", prediction_usable))
+    if formatted_next is not None:
+        next_text = formatted_next
+    elif prediction_usable and has_explicit_next_occurrence:
+        next_text = "--"
+        next_visible = False
+    presentation = {
+        "confidence_percent": confidence_percent,
+        "confidence_kind": confidence_kind,
+        "confidence_label": str(summary.get("confidence_label") or default_label),
+        "confidence_visible": confidence_visible,
+        "confidence_style_class": RESTART_CONFIDENCE_STYLE_CLASSES[severity],
+        "cycle_text": format_restart_cycle_text(summary.get("cycle_text")),
+        "next_text": next_text,
+        "countdown_text": str(summary.get("countdown_text") or "--"),
+        "next_visible": next_visible,
+        "countdown_visible": bool(summary.get("countdown_visible", prediction_usable)),
+        "prediction_usable": prediction_usable,
+        "presentation_key": str(summary.get("presentation_key") or ""),
+        "authority_consumer": bool(summary.get("authority_consumer", False)),
+    }
+    if presentation["authority_consumer"]:
+        presentation["countdown_safe"] = bool(summary.get("countdown_safe", False))
+        presentation["reason_codes"] = tuple(summary.get("reason_codes") or ())
+    return presentation
 
 
 class ServerCompanionPanel(Gtk.Box):
@@ -322,7 +441,6 @@ class ServerCompanionPanel(Gtk.Box):
         self.restart_alert_info_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.restart_alert_info_box.add_css_class("companion-alert-info-box")
         self.restart_alert_info_box.set_visible(False)
-        self.server_box.append(self.restart_alert_info_box)
 
         self.restart_alert_info_label = Gtk.Label()
         self.restart_alert_info_label.set_xalign(0.0)
@@ -340,7 +458,6 @@ class ServerCompanionPanel(Gtk.Box):
         self.alert_audio_status_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
         self.alert_audio_status_label.set_opacity(0.72)
         self.alert_audio_status_label.set_visible(False)
-        self.server_box.append(self.alert_audio_status_label)
 
         self.server_box.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
 
@@ -422,12 +539,22 @@ class ServerCompanionPanel(Gtk.Box):
     def set_restart_alert_usability(self, summary: dict | None):
         summary = summary if isinstance(summary, dict) else {}
         usable = bool(summary.get("usable", False))
-        message = str(summary.get("message") or "").strip()
         self._restart_alert_usable = usable
         self.sound_row.set_visible(True)
         self.volume_row.set_visible(True)
-        self.restart_alert_info_label.set_text(message)
-        self.restart_alert_info_box.set_visible(not usable and bool(message))
+        ServerCompanionPanel._suppress_restart_alert_status(self)
+
+    def _suppress_restart_alert_status(self):
+        info_label = getattr(self, "restart_alert_info_label", None)
+        if info_label is not None:
+            info_label.set_text("")
+        info_box = getattr(self, "restart_alert_info_box", None)
+        if info_box is not None:
+            info_box.set_visible(False)
+        audio_label = getattr(self, "alert_audio_status_label", None)
+        if audio_label is not None:
+            audio_label.set_text("")
+            audio_label.set_visible(False)
 
     def set_on_alert_sound_changed(self, callback):
         self._on_alert_sound_changed = callback
@@ -463,9 +590,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.alert_volume_percent_label.set_text(f"{volume}%")
 
     def set_alert_audio_status(self, message: str | None):
-        message = str(message or "").strip()
-        self.alert_audio_status_label.set_text(message)
-        self.alert_audio_status_label.set_visible(bool(message))
+        ServerCompanionPanel._suppress_restart_alert_status(self)
 
     def set_join_status(self, message: str | None, flash: bool = False):
         message = str(message or "").strip()
@@ -628,22 +753,25 @@ class ServerCompanionPanel(Gtk.Box):
         return True
 
     def set_restart_learning_summary(self, summary: dict | None):
-        if summary is None:
+        ServerCompanionPanel._suppress_restart_alert_status(self)
+        presentation = restart_learning_presentation(summary)
+        if presentation is None:
             self._stop_restart_countdown_colon()
             self.restart_learning_box.set_visible(False)
             return
 
-        try:
-            confidence_percent = int(summary.get("confidence_percent", 0) or 0)
-        except Exception:
-            confidence_percent = 0
+        confidence_percent = presentation["confidence_percent"]
         self.restart_cycle_label.set_text("Restart Cycle:")
         self.restart_next_label.set_text("Next Restart:")
         self.restart_countdown_label.set_text("Countdown:")
-        self.restart_confidence_label.set_text("Confidence:")
-        self.restart_cycle_value_label.set_text(str(summary.get("cycle_text") or "--"))
-        self.restart_next_value_label.set_text(str(summary.get("next_text") or "--"))
-        countdown_text = str(summary.get("countdown_text") or "--")
+        self.restart_confidence_label.set_text(presentation["confidence_label"])
+        self.restart_cycle_value_label.set_text(presentation["cycle_text"])
+        if hasattr(self.restart_cycle_value_label, "set_tooltip_text"):
+            self.restart_cycle_value_label.set_tooltip_text(
+                RESTART_PRESENTATION_TOOLTIPS.get(presentation["presentation_key"])
+            )
+        self.restart_next_value_label.set_text(presentation["next_text"])
+        countdown_text = presentation["countdown_text"]
         countdown_hh, countdown_mm = (
             countdown_text.split(":", 1) if ":" in countdown_text else (countdown_text, "")
         )
@@ -651,17 +779,16 @@ class ServerCompanionPanel(Gtk.Box):
         self.restart_countdown_mm_label.set_text(countdown_mm)
         self.restart_confidence_value_label.set_text(f"{confidence_percent}%")
         self.restart_cycle_row.set_visible(True)
-        prediction_usable = bool(summary.get("prediction_usable", False))
-        self.restart_next_row.set_visible(prediction_usable)
-        self.restart_countdown_row.set_visible(prediction_usable)
-        self.restart_confidence_row.set_visible(True)
+        self.restart_next_row.set_visible(presentation["next_visible"])
+        self.restart_countdown_row.set_visible(presentation["countdown_visible"])
+        self.restart_confidence_row.set_visible(presentation["confidence_visible"])
         for c in PING_CLASSES:
             self.restart_confidence_value_label.remove_css_class(c)
         self.restart_confidence_value_label.add_css_class(
-            "ping-good" if confidence_percent >= 90 else "ping-greeny"
+            presentation["confidence_style_class"]
         )
         self.restart_learning_box.set_visible(True)
-        if prediction_usable:
+        if presentation["countdown_visible"]:
             self._start_restart_countdown_colon()
         else:
             self._stop_restart_countdown_colon()

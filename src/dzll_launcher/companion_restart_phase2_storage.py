@@ -26,6 +26,18 @@ class InvalidPhase2StateError(ValueError):
     """Raised when JSON does not identify a Phase 2 restart-learning state."""
 
 
+class UnsupportedPhase2SchemaError(InvalidPhase2StateError):
+    """Raised when schema-3 code encounters another explicit schema version."""
+
+    def __init__(self, found: int, expected: int = PHASE2_SCHEMA_VERSION):
+        self.found = int(found)
+        self.expected = int(expected)
+        super().__init__(
+            f"restart-learning schema {self.found} is incompatible with "
+            f"schema-{self.expected} runtime; file preserved without writing"
+        )
+
+
 class AtomicWriteError(OSError):
     """A destination was not safely installed by an atomic write."""
 
@@ -46,6 +58,7 @@ class Phase2InitializationStatus(str, Enum):
 
 class Phase2MigrationFailure(str, Enum):
     ACTIVE_READ_FAILED = "active_read_failed"
+    ACTIVE_SCHEMA_INCOMPATIBLE = "active_schema_incompatible"
     FRESH_WRITE_FAILED = "fresh_write_failed"
     LEGACY_READ_FAILED = "legacy_read_failed"
     ACTIVE_PREPARE_FAILED = "active_prepare_failed"
@@ -124,6 +137,9 @@ def is_phase2_state(state: object) -> bool:
 def normalize_phase2_state(state: object, *, now: int | float | None = None) -> dict:
     if not isinstance(state, dict):
         raise InvalidPhase2StateError("Phase 2 state must be a dictionary")
+    explicit_version = state.get("schema_version")
+    if type(explicit_version) is int and explicit_version > PHASE2_SCHEMA_VERSION:
+        raise UnsupportedPhase2SchemaError(explicit_version)
     if not is_phase2_state(state):
         raise InvalidPhase2StateError("JSON is not a valid Phase 2 restart-learning state")
 
@@ -193,6 +209,34 @@ def atomic_write_json(path: str | os.PathLike[str], data: object) -> None:
     except Exception as exc:
         raise AtomicWriteError(destination, "serialization", exc) from exc
     atomic_write_bytes(destination, payload)
+
+
+def atomic_write_phase2_state(
+    path: str | os.PathLike[str], state: object
+) -> None:
+    """Schema-3 writer that refuses to overwrite explicit mixed versions."""
+
+    if not isinstance(state, dict):
+        raise InvalidPhase2StateError("Phase 2 state must be a dictionary")
+    version = state.get("schema_version")
+    if type(version) is not int or version != PHASE2_SCHEMA_VERSION:
+        if type(version) is int:
+            raise UnsupportedPhase2SchemaError(version)
+        raise InvalidPhase2StateError("schema-3 write requires an integer version 3")
+    destination = Path(path)
+    if destination.exists():
+        try:
+            existing = _decode_json_bytes(destination.read_bytes())
+        except Exception:
+            existing = None
+        if isinstance(existing, dict):
+            existing_version = existing.get("schema_version")
+            if (
+                type(existing_version) is int
+                and existing_version != PHASE2_SCHEMA_VERSION
+            ):
+                raise UnsupportedPhase2SchemaError(existing_version)
+    atomic_write_json(destination, normalize_phase2_state(state))
 
 
 def atomic_write_bytes(path: str | os.PathLike[str], payload: bytes) -> None:
@@ -416,7 +460,22 @@ def _load_or_recover_active(
         )
 
     try:
-        state = normalize_phase2_state(_decode_json_bytes(active_bytes))
+        decoded = _decode_json_bytes(active_bytes)
+        if (
+            isinstance(decoded, dict)
+            and type(decoded.get("schema_version")) is int
+            and decoded.get("schema_version") > PHASE2_SCHEMA_VERSION
+        ):
+            incompatible = UnsupportedPhase2SchemaError(
+                decoded["schema_version"]
+            )
+            return _failure_result(
+                state=new_phase2_state(now=now, generation_id=generation_id),
+                active=active,
+                failure=Phase2MigrationFailure.ACTIVE_SCHEMA_INCOMPATIBLE,
+                exc=incompatible,
+            )
+        state = normalize_phase2_state(decoded)
     except Exception:
         state = new_phase2_state(now=now, generation_id=generation_id)
         corrupt_prefix = f"{active.stem}.corrupt"

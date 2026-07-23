@@ -311,9 +311,13 @@ def test_unresolved_longer_harmonic_receives_confidence_cap():
     assert result.candidate(6 * HOUR).fundamental_period_confidence == 0
 
 
-def test_hints_alone_raise_schedule_and_phase_but_never_period_confidence():
+def test_phase_only_hints_raise_schedule_and_phase_but_never_period_confidence():
     hours = (0, 6, 27, 48)
-    result = score(hours, coverage=scoring.CoverageTimeline())
+    result = score(
+        hours,
+        outcome=detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART,
+        coverage=scoring.CoverageTimeline(),
+    )
     three = result.candidate(3 * HOUR)
     assert three.hints.event_count == 4
     assert three.fundamental_period_confidence == 0
@@ -335,7 +339,10 @@ def test_one_direct_interval_gets_no_hint_bonus():
 def test_covered_confirmation_unlocks_only_small_hint_bonus(direct_intervals, maximum):
     hints = (0, 24, 48)
     direct = tuple(72 + index * 3 for index in range(direct_intervals + 1))
-    physical = events_at((*hints, *direct))
+    physical = (
+        *events_at(hints, detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART),
+        *events_at(direct),
+    )
     timeline = full_coverage(72, direct[-1])
     result = scoring.RestartScheduleScorer().score(physical, timeline, now=BASE + direct[-1] * HOUR)
     candidate = result.candidate(3 * HOUR)
@@ -401,7 +408,11 @@ def test_event_authenticity_is_not_changed_by_scoring():
 
 
 def test_schedule_existence_phase_and_period_are_independent_dimensions():
-    result = score((0, 6, 27, 48), coverage=scoring.CoverageTimeline())
+    result = score(
+        (0, 6, 27, 48),
+        outcome=detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART,
+        coverage=scoring.CoverageTimeline(),
+    )
     candidate = result.candidate(3 * HOUR)
     assert result.schedule_existence_confidence > 0
     assert candidate.phase_confidence > 0
@@ -418,6 +429,90 @@ def test_stale_phase_observations_apply_recency_cap_and_disable_prediction():
     assert candidate.phase_confidence <= 0.60
     assert candidate.confidence_cap <= 0.79
     assert not result.prediction_usable
+
+
+def test_inactivity_neutral_phase_policy_preserves_evidence_derived_confidence():
+    physical = events_at(tuple(range(0, 36, 4)))
+    timeline = full_coverage(0, 32)
+    recent = scoring.RestartScheduleScorer().score(
+        physical,
+        timeline,
+        now=BASE + 32 * HOUR,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+    stale = scoring.RestartScheduleScorer().score(
+        physical,
+        timeline,
+        now=BASE + 32 * HOUR + 30 * DAY,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+    assert stale.candidate(4 * HOUR).phase_confidence == recent.candidate(
+        4 * HOUR
+    ).phase_confidence
+    assert stale.candidate(4 * HOUR).fundamental_period_confidence == recent.candidate(
+        4 * HOUR
+    ).fundamental_period_confidence
+
+
+def test_inactivity_neutral_policy_ignores_non_evidential_partial_gap():
+    physical = events_at((0, 3, 6, 9))
+    baseline = scoring.CoverageTimeline(
+        (
+            scoring.CoverageSegment(
+                BASE, BASE + 9 * HOUR, scoring.CoverageKind.ONLINE_HEALTHY
+            ),
+        )
+    )
+    with_unrelated_gap = scoring.CoverageTimeline(
+        (
+            *baseline.segments,
+            scoring.CoverageSegment(
+                BASE + 20 * HOUR,
+                BASE + 21 * HOUR,
+                scoring.CoverageKind.PARTIAL,
+            ),
+        )
+    )
+    scorer = scoring.RestartScheduleScorer()
+    first = scorer.score(
+        physical,
+        baseline,
+        now=BASE + 40 * DAY,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+    second = scorer.score(
+        physical,
+        with_unrelated_gap,
+        now=BASE + 40 * DAY,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+    assert second == first
+
+
+def test_legacy_phase_policy_remains_the_default():
+    physical = events_at(tuple(range(0, 36, 4)))
+    timeline = full_coverage(0, 32)
+    implicit = scoring.RestartScheduleScorer().score(
+        physical, timeline, now=BASE + 100 * HOUR
+    )
+    explicit = scoring.RestartScheduleScorer().score(
+        physical,
+        timeline,
+        now=BASE + 100 * HOUR,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.LEGACY_DECAY,
+    )
+    assert implicit == explicit
+    assert implicit.candidate(4 * HOUR).phase_confidence <= 0.60
+
+
+def test_phase_recency_policy_rejects_ambiguous_values():
+    with pytest.raises(ValueError, match="PhaseRecencyPolicy"):
+        scoring.RestartScheduleScorer().score(
+            events_at((0, 3)),
+            full_coverage(0, 3),
+            now=BASE + 3 * HOUR,
+            phase_recency_policy="neutral",
+        )
 
 
 @pytest.mark.parametrize(

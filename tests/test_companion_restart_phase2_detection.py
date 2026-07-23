@@ -173,7 +173,10 @@ def test_observation_rejects_inconsistent_or_malformed_status_fields(overrides):
 def test_configuration_defaults_and_validation():
     config = detection.DetectionConfig()
     assert config.abrupt_drain_window == 25
-    assert config.pre_roll_sample_cap == 12
+    assert config.pending_strike_lifetime == 25
+    assert config.pre_roll_seconds == 600
+    assert config.pre_roll_sample_cap == 60
+    assert config.drain_to_outage_merge == 300
     with pytest.raises(ValueError):
         detection.DetectionConfig(online_poll_interval=0)
     with pytest.raises(ValueError):
@@ -184,36 +187,118 @@ def test_configuration_defaults_and_validation():
 
 def test_engine_starts_idle_and_populates_bounded_preroll():
     engine = detection.PhysicalEpisodeEngine()
-    for index in range(20):
+    for index in range(80):
         engine.ingest(sample(index * 10, 10))
 
     assert engine.state is detection.EpisodeState.IDLE
-    assert len(engine.pre_roll) == 12
-    assert engine.pre_roll[0].monotonic_at == 80
+    assert len(engine.pre_roll) == 60
+    assert engine.pre_roll[0].monotonic_at == 200
 
 
-def test_abrupt_drain_opens_observing_and_records_landmarks():
+def test_abrupt_drain_stays_provisional_and_does_not_open_episode():
     engine = detection.PhysicalEpisodeEngine()
     populated(engine)
     engine.ingest(sample(30, 0))
+    assert engine.provisional_drain is None
+    engine.ingest(sample(40, 0))
 
-    assert engine.state is detection.EpisodeState.OBSERVING
-    assert engine.active_episode.baseline_players == 12
-    assert engine.active_episode.zero_reached
-    assert engine.active_episode.drain_mono == 30
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    assert engine.provisional_drain.baseline_players == 12
+    assert engine.provisional_drain.zero_reached
+    assert engine.provisional_drain.abrupt
 
 
 def test_first_failure_observes_then_two_timed_failures_confirm_offline():
     engine = detection.PhysicalEpisodeEngine()
     populated(engine)
     engine.ingest(sample(30, MISSING, info=detection.InfoStatus.TIMEOUT))
-    assert engine.state is detection.EpisodeState.OBSERVING
-    engine.ingest(sample(36, MISSING, info=detection.InfoStatus.ERROR))
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    engine.ingest(sample(36, MISSING, info=detection.InfoStatus.NETWORK_ERROR))
     assert engine.state is detection.EpisodeState.OFFLINE
     assert engine.active_episode.confirmed_offline_mono == 36
 
 
-def test_offline_return_and_visible_recovery_enter_recovering():
+def test_stale_pending_failure_expires_through_neutral_and_protocol_observations():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine)
+    feed(
+        engine,
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(40, MISSING, info=detection.InfoStatus.NEUTRAL),
+            sample(50, MISSING, info=detection.InfoStatus.ERROR),
+            sample(60, MISSING, info=detection.InfoStatus.TIMEOUT),
+        ],
+    )
+
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    engine.ingest(sample(70, MISSING, info=detection.InfoStatus.NETWORK_ERROR))
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.first_failure_mono == 60
+
+
+def test_recent_pending_failure_survives_neutral_until_qualifying_second_strike():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine)
+    feed(
+        engine,
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(40, MISSING, info=detection.InfoStatus.NEUTRAL),
+            sample(47, MISSING, info=detection.InfoStatus.NETWORK_ERROR),
+        ],
+    )
+
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.first_failure_mono == 30
+    assert engine.active_episode.confirmed_offline_mono == 47
+
+
+def test_lifecycle_boundary_clears_pending_failure():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine)
+    engine.ingest(sample(30, MISSING, info=detection.InfoStatus.TIMEOUT))
+    engine.ingest(sample(35, MISSING, lifecycle=detection.LifecycleMarker.PAUSE))
+    engine.ingest(sample(40, MISSING, info=detection.InfoStatus.TIMEOUT))
+
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+
+
+def test_weak_failure_then_healthy_closes_without_episode_or_stale_state():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine, (12, 12, 12))
+    feed(engine, [
+        sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+        sample(40, 12),
+        sample(50, 12),
+        sample(60, 12),
+    ])
+
+    assert engine.active_episode is None
+    assert engine.state is detection.EpisodeState.IDLE
+
+
+def test_player_drain_after_pending_strike_recovery_is_not_bypassed():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine, (12, 12, 12))
+    feed(engine, [
+        sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+        sample(40, 12),
+        sample(50, 0),
+        sample(60, 0),
+    ])
+
+    assert engine.active_episode is None
+    assert engine.provisional_drain.baseline_players == 12
+    assert engine.provisional_drain.minimum_players == 0
+    assert engine.provisional_drain.zero_reached
+
+
+def test_offline_return_enters_recovering():
     offline = detection.PhysicalEpisodeEngine()
     populated(offline)
     feed(
@@ -222,29 +307,6 @@ def test_offline_return_and_visible_recovery_enter_recovering():
     )
     offline.ingest(sample(60, MISSING))
     assert offline.state is detection.EpisodeState.RECOVERING
-
-    visible = detection.PhysicalEpisodeEngine()
-    populated(visible)
-    feed(visible, [sample(30, 0), sample(60, 0), sample(90, 0), sample(190, 2)])
-    assert visible.state is detection.EpisodeState.RECOVERING
-
-
-def test_crowbar_sequence_finalizes_one_strong_query_visible_event():
-    engine = detection.PhysicalEpisodeEngine()
-    events = crowbar_sequence(engine)
-
-    assert len(events) == 1
-    event = events[0]
-    assert event.outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
-    assert 0.80 <= event.authenticity <= 0.95
-    assert event.outage.confirmed_offline_at is None
-    assert event.drain.low_duration == 170
-    assert event.canonical_phase_at == BASE_WALL + 200
-    assert event.sources >= {
-        detection.SignalSource.PLAYER_DRAIN,
-        detection.SignalSource.VISIBLE_LOW,
-        detection.SignalSource.PLAYER_RECOVERY,
-    }
 
 
 def test_conventional_sequence_clusters_all_signals_into_one_event():
@@ -291,320 +353,57 @@ def test_changed_player_repopulation_corroborates_offline_restart():
     assert detection.SignalSource.PLAYER_RECOVERY in event.sources
 
 
-def test_tick_and_flush_finalize_without_new_observation():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0), sample(180, 2), sample(190, 3)])
-
-    assert engine.tick(219, BASE_WALL + 219) == ()
-    event = engine.tick(220, BASE_WALL + 220)[0]
-    assert event.outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
-    assert engine.tick(300, BASE_WALL + 300) == ()
-
-    second = detection.PhysicalEpisodeEngine()
-    populated(second)
-    second.ingest(sample(30, 0))
-    flushed = second.flush(40, BASE_WALL + 40)
-    assert flushed[0].outcome is detection.EventOutcome.INCOMPLETE
-
-
-def test_new_observation_advances_due_finalization_before_late_signal():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0), sample(180, 2), sample(190, 3)])
-    events = engine.ingest(sample(221, 4, queue=2))
-    assert len(events) == 1
-    assert events[0].recovery.first_queue_at is None
-
-
-def test_single_a2s_failure_with_unchanged_population_is_uncertain():
+def test_single_a2s_failure_with_unchanged_population_is_discarded():
     engine = detection.PhysicalEpisodeEngine()
     populated(engine, (15, 15, 15))
     feed(engine, [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(40, 15)])
-    event = engine.tick(70, BASE_WALL + 70)[0]
-
-    assert event.outcome is detection.EventOutcome.UNCERTAIN_A2S_INTERRUPTION
-    assert event.authenticity == 0.10
-    assert event.outage.confirmed_offline_at is None
-
-
-@pytest.mark.parametrize(
-    ("return_players", "expected_score"),
-    [(8, 0.25), (MISSING, 0.25)],
-)
-def test_single_failure_with_changed_or_missing_return_snapshot_stays_uncertain(
-    return_players, expected_score
-):
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine, (15, 15, 15))
-    feed(engine, [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(40, return_players)])
-    event = engine.tick(70, BASE_WALL + 70)[0]
-    assert event.outcome is detection.EventOutcome.UNCERTAIN_A2S_INTERRUPTION
-    assert event.authenticity == expected_score
-
-
-def test_offline_confirmation_timing_bounds():
-    too_fast = detection.PhysicalEpisodeEngine()
-    populated(too_fast)
-    feed(
-        too_fast,
-        [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(35, MISSING, info=detection.InfoStatus.TIMEOUT)],
-    )
-    assert too_fast.state is detection.EpisodeState.OBSERVING
-
-    delayed = detection.PhysicalEpisodeEngine()
-    populated(delayed)
-    feed(
-        delayed,
-        [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(45, MISSING, info=detection.InfoStatus.TIMEOUT)],
-    )
-    assert delayed.state is detection.EpisodeState.OFFLINE
-
-    late = detection.PhysicalEpisodeEngine()
-    populated(late)
-    feed(
-        late,
-        [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(46, MISSING, info=detection.InfoStatus.TIMEOUT)],
-    )
-    assert late.state is detection.EpisodeState.OBSERVING
-    assert "offline_confirmation_window_missed" in late.active_episode.reason_codes
-
-
-@pytest.mark.parametrize(
-    ("baseline", "outcome", "maximum"),
-    [
-        (1, detection.EventOutcome.AMBIGUOUS_DRAIN, 0.35),
-        (2, detection.EventOutcome.AMBIGUOUS_DRAIN, 0.35),
-        (3, detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART, 0.70),
-        (4, detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART, 0.70),
-        (5, detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART, 0.95),
-        (12, detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART, 0.95),
-    ],
-)
-def test_population_strength_bands(baseline, outcome, maximum):
-    engine = detection.PhysicalEpisodeEngine()
-    events = crowbar_sequence(engine, baseline=baseline)
-    assert events[0].outcome is outcome
-    assert events[0].authenticity <= maximum
-
-
-def test_five_to_one_is_probable_not_strong():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine, (5, 5, 5))
-    feed(engine, [sample(30, 1), sample(60, 1), sample(90, 1), sample(180, 2), sample(190, 3)])
-    event = engine.tick(220, BASE_WALL + 220)[0]
-    assert event.outcome is detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART
-
-
-def test_gradual_decline_over_sixty_seconds_does_not_open_abrupt_drain():
-    engine = detection.PhysicalEpisodeEngine()
-    counts = [(0, 10), (20, 9), (40, 7), (60, 5), (80, 3), (100, 1), (120, 0)]
-    feed(engine, [sample(at, count) for at, count in counts])
-    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.tick(70, BASE_WALL + 70) == ()
     assert engine.active_episode is None
 
 
-def test_partial_drain_only_becomes_strong_when_confirmed_outage_corroborates():
-    no_outage = detection.PhysicalEpisodeEngine()
-    populated(no_outage, (10, 10, 10))
-    no_outage.ingest(sample(30, 3))
-    assert no_outage.active_episode is None
-
-    outage = detection.PhysicalEpisodeEngine()
-    populated(outage, (10, 10, 10))
-    feed(
-        outage,
-        [
-            sample(30, 3),
-            sample(40, MISSING, info=detection.InfoStatus.TIMEOUT),
-            sample(46, MISSING, info=detection.InfoStatus.TIMEOUT),
-            sample(70, 1),
-        ],
-    )
-    event = outage.tick(100, BASE_WALL + 100)[0]
-    assert event.outcome is detection.EventOutcome.CORROBORATED_OFFLINE_RESTART
-
-
 @pytest.mark.parametrize(
-    ("low_times", "expected"),
-    [
-        ((30, 60), detection.EventOutcome.AMBIGUOUS_DRAIN),
-        ((30, 40, 50), detection.EventOutcome.AMBIGUOUS_DRAIN),
-        ((30, 50, 75), detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART),
-    ],
+    "return_players",
+    [8, MISSING],
 )
-def test_low_state_requires_three_samples_duration_and_thirty_second_confirmation(low_times, expected):
+def test_single_failure_with_changed_or_missing_return_snapshot_is_discarded(return_players):
     engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(at, 0) for at in low_times])
-    recover_at = max(low_times) + 100
-    feed(engine, [sample(recover_at, 2), sample(recover_at + 10, 3)])
-    event = engine.tick(recover_at + 40, BASE_WALL + recover_at + 40)[0]
-    assert event.outcome is expected
+    populated(engine, (15, 15, 15))
+    feed(engine, [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(40, return_players)])
+    assert engine.tick(70, BASE_WALL + 70) == ()
+    assert engine.active_episode is None
 
 
-def test_missing_player_data_breaks_visible_episode_quality():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(
-        engine,
-        [sample(30, 0), sample(60, MISSING), sample(90, 0), sample(120, 0), sample(180, 2), sample(190, 3)],
-    )
-    event = engine.tick(220, BASE_WALL + 220)[0]
-    assert event.outcome is detection.EventOutcome.AMBIGUOUS_DRAIN
-    assert not event.coverage_complete
-
-
-@pytest.mark.parametrize(
-    ("recover_at", "outcome"),
-    [
-        (510, detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART),
-        (511, detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART),
-        (620, detection.EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART),
-    ],
-)
-def test_visible_recovery_quality_bands(recover_at, outcome):
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0), sample(recover_at, 2), sample(recover_at + 10, 3)])
-    event = engine.tick(recover_at + 40, BASE_WALL + recover_at + 40)[0]
-    assert event.outcome is outcome
-
-
-def test_visible_episode_expires_after_absolute_recovery_window():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0)])
-    event = engine.tick(631, BASE_WALL + 631)[0]
-    assert event.outcome is detection.EventOutcome.EXPIRED
-
-
-def test_recovery_arriving_after_absolute_window_finalizes_expired_first():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0)])
-    event = engine.ingest(sample(631, 2))[0]
-    assert event.outcome is detection.EventOutcome.EXPIRED
-    assert event.schedule_weight_suggestion == 0.0
-
-
-def test_low_state_shorter_than_forty_five_seconds_remains_ambiguous():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(35, 0), sample(40, 0), sample(42, 2), sample(52, 3)])
-    event = engine.tick(82, BASE_WALL + 82)[0]
-    assert event.outcome is detection.EventOutcome.AMBIGUOUS_DRAIN
-
-
-@pytest.mark.parametrize("gap", [10, 35])
-def test_two_positive_samples_at_recovery_spacing_bounds_are_stable(gap):
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0), sample(180, 2), sample(180 + gap, 3)])
-    assert engine.active_episode.stable_recovery_mono == 180 + gap
-
-
-@pytest.mark.parametrize("gap", [9, 36])
-def test_positive_samples_outside_spacing_bounds_are_not_stable(gap):
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(engine, [sample(30, 0), sample(60, 0), sample(90, 0), sample(180, 2), sample(180 + gap, 3)])
-    assert engine.active_episode.stable_recovery_mono is None
-
-
-def test_bouncing_recovery_requires_three_new_positive_samples():
+@pytest.mark.parametrize("gap", [5, 10, 15, 17, 25])
+def test_shared_pending_strike_window_confirms_without_learner_only_bounds(gap):
     engine = detection.PhysicalEpisodeEngine()
     populated(engine)
     feed(
         engine,
         [
-            sample(30, 0), sample(60, 0), sample(90, 0),
-            sample(180, 2), sample(190, 0),
-            sample(200, 1), sample(210, 2), sample(220, 3),
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(30 + gap, MISSING, info=detection.InfoStatus.NETWORK_ERROR),
         ],
     )
-    assert engine.active_episode.recovery_bounced
-    assert engine.active_episode.stable_recovery_mono == 220
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.confirmed_offline_mono == 30 + gap
 
 
-def test_queue_does_not_bypass_three_samples_after_recovery_bounce():
+def test_failure_after_shared_pending_strike_window_becomes_new_strike_one():
     engine = detection.PhysicalEpisodeEngine()
     populated(engine)
     feed(
         engine,
         [
-            sample(30, 0), sample(60, 0), sample(90, 0),
-            sample(180, 2), sample(190, 0, queue=2), sample(200, 1),
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(56, MISSING, info=detection.InfoStatus.NETWORK_ERROR),
         ],
     )
-    assert engine.active_episode.stable_recovery_mono is None
-    feed(engine, [sample(210, 2), sample(220, 3)])
-    assert engine.active_episode.stable_recovery_mono == 220
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
 
-
-def test_queue_then_player_is_alternative_recovery_but_queue_alone_is_not():
-    queue_only = detection.PhysicalEpisodeEngine()
-    populated(queue_only)
-    feed(queue_only, [sample(30, 0), sample(60, 0), sample(90, 0), sample(180, 0, queue=2)])
-    assert queue_only.active_episode.stable_recovery_mono is None
-
-    with_player = detection.PhysicalEpisodeEngine()
-    populated(with_player)
-    feed(
-        with_player,
-        [sample(30, 0), sample(60, 0), sample(90, 0), sample(180, 0, queue=2), sample(250, 1)],
-    )
-    assert with_player.active_episode.stable_recovery_mono == 250
-
-
-def test_query_failure_during_visible_episode_prevents_strong_visible_classification():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(
-        engine,
-        [
-            sample(30, 0),
-            sample(60, 0),
-            sample(90, 0, info=detection.InfoStatus.TIMEOUT),
-            sample(100, 0),
-        ],
-    )
-    event = engine.tick(130, BASE_WALL + 130)[0]
-    assert event.outcome is detection.EventOutcome.UNCERTAIN_A2S_INTERRUPTION
-    assert event.authenticity <= 0.30
-
-
-def test_player_recovery_needs_no_queue_and_may_be_below_baseline():
-    engine = detection.PhysicalEpisodeEngine()
-    events = crowbar_sequence(engine, baseline=20)
-    assert events[0].recovery.first_queue_at is None
-    assert events[0].outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
-
-
-@pytest.mark.parametrize("failure_at", [150, 210])
-def test_drain_to_outage_merge_boundary(failure_at):
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    feed(
-        engine,
-        [
-            sample(30, 0),
-            sample(failure_at, 0, info=detection.InfoStatus.TIMEOUT),
-            sample(failure_at + 6, 0, info=detection.InfoStatus.TIMEOUT),
-            sample(failure_at + 30, 2),
-        ],
-    )
-    events = engine.tick(failure_at + 60, BASE_WALL + failure_at + 60)
-    assert len(events) == 1
-    assert events[0].outcome is detection.EventOutcome.CORROBORATED_OFFLINE_RESTART
-
-
-def test_outage_beyond_merge_window_does_not_corroborate_old_drain():
-    engine = detection.PhysicalEpisodeEngine()
-    populated(engine)
-    events = feed(engine, [sample(30, 0), sample(211, 0, info=detection.InfoStatus.TIMEOUT)])
-    assert events[0].outcome is detection.EventOutcome.AMBIGUOUS_DRAIN
-    assert engine.active_episode.drain_mono is None
+    engine.ingest(sample(66, MISSING, info=detection.InfoStatus.TIMEOUT))
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.first_failure_mono == 56
 
 
 def test_outage_then_zero_return_is_clustered_as_one_reverse_order_episode():
@@ -623,15 +422,84 @@ def test_outage_then_zero_return_is_clustered_as_one_reverse_order_episode():
 def test_duplicate_samples_and_finalization_are_idempotent():
     engine = detection.PhysicalEpisodeEngine()
     populated(engine)
-    drain = sample(30, 0)
-    assert engine.ingest(drain) == ()
-    assert engine.ingest(drain) == ()
-    assert engine.active_episode.drain_mono == 30
-    feed(engine, [sample(60, 0), sample(90, 0), sample(180, 2), sample(190, 3)])
-    first = engine.tick(220, BASE_WALL + 220)
-    second = engine.tick(220, BASE_WALL + 220)
+    failure = sample(30, MISSING, info=detection.InfoStatus.TIMEOUT)
+    assert engine.ingest(failure) == ()
+    assert engine.ingest(failure) == ()
+    feed(engine, [sample(40, MISSING, info=detection.InfoStatus.TIMEOUT), sample(43, MISSING)])
+    first = engine.tick(73, BASE_WALL + 73)
+    second = engine.tick(73, BASE_WALL + 73)
     assert len(first) == 1
     assert second == ()
+
+
+def test_flush_finalizes_confirmed_outage_once_and_clears_transient_state():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine)
+    feed(
+        engine,
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(40, MISSING, info=detection.InfoStatus.NETWORK_ERROR),
+        ],
+    )
+    assert engine.state is detection.EpisodeState.OFFLINE
+
+    flushed = engine.flush(43, BASE_WALL + 43)
+    assert len(flushed) == 1
+    assert flushed[0].outcome is detection.EventOutcome.INCOMPLETE
+    assert flushed[0].reason_codes == ("explicit_flush",)
+    assert flushed[0].schedule_weight_suggestion == 0.0
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    assert engine.pre_roll == []
+    assert engine.provisional_drain is None
+    assert engine.flush(46, BASE_WALL + 46) == ()
+
+    pending = detection.PhysicalEpisodeEngine()
+    populated(pending)
+    pending.ingest(sample(30, MISSING, info=detection.InfoStatus.TIMEOUT))
+    assert pending.flush(35, BASE_WALL + 35) == ()
+    pending.ingest(sample(40, MISSING, info=detection.InfoStatus.TIMEOUT))
+    assert pending.state is detection.EpisodeState.IDLE
+    assert pending.active_episode is None
+
+    provisional = detection.PhysicalEpisodeEngine()
+    populated(provisional)
+    feed(provisional, [sample(30, 0), sample(40, 0)])
+    assert provisional.provisional_drain is not None
+    assert provisional.flush(45, BASE_WALL + 45) == ()
+    assert provisional.provisional_drain is None
+    assert provisional.pre_roll == []
+
+
+def test_due_episode_finalizes_before_new_observation_starts_fresh_state():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine)
+    feed(
+        engine,
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(40, MISSING, info=detection.InfoStatus.NETWORK_ERROR),
+            sample(43, MISSING),
+        ],
+    )
+    assert engine.active_episode.info_return_mono == 43
+    assert engine.active_episode.stable_recovery_mono == 43
+
+    events = engine.ingest(sample(73, MISSING, info=detection.InfoStatus.TIMEOUT))
+    assert len(events) == 1
+    assert events[0].outcome is detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
+    assert events[0].outage.info_return_at == BASE_WALL + 43
+    assert events[0].recovery.stable_recovery_at == BASE_WALL + 43
+    assert events[0].finalized_at == BASE_WALL + 73
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+
+    engine.ingest(sample(83, MISSING, info=detection.InfoStatus.NETWORK_ERROR))
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.first_failure_mono == 73
+    assert engine.active_episode.confirmed_offline_mono == 83
+    assert engine.active_episode.event_id != events[0].event_id
 
 
 def test_repeated_outage_segment_before_finalization_stays_one_episode():
@@ -656,18 +524,58 @@ def test_repeated_outage_segment_before_finalization_stays_one_episode():
 def test_event_fingerprint_and_id_are_deterministic():
     first = detection.PhysicalEpisodeEngine()
     second = detection.PhysicalEpisodeEngine()
-    event1 = crowbar_sequence(first)[0]
-    event2 = crowbar_sequence(second)[0]
+    event1 = offline_sequence(first)[0]
+    event2 = offline_sequence(second)[0]
     assert event1.fingerprint == event2.fingerprint
     assert event1.event_id == event2.event_id
 
 
 def test_stable_normal_period_allows_a_later_separate_event():
     engine = detection.PhysicalEpisodeEngine()
-    first = crowbar_sequence(engine)[0]
-    feed(engine, [sample(250, 8), sample(310, 8), sample(320, 8), sample(330, 8), sample(340, 0)])
-    assert engine.active_episode is not None
+    first = offline_sequence(engine)[0]
+    feed(engine, [sample(160, 8), sample(220, 8), sample(230, MISSING, info=detection.InfoStatus.TIMEOUT), sample(240, MISSING, info=detection.InfoStatus.TIMEOUT)])
+    assert engine.state is detection.EpisodeState.OFFLINE
     assert engine.active_episode.event_id != first.event_id
+
+
+def test_idle_lifecycle_boundary_clears_positive_event_cooldown_and_transient_history():
+    engine = detection.PhysicalEpisodeEngine()
+    event = offline_sequence(engine)[0]
+
+    assert event.schedule_weight_suggestion > 0.0
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    assert engine._cooldown_until_stable
+
+    feed(
+        engine,
+        [
+            sample(160, 12),
+            sample(170, 12),
+            sample(180, 12),
+            sample(190, 0),
+            sample(200, 0),
+        ],
+    )
+    assert engine.pre_roll
+    assert engine.provisional_drain is not None
+    assert engine._normal_since_mono == 160
+
+    assert engine.ingest(
+        sample(205, MISSING, lifecycle=detection.LifecycleMarker.PAUSE)
+    ) == ()
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    assert not engine._cooldown_until_stable
+    assert engine._pending_failure is None
+    assert engine.provisional_drain is None
+    assert engine.pre_roll == []
+    assert engine._normal_since_mono is None
+
+    engine.ingest(sample(210, 9, monitor="monitor-2"))
+    assert len(engine.pre_roll) == 1
+    assert engine.pre_roll[0].players == 9
+    assert not engine._cooldown_until_stable
 
 
 @pytest.mark.parametrize(
@@ -681,15 +589,69 @@ def test_stable_normal_period_allows_a_later_separate_event():
         detection.LifecycleMarker.APP_RESTART,
     ],
 )
-def test_lifecycle_boundaries_finalize_incomplete_and_break_coverage(marker):
+def test_lifecycle_boundaries_discard_provisional_drain_without_event(marker):
     engine = detection.PhysicalEpisodeEngine()
     populated(engine)
-    engine.ingest(sample(30, 0))
-    event = engine.ingest(sample(40, MISSING, lifecycle=marker))[0]
-    assert event.outcome is detection.EventOutcome.AMBIGUOUS_DRAIN
-    assert not event.coverage_complete
-    assert event.lifecycle_interruption is marker
+    feed(engine, [sample(30, 0), sample(40, 0)])
+    assert engine.provisional_drain is not None
+    assert engine.ingest(sample(50, MISSING, lifecycle=marker)) == ()
     assert engine.pre_roll == []
+    assert engine.provisional_drain is None
+
+
+def test_lifecycle_interrupts_active_confirmed_outage_and_resets_for_next_session():
+    engine = detection.PhysicalEpisodeEngine()
+    populated(engine)
+    feed(
+        engine,
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(40, MISSING, info=detection.InfoStatus.NETWORK_ERROR),
+        ],
+    )
+    assert engine.state is detection.EpisodeState.OFFLINE
+
+    events = engine.ingest(
+        sample(43, MISSING, lifecycle=detection.LifecycleMarker.PAUSE)
+    )
+    assert len(events) == 1
+    assert events[0].outcome is detection.EventOutcome.INCOMPLETE
+    assert events[0].schedule_weight_suggestion == 0.0
+    assert events[0].lifecycle_interruption is detection.LifecycleMarker.PAUSE
+    assert "lifecycle_pause" in events[0].reason_codes
+    assert not events[0].coverage_complete
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    assert engine.pre_roll == []
+    assert engine.provisional_drain is None
+    assert engine._pending_failure is None
+    assert not engine._cooldown_until_stable
+
+    engine.ingest(sample(50, 9, monitor="monitor-2", server="other:2302"))
+    engine.ingest(
+        sample(
+            60,
+            MISSING,
+            info=detection.InfoStatus.TIMEOUT,
+            monitor="monitor-2",
+            server="other:2302",
+        )
+    )
+    assert engine.state is detection.EpisodeState.IDLE
+    assert engine.active_episode is None
+    engine.ingest(
+        sample(
+            70,
+            MISSING,
+            info=detection.InfoStatus.NETWORK_ERROR,
+            monitor="monitor-2",
+            server="other:2302",
+        )
+    )
+    assert engine.state is detection.EpisodeState.OFFLINE
+    assert engine.active_episode.server_key == "other:2302"
+    assert engine.active_episode.monitoring_session_id == "monitor-2"
+    assert engine.active_episode.first_failure_mono == 60
 
 
 def test_session_server_and_out_of_order_boundaries_do_not_preserve_continuity():
@@ -700,24 +662,23 @@ def test_session_server_and_out_of_order_boundaries_do_not_preserve_continuity()
     ):
         engine = detection.PhysicalEpisodeEngine()
         populated(engine)
-        engine.ingest(sample(30, 0))
-        event = engine.ingest(changed)[0]
-        assert event.outcome is detection.EventOutcome.INCOMPLETE
-        assert not event.coverage_complete
+        feed(engine, [sample(30, 0), sample(35, 0)])
+        assert engine.ingest(changed) == ()
+        assert engine.active_episode is None
 
 
 def test_authenticity_is_signal_based_and_has_no_schedule_input():
     assert "phase" not in detection.PhysicalEpisodeEngine.ingest.__annotations__
-    strong = crowbar_sequence(detection.PhysicalEpisodeEngine())[0]
+    strong = offline_sequence(detection.PhysicalEpisodeEngine(), drain=True)[0]
     confirmed = offline_sequence(detection.PhysicalEpisodeEngine(), drain=False)[0]
     assert strong.authenticity >= 0.80
     assert 0.80 <= confirmed.authenticity <= 0.90
 
 
 def test_queue_absence_is_not_an_authenticity_penalty():
-    without_queue = crowbar_sequence(detection.PhysicalEpisodeEngine(), queue=MISSING)[0]
-    with_queue = crowbar_sequence(detection.PhysicalEpisodeEngine(), queue=2)[0]
-    assert without_queue.outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
+    without_queue = offline_sequence(detection.PhysicalEpisodeEngine(), queue=MISSING)[0]
+    with_queue = offline_sequence(detection.PhysicalEpisodeEngine(), queue=2)[0]
+    assert without_queue.outcome is detection.EventOutcome.CORROBORATED_OFFLINE_RESTART
     assert with_queue.authenticity >= without_queue.authenticity
 
 
@@ -746,15 +707,12 @@ def test_active_samples_are_bounded_and_repeated_polls_are_downsampled():
 
     repeated = detection.PhysicalEpisodeEngine()
     populated(repeated)
-    repeated.ingest(sample(30, 0))
-    for at in range(31, 131):
+    for at in range(30, 131):
         repeated.ingest(sample(at, 0))
-    low_samples = [item for item in repeated.active_episode.samples if item.players == 0]
-    assert len(low_samples) <= 3
-    assert low_samples[0].monotonic_at == 30
-    assert low_samples[-1].monotonic_at == 130
-    assert len(repeated.active_episode.low_samples) <= 16
-    assert repeated.active_episode.low_sample_count == 101
+    assert repeated.active_episode is None
+    assert repeated.provisional_drain.low_sample_count == 101
+    assert len(repeated.provisional_drain.low_samples) <= 32
+    assert len(repeated.provisional_drain.evidence_samples) <= 36
 
 
 def test_tick_rejects_time_before_latest_observation():
@@ -765,7 +723,7 @@ def test_tick_rejects_time_before_latest_observation():
 
 
 def test_finalized_event_and_nested_summaries_are_immutable():
-    event = crowbar_sequence(detection.PhysicalEpisodeEngine())[0]
+    event = offline_sequence(detection.PhysicalEpisodeEngine())[0]
     with pytest.raises(FrozenInstanceError):
         event.authenticity = 0
     with pytest.raises(FrozenInstanceError):

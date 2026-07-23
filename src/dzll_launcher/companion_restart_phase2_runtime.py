@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import logging
 import math
 import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable, Mapping
 
+from . import companion_restart_phase2_detection as detection_module
+from .companion_restart_phase2_authority import (
+    AuthorityDecision,
+    evaluate_authority,
+)
 from .companion_restart_phase2_consumers import (
     CONSUMER_ADAPTER_VERSION,
     AlertKeyKind,
@@ -40,6 +47,30 @@ from .companion_restart_phase2_detection import (
     RecoverySummary,
     SignalSource,
 )
+from .companion_restart_phase2_continuity import (
+    CONTINUITY_PROVENANCE_VERSION,
+    ContinuityShadowSnapshot,
+    ContinuityShadowTracker,
+    build_cadence_streaks,
+    build_continuity_chains,
+    continuity_span_terminates_chain,
+    deterministic_continuity_chain_id,
+    extract_interval_relationships,
+    observed_transition_spans_from_events,
+    reconstruct_historical_event_provenance,
+    span_from_observations,
+)
+from .companion_restart_phase2_expected_windows import (
+    ExpectedWindowEpisodeEvidence,
+    ExpectedWindowLedgerRecord,
+    ExpectedWindowOutcome,
+    ExpectedWindowRevision,
+    classify_expected_window,
+    continuity_spans_from_coverage,
+    deterministic_model_revision_id,
+    reconcile_expected_window_ledger,
+)
+from .a2s_status_diagnostics import result_classification
 from .companion_restart_phase2_scoring import (
     AGGREGATE_SEMANTICS_VERSION,
     CANDIDATE_PERIODS,
@@ -59,14 +90,16 @@ from .companion_restart_phase2_scoring import (
 from .companion_restart_phase2_storage import (
     PHASE2_SCHEMA_VERSION,
     PHASE2_SCORING_ALGORITHM_VERSION,
+    Phase2InitializationStatus,
     Phase2MigrationResult,
-    atomic_write_json,
+    atomic_write_phase2_state,
     initialize_phase2_state,
     normalize_phase2_state,
 )
 
 
 RUNTIME_STATE_VERSION = 1
+ACTIVE_EPISODE_SNAPSHOT_VERSION = 1
 MAX_FINALIZED_EVENTS = 80
 MAX_COVERAGE_SEGMENTS = 120
 MAX_FIRED_KEYS = 200
@@ -82,10 +115,26 @@ COMPACT_EVENT_LIMIT = 12
 COLD_EVENT_LIMIT = 2
 
 
+logger = logging.getLogger(__name__)
+
+
+# Preserve the existing runtime patch/test seam while making every production
+# runtime save pass through the schema-aware mixed-version guard.
+def atomic_write_json(path: str | Path, state: object) -> None:
+    atomic_write_phase2_state(path, state)
+
+
 class RuntimePersistenceStatus(str, Enum):
     ENABLED = "enabled"
     DISABLED_INITIALIZATION_FAILED = "disabled_initialization_failed"
     DISABLED_WRITE_FAILED = "disabled_write_failed"
+
+
+class LiveResultDisposition(str, Enum):
+    HEALTHY = "healthy"
+    NEUTRAL = "neutral"
+    QUALIFYING_FAILURE = "qualifying_failure"
+    PROTOCOL_FAILURE = "protocol_failure"
 
 
 @dataclass(frozen=True)
@@ -105,6 +154,16 @@ class RuntimeNotice:
     title: str
     body: str
     backup_path: str | None = None
+
+
+@dataclass(frozen=True)
+class AuthorityConsumerActionResult:
+    attempted: bool
+    emitted: bool
+    source: str
+    key: str | None
+    persistence_generation: int | None
+    reason_codes: tuple[str, ...]
 
 
 @dataclass
@@ -127,6 +186,7 @@ class _ServerRuntime:
     app_session_id: str = ""
     monitoring_session_id: str = ""
     poll_generation: int = 0
+    continuity_chain_id: str = ""
     dirty: bool = False
     last_saved_at: float = 0.0
     last_expected_miss_signature: tuple[tuple[int, int], ...] = ()
@@ -155,6 +215,15 @@ class Phase2RestartRuntime:
         now: float | None = None,
         app_session_id: str | None = None,
         detection_config: DetectionConfig | None = None,
+        continuity_shadow_enabled: bool = False,
+        expected_window_v2_shadow_enabled: bool = False,
+        continuity_authority_shadow_enabled: bool = False,
+        schema4_authority_shadow_enabled: bool = False,
+        schema4_authority_shadow_state: Mapping[str, object] | None = None,
+        authoritative_schema4_runtime_enabled: bool = False,
+        schema4_authority_consumer_shadow_enabled: bool = False,
+        schema4_authority_production_cutover_enabled: bool = False,
+        _authoritative_schema4_backend: object | None = None,
     ) -> None:
         self.migration = migration
         self.active_path = Path(migration.active_path)
@@ -162,6 +231,41 @@ class Phase2RestartRuntime:
         self.app_session_id = app_session_id or str(uuid.uuid4())
         self.detection_config = detection_config or DetectionConfig()
         self.scorer = RestartScheduleScorer()
+        self.continuity_shadow_enabled = bool(continuity_shadow_enabled)
+        self._continuity_shadow_trackers: dict[str, ContinuityShadowTracker] = {}
+        self._continuity_shadow_logged_ids: set[str] = set()
+        self.expected_window_v2_shadow_enabled = bool(
+            expected_window_v2_shadow_enabled
+        )
+        self._expected_window_v2_shadow_ledgers: dict[
+            str, list[ExpectedWindowLedgerRecord]
+        ] = {}
+        self._expected_window_v2_shadow_logged_ids: set[str] = set()
+        self.continuity_authority_shadow_enabled = bool(
+            continuity_authority_shadow_enabled
+        )
+        self._continuity_authority_shadow_decisions: dict[str, AuthorityDecision] = {}
+        self._continuity_authority_shadow_logged_ids: set[str] = set()
+        self.schema4_authority_shadow_enabled = bool(
+            schema4_authority_shadow_enabled
+        )
+        self._schema4_authority_shadow_state = schema4_authority_shadow_state
+        self._schema4_authority_shadow_comparisons: dict[str, object] = {}
+        self._schema4_authority_shadow_logged_ids: set[str] = set()
+        self.authoritative_schema4_runtime_enabled = bool(
+            authoritative_schema4_runtime_enabled
+        )
+        self._authoritative_schema4_backend = _authoritative_schema4_backend
+        self.schema4_authority_consumer_shadow_enabled = bool(
+            schema4_authority_consumer_shadow_enabled
+        )
+        self.schema4_authority_production_cutover_enabled = bool(
+            schema4_authority_production_cutover_enabled
+        )
+        self._authority_consumer_shadow_decisions: dict[str, object] = {}
+        self._authority_consumer_comparisons: dict[str, object] = {}
+        self._authority_consumer_resolutions: dict[str, object] = {}
+        self._authority_consumer_logged_ids: set[str] = set()
         self.persistence_status = (
             RuntimePersistenceStatus.ENABLED
             if migration.persistence_enabled
@@ -182,19 +286,67 @@ class Phase2RestartRuntime:
         app_session_id: str | None = None,
         generation_id: str | None = None,
         detection_config: DetectionConfig | None = None,
+        continuity_shadow_enabled: bool = False,
+        expected_window_v2_shadow_enabled: bool = False,
+        continuity_authority_shadow_enabled: bool = False,
+        schema4_authority_shadow_enabled: bool = False,
+        schema4_authority_shadow_state: Mapping[str, object] | None = None,
+        authoritative_schema4_runtime_enabled: bool = False,
+        schema4_authority_consumer_shadow_enabled: bool = False,
+        schema4_authority_production_cutover_enabled: bool = False,
     ) -> "Phase2RestartRuntime":
-        migration = initialize_phase2_state(
-            active_path=active_path,
-            legacy_path=legacy_path,
-            now=now,
-            generation_id=generation_id,
-        )
-        return cls(
-            migration,
-            now=now,
-            app_session_id=app_session_id,
-            detection_config=detection_config,
-        )
+        schema4_backend = None
+        if authoritative_schema4_runtime_enabled:
+            from .companion_restart_phase2_schema4_runtime import (
+                AuthoritativeSchema4Runtime,
+            )
+
+            schema4_backend = AuthoritativeSchema4Runtime.open(
+                active_path, enabled=True
+            )
+            migration = Phase2MigrationResult(
+                state=schema4_backend.schema3_projection(),
+                status=Phase2InitializationStatus.ACTIVE_LOADED,
+                reset_performed=False,
+                recovery_performed=False,
+                active_path=Path(active_path),
+                backup_path=None,
+                legacy_checksum=None,
+                persistence_enabled=True,
+            )
+        else:
+            migration = initialize_phase2_state(
+                active_path=active_path,
+                legacy_path=legacy_path,
+                now=now,
+                generation_id=generation_id,
+            )
+        try:
+            return cls(
+                migration,
+                now=now,
+                app_session_id=app_session_id,
+                detection_config=detection_config,
+                continuity_shadow_enabled=continuity_shadow_enabled,
+                expected_window_v2_shadow_enabled=expected_window_v2_shadow_enabled,
+                continuity_authority_shadow_enabled=continuity_authority_shadow_enabled,
+                schema4_authority_shadow_enabled=schema4_authority_shadow_enabled,
+                schema4_authority_shadow_state=schema4_authority_shadow_state,
+                authoritative_schema4_runtime_enabled=(
+                    authoritative_schema4_runtime_enabled
+                ),
+                schema4_authority_consumer_shadow_enabled=(
+                    schema4_authority_consumer_shadow_enabled
+                ),
+                schema4_authority_production_cutover_enabled=(
+                    schema4_authority_production_cutover_enabled
+                ),
+                _authoritative_schema4_backend=schema4_backend,
+            )
+        except Exception:
+            if schema4_backend is not None:
+                schema4_backend.close(flush=False)
+            raise
 
     @property
     def persistence_enabled(self) -> bool:
@@ -257,15 +409,34 @@ class Phase2RestartRuntime:
                 wall_at=wall_at,
                 monotonic_at=monotonic_at,
             )
-        server.engine = PhysicalEpisodeEngine(self.detection_config)
+        if server.engine.active_episode is None:
+            server.engine = PhysicalEpisodeEngine(self.detection_config)
+        else:
+            # A confirmed durable episode may span an application restart.  Keep
+            # its immutable event identity and semantic state, while explicitly
+            # breaking high-authority continuity across the process boundary.
+            server.engine.active_episode.coverage_complete = False
+            server.engine.active_episode.reason_codes.add(
+                "application_restart_episode_resumed"
+            )
         server.app_session_id = self.app_session_id
         server.monitoring_session_id = str(uuid.uuid4())
         server.poll_generation = _nonnegative_int(poll_generation, 0)
+        server.continuity_chain_id = deterministic_continuity_chain_id(
+            server.key,
+            server.app_session_id,
+            server.monitoring_session_id,
+            server.poll_generation,
+            wall_at,
+        )
         server.previous_sample = None
         server.monitoring_sessions.append({
             "session_id": server.monitoring_session_id,
             "app_session_id": server.app_session_id,
             "poll_generation": server.poll_generation,
+            "continuity_chain_id": server.continuity_chain_id,
+            "continuity_chain_ids": [server.continuity_chain_id],
+            "provenance_version": CONTINUITY_PROVENANCE_VERSION,
             "started_at": wall_at,
             "ended_at": None,
             "reason": None,
@@ -297,6 +468,8 @@ class Phase2RestartRuntime:
             player_status=FieldStatus.MISSING,
             queue_status=FieldStatus.MISSING,
             lifecycle=marker,
+            continuity_chain_id=server.continuity_chain_id,
+            provenance_version=CONTINUITY_PROVENANCE_VERSION,
         )
         update = self._ingest_sample(server, sample, persist_immediately=True)
         for session in reversed(server.monitoring_sessions):
@@ -305,6 +478,7 @@ class Phase2RestartRuntime:
                 session["reason"] = marker.value
                 break
         server.monitoring_session_id = ""
+        server.continuity_chain_id = ""
         server.previous_sample = None
         server.dirty = True
         persisted = self._persist_server(server, force=True, now=wall_at)
@@ -334,6 +508,8 @@ class Phase2RestartRuntime:
             monitoring_session_id=server.monitoring_session_id,
             poll_generation=poll_generation,
             server_key=server.key,
+            continuity_chain_id=server.continuity_chain_id,
+            provenance_version=CONTINUITY_PROVENANCE_VERSION,
         )
         return self._ingest_sample(server, sample)
 
@@ -349,6 +525,12 @@ class Phase2RestartRuntime:
             or sample.poll_generation != server.poll_generation
         ):
             return RuntimeUpdate(accepted=False, rejected_reason="stale_sample_continuity")
+        if sample.continuity_chain_id is None:
+            sample = replace(
+                sample,
+                continuity_chain_id=server.continuity_chain_id,
+                provenance_version=CONTINUITY_PROVENANCE_VERSION,
+            )
         return self._ingest_sample(server, sample)
 
     def tick(self, server_key: str, *, wall_at: float, monotonic_at: float) -> RuntimeUpdate:
@@ -468,6 +650,191 @@ class Phase2RestartRuntime:
                     monotonic_at=monotonic_at,
                 )
             self._persist_server(server, force=True, now=wall_at)
+        backend = self._authoritative_schema4_backend
+        if backend is not None:
+            backend.close(flush=True)
+
+    def authoritative_schema4_snapshot(self) -> object | None:
+        """Read-only backend diagnostics; never consumed by Stage 3A policy."""
+
+        backend = self._authoritative_schema4_backend
+        if not self.authoritative_schema4_runtime_enabled or backend is None:
+            return None
+        return backend.snapshot()
+
+    def authority_consumer_shadow_snapshot(self, server_key: str) -> object | None:
+        """Return an in-memory Stage 3B1 comparison; never a production input."""
+
+        if not (
+            self.schema4_authority_consumer_shadow_enabled
+            or self.schema4_authority_production_cutover_enabled
+        ):
+            return None
+        return self._authority_consumer_comparisons.get(str(server_key))
+
+    def authority_consumer_resolution(self, server_key: str) -> object | None:
+        """Expose the gated future resolver without changing ``decision()``."""
+
+        return self._authority_consumer_resolutions.get(str(server_key))
+
+    def authority_consumer_cutover_summary(
+        self, server_key: str, *, now: float
+    ) -> dict | None:
+        """Return schema-4 presentation only when the explicit resolver selected it."""
+
+        if not self.schema4_authority_production_cutover_enabled:
+            return None
+        from .companion_restart_phase2_authority_consumers import (
+            AuthorityConsumerDecision,
+            CutoverSource,
+            authority_consumer_summary,
+        )
+
+        resolution = self._authority_consumer_resolutions.get(str(server_key))
+        if resolution is None or resolution.source is not CutoverSource.SCHEMA4:
+            return None
+        if not isinstance(resolution.selected_output, AuthorityConsumerDecision):
+            return None
+        return authority_consumer_summary(resolution.selected_output, now=now)
+
+    def dispatch_authority_consumer_action(
+        self,
+        server_key: str,
+        *,
+        kind: str,
+        now: float,
+        action: Callable[[], bool],
+        after_reservation: Callable[[], None] | None = None,
+        after_dispatch: Callable[[], None] | None = None,
+    ) -> AuthorityConsumerActionResult:
+        """Reserve durably, then invoke one existing external action at most once."""
+
+        from .companion_restart_phase2_authority_consumers import (
+            AuthorityConsumerDecision,
+            CutoverSource,
+        )
+
+        if not self.schema4_authority_production_cutover_enabled:
+            return AuthorityConsumerActionResult(
+                False, False, "schema3", None, None, ("production_cutover_disabled",)
+            )
+        resolution = self._authority_consumer_resolutions.get(str(server_key))
+        if resolution is None or resolution.source is not CutoverSource.SCHEMA4:
+            return AuthorityConsumerActionResult(
+                False,
+                False,
+                "schema3_safe_fallback",
+                None,
+                None,
+                ("schema4_consumer_not_selected",),
+            )
+        decision = resolution.selected_output
+        if not isinstance(decision, AuthorityConsumerDecision):
+            return AuthorityConsumerActionResult(
+                False, False, "schema3_safe_fallback", None, None, ("invalid_consumer_output",)
+            )
+        if kind == "scheduled_warning":
+            eligible = decision.scheduled_pre_restart_alert_eligible
+            key = decision.scheduled_warning_suppression_key
+        elif kind == "generic_recovery":
+            eligible = decision.generic_recovery_alert_eligible
+            key = decision.generic_recovery_suppression_key
+        else:
+            raise ValueError("unsupported authority consumer action kind")
+        if not eligible or key is None:
+            return AuthorityConsumerActionResult(
+                False,
+                False,
+                "schema4",
+                None if key is None else key.serialize(),
+                None,
+                ("schema4_action_not_eligible",),
+            )
+        backend = self._authoritative_schema4_backend
+        if backend is None or not self.authoritative_schema4_runtime_enabled:
+            return AuthorityConsumerActionResult(
+                False, False, "schema3_safe_fallback", None, None, ("schema4_backend_unavailable",)
+            )
+        reservation = backend.reserve_consumer_alert(
+            decision=decision,
+            key=key,
+            created_at=now,
+        )
+        if not reservation.reserved:
+            return AuthorityConsumerActionResult(
+                False,
+                False,
+                "schema4",
+                key.serialize(),
+                None,
+                reservation.reason_codes,
+            )
+        if after_reservation is not None:
+            after_reservation()
+        succeeded = False
+        try:
+            succeeded = bool(action())
+            if after_dispatch is not None:
+                after_dispatch()
+        except Exception:
+            succeeded = False
+        completed = backend.complete_consumer_alert(
+            decision=decision,
+            reservation=reservation,
+            completed_at=now,
+            action_succeeded=succeeded,
+        )
+        return AuthorityConsumerActionResult(
+            True,
+            succeeded,
+            "schema4",
+            key.serialize(),
+            completed.generation,
+            (
+                "external_action_emitted_once"
+                if succeeded
+                else "external_action_failed_after_reservation",
+                "at_most_once_delivery",
+            ),
+        )
+
+    def continuity_shadow_snapshot(
+        self, server_key: str
+    ) -> ContinuityShadowSnapshot | None:
+        """Expose diagnostics only when the development shadow is enabled."""
+
+        if not self.continuity_shadow_enabled:
+            return None
+        server = self._servers.get(str(server_key))
+        tracker = self._continuity_shadow_trackers.get(str(server_key))
+        if server is None or tracker is None:
+            return ContinuityShadowSnapshot((), (), ())
+        return tracker.snapshot(server.events)
+
+    def expected_window_v2_shadow_snapshot(
+        self, server_key: str
+    ) -> tuple[ExpectedWindowLedgerRecord, ...] | None:
+        """Expose non-authoritative v2 results only when explicitly enabled."""
+
+        if not self.expected_window_v2_shadow_enabled:
+            return None
+        return tuple(self._expected_window_v2_shadow_ledgers.get(str(server_key), ()))
+
+    def continuity_authority_shadow_snapshot(
+        self, server_key: str
+    ) -> AuthorityDecision | None:
+        """Expose the immutable non-authoritative Stage 2B1 decision."""
+
+        if not self.continuity_authority_shadow_enabled:
+            return None
+        return self._continuity_authority_shadow_decisions.get(str(server_key))
+
+    def schema4_authority_shadow_snapshot(self, server_key: str) -> object | None:
+        """Expose persisted/in-memory comparison only when explicitly enabled."""
+
+        if not self.schema4_authority_shadow_enabled:
+            return None
+        return self._schema4_authority_shadow_comparisons.get(str(server_key))
 
     def _ingest_sample(
         self,
@@ -476,19 +843,88 @@ class Phase2RestartRuntime:
         *,
         persist_immediately: bool = False,
     ) -> RuntimeUpdate:
+        tracker = None
+        if self.continuity_shadow_enabled:
+            tracker = self._continuity_shadow_trackers.setdefault(
+                server.key, ContinuityShadowTracker(self.detection_config)
+            )
+            tracker.observe(sample)
+        previous_sample = server.previous_sample
+        if (
+            previous_sample is not None
+            and sample.lifecycle is LifecycleMarker.NORMAL
+        ):
+            edge = span_from_observations(
+                previous_sample,
+                sample,
+                config=self.detection_config,
+            )
+            if continuity_span_terminates_chain(edge):
+                prior_chain_id = server.continuity_chain_id
+                server.continuity_chain_id = deterministic_continuity_chain_id(
+                    server.key,
+                    server.app_session_id,
+                    server.monitoring_session_id,
+                    server.poll_generation,
+                    sample.wall_at,
+                )
+                sample = replace(
+                    sample,
+                    continuity_chain_id=server.continuity_chain_id,
+                    provenance_version=CONTINUITY_PROVENANCE_VERSION,
+                )
+                for session in reversed(server.monitoring_sessions):
+                    if session.get("session_id") != server.monitoring_session_id:
+                        continue
+                    chain_ids = [
+                        str(item)
+                        for item in session.get("continuity_chain_ids", ())
+                        if isinstance(item, str) and item
+                    ]
+                    if prior_chain_id and prior_chain_id not in chain_ids:
+                        chain_ids.append(prior_chain_id)
+                    if server.continuity_chain_id not in chain_ids:
+                        chain_ids.append(server.continuity_chain_id)
+                    session["continuity_chain_ids"] = chain_ids
+                    break
+                if tracker is not None:
+                    tracker.begin_chain(sample)
+                    logger.debug(
+                        "restart continuity shadow chain boundary kind=%s old=%s new=%s",
+                        edge.kind.value,
+                        prior_chain_id,
+                        server.continuity_chain_id,
+                    )
+                server.dirty = True
         previous_state = server.engine.state
-        previous_episode = _active_episode_signature(server.engine.active_episode)
-        self._extend_coverage(server, sample)
+        previous_episode = _active_episode_persistence_signature(
+            server.engine.active_episode,
+            config=self.detection_config,
+        )
         events = server.engine.ingest(sample)
+        self._extend_coverage(
+            server,
+            sample,
+            previous_engine_state=previous_state,
+            current_engine_state=server.engine.state,
+        )
         state_changed = (
             server.engine.state is not previous_state
-            or _active_episode_signature(server.engine.active_episode) != previous_episode
+            or _active_episode_persistence_signature(
+                server.engine.active_episode,
+                config=self.detection_config,
+            )
+            != previous_episode
             or bool(events)
             or sample.lifecycle is not LifecycleMarker.NORMAL
         )
         server.previous_sample = sample if sample.lifecycle is LifecycleMarker.NORMAL else None
         if events:
             events = self._route_finalized(server, events, now=sample.wall_at)
+        if self.continuity_shadow_enabled and (
+            events or sample.lifecycle is not LifecycleMarker.NORMAL
+        ):
+            self._log_continuity_shadow(server, events)
         if state_changed:
             server.dirty = True
         self._evaluate_expected_windows(server, now=sample.wall_at)
@@ -521,7 +957,65 @@ class Phase2RestartRuntime:
             persisted=persisted,
         )
 
-    def _extend_coverage(self, server: _ServerRuntime, sample: ObservationSample) -> None:
+    def _log_continuity_shadow(
+        self,
+        server: _ServerRuntime,
+        events: Iterable[PhysicalRestartEvent],
+    ) -> None:
+        tracker = self._continuity_shadow_trackers.get(server.key)
+        if tracker is None:
+            return
+        snapshot = tracker.snapshot(server.events)
+        for chain in snapshot.chains:
+            identity = f"chain:{chain.chain_id}:{chain.termination_reason}"
+            if identity in self._continuity_shadow_logged_ids:
+                continue
+            self._continuity_shadow_logged_ids.add(identity)
+            logger.debug(
+                "restart continuity shadow chain id=%s lifecycle=%s termination=%s reasons=%s",
+                chain.chain_id,
+                chain.lifecycle.value,
+                chain.termination_reason,
+                ",".join(chain.reason_codes),
+            )
+        event_ids = {item.event_id for item in events}
+        for relationship in snapshot.relationships:
+            if not event_ids.intersection(
+                {relationship.left_event_id, relationship.right_event_id}
+            ):
+                continue
+            identity = f"relationship:{relationship.relationship_id}"
+            if identity in self._continuity_shadow_logged_ids:
+                continue
+            self._continuity_shadow_logged_ids.add(identity)
+            logger.debug(
+                "restart continuity shadow relationship id=%s high=%s reasons=%s",
+                relationship.relationship_id,
+                relationship.high_authority_eligible,
+                ",".join(relationship.reason_codes),
+            )
+        for streak in snapshot.streaks:
+            if not event_ids.intersection(streak.event_ids):
+                continue
+            identity = f"streak:{streak.streak_id}"
+            if identity in self._continuity_shadow_logged_ids:
+                continue
+            self._continuity_shadow_logged_ids.add(identity)
+            logger.debug(
+                "restart continuity shadow streak id=%s intervals=%s reasons=%s",
+                streak.streak_id,
+                streak.interval_count,
+                ",".join(streak.reason_codes),
+            )
+
+    def _extend_coverage(
+        self,
+        server: _ServerRuntime,
+        sample: ObservationSample,
+        *,
+        previous_engine_state: EpisodeState,
+        current_engine_state: EpisodeState,
+    ) -> None:
         previous = server.previous_sample
         if previous is None or sample.lifecycle is not LifecycleMarker.NORMAL:
             return
@@ -534,11 +1028,11 @@ class Phase2RestartRuntime:
         ):
             return
         elapsed = sample.wall_at - previous.wall_at
-        previous_online = previous.info_status is InfoStatus.HEALTHY
+        previous_confirmed_offline = previous_engine_state is EpisodeState.OFFLINE
         threshold = (
-            max(30.0, 3.0 * self.detection_config.online_poll_interval)
-            if previous_online
-            else max(12.0, 4.0 * self.detection_config.offline_poll_interval)
+            max(12.0, 4.0 * self.detection_config.offline_poll_interval)
+            if previous_confirmed_offline
+            else max(30.0, 3.0 * self.detection_config.online_poll_interval)
         )
         if elapsed > threshold:
             kind = CoverageKind.SLEEP_GAP
@@ -547,7 +1041,18 @@ class Phase2RestartRuntime:
                 kind = CoverageKind.ONLINE_HEALTHY
             else:
                 kind = CoverageKind.MISSING_PLAYERS
-        elif previous.info_status is not InfoStatus.HEALTHY and sample.info_status is not InfoStatus.HEALTHY:
+        elif previous.info_status in {InfoStatus.NEUTRAL, InfoStatus.ERROR, InfoStatus.MISSING} or sample.info_status in {
+            InfoStatus.NEUTRAL,
+            InfoStatus.ERROR,
+            InfoStatus.MISSING,
+        }:
+            kind = CoverageKind.QUERY_HEALTH_GAP
+        elif (
+            previous_engine_state is EpisodeState.OFFLINE
+            and current_engine_state is EpisodeState.OFFLINE
+            and previous.info_status in {InfoStatus.TIMEOUT, InfoStatus.NETWORK_ERROR}
+            and sample.info_status in {InfoStatus.TIMEOUT, InfoStatus.NETWORK_ERROR}
+        ):
             kind = CoverageKind.OFFLINE_OBSERVED
         else:
             # A healthy/failure boundary is timestamped by two real polls. Leave
@@ -556,21 +1061,32 @@ class Phase2RestartRuntime:
             # genuine observed outage destroy otherwise continuous coverage.
             return
         cadence = (
-            self.detection_config.online_poll_interval
-            if previous_online
-            else self.detection_config.offline_poll_interval
+            self.detection_config.offline_poll_interval
+            if previous_confirmed_offline
+            else self.detection_config.online_poll_interval
         )
-        segment = CoverageSegment(previous.wall_at, sample.wall_at, kind, cadence)
+        segment = CoverageSegment(
+            previous.wall_at,
+            sample.wall_at,
+            kind,
+            cadence,
+            server_key=server.key,
+            app_session_id=sample.app_session_id,
+            monitoring_session_id=sample.monitoring_session_id,
+            poll_generation=sample.poll_generation,
+            continuity_chain_id=sample.continuity_chain_id,
+            provenance_version=sample.provenance_version,
+        )
         if (
             server.coverage
             and server.coverage[-1].kind is segment.kind
             and server.coverage[-1].end_at == segment.start_at
             and server.coverage[-1].cadence == segment.cadence
+            and server.coverage[-1].continuity_chain_id
+            == segment.continuity_chain_id
         ):
             prior = server.coverage[-1]
-            server.coverage[-1] = CoverageSegment(
-                prior.start_at, segment.end_at, segment.kind, segment.cadence
-            )
+            server.coverage[-1] = replace(prior, end_at=segment.end_at)
         else:
             server.coverage.append(segment)
         cutoff = sample.wall_at - COVERAGE_MAX_AGE_SECONDS
@@ -723,6 +1239,7 @@ class Phase2RestartRuntime:
             incumbent_period_seconds=server.incumbent_period_seconds,
             aggregate=server.aggregate,
             expected_misses=server.expected_misses,
+            regime_boundaries=(item.ended_at for item in server.prior_regimes),
         )
         if server.prior_regimes and not score.prior_regimes:
             score = replace(score, prior_regimes=server.prior_regimes)
@@ -774,7 +1291,226 @@ class Phase2RestartRuntime:
             )
         )
         server.decision = decision
+        if self.continuity_authority_shadow_enabled:
+            self._evaluate_continuity_authority_shadow(server)
+        if (
+            self.schema4_authority_consumer_shadow_enabled
+            or self.schema4_authority_production_cutover_enabled
+        ):
+            self._evaluate_authority_consumer_shadow(
+                server,
+                schema3_decision=decision,
+                now=now,
+                server_online_healthy=server_online_healthy,
+                restart_alert_enabled=restart_alert_enabled,
+                event=event,
+            )
         return decision
+
+    def _evaluate_authority_consumer_shadow(
+        self,
+        server: _ServerRuntime,
+        *,
+        schema3_decision: ConsumerDecision,
+        now: float,
+        server_online_healthy: bool,
+        restart_alert_enabled: bool,
+        event: PhysicalRestartEvent | None,
+    ) -> None:
+        from .companion_restart_phase2_authority_consumers import (
+            AuthorityConsumerPolicyInput,
+            compare_authority_consumers,
+            evaluate_authority_consumers,
+            resolve_authority_consumer_cutover,
+        )
+
+        backend = self._authoritative_schema4_backend
+        authority_decision = None
+        valid = False
+        if self.authoritative_schema4_runtime_enabled and backend is not None:
+            valid = bool(backend.server_authority_valid(server.key))
+            if valid:
+                authority_decision = backend.authority_decision(server.key)
+        if authority_decision is None:
+            authority_decision = self._continuity_authority_shadow_decisions.get(
+                server.key
+            )
+            valid = authority_decision is not None
+
+        consumer = None
+        if authority_decision is not None:
+            fired_keys = (
+                backend.consumer_fired_keys(server.key)
+                if self.authoritative_schema4_runtime_enabled
+                and backend is not None
+                and valid
+                else frozenset()
+            )
+            consumer = evaluate_authority_consumers(
+                AuthorityConsumerPolicyInput(
+                    authority_decision=authority_decision,
+                    now=now,
+                    server_online_healthy=server_online_healthy,
+                    restart_alert_enabled=restart_alert_enabled,
+                    physical_recovery_event_id=(event.event_id if event else None),
+                    physical_recovery_eligible=schema3_decision.generic_recovery_eligible,
+                    fired_keys=fired_keys,
+                    normal_pattern_supported=(
+                        schema3_decision.model_status is not ConsumerModelStatus.NO_PATTERN
+                    ),
+                    normal_pattern_confidence=(
+                        schema3_decision.schedule_existence_confidence
+                    ),
+                )
+            )
+            self._authority_consumer_shadow_decisions[server.key] = consumer
+            if (
+                self.schema4_authority_production_cutover_enabled
+                and self.authoritative_schema4_runtime_enabled
+                and backend is not None
+                and valid
+                and server_online_healthy
+            ):
+                backend.record_consumer_decision(consumer, created_at=now)
+            comparison = compare_authority_consumers(schema3_decision, consumer)
+            self._authority_consumer_comparisons[server.key] = comparison
+            if (
+                comparison.significant_difference
+                and comparison.comparison_id not in self._authority_consumer_logged_ids
+            ):
+                self._authority_consumer_logged_ids.add(comparison.comparison_id)
+                logger.debug(
+                    "restart authority consumer shadow server=%s comparison=%s "
+                    "schema3=%s schema4=%s differences=%s",
+                    server.key,
+                    comparison.comparison_id,
+                    comparison.schema3_presentation_key,
+                    comparison.schema4_presentation_key,
+                    ",".join(comparison.reason_code_differences),
+                )
+        self._authority_consumer_resolutions[server.key] = (
+            resolve_authority_consumer_cutover(
+                schema3_decision=schema3_decision,
+                schema4_decision=consumer,
+                production_cutover_enabled=(
+                    self.schema4_authority_production_cutover_enabled
+                ),
+                authoritative_schema4_runtime_enabled=(
+                    self.authoritative_schema4_runtime_enabled
+                ),
+                schema4_server_valid=valid,
+            )
+        )
+
+    def _evaluate_continuity_authority_shadow(
+        self, server: _ServerRuntime
+    ) -> None:
+        """Reconstruct and evaluate authority without changing production state."""
+
+        if server.score is None:
+            return
+        reconstructed_events = tuple(
+            reconstruct_historical_event_provenance(
+                item, server.monitoring_sessions
+            ).event
+            for item in server.events
+        )
+        spans = continuity_spans_from_coverage(
+            server.coverage,
+            server_key=server.key,
+            monitoring_sessions=server.monitoring_sessions,
+        )
+        transition_spans = observed_transition_spans_from_events(
+            reconstructed_events
+        )
+        span_values = tuple(
+            {
+                item.reference_id: item for item in (*spans, *transition_spans)
+            }.values()
+        )
+        chains = build_continuity_chains(span_values)
+        relationships = extract_interval_relationships(
+            reconstructed_events, span_values
+        )
+        streaks = build_cadence_streaks(relationships, chains=chains)
+        previous = self._continuity_authority_shadow_decisions.get(server.key)
+        decision = evaluate_authority(
+            server_key=server.key,
+            normal_score=server.score,
+            relationships=relationships,
+            streaks=streaks,
+            expected_window_ledger=self._expected_window_v2_shadow_ledgers.get(
+                server.key, ()
+            ),
+            events=reconstructed_events,
+            prior_decision=previous,
+        )
+        self._continuity_authority_shadow_decisions[server.key] = decision
+        if self.schema4_authority_shadow_enabled:
+            self._compare_schema4_authority_shadow(
+                server,
+                decision=decision,
+                relationship_count=len(relationships),
+                streak_count=len(streaks),
+            )
+        if decision.decision_id in self._continuity_authority_shadow_logged_ids:
+            return
+        self._continuity_authority_shadow_logged_ids.add(decision.decision_id)
+        selected = decision.selected_shadow_regime
+        challenger = decision.strongest_challenger
+        logger.debug(
+            "restart authority shadow decision=%s state=%s selected=%s period=%s "
+            "challenger=%s high_relationships=%s streaks=%s reasons=%s",
+            decision.decision_id,
+            decision.state.value,
+            selected.regime_id if selected is not None else "none",
+            selected.candidate_period_seconds if selected is not None else "none",
+            challenger.context_id if challenger is not None else "none",
+            ",".join(decision.high_ledger.high_relationship_ids),
+            ",".join(decision.high_ledger.maximal_streak_ids),
+            ",".join(decision.reason_codes),
+        )
+
+    def _compare_schema4_authority_shadow(
+        self,
+        server: _ServerRuntime,
+        *,
+        decision: AuthorityDecision,
+        relationship_count: int,
+        streak_count: int,
+    ) -> None:
+        from .companion_restart_phase2_schema4 import compare_persisted_authority
+
+        root = self._schema4_authority_shadow_state
+        servers = root.get("servers") if isinstance(root, Mapping) else None
+        record = servers.get(server.key) if isinstance(servers, Mapping) else None
+        comparison = compare_persisted_authority(
+            record=record if isinstance(record, Mapping) else None,
+            in_memory_decision=decision,
+            in_memory_relationship_count=relationship_count,
+            in_memory_streak_count=streak_count,
+            in_memory_expected_window_count=len(
+                self._expected_window_v2_shadow_ledgers.get(server.key, ())
+            ),
+        )
+        self._schema4_authority_shadow_comparisons[server.key] = comparison
+        identity = (
+            f"{comparison.in_memory_decision_id}:"
+            f"{comparison.persisted_decision_id}:"
+            f"{comparison.object_counts_equal}"
+        )
+        if identity in self._schema4_authority_shadow_logged_ids:
+            return
+        self._schema4_authority_shadow_logged_ids.add(identity)
+        logger.debug(
+            "restart schema4 authority shadow server=%s decision_equal=%s "
+            "counts_equal=%s warnings=%s reasons=%s",
+            server.key,
+            comparison.decision_id_equal,
+            comparison.object_counts_equal,
+            ",".join(comparison.migration_warnings),
+            ",".join(comparison.reason_codes),
+        )
 
     def _evaluate_expected_windows(self, server: _ServerRuntime, *, now: float) -> None:
         score = server.score
@@ -786,7 +1522,7 @@ class Phase2RestartRuntime:
         added = False
         for candidate in score.candidates:
             if (
-                candidate.strict_direct_interval_count < 2
+                candidate.fundamental_relationship_count < 2
                 or candidate.phase_offset is None
                 or candidate.phase_confidence <= 0
             ):
@@ -857,6 +1593,133 @@ class Phase2RestartRuntime:
                 self._fold_expected_misses(server, ordered[:-60])
             server.expected_misses[:] = ordered[-60:]
             server.dirty = True
+        if (
+            self.expected_window_v2_shadow_enabled
+            or self.continuity_authority_shadow_enabled
+        ):
+            self._evaluate_expected_windows_v2_shadow(server, now=now)
+
+    def _evaluate_expected_windows_v2_shadow(
+        self, server: _ServerRuntime, *, now: float
+    ) -> None:
+        """Evaluate the same completed windows without affecting v1 authority."""
+
+        score = server.score
+        if score is None or not server.coverage:
+            return
+        ledger = self._expected_window_v2_shadow_ledgers.setdefault(server.key, [])
+        spans = continuity_spans_from_coverage(
+            server.coverage,
+            server_key=server.key,
+            monitoring_sessions=server.monitoring_sessions,
+        )
+        episodes = _expected_window_v2_episode_evidence(server)
+        coverage_start = min(item.start_at for item in server.coverage)
+        for candidate in score.candidates:
+            if (
+                candidate.fundamental_relationship_count < 2
+                or candidate.phase_offset is None
+                or candidate.phase_confidence <= 0
+            ):
+                continue
+            period = candidate.period_seconds
+            tolerance = candidate_phase_tolerance(period)
+            start = max(coverage_start, now - 7 * 24 * 3600)
+            multiplier = math.ceil((start - candidate.phase_offset) / period)
+            expected = candidate.phase_offset + multiplier * period
+            model_revision_id = deterministic_model_revision_id(
+                server.key,
+                period,
+                candidate.phase_offset,
+                (
+                    f"normal-scorer-v{SCORING_SEMANTICS_VERSION}:"
+                    f"relationships={candidate.fundamental_relationship_count}:"
+                    f"phase={candidate.phase_confidence:.6f}"
+                ),
+            )
+            checked = 0
+            while expected + tolerance <= now and checked < 64:
+                checked += 1
+                result = classify_expected_window(
+                    server_key=server.key,
+                    candidate_period_seconds=period,
+                    expected_phase_offset=candidate.phase_offset,
+                    window_start_at=max(0.0, expected - tolerance),
+                    expected_at=expected,
+                    window_end_at=expected + tolerance,
+                    model_revision_id=model_revision_id,
+                    regime_interpretation_id=None,
+                    events=server.events,
+                    spans=spans,
+                    episodes=episodes,
+                )
+                window_key = (server.key, period, int(round(expected)))
+                existing_for_window = [
+                    item
+                    for item in ledger
+                    if (
+                        item.server_key,
+                        item.candidate_period_seconds,
+                        int(round(item.expected_at)),
+                    )
+                    == window_key
+                ]
+                new_records: tuple[ExpectedWindowLedgerRecord, ...] = ()
+                if not existing_for_window:
+                    ledger.append(result)
+                    new_records = (result,)
+                else:
+                    reconciled = reconcile_expected_window_ledger(
+                        ledger,
+                        (result,),
+                        reconciled_at=now,
+                        evidence_revision_id=_expected_window_v2_evidence_revision(
+                            server, result
+                        ),
+                    )
+                    if len(reconciled) > len(ledger):
+                        new_records = tuple(reconciled[len(ledger):])
+                        ledger[:] = reconciled
+                for record in new_records:
+                    self._log_expected_window_v2_shadow(server, record)
+                expected += period
+
+    def _log_expected_window_v2_shadow(
+        self,
+        server: _ServerRuntime,
+        record: ExpectedWindowLedgerRecord,
+    ) -> None:
+        if record.result_id in self._expected_window_v2_shadow_logged_ids:
+            return
+        self._expected_window_v2_shadow_logged_ids.add(record.result_id)
+        v1_miss = any(
+            item.period_seconds == record.candidate_period_seconds
+            and int(round(item.expected_at)) == int(round(record.expected_at))
+            for item in server.expected_misses
+        )
+        if isinstance(record, ExpectedWindowRevision):
+            comparison = "proposed_retraction"
+        elif v1_miss and record.outcome is ExpectedWindowOutcome.AMBIGUOUS:
+            comparison = "v1_miss_v2_ambiguous"
+        elif v1_miss and record.outcome is ExpectedWindowOutcome.UNKNOWN:
+            comparison = "v1_miss_v2_unknown"
+        elif v1_miss and record.outcome is ExpectedWindowOutcome.GENUINE_MISS:
+            comparison = "v1_v2_genuine_miss_agreement"
+        elif record.outcome is ExpectedWindowOutcome.HIT:
+            comparison = "v2_hit"
+        else:
+            comparison = "v2_completed_window"
+        logger.debug(
+            "restart expected-window v2 shadow comparison=%s id=%s period=%s "
+            "expected=%s outcome=%s evidence=%s reasons=%s",
+            comparison,
+            record.result_id,
+            record.candidate_period_seconds,
+            record.expected_at,
+            record.outcome.value,
+            ",".join(record.overlapping_outage_episode_ids),
+            ",".join(record.reason_codes),
+        )
 
     def _fold_expected_misses(
         self, server: _ServerRuntime, misses: list[CoveredExpectedMiss]
@@ -885,8 +1748,34 @@ class Phase2RestartRuntime:
     def _persist_server(self, server: _ServerRuntime, *, force: bool, now: float) -> bool:
         if not self.persistence_enabled or not server.dirty:
             return False
+        backend = self._authoritative_schema4_backend
+        # Schema 4 persists completed durable evidence, not a growing healthy
+        # poll edge.  A later event, lifecycle close, expected-window result,
+        # regime change, compaction, or shutdown captures the coalesced span.
+        if backend is not None and not force:
+            return False
         if not force and now - server.last_saved_at < PERSIST_HEARTBEAT_SECONDS:
             return False
+        if backend is not None:
+            try:
+                changed = backend.update_server_from_schema3(
+                    server.key,
+                    _serialize_server(server),
+                    updated_at=now,
+                    durable_reason=(
+                        "schema4_chain_or_event_durable_update"
+                        if force
+                        else "schema4_coalesced_runtime_update"
+                    ),
+                )
+                result = backend.flush() if force else None
+            except Exception as exc:
+                self.persistence_status = RuntimePersistenceStatus.DISABLED_WRITE_FAILED
+                self.persistence_error = f"{type(exc).__name__}: {exc}"
+                return False
+            server.dirty = False
+            server.last_saved_at = now
+            return bool(changed and result is not None and result.wrote)
         servers = self.state.setdefault("servers", {})
         servers[server.key] = _serialize_server(server)
         self._compact_global_history(active_key=server.key, now=now)
@@ -1021,6 +1910,9 @@ class Phase2RestartRuntime:
                     incumbent_period_seconds=server.incumbent_period_seconds,
                     aggregate=server.aggregate,
                     expected_misses=server.expected_misses,
+                    regime_boundaries=(
+                        item.ended_at for item in server.prior_regimes
+                    ),
                 )
                 if server.prior_regimes and not server.score.prior_regimes:
                     server.score = replace(
@@ -1047,14 +1939,25 @@ def observation_from_live_result(
     monitoring_session_id: str,
     poll_generation: int,
     server_key: str,
+    continuity_chain_id: str | None = None,
+    provenance_version: int = 0,
 ) -> ObservationSample:
     payload = info if isinstance(info, dict) else {}
-    healthy = payload.get("ok") is True
-    if healthy:
+    disposition = live_result_disposition(payload)
+    healthy = disposition is LiveResultDisposition.HEALTHY
+    if disposition is LiveResultDisposition.HEALTHY:
         info_status = InfoStatus.HEALTHY
+    elif disposition is LiveResultDisposition.NEUTRAL:
+        info_status = InfoStatus.NEUTRAL
+    elif disposition is LiveResultDisposition.QUALIFYING_FAILURE:
+        classification = _live_result_classification(payload)
+        info_status = (
+            InfoStatus.TIMEOUT
+            if classification in {"timeout", "explicit-offline"}
+            else InfoStatus.NETWORK_ERROR
+        )
     else:
-        error = str(payload.get("err") or payload.get("error") or "").lower()
-        info_status = InfoStatus.TIMEOUT if "timeout" in error or "timed out" in error else InfoStatus.ERROR
+        info_status = InfoStatus.ERROR
 
     player_status, players = _field_from_payload(payload, "players", healthy=healthy)
     queue_status, queue = _field_from_payload(payload, "queue", healthy=healthy)
@@ -1078,7 +1981,35 @@ def observation_from_live_result(
         max_players=max_players,
         queue_status=queue_status,
         queue=queue,
+        continuity_chain_id=continuity_chain_id,
+        provenance_version=provenance_version,
     )
+
+
+def live_result_disposition(info: object) -> LiveResultDisposition:
+    payload = info if isinstance(info, dict) else {}
+    if payload.get("ok") is True:
+        return LiveResultDisposition.HEALTHY
+    if payload.get("neutral") is True or payload.get("outcome") == "alive-but-info-unavailable":
+        return LiveResultDisposition.NEUTRAL
+    classification = _live_result_classification(payload)
+    if classification == "alive-but-info-unavailable":
+        return LiveResultDisposition.NEUTRAL
+    if classification in {"timeout", "socket-error", "explicit-offline"}:
+        return LiveResultDisposition.QUALIFYING_FAILURE
+    return LiveResultDisposition.PROTOCOL_FAILURE
+
+
+def _live_result_classification(payload: dict) -> str:
+    structured = str(payload.get("a2s_classification") or "").strip().lower()
+    if not structured:
+        diagnostics = payload.get("_a2s_diag")
+        if isinstance(diagnostics, dict):
+            structured = str(diagnostics.get("classification") or "").strip().lower()
+    if structured:
+        return structured
+    error = payload.get("err") or payload.get("error")
+    return result_classification(error)
 
 
 def _new_server_runtime(key: str, config: DetectionConfig) -> _ServerRuntime:
@@ -1127,13 +2058,7 @@ def _serialize_server(server: _ServerRuntime) -> dict:
         "aggregate": _serialize_aggregate(server.aggregate),
         "prior_regimes": [asdict(item) for item in server.prior_regimes],
         "active_episode": (
-            {
-                "event_id": active.event_id,
-                "fingerprint": active.fingerprint,
-                "started_at": active.started_wall,
-                "state": server.engine.state.value,
-                "coverage_complete": active.coverage_complete,
-            }
+            _serialize_active_episode(active, state=server.engine.state)
             if active is not None
             else None
         ),
@@ -1141,6 +2066,233 @@ def _serialize_server(server: _ServerRuntime) -> dict:
         "candidate_diagnostics": _serialize_score(server.score),
         "consumer_adapter_version": CONSUMER_ADAPTER_VERSION,
     }
+
+
+def _serialize_active_episode(
+    episode: object,
+    *,
+    state: EpisodeState,
+) -> dict:
+    """Serialize the last meaningful episode boundary for crash-safe recovery."""
+
+    return {
+        "snapshot_version": ACTIVE_EPISODE_SNAPSHOT_VERSION,
+        "state": state.value,
+        "sequence": episode.sequence,
+        "server_key": episode.server_key,
+        "app_session_id": episode.app_session_id,
+        "monitoring_session_id": episode.monitoring_session_id,
+        "poll_generation": episode.poll_generation,
+        "started_wall": episode.started_wall,
+        "started_mono": episode.started_mono,
+        "fingerprint": episode.fingerprint,
+        "event_id": episode.event_id,
+        "continuity_chain_id": episode.continuity_chain_id,
+        "provenance_version": episode.provenance_version,
+        "baseline_players": episode.baseline_players,
+        "baseline_wall": episode.baseline_wall,
+        "baseline_mono": episode.baseline_mono,
+        "last_positive_wall": episode.last_positive_wall,
+        "last_positive_mono": episode.last_positive_mono,
+        "drain_wall": episode.drain_wall,
+        "drain_mono": episode.drain_mono,
+        "low_start_wall": episode.low_start_wall,
+        "low_start_mono": episode.low_start_mono,
+        "zero_reached": episode.zero_reached,
+        "minimum_players": episode.minimum_players,
+        "drop_fraction": episode.drop_fraction,
+        "abrupt_drain": episode.abrupt_drain,
+        "drain_inherited": episode.drain_inherited,
+        "low_samples": list(episode.low_samples),
+        "low_sample_count": episode.low_sample_count,
+        "first_failure_wall": episode.first_failure_wall,
+        "first_failure_mono": episode.first_failure_mono,
+        "last_failure_mono": episode.last_failure_mono,
+        "failure_count": episode.failure_count,
+        "failure_statuses": [item.value for item in episode.failure_statuses],
+        "confirmed_offline_wall": episode.confirmed_offline_wall,
+        "confirmed_offline_mono": episode.confirmed_offline_mono,
+        "info_return_wall": episode.info_return_wall,
+        "info_return_mono": episode.info_return_mono,
+        "first_queue_wall": episode.first_queue_wall,
+        "first_queue_mono": episode.first_queue_mono,
+        "first_player_wall": episode.first_player_wall,
+        "first_player_mono": episode.first_player_mono,
+        "recovery_positive_times": list(episode.recovery_positive_times),
+        "recovery_positive_count": episode.recovery_positive_count,
+        "stable_recovery_wall": episode.stable_recovery_wall,
+        "stable_recovery_mono": episode.stable_recovery_mono,
+        "recovery_bounced": episode.recovery_bounced,
+        "healthy_samples": episode.healthy_samples,
+        "failed_samples": episode.failed_samples,
+        "missing_player_samples": episode.missing_player_samples,
+        "coverage_complete": episode.coverage_complete,
+        "lifecycle_interruption": (
+            episode.lifecycle_interruption.value
+            if episode.lifecycle_interruption is not None
+            else None
+        ),
+        "sources": sorted(item.value for item in episode.sources),
+        "samples": [_serialize_sample(item) for item in episode.samples],
+        "reason_codes": sorted(episode.reason_codes),
+        "recovery_snapshot_unchanged": episode.recovery_snapshot_unchanged,
+    }
+
+
+def _deserialize_active_episode(
+    server_key: str,
+    raw: dict,
+    config: DetectionConfig,
+) -> PhysicalEpisodeEngine | None:
+    """Restore versioned semantic episode state; legacy summaries stay incomplete."""
+
+    if raw.get("snapshot_version") != ACTIVE_EPISODE_SNAPSHOT_VERSION:
+        return None
+    try:
+        if _required_string(raw.get("server_key")) != server_key:
+            raise ValueError("active episode server key mismatch")
+        episode = detection_module._Episode(
+            sequence=_nonnegative_int(raw.get("sequence"), 0),
+            server_key=server_key,
+            app_session_id=_required_string(raw.get("app_session_id")),
+            monitoring_session_id=_required_string(
+                raw.get("monitoring_session_id")
+            ),
+            poll_generation=_nonnegative_int(raw.get("poll_generation"), 0),
+            started_wall=_safe_nonnegative_float(raw.get("started_wall"), 0.0),
+            started_mono=_safe_nonnegative_float(raw.get("started_mono"), 0.0),
+            fingerprint=_required_string(raw.get("fingerprint")),
+            event_id=_required_string(raw.get("event_id")),
+            continuity_chain_id=_optional_string(
+                raw.get("continuity_chain_id")
+            ),
+            provenance_version=_nonnegative_int(
+                raw.get("provenance_version"), 0
+            ),
+            baseline_players=_optional_count(raw.get("baseline_players")),
+            baseline_wall=_optional_nonnegative_float(raw.get("baseline_wall")),
+            baseline_mono=_optional_nonnegative_float(raw.get("baseline_mono")),
+            last_positive_wall=_optional_nonnegative_float(
+                raw.get("last_positive_wall")
+            ),
+            last_positive_mono=_optional_nonnegative_float(
+                raw.get("last_positive_mono")
+            ),
+            drain_wall=_optional_nonnegative_float(raw.get("drain_wall")),
+            drain_mono=_optional_nonnegative_float(raw.get("drain_mono")),
+            low_start_wall=_optional_nonnegative_float(
+                raw.get("low_start_wall")
+            ),
+            low_start_mono=_optional_nonnegative_float(
+                raw.get("low_start_mono")
+            ),
+            zero_reached=bool(raw.get("zero_reached", False)),
+            minimum_players=_optional_count(raw.get("minimum_players")),
+            drop_fraction=_optional_unit_float(raw.get("drop_fraction")),
+            abrupt_drain=bool(raw.get("abrupt_drain", False)),
+            drain_inherited=bool(raw.get("drain_inherited", False)),
+            low_samples=_finite_nonnegative_float_list(raw.get("low_samples"), 16),
+            low_sample_count=_nonnegative_int(raw.get("low_sample_count"), 0),
+            first_failure_wall=_optional_nonnegative_float(
+                raw.get("first_failure_wall")
+            ),
+            first_failure_mono=_optional_nonnegative_float(
+                raw.get("first_failure_mono")
+            ),
+            last_failure_mono=_optional_nonnegative_float(
+                raw.get("last_failure_mono")
+            ),
+            failure_count=_nonnegative_int(raw.get("failure_count"), 0),
+            failure_statuses=[
+                InfoStatus(item)
+                for item in raw.get("failure_statuses", ())
+                if isinstance(item, str)
+            ][-16:],
+            confirmed_offline_wall=_optional_nonnegative_float(
+                raw.get("confirmed_offline_wall")
+            ),
+            confirmed_offline_mono=_optional_nonnegative_float(
+                raw.get("confirmed_offline_mono")
+            ),
+            info_return_wall=_optional_nonnegative_float(
+                raw.get("info_return_wall")
+            ),
+            info_return_mono=_optional_nonnegative_float(
+                raw.get("info_return_mono")
+            ),
+            first_queue_wall=_optional_nonnegative_float(
+                raw.get("first_queue_wall")
+            ),
+            first_queue_mono=_optional_nonnegative_float(
+                raw.get("first_queue_mono")
+            ),
+            first_player_wall=_optional_nonnegative_float(
+                raw.get("first_player_wall")
+            ),
+            first_player_mono=_optional_nonnegative_float(
+                raw.get("first_player_mono")
+            ),
+            recovery_positive_times=_finite_nonnegative_float_list(
+                raw.get("recovery_positive_times"), 8
+            ),
+            recovery_positive_count=_nonnegative_int(
+                raw.get("recovery_positive_count"), 0
+            ),
+            stable_recovery_wall=_optional_nonnegative_float(
+                raw.get("stable_recovery_wall")
+            ),
+            stable_recovery_mono=_optional_nonnegative_float(
+                raw.get("stable_recovery_mono")
+            ),
+            recovery_bounced=bool(raw.get("recovery_bounced", False)),
+            healthy_samples=_nonnegative_int(raw.get("healthy_samples"), 0),
+            failed_samples=_nonnegative_int(raw.get("failed_samples"), 0),
+            missing_player_samples=_nonnegative_int(
+                raw.get("missing_player_samples"), 0
+            ),
+            coverage_complete=bool(raw.get("coverage_complete", False)),
+            lifecycle_interruption=(
+                LifecycleMarker(raw.get("lifecycle_interruption"))
+                if raw.get("lifecycle_interruption") is not None
+                else None
+            ),
+            sources={
+                SignalSource(item)
+                for item in raw.get("sources", ())
+                if isinstance(item, str)
+            },
+            samples=[
+                sample
+                for item in raw.get("samples", ())
+                for sample in (_deserialize_sample(item),)
+                if sample.server_key == server_key
+            ],
+            reason_codes={
+                str(item)
+                for item in raw.get("reason_codes", ())
+                if isinstance(item, str) and item
+            },
+            recovery_snapshot_unchanged=bool(
+                raw.get("recovery_snapshot_unchanged", False)
+            ),
+        )
+        state = EpisodeState(raw.get("state"))
+        if (
+            state is EpisodeState.IDLE
+            or episode.sequence < 1
+            or (
+                state is EpisodeState.OFFLINE
+                and episode.confirmed_offline_mono is None
+            )
+        ):
+            raise ValueError("active episode semantic state is inconsistent")
+        engine = PhysicalEpisodeEngine(config)
+        engine._episode = episode
+        engine._sequence = episode.sequence
+        engine.state = state
+        return engine
+    except (TypeError, ValueError):
+        return None
 
 
 def _deserialize_server(key: str, raw: object, config: DetectionConfig) -> _ServerRuntime:
@@ -1233,6 +2385,17 @@ def _deserialize_server(key: str, raw: object, config: DetectionConfig) -> _Serv
             "session_id": session_id,
             "app_session_id": app_id,
             "poll_generation": _nonnegative_int(item.get("poll_generation"), 0),
+            "continuity_chain_id": _optional_string(
+                item.get("continuity_chain_id")
+            ),
+            "continuity_chain_ids": [
+                value
+                for value in item.get("continuity_chain_ids", ())
+                if isinstance(value, str) and value
+            ] if isinstance(item.get("continuity_chain_ids"), list) else [],
+            "provenance_version": _nonnegative_int(
+                item.get("provenance_version"), 0
+            ),
             "started_at": _safe_nonnegative_float(item.get("started_at"), 0.0),
             "ended_at": _optional_nonnegative_float(item.get("ended_at")),
             "reason": str(item.get("reason") or "") or None,
@@ -1285,7 +2448,14 @@ def _deserialize_server(key: str, raw: object, config: DetectionConfig) -> _Serv
             session["reason"] = LifecycleMarker.APP_RESTART.value
             server.dirty = True
     active = raw.get("active_episode")
-    if isinstance(active, dict):
+    restored_engine = (
+        _deserialize_active_episode(key, active, config)
+        if isinstance(active, dict)
+        else None
+    )
+    if restored_engine is not None:
+        server.engine = restored_engine
+    elif isinstance(active, dict):
         server.incomplete_episodes.append({
             "event_id": str(active.get("event_id") or ""),
             "fingerprint": str(active.get("fingerprint") or ""),
@@ -1299,6 +2469,9 @@ def _deserialize_server(key: str, raw: object, config: DetectionConfig) -> _Serv
 
 
 def _serialize_event(event: PhysicalRestartEvent, *, include_samples: bool = True) -> dict:
+    diagnostic_samples = list(event.samples)
+    if len(diagnostic_samples) > 48:
+        diagnostic_samples = [diagnostic_samples[0], *diagnostic_samples[-47:]]
     return {
         "event_id": event.event_id,
         "sequence": event.sequence,
@@ -1322,11 +2495,16 @@ def _serialize_event(event: PhysicalRestartEvent, *, include_samples: bool = Tru
         "coverage_complete": event.coverage_complete,
         "lifecycle_interruption": event.lifecycle_interruption.value if event.lifecycle_interruption else None,
         "samples": (
-            [_serialize_sample(item) for item in event.samples[-48:]]
+            [_serialize_sample(item) for item in diagnostic_samples]
             if include_samples
             else []
         ),
         "reason_codes": list(event.reason_codes),
+        "app_session_id": event.app_session_id,
+        "monitoring_session_id": event.monitoring_session_id,
+        "poll_generation": event.poll_generation,
+        "continuity_chain_id": event.continuity_chain_id,
+        "provenance_version": event.provenance_version,
     }
 
 
@@ -1368,6 +2546,9 @@ def _deserialize_event(raw: object) -> PhysicalRestartEvent:
             low_sample_count=_nonnegative_int(drain.get("low_sample_count"), 0),
             low_duration=_safe_nonnegative_float(drain.get("low_duration"), 0.0),
             abrupt=_strict_bool(drain.get("abrupt"), False),
+            baseline_at=_optional_nonnegative_float(drain.get("baseline_at")),
+            decline_duration=_safe_nonnegative_float(drain.get("decline_duration"), 0.0),
+            inherited=_strict_bool(drain.get("inherited"), False),
         ),
         outage=OutageSummary(
             first_failure_at=_optional_nonnegative_float(outage.get("first_failure_at")),
@@ -1396,6 +2577,11 @@ def _deserialize_event(raw: object) -> PhysicalRestartEvent:
         lifecycle_interruption=LifecycleMarker(lifecycle) if lifecycle in {item.value for item in LifecycleMarker} else None,
         samples=tuple(samples),
         reason_codes=tuple(str(item) for item in raw.get("reason_codes", []) if isinstance(item, str)),
+        app_session_id=_optional_string(raw.get("app_session_id")),
+        monitoring_session_id=_optional_string(raw.get("monitoring_session_id")),
+        poll_generation=_optional_nonnegative_int(raw.get("poll_generation")),
+        continuity_chain_id=_optional_string(raw.get("continuity_chain_id")),
+        provenance_version=_nonnegative_int(raw.get("provenance_version"), 0),
     )
 
 
@@ -1415,6 +2601,8 @@ def _serialize_sample(sample: ObservationSample) -> dict:
         "queue_status": sample.queue_status.value,
         "queue": sample.queue,
         "lifecycle": sample.lifecycle.value,
+        "continuity_chain_id": sample.continuity_chain_id,
+        "provenance_version": sample.provenance_version,
     }
 
 
@@ -1436,6 +2624,8 @@ def _deserialize_sample(raw: object) -> ObservationSample:
         queue_status=FieldStatus(raw.get("queue_status")),
         queue=_optional_count(raw.get("queue")),
         lifecycle=LifecycleMarker(raw.get("lifecycle", LifecycleMarker.NORMAL.value)),
+        continuity_chain_id=_optional_string(raw.get("continuity_chain_id")),
+        provenance_version=_nonnegative_int(raw.get("provenance_version"), 0),
     )
 
 
@@ -1445,6 +2635,12 @@ def _serialize_coverage(segment: CoverageSegment) -> dict:
         "end_at": segment.end_at,
         "kind": segment.kind.value,
         "cadence": segment.cadence,
+        "server_key": segment.server_key,
+        "app_session_id": segment.app_session_id,
+        "monitoring_session_id": segment.monitoring_session_id,
+        "poll_generation": segment.poll_generation,
+        "continuity_chain_id": segment.continuity_chain_id,
+        "provenance_version": segment.provenance_version,
     }
 
 
@@ -1456,6 +2652,12 @@ def _deserialize_coverage(raw: object) -> CoverageSegment:
         end_at=_safe_nonnegative_float(raw.get("end_at"), 0.0),
         kind=CoverageKind(raw.get("kind")),
         cadence=max(0.001, _safe_nonnegative_float(raw.get("cadence"), 10.0)),
+        server_key=_optional_string(raw.get("server_key")),
+        app_session_id=_optional_string(raw.get("app_session_id")),
+        monitoring_session_id=_optional_string(raw.get("monitoring_session_id")),
+        poll_generation=_optional_nonnegative_int(raw.get("poll_generation")),
+        continuity_chain_id=_optional_string(raw.get("continuity_chain_id")),
+        provenance_version=_nonnegative_int(raw.get("provenance_version"), 0),
     )
 
 
@@ -1546,6 +2748,10 @@ def _serialize_score(score: ScheduleScore | None) -> dict:
                 "period_seconds": item.period_seconds,
                 "direct_support": item.direct_support,
                 "strict_direct_interval_count": item.strict_direct_interval_count,
+                "compatible_multiple_support": item.compatible_multiple_support,
+                "compatible_multiple_interval_count": item.compatible_multiple_interval_count,
+                "skip_over_interval_count": item.skip_over_interval_count,
+                "fundamental_relationship_count": item.fundamental_relationship_count,
                 "covered_miss_count": item.covered_miss_count,
                 "covered_miss_penalty": item.covered_miss_penalty,
                 "off_grid_penalty": item.off_grid_penalty,
@@ -1587,21 +2793,122 @@ def _event_diagnostic(event: PhysicalRestartEvent) -> dict:
     }
 
 
-def _active_episode_signature(episode: object) -> tuple[object, ...] | None:
+def _active_episode_persistence_signature(
+    episode: object,
+    *,
+    config: DetectionConfig,
+) -> tuple[object, ...] | None:
     if episode is None:
         return None
+    low_start = getattr(episode, "low_start_mono", None)
+    low_samples = tuple(getattr(episode, "low_samples", ()) or ())
+    low_count = _nonnegative_int(getattr(episode, "low_sample_count", 0), 0)
+    low_endpoint = (
+        getattr(episode, "first_player_mono", None)
+        or getattr(episode, "first_queue_mono", None)
+        or getattr(episode, "stable_recovery_mono", None)
+        or (low_samples[-1] if low_samples else low_start)
+    )
+    confirmed_visible_low = bool(
+        low_start is not None
+        and low_endpoint is not None
+        and low_endpoint - low_start >= config.low_state_minimum
+        and low_count >= 3
+        and any(value - low_start >= 30.0 for value in low_samples)
+    )
     return (
         getattr(episode, "event_id", None),
         getattr(episode, "drain_wall", None),
-        getattr(episode, "low_sample_count", None),
-        getattr(episode, "failure_count", None),
+        getattr(episode, "low_start_wall", None),
+        getattr(episode, "zero_reached", None),
+        confirmed_visible_low,
         getattr(episode, "confirmed_offline_wall", None),
         getattr(episode, "info_return_wall", None),
         getattr(episode, "first_queue_wall", None),
         getattr(episode, "first_player_wall", None),
         getattr(episode, "stable_recovery_wall", None),
+        getattr(episode, "recovery_bounced", None),
+        getattr(episode, "recovery_snapshot_unchanged", None),
         getattr(episode, "coverage_complete", None),
+        getattr(episode, "lifecycle_interruption", None),
     )
+
+
+def _expected_window_v2_episode_evidence(
+    server: _ServerRuntime,
+) -> tuple[ExpectedWindowEpisodeEvidence, ...]:
+    values = []
+    active = server.engine.active_episode
+    if active is not None:
+        end_at = (
+            active.stable_recovery_wall
+            or active.info_return_wall
+            or None
+        )
+        values.append(
+            ExpectedWindowEpisodeEvidence(
+                evidence_id=active.event_id,
+                start_at=active.started_wall,
+                end_at=end_at,
+                outage_observed=bool(
+                    active.failure_count > 0
+                    or active.confirmed_offline_wall is not None
+                ),
+                recovery_observed=bool(
+                    active.info_return_wall is not None
+                    or active.stable_recovery_wall is not None
+                ),
+                unresolved=True,
+                restart_like=bool(
+                    active.failure_count > 0
+                    or active.drain_wall is not None
+                    or active.low_sample_count > 0
+                ),
+                reason_codes=("runtime_active_physical_episode",),
+            )
+        )
+    for item in server.incomplete_episodes or ():
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("event_id") or item.get("fingerprint") or "")
+        started_at = _optional_nonnegative_float(item.get("started_at"))
+        if not evidence_id or started_at is None:
+            continue
+        values.append(
+            ExpectedWindowEpisodeEvidence(
+                evidence_id=evidence_id,
+                start_at=started_at,
+                end_at=_optional_nonnegative_float(item.get("finalized_at")),
+                outage_observed=False,
+                recovery_observed=False,
+                unresolved=True,
+                restart_like=True,
+                reason_codes=("persisted_incomplete_episode_diagnostic",),
+            )
+        )
+    return tuple(values)
+
+
+def _expected_window_v2_evidence_revision(
+    server: _ServerRuntime,
+    record: ExpectedWindowLedgerRecord,
+) -> str:
+    parts = [
+        "expected-window-v2-shadow-evidence",
+        server.key,
+        str(record.candidate_period_seconds),
+        str(int(round(record.expected_at))),
+    ]
+    parts.extend(sorted(item.event_id for item in server.events))
+    parts.extend(
+        sorted(
+            f"{item.kind.value}:{item.start_at:.6f}:{item.end_at:.6f}"
+            for item in server.coverage
+            if item.end_at >= record.window_start_at
+            and item.start_at <= record.window_end_at
+        )
+    )
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _next_prediction(score: ScheduleScore, now: float) -> float | None:
@@ -1621,27 +2928,59 @@ def decision_score(server: _ServerRuntime) -> ScheduleScore:
     return server.score
 
 
+def _learning_confidence_severity(confidence: float) -> str:
+    if confidence < 0.50:
+        return "low"
+    if confidence < 0.75:
+        return "moderate"
+    if confidence < 0.90:
+        return "improving"
+    return "strong"
+
+
 def phase2_learning_summary(decision: ConsumerDecision | None, *, now: float) -> dict | None:
     if decision is None or decision.model_status is ConsumerModelStatus.NO_PATTERN:
         return None
-    confidence = decision.fundamental_period_confidence
     cycle = decision.selected_period_seconds
     prediction = decision.prediction_at if decision.prediction_usable else None
-    if decision.model_status is ConsumerModelStatus.PATTERN_OBSERVED:
-        cycle_text = "Pattern observed"
+    if cycle is not None:
+        hours = cycle / 3600
+        unit = "hour" if hours == 1 else "hours"
+        cycle_text = f"Every {hours:g} {unit}"
+        confidence = decision.fundamental_period_confidence
+        confidence_kind = "period"
+        confidence_label = "Confidence:"
+    elif decision.model_status is ConsumerModelStatus.PATTERN_OBSERVED:
+        cycle_text = "Recurring timing observed"
+        confidence = decision.schedule_existence_confidence
+        confidence_kind = "pattern"
+        confidence_label = "Pattern Confidence:"
     elif decision.model_status is ConsumerModelStatus.PERIOD_UNCERTAIN:
         cycle_text = "Period uncertain"
+        confidence = decision.schedule_existence_confidence
+        confidence_kind = "pattern"
+        confidence_label = "Pattern Confidence:"
     elif decision.model_status is ConsumerModelStatus.SCHEDULE_CHANGE_SUSPECTED:
         cycle_text = "Schedule change suspected"
+        confidence = decision.schedule_existence_confidence
+        confidence_kind = "pattern"
+        confidence_label = "Pattern Confidence:"
     elif decision.model_status is ConsumerModelStatus.NEW_REGIME_ESTABLISHING:
         cycle_text = "New schedule learning"
-    elif cycle:
-        prefix = "Likely " if decision.model_status is ConsumerModelStatus.LIKELY_PERIOD else ""
-        cycle_text = f"{prefix}{cycle / 3600:g} hours"
+        confidence = decision.schedule_existence_confidence
+        confidence_kind = "pattern"
+        confidence_label = "Pattern Confidence:"
     else:
         cycle_text = "Period uncertain"
+        confidence = decision.schedule_existence_confidence
+        confidence_kind = "pattern"
+        confidence_label = "Pattern Confidence:"
     if prediction is None:
-        next_text = "Prediction suspended"
+        next_text = (
+            "Period still learning"
+            if cycle is None
+            else "Prediction suspended"
+        )
         countdown = "--"
     else:
         next_text = time.strftime("%a %H:%M", time.localtime(prediction))
@@ -1649,9 +2988,16 @@ def phase2_learning_summary(decision: ConsumerDecision | None, *, now: float) ->
         countdown = f"{remaining // 3600:02d}:{(remaining % 3600) // 60:02d}"
     return {
         "confidence_percent": int(round(confidence * 100)),
+        "confidence_kind": confidence_kind,
+        "confidence_label": confidence_label,
+        "confidence_severity": _learning_confidence_severity(confidence),
+        "confidence_visible": True,
         "cycle_text": cycle_text,
         "next_text": next_text,
+        "next_restart_at": prediction,
         "countdown_text": countdown,
+        "next_visible": cycle is None or decision.prediction_usable,
+        "countdown_visible": decision.prediction_usable,
         "model_status": decision.model_status.value,
         "prediction_usable": decision.prediction_usable,
         "phase2": True,
@@ -1697,6 +3043,10 @@ def _required_string(value: object) -> str:
     return value
 
 
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 def _finite_number(value: object) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -1719,6 +3069,22 @@ def _optional_nonnegative_float(value: object) -> float | None:
     return parsed if parsed is not None and parsed >= 0 else None
 
 
+def _optional_unit_float(value: object) -> float | None:
+    parsed = _finite_number(value)
+    return parsed if parsed is not None and 0.0 <= parsed <= 1.0 else None
+
+
+def _finite_nonnegative_float_list(value: object, limit: int) -> list[float]:
+    if not isinstance(value, list):
+        return []
+    values = []
+    for item in value:
+        parsed = _optional_nonnegative_float(item)
+        if parsed is not None:
+            values.append(parsed)
+    return values[-limit:]
+
+
 def _bounded_float(value: object, low: float, high: float) -> float:
     parsed = _finite_number(value)
     return low if parsed is None else min(high, max(low, parsed))
@@ -1737,6 +3103,16 @@ def _nonnegative_int(value: object, default: int) -> int:
     except (TypeError, ValueError, OverflowError):
         return default
     return parsed if parsed >= 0 else default
+
+
+def _optional_nonnegative_int(value: object) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed >= 0 else None
 
 
 def _optional_count(value: object) -> int | None:

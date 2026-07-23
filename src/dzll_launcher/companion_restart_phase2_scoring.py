@@ -25,6 +25,18 @@ EXACT_DIVISORS = {
     12 * HOUR: (2 * HOUR, 3 * HOUR, 4 * HOUR, 6 * HOUR),
 }
 PHASE_UNCERTAINTY_CAP = 5 * 60
+# Phase 3 deliberately avoids unrestricted all-pairs inference.  Each positive
+# endpoint may look past at most one other positive event, and long gaps may
+# explain at most eight candidate cycles.  Compatible-multiple evidence is
+# weaker than a directly observed cycle and decays with the number of unseen
+# cycles.  A relationship that skips an isolated off-grid event is weaker
+# again.  These values are scorer semantics only; they are not persisted.
+MAX_POSITIVE_PAIR_LOOKAHEAD = 2
+MAX_SKIPPED_POSITIVE_EVENTS = MAX_POSITIVE_PAIR_LOOKAHEAD - 1
+MAX_COMPATIBLE_MULTIPLIER = 8
+COMPATIBLE_MULTIPLE_BASE_WEIGHT = 0.65
+SKIP_OVER_WEIGHT_FACTOR = 0.75
+ISOLATED_SKIPPED_EVENT_PENALTY = 0.25
 # Sixteen events are the smallest simple horizon that can contain the reviewed
 # seven-day 12h high-confidence boundary (15 events / 14 adjacent intervals).
 RECENT_EVENT_LIMIT = 16
@@ -72,6 +84,51 @@ class EvidenceKind(str, Enum):
     PHASE_HINT = "phase_hint"
 
 
+class IntervalEvidenceKind(str, Enum):
+    """Transient scorer taxonomy; only DIRECT is represented by aggregates."""
+
+    STRICT_DIRECT = "strict_direct_interval"
+    COMPATIBLE_MULTIPLE = "compatible_integer_multiple"
+    SKIP_OVER_MULTIPLE = "skip_over_integer_multiple"
+    PHASE_ONLY_HINT = "phase_only_hint"
+
+
+class PhaseRecencyPolicy(str, Enum):
+    """Controls whether elapsed time alone may reduce phase confidence."""
+
+    LEGACY_DECAY = "legacy_elapsed_time_decay"
+    INACTIVITY_NEUTRAL = "continuity_inactivity_neutral"
+
+
+class IntermediateWindowStatus(str, Enum):
+    OBSERVED_COMPATIBLE = "observed_compatible_restart"
+    ADEQUATELY_MONITORED_MISS = "adequately_monitored_miss"
+    INSUFFICIENT_MONITORING = "insufficient_monitoring"
+    QUERY_HEALTH_GAP = "query_health_gap"
+    LIFECYCLE_GAP = "lifecycle_or_session_gap"
+
+
+@dataclass(frozen=True)
+class IntermediateWindowDiagnostic:
+    expected_at: float
+    status: IntermediateWindowStatus
+    blocking_kinds: tuple[CoverageKind, ...] = ()
+
+
+@dataclass(frozen=True)
+class MultipleIntervalDiagnostic:
+    left_event_id: str
+    right_event_id: str
+    multiplier: int
+    residual_seconds: float
+    evidence_kind: IntervalEvidenceKind
+    support_weight: float
+    skipped_event_ids: tuple[str, ...]
+    intermediate_windows: tuple[IntermediateWindowDiagnostic, ...]
+    accepted: bool
+    reason: str
+
+
 @dataclass(frozen=True)
 class CoveredExpectedMiss:
     period_seconds: int
@@ -94,6 +151,12 @@ class CoverageSegment:
     end_at: float
     kind: CoverageKind
     cadence: float = 10.0
+    server_key: str | None = None
+    app_session_id: str | None = None
+    monitoring_session_id: str | None = None
+    poll_generation: int | None = None
+    continuity_chain_id: str | None = None
+    provenance_version: int = 0
 
     def __post_init__(self) -> None:
         _finite_nonnegative("start_at", self.start_at)
@@ -103,6 +166,21 @@ class CoverageSegment:
             raise ValueError("coverage segment must have positive duration")
         if not isinstance(self.kind, CoverageKind):
             raise ValueError("kind must be a CoverageKind")
+        for name in (
+            "server_key",
+            "app_session_id",
+            "monitoring_session_id",
+            "continuity_chain_id",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ValueError(f"{name} must be a non-empty string or None")
+        if self.poll_generation is not None and (
+            type(self.poll_generation) is not int or self.poll_generation < 0
+        ):
+            raise ValueError("poll_generation must be a non-negative integer or None")
+        if type(self.provenance_version) is not int or self.provenance_version < 0:
+            raise ValueError("provenance_version must be a non-negative integer")
 
 
 @dataclass(frozen=True)
@@ -268,6 +346,12 @@ class CandidateScore:
     confidence_cap: float
     strong_covered_contradiction: bool
     recent_phase_observation_at: float | None
+    compatible_multiple_support: float = 0.0
+    compatible_multiple_interval_count: int = 0
+    skip_over_interval_count: int = 0
+    fundamental_relationship_count: int = 0
+    bounded_pair_count: int = 0
+    multiple_interval_diagnostics: tuple[MultipleIntervalDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -336,6 +420,13 @@ class _CandidateWork:
     hint_times: dict[str, float] = field(default_factory=dict)
     offgrid_ids: set[str] = field(default_factory=set)
     offgrid_penalty: float = 0.0
+    multiple_support: float = 0.0
+    multiple_pairs: list[tuple[str, str, float, float]] = field(default_factory=list)
+    skip_over_pairs: list[tuple[str, str, float, float]] = field(default_factory=list)
+    multiple_diagnostics: list[MultipleIntervalDiagnostic] = field(default_factory=list)
+    used_evidence_spans: list[tuple[float, float]] = field(default_factory=list)
+    skipped_offgrid_ids: set[str] = field(default_factory=set)
+    bounded_pair_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -501,12 +592,27 @@ class RestartScheduleScorer:
         incumbent_period_seconds: int | None = None,
         aggregate: LongTermAggregate | None = None,
         expected_misses: Iterable[CoveredExpectedMiss] = (),
+        regime_boundaries: Iterable[float] = (),
+        phase_recency_policy: PhaseRecencyPolicy = PhaseRecencyPolicy.LEGACY_DECAY,
     ) -> ScheduleScore:
         _finite_nonnegative("now", now)
+        if not isinstance(phase_recency_policy, PhaseRecencyPolicy):
+            raise ValueError("phase_recency_policy must be a PhaseRecencyPolicy")
         unique = _unique_events(events)
         recent = _recent_events(unique)
         work = {period: _CandidateWork(period) for period in CANDIDATE_PERIODS}
-        self._collect_interval_evidence(recent, coverage, work)
+        boundary_values = list(regime_boundaries)
+        if previous is not None:
+            boundary_values.extend(item.ended_at for item in previous.prior_regimes)
+        for boundary in boundary_values:
+            _finite_nonnegative("regime boundary", boundary)
+        regime_boundary = max(boundary_values, default=None)
+        self._collect_interval_evidence(
+            recent,
+            coverage,
+            work,
+            regime_boundary=regime_boundary,
+        )
         seen_miss_keys: set[tuple[int, str]] = set()
         for miss in expected_misses:
             if not isinstance(miss, CoveredExpectedMiss):
@@ -518,7 +624,14 @@ class RestartScheduleScorer:
             work[miss.period_seconds].misses.append((miss.expected_at, miss.weight, miss.key))
         self._collect_offgrid_evidence(recent, work)
         candidate_scores = tuple(
-            self._finish_candidate(period, recent, work[period], now, aggregate)
+            self._finish_candidate(
+                period,
+                recent,
+                work[period],
+                now,
+                aggregate,
+                phase_recency_policy,
+            )
             for period in CANDIDATE_PERIODS
         )
         schedule_confidence = _schedule_existence_confidence(recent, candidate_scores)
@@ -546,34 +659,41 @@ class RestartScheduleScorer:
         events: tuple[PhysicalRestartEvent, ...],
         coverage: CoverageTimeline,
         work: dict[int, _CandidateWork],
+        *,
+        regime_boundary: float | None,
     ) -> None:
         endpoints = tuple(event for event in events if _event_weight(event) > 0)
-        for left, right in zip(endpoints, endpoints[1:]):
-            left_at = _event_at(left)
-            right_at = _event_at(right)
-            if left_at is None or right_at is None or right_at <= left_at:
-                continue
-            gap = right_at - left_at
-            assessment = coverage.assess(left_at, right_at)
-            unresolved_inside = any(
-                _blocks_interval(event)
-                and left_at < (_event_at(event) or left_at) < right_at
-                for event in events
-            )
-            fully_covered = (
-                assessment.fully_covered
-                and assessment.query_health_adequate
-                and not unresolved_inside
-            )
-            pair_weight = min(_event_weight(left), _event_weight(right))
-            for period in CANDIDATE_PERIODS:
-                tolerance = _pair_tolerance(period, left, right)
-                direct_match = abs(gap - period) <= tolerance
-                multiple = max(1, round(gap / period))
-                multiple_match = abs(gap - multiple * period) <= tolerance
-                candidate = work[period]
-                if direct_match and fully_covered:
-                    if pair_weight > 0:
+        for left_index, left in enumerate(endpoints):
+            upper = min(len(endpoints), left_index + MAX_POSITIVE_PAIR_LOOKAHEAD + 1)
+            for right_index in range(left_index + 1, upper):
+                right = endpoints[right_index]
+                left_at = _event_at(left)
+                right_at = _event_at(right)
+                if left_at is None or right_at is None or right_at <= left_at:
+                    continue
+                gap = right_at - left_at
+                skipped = endpoints[left_index + 1:right_index]
+                adjacent = not skipped
+                assessment = coverage.assess(left_at, right_at)
+                unresolved_inside = any(
+                    _blocks_interval(event)
+                    and left_at < (_event_at(event) or left_at) < right_at
+                    for event in events
+                )
+                fully_covered = (
+                    assessment.fully_covered
+                    and assessment.query_health_adequate
+                    and not unresolved_inside
+                )
+                pair_weight = min(_event_weight(left), _event_weight(right))
+                for period in CANDIDATE_PERIODS:
+                    candidate = work[period]
+                    candidate.bounded_pair_count += 1
+                    tolerance = _pair_tolerance(period, left, right)
+                    direct_match = abs(gap - period) <= tolerance
+                    multiple = max(1, round(gap / period))
+                    multiple_match = abs(gap - multiple * period) <= tolerance
+                    if adjacent and direct_match and fully_covered:
                         candidate.direct_support += pair_weight
                         pair = (left.event_id, right.event_id, left_at, right_at)
                         if _strict_event(left) and _strict_event(right):
@@ -581,37 +701,227 @@ class RestartScheduleScorer:
                         else:
                             candidate.weak_pairs.append(pair)
                         candidate.qualifying_ids.update((left.event_id, right.event_id))
-                    continue
-                if multiple_match and not fully_covered:
-                    self._add_hint(candidate, left)
-                    self._add_hint(candidate, right)
-
-            if not fully_covered:
-                continue
-            if not (_strict_event(left) and _strict_event(right)):
-                continue
-            for longer in CANDIDATE_PERIODS:
-                tolerance = _pair_tolerance(longer, left, right)
-                if abs(gap - longer) > tolerance:
-                    continue
-                interval_key = hash((left.event_id, right.event_id, longer))
-                for divisor in EXACT_DIVISORS[longer]:
-                    windows = range(1, longer // divisor)
-                    for index in windows:
-                        expected = left_at + index * divisor
-                        if expected >= right_at - tolerance:
-                            continue
-                        window_tolerance = candidate_phase_tolerance(divisor)
-                        window = coverage.assess(
-                            max(left_at, expected - window_tolerance),
-                            min(right_at, expected + window_tolerance),
+                        candidate.used_evidence_spans.append((left_at, right_at))
+                        continue
+                    if multiple_match and multiple >= 2:
+                        self._collect_compatible_multiple(
+                            candidate,
+                            period,
+                            multiple,
+                            left,
+                            right,
+                            skipped,
+                            events,
+                            coverage,
+                            regime_boundary=regime_boundary,
                         )
-                        if window.fully_covered and window.query_health_adequate and not window.unresolved_episode:
-                            work[divisor].misses.append((expected, 1.0, f"{left.event_id}:{right.event_id}"))
-                            work[longer].resolution_windows.setdefault(divisor, []).append(
-                                (expected, interval_key)
+                    elif multiple_match and not fully_covered and adjacent:
+                        self._add_hint(candidate, left)
+                        self._add_hint(candidate, right)
+
+                # Direct divisor resolution remains adjacent-only.  A skipped
+                # event cannot prove that a longer fundamental period occurred.
+                if not adjacent or not fully_covered:
+                    continue
+                if not (_strict_event(left) and _strict_event(right)):
+                    continue
+                for longer in CANDIDATE_PERIODS:
+                    tolerance = _pair_tolerance(longer, left, right)
+                    if abs(gap - longer) > tolerance:
+                        continue
+                    interval_key = hash((left.event_id, right.event_id, longer))
+                    for divisor in EXACT_DIVISORS[longer]:
+                        windows = range(1, longer // divisor)
+                        for index in windows:
+                            expected = left_at + index * divisor
+                            if expected >= right_at - tolerance:
+                                continue
+                            window_tolerance = candidate_phase_tolerance(divisor)
+                            window = coverage.assess(
+                                max(left_at, expected - window_tolerance),
+                                min(right_at, expected + window_tolerance),
                             )
+                            if window.fully_covered and window.query_health_adequate and not window.unresolved_episode:
+                                work[divisor].misses.append((expected, 1.0, f"{left.event_id}:{right.event_id}"))
+                                work[longer].resolution_windows.setdefault(divisor, []).append(
+                                    (expected, interval_key)
+                                )
         self._collect_weak_hint_evidence(events, coverage, work)
+
+    def _collect_compatible_multiple(
+        self,
+        candidate: _CandidateWork,
+        period: int,
+        multiplier: int,
+        left: PhysicalRestartEvent,
+        right: PhysicalRestartEvent,
+        skipped: tuple[PhysicalRestartEvent, ...],
+        events: tuple[PhysicalRestartEvent, ...],
+        coverage: CoverageTimeline,
+        *,
+        regime_boundary: float | None,
+    ) -> None:
+        left_at = _event_at(left)
+        right_at = _event_at(right)
+        assert left_at is not None and right_at is not None
+        evidence_kind = (
+            IntervalEvidenceKind.SKIP_OVER_MULTIPLE
+            if skipped
+            else IntervalEvidenceKind.COMPATIBLE_MULTIPLE
+        )
+        residual = abs((right_at - left_at) - multiplier * period)
+        windows = tuple(
+            self._classify_intermediate_window(
+                left_at + index * period,
+                period,
+                left_at,
+                right_at,
+                events,
+                coverage,
+            )
+            for index in range(1, multiplier)
+        )
+        reason = "accepted"
+        accepted = True
+        if multiplier > MAX_COMPATIBLE_MULTIPLIER:
+            accepted = False
+            reason = "multiplier_exceeds_cap"
+        elif not (_strict_event(left) and _strict_event(right)):
+            accepted = False
+            reason = "endpoint_quality_insufficient"
+        elif (
+            skipped
+            and regime_boundary is not None
+            and left_at < regime_boundary < right_at
+        ):
+            accepted = False
+            reason = "crosses_regime_boundary"
+        elif any(
+            item.status is IntermediateWindowStatus.OBSERVED_COMPATIBLE
+            for item in windows
+        ):
+            accepted = False
+            reason = "intermediate_restart_observed"
+        elif any(
+            item.status is IntermediateWindowStatus.ADEQUATELY_MONITORED_MISS
+            for item in windows
+        ):
+            accepted = False
+            reason = "covered_intermediate_miss"
+
+        strict_endpoints = _strict_event(left) and _strict_event(right)
+        for item in windows:
+            if (
+                strict_endpoints
+                and item.status is IntermediateWindowStatus.ADEQUATELY_MONITORED_MISS
+            ):
+                candidate.misses.append(
+                    (
+                        item.expected_at,
+                        1.0,
+                        f"multiple:{left.event_id}:{right.event_id}:{int(round(item.expected_at))}",
+                    )
+                )
+
+        overlaps_existing = any(
+            max(left_at, used_start) < min(right_at, used_end)
+            for used_start, used_end in candidate.used_evidence_spans
+        )
+        if accepted and overlaps_existing:
+            accepted = False
+            reason = "overlapping_cycle_evidence"
+
+        support = 0.0
+        if accepted:
+            pair_weight = min(_event_weight(left), _event_weight(right))
+            support = (
+                pair_weight
+                * COMPATIBLE_MULTIPLE_BASE_WEIGHT
+                / math.sqrt(multiplier - 1)
+            )
+            if skipped:
+                support *= SKIP_OVER_WEIGHT_FACTOR
+            candidate.multiple_support += support
+            pair = (left.event_id, right.event_id, left_at, right_at)
+            candidate.multiple_pairs.append(pair)
+            if skipped:
+                candidate.skip_over_pairs.append(pair)
+                candidate.skipped_offgrid_ids.update(item.event_id for item in skipped)
+            candidate.qualifying_ids.update((left.event_id, right.event_id))
+            candidate.used_evidence_spans.append((left_at, right_at))
+        else:
+            self._add_hint(candidate, left)
+            self._add_hint(candidate, right)
+
+        candidate.multiple_diagnostics.append(
+            MultipleIntervalDiagnostic(
+                left_event_id=left.event_id,
+                right_event_id=right.event_id,
+                multiplier=multiplier,
+                residual_seconds=round(residual, 6),
+                evidence_kind=evidence_kind,
+                support_weight=round(support, 6),
+                skipped_event_ids=tuple(item.event_id for item in skipped),
+                intermediate_windows=windows,
+                accepted=accepted,
+                reason=reason,
+            )
+        )
+
+    @staticmethod
+    def _classify_intermediate_window(
+        expected_at: float,
+        period: int,
+        left_at: float,
+        right_at: float,
+        events: tuple[PhysicalRestartEvent, ...],
+        coverage: CoverageTimeline,
+    ) -> IntermediateWindowDiagnostic:
+        tolerance = candidate_phase_tolerance(period)
+        start = max(left_at, expected_at - tolerance)
+        end = min(right_at, expected_at + tolerance)
+        events_inside = tuple(
+            event
+            for event in events
+            if (at := _event_at(event)) is not None and start <= at <= end
+        )
+        if any(_event_weight(event) > 0 for event in events_inside):
+            status = IntermediateWindowStatus.OBSERVED_COMPATIBLE
+            return IntermediateWindowDiagnostic(expected_at, status)
+        assessment = coverage.assess(start, end)
+        unresolved = any(_blocks_interval(event) for event in events_inside)
+        if (
+            assessment.fully_covered
+            and assessment.query_health_adequate
+            and not assessment.unresolved_episode
+            and not unresolved
+        ):
+            status = IntermediateWindowStatus.ADEQUATELY_MONITORED_MISS
+        elif set(assessment.blocking_kinds).intersection(
+            {
+                CoverageKind.QUERY_HEALTH_GAP,
+                CoverageKind.MISSING_PLAYERS,
+                CoverageKind.MISSING_INFO,
+            }
+        ):
+            status = IntermediateWindowStatus.QUERY_HEALTH_GAP
+        elif set(assessment.blocking_kinds).intersection(
+            {
+                CoverageKind.UNMONITORED,
+                CoverageKind.APP_STOPPED,
+                CoverageKind.PAUSED,
+                CoverageKind.SERVER_SWITCH,
+                CoverageKind.SLEEP_GAP,
+            }
+        ):
+            status = IntermediateWindowStatus.LIFECYCLE_GAP
+        else:
+            status = IntermediateWindowStatus.INSUFFICIENT_MONITORING
+        return IntermediateWindowDiagnostic(
+            expected_at=expected_at,
+            status=status,
+            blocking_kinds=assessment.blocking_kinds,
+        )
 
     def _collect_weak_hint_evidence(
         self,
@@ -656,10 +966,22 @@ class RestartScheduleScorer:
         work: dict[int, _CandidateWork],
     ) -> None:
         for period, candidate in work.items():
-            if len(candidate.strict_pairs) < 2:
+            relationships = (*candidate.strict_pairs, *candidate.multiple_pairs)
+            for event in events:
+                if (
+                    event.event_id in candidate.skipped_offgrid_ids
+                    and event.event_id not in candidate.offgrid_ids
+                ):
+                    weight = _event_weight(event)
+                    if weight > 0:
+                        candidate.offgrid_ids.add(event.event_id)
+                        candidate.offgrid_penalty += (
+                            ISOLATED_SKIPPED_EVENT_PENALTY * weight
+                        )
+            if len(relationships) < 2:
                 continue
-            participants = {item for pair in candidate.strict_pairs for item in pair[:2]}
-            evidence_started_at = min(pair[2] for pair in candidate.strict_pairs)
+            participants = {item for pair in relationships for item in pair[:2]}
+            evidence_started_at = min(pair[2] for pair in relationships)
             phase_events = [event for event in events if event.event_id in participants]
             phase = _phase_cluster(phase_events, period)
             if phase[0] is None:
@@ -668,6 +990,8 @@ class RestartScheduleScorer:
             for event in events:
                 at = _event_at(event)
                 if at is None or at < evidence_started_at or event.event_id in participants:
+                    continue
+                if event.event_id in candidate.offgrid_ids:
                     continue
                 residual = abs(_signed_phase_residual(at, offset, period))
                 if residual <= _event_tolerance(period, event):
@@ -679,7 +1003,12 @@ class RestartScheduleScorer:
                 if event.outcome is EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART:
                     candidate.offgrid_penalty += min(0.35, weight * 0.70)
                 elif _strict_event(event):
-                    candidate.offgrid_penalty += 0.75 * weight
+                    factor = (
+                        ISOLATED_SKIPPED_EVENT_PENALTY
+                        if event.event_id in candidate.skipped_offgrid_ids
+                        else 0.75
+                    )
+                    candidate.offgrid_penalty += factor * weight
 
     def _finish_candidate(
         self,
@@ -688,11 +1017,15 @@ class RestartScheduleScorer:
         work: _CandidateWork,
         now: float,
         aggregate: LongTermAggregate | None,
+        phase_recency_policy: PhaseRecencyPolicy,
     ) -> CandidateScore:
         strict_count = len(work.strict_pairs)
         weak_count = len(work.weak_pairs)
+        multiple_count = len(work.multiple_pairs)
+        relationship_count = strict_count + multiple_count
         hint = _hint_diagnostics(work, period)
-        evidence_started_at = min((pair[2] for pair in work.strict_pairs), default=-math.inf)
+        relationship_pairs = (*work.strict_pairs, *work.multiple_pairs)
+        evidence_started_at = min((pair[2] for pair in relationship_pairs), default=-math.inf)
         unique_misses: dict[int, tuple[float, float, str]] = {}
         for item in work.misses:
             if item[0] < evidence_started_at:
@@ -704,9 +1037,16 @@ class RestartScheduleScorer:
         recent_misses = list(unique_misses.values())
         miss_penalty = sum(item[1] for item in recent_misses)
         direct_support = round(work.direct_support, 6)
+        multiple_support = round(work.multiple_support, 6)
         old = aggregate.candidate(period) if aggregate is not None else CandidateAggregate(period)
-        recent_net = max(0.0, direct_support - miss_penalty - work.offgrid_penalty)
+        recent_net = max(
+            0.0,
+            direct_support + multiple_support - miss_penalty - work.offgrid_penalty,
+        )
         long_term_used = 0.0
+        # Compatible multiples depend on endpoint identity and per-window
+        # coverage, neither of which the legacy folded aggregate can express.
+        # They therefore remain bounded, recomputed detailed-event evidence.
         if miss_penalty == 0 and work.offgrid_penalty == 0:
             long_term_used = min(old.direct_weight * 0.30, direct_support * 0.30)
         net = recent_net + long_term_used
@@ -726,30 +1066,34 @@ class RestartScheduleScorer:
                 hint_bonus = min(0.05, hint.weighted_alignment)
         before_caps = min(1.0, base_confidence + hint_bonus)
 
-        strict_ids = {item for pair in work.strict_pairs for item in pair[:2]}
-        qualifying_count = len(strict_ids)
-        strict_times = [value for pair in work.strict_pairs for value in pair[2:]]
-        span = max(strict_times) - min(strict_times) if strict_times else 0.0
+        relationship_ids = {item for pair in relationship_pairs for item in pair[:2]}
+        qualifying_count = len(relationship_ids)
+        relationship_times = [value for pair in relationship_pairs for value in pair[2:]]
+        span = (
+            max(relationship_times) - min(relationship_times)
+            if relationship_times
+            else 0.0
+        )
         resolutions = _divisor_resolutions(period, work)
         requirements = GATES[period]
         divisors_established = all(item.established_resolved for item in resolutions)
         divisors_high = all(item.high_resolved for item in resolutions)
         gate_passed = (
-            strict_count >= requirements.established_intervals
+            relationship_count >= requirements.established_intervals
             and qualifying_count >= requirements.established_events
             and span >= requirements.established_span
             and (not requirements.require_divisors or divisors_established)
         )
         high_passed = (
-            strict_count >= requirements.high_intervals
+            relationship_count >= requirements.high_intervals
             and qualifying_count >= requirements.high_events
             and span >= requirements.high_span
             and (not requirements.require_divisors or divisors_high)
         )
         cap = 1.0
-        if strict_count == 0:
+        if relationship_count == 0:
             cap = min(cap, 0.49 if weak_count else 0.0)
-        elif strict_count < requirements.established_intervals:
+        elif relationship_count < requirements.established_intervals:
             cap = min(cap, 0.79)
         if qualifying_count < requirements.established_events or span < requirements.established_span:
             cap = min(cap, 0.79)
@@ -767,8 +1111,12 @@ class RestartScheduleScorer:
             recent_phase,
             now,
             period,
+            phase_recency_policy,
         )
-        if recent_phase is None or now - recent_phase > 3 * period:
+        if (
+            phase_recency_policy is PhaseRecencyPolicy.LEGACY_DECAY
+            and (recent_phase is None or now - recent_phase > 3 * period)
+        ):
             cap = min(cap, 0.79)
         final_confidence = min(before_caps, cap)
         return CandidateScore(
@@ -798,6 +1146,12 @@ class RestartScheduleScorer:
             confidence_cap=cap,
             strong_covered_contradiction=miss_penalty + work.offgrid_penalty >= 1.0,
             recent_phase_observation_at=recent_phase,
+            compatible_multiple_support=multiple_support,
+            compatible_multiple_interval_count=multiple_count,
+            skip_over_interval_count=len(work.skip_over_pairs),
+            fundamental_relationship_count=relationship_count,
+            bounded_pair_count=work.bounded_pair_count,
+            multiple_interval_diagnostics=tuple(work.multiple_diagnostics),
         )
 
 
@@ -1107,6 +1461,7 @@ def _phase_confidence(
     recent_at: float | None,
     now: float,
     period: int,
+    recency_policy: PhaseRecencyPolicy = PhaseRecencyPolicy.LEGACY_DECAY,
 ) -> float:
     if mad is None or aligned_count == 0:
         return 0.0
@@ -1123,7 +1478,10 @@ def _phase_confidence(
     cap = _event_count_cap(aligned_count)
     consistency = aligned_count / max(1, total_count)
     confidence = cap * quality * consistency
-    if recent_at is None or now - recent_at > 3 * period:
+    if (
+        recency_policy is PhaseRecencyPolicy.LEGACY_DECAY
+        and (recent_at is None or now - recent_at > 3 * period)
+    ):
         confidence = min(confidence, 0.60)
     return min(1.0, confidence)
 
@@ -1188,7 +1546,7 @@ def _schedule_existence_confidence(
     best = max(candidates, key=lambda item: (item.aligned_event_count, item.hints.event_count))
     alignment = max(best.aligned_event_count, best.hints.event_count) / len(authentic)
     confidence = _event_count_cap(len(authentic)) * min(1.0, alignment)
-    if max(item.strict_direct_interval_count for item in candidates) == 0:
+    if max(item.fundamental_relationship_count for item in candidates) == 0:
         confidence = min(confidence + best.hints.schedule_existence_contribution, 0.75)
     return round(min(1.0, confidence), 6)
 
@@ -1209,17 +1567,30 @@ def _select_candidate(
     tuple[int, ...],
     tuple[RegimeSummary, ...],
 ]:
-    ranked = sorted(candidates, key=lambda item: (item.fundamental_period_confidence, item.direct_support), reverse=True)
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            item.fundamental_period_confidence,
+            item.direct_support + item.compatible_multiple_support,
+        ),
+        reverse=True,
+    )
     top = ranked[0]
     competitors = tuple(
         item.period_seconds
         for item in ranked[1:]
         if item.fundamental_period_confidence >= 0.65
+        and item.establishment_gates_passed
         and abs(item.fundamental_period_confidence - top.fundamental_period_confidence) <= 0.05
     )
     unresolved = bool(competitors)
     prior_regimes = previous.prior_regimes if previous is not None else ()
-    selected = top.period_seconds if top.fundamental_period_confidence >= 0.65 else None
+    selected = (
+        top.period_seconds
+        if top.fundamental_period_confidence >= 0.65
+        and top.establishment_gates_passed
+        else None
+    )
     regime = RegimeStatus.STABLE
 
     incumbent = next((item for item in candidates if item.period_seconds == incumbent_period), None)
@@ -1300,6 +1671,7 @@ def _select_candidate(
         and schedule_confidence >= 0.80
         and selected_candidate.fundamental_period_confidence >= 0.80
         and selected_candidate.phase_confidence >= 0.80
+        and selected_candidate.establishment_gates_passed
     )
     warning = bool(
         prediction

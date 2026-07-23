@@ -7,9 +7,34 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 
+PENDING_STRIKE_EXPIRY_POLL_MULTIPLIER = 2.5
+
+
+def pending_strike_lifetime_seconds(online_poll_interval: float) -> float:
+    """Return the shared cadence-aware lifetime for an unconfirmed first strike."""
+    _require_finite_positive("online_poll_interval", online_poll_interval)
+    return PENDING_STRIKE_EXPIRY_POLL_MULTIPLIER * online_poll_interval
+
+
+def pending_strike_is_recent(
+    first_monotonic_at: float | None,
+    observed_monotonic_at: float,
+    online_poll_interval: float,
+) -> bool:
+    """Whether a later observation may still use an earlier first strike."""
+    if first_monotonic_at is None:
+        return False
+    if not math.isfinite(first_monotonic_at) or not math.isfinite(observed_monotonic_at):
+        return False
+    elapsed = observed_monotonic_at - first_monotonic_at
+    return 0.0 <= elapsed <= pending_strike_lifetime_seconds(online_poll_interval)
+
+
 class InfoStatus(str, Enum):
     HEALTHY = "healthy"
+    NEUTRAL = "neutral_alive"
     TIMEOUT = "timeout"
+    NETWORK_ERROR = "network_error"
     ERROR = "protocol_error"
     MISSING = "unavailable"
 
@@ -75,6 +100,8 @@ class ObservationSample:
     queue_status: FieldStatus = FieldStatus.MISSING
     queue: int | None = None
     lifecycle: LifecycleMarker = LifecycleMarker.NORMAL
+    continuity_chain_id: str | None = None
+    provenance_version: int = 0
 
     def __post_init__(self) -> None:
         _require_finite_nonnegative("wall_at", self.wall_at)
@@ -93,6 +120,13 @@ class ObservationSample:
             raise ValueError("queue_status must be a FieldStatus")
         if not isinstance(self.lifecycle, LifecycleMarker):
             raise ValueError("lifecycle must be a LifecycleMarker")
+        if self.continuity_chain_id is not None and (
+            not isinstance(self.continuity_chain_id, str)
+            or not self.continuity_chain_id
+        ):
+            raise ValueError("continuity_chain_id must be a non-empty string or None")
+        if type(self.provenance_version) is not int or self.provenance_version < 0:
+            raise ValueError("provenance_version must be a non-negative integer")
         if self.info_latency is not None:
             _require_finite_nonnegative("info_latency", self.info_latency)
         _validate_field("players", self.player_status, self.players)
@@ -106,7 +140,7 @@ class DetectionConfig:
     offline_poll_interval: float = 3.0
     abrupt_drain_minimum: float = 25.0
     low_state_minimum: float = 45.0
-    drain_to_outage_merge: float = 180.0
+    drain_to_outage_merge: float = 300.0
     visible_recovery_strong_maximum: float = 480.0
     visible_recovery_absolute_maximum: float = 600.0
     recovery_spacing_minimum: float = 10.0
@@ -115,11 +149,17 @@ class DetectionConfig:
     finalization_grace: float = 30.0
     finalization_maximum: float = 60.0
     stable_normal_reset: float = 60.0
-    pre_roll_seconds: float = 120.0
-    pre_roll_sample_cap: int = 12
+    pre_roll_seconds: float = 600.0
+    pre_roll_sample_cap: int = 60
+    event_pre_roll_sample_cap: int = 36
     active_sample_cap: int = 96
-    offline_confirmation_minimum: float = 6.0
-    offline_confirmation_maximum: float = 15.0
+    drain_baseline_minimum: int = 4
+    drain_baseline_sample_minimum: int = 2
+    drain_absolute_drop_minimum: int = 3
+    drain_relative_drop_minimum: float = 0.70
+    drain_low_sample_minimum: int = 2
+    gradual_drain_maximum: float = 300.0
+    drain_recovery_fraction: float = 0.80
 
     def __post_init__(self) -> None:
         numeric = (
@@ -137,28 +177,44 @@ class DetectionConfig:
             "finalization_maximum",
             "stable_normal_reset",
             "pre_roll_seconds",
-            "offline_confirmation_minimum",
-            "offline_confirmation_maximum",
+            "drain_relative_drop_minimum",
+            "gradual_drain_maximum",
+            "drain_recovery_fraction",
         )
         for name in numeric:
             value = getattr(self, name)
             _require_finite_positive(name, value)
-        for name in ("pre_roll_sample_cap", "active_sample_cap"):
+        for name in ("pre_roll_sample_cap", "event_pre_roll_sample_cap", "active_sample_cap"):
             value = getattr(self, name)
             if type(value) is not int or value < 2:
                 raise ValueError(f"{name} must be an integer of at least two")
+        for name in (
+            "drain_baseline_minimum",
+            "drain_baseline_sample_minimum",
+            "drain_absolute_drop_minimum",
+            "drain_low_sample_minimum",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value < 1:
+                raise ValueError(f"{name} must be a positive integer")
+        for name in ("drain_relative_drop_minimum", "drain_recovery_fraction"):
+            value = getattr(self, name)
+            if not 0.0 < value <= 1.0:
+                raise ValueError(f"{name} must be greater than zero and at most one")
         if self.visible_recovery_strong_maximum > self.visible_recovery_absolute_maximum:
             raise ValueError("strong recovery maximum must not exceed absolute maximum")
         if self.recovery_spacing_minimum > self.recovery_spacing_maximum:
             raise ValueError("recovery spacing bounds are reversed")
         if self.finalization_grace > self.finalization_maximum:
             raise ValueError("finalization grace must not exceed its maximum")
-        if self.offline_confirmation_minimum > self.offline_confirmation_maximum:
-            raise ValueError("offline confirmation bounds are reversed")
 
     @property
     def abrupt_drain_window(self) -> float:
         return max(self.abrupt_drain_minimum, 2.5 * self.online_poll_interval)
+
+    @property
+    def pending_strike_lifetime(self) -> float:
+        return pending_strike_lifetime_seconds(self.online_poll_interval)
 
 
 @dataclass(frozen=True)
@@ -173,6 +229,9 @@ class DrainSummary:
     low_sample_count: int
     low_duration: float
     abrupt: bool
+    baseline_at: float | None = None
+    decline_duration: float = 0.0
+    inherited: bool = False
 
 
 @dataclass(frozen=True)
@@ -223,6 +282,11 @@ class PhysicalRestartEvent:
     lifecycle_interruption: LifecycleMarker | None
     samples: tuple[ObservationSample, ...]
     reason_codes: tuple[str, ...]
+    app_session_id: str | None = None
+    monitoring_session_id: str | None = None
+    poll_generation: int | None = None
+    continuity_chain_id: str | None = None
+    provenance_version: int = 0
 
 
 @dataclass
@@ -236,7 +300,11 @@ class _Episode:
     started_mono: float
     fingerprint: str
     event_id: str
+    continuity_chain_id: str | None = None
+    provenance_version: int = 0
     baseline_players: int | None = None
+    baseline_wall: float | None = None
+    baseline_mono: float | None = None
     last_positive_wall: float | None = None
     last_positive_mono: float | None = None
     drain_wall: float | None = None
@@ -247,6 +315,7 @@ class _Episode:
     minimum_players: int | None = None
     drop_fraction: float | None = None
     abrupt_drain: bool = False
+    drain_inherited: bool = False
     low_samples: list[float] = field(default_factory=list)
     low_sample_count: int = 0
     first_failure_wall: float | None = None
@@ -278,6 +347,26 @@ class _Episode:
     recovery_snapshot_unchanged: bool = False
 
 
+@dataclass
+class _ProvisionalDrain:
+    baseline_players: int
+    baseline_wall: float
+    baseline_mono: float
+    last_positive_wall: float | None
+    last_positive_mono: float | None
+    low_start_wall: float
+    low_start_mono: float
+    minimum_players: int
+    zero_reached: bool
+    drop_fraction: float
+    low_sample_count: int
+    low_samples: list[float]
+    abrupt: bool
+    decline_duration: float
+    expires_mono: float
+    evidence_samples: list[ObservationSample]
+
+
 class PhysicalEpisodeEngine:
     """Pure detector that clusters restart signals into one physical episode."""
 
@@ -293,12 +382,18 @@ class PhysicalEpisodeEngine:
         self._seen_samples: set[tuple[object, ...]] = set()
         self._seen_sample_order: list[tuple[object, ...]] = []
         self._last_sample: ObservationSample | None = None
+        self._pending_failure: ObservationSample | None = None
+        self._provisional_drain: _ProvisionalDrain | None = None
         self._normal_since_mono: float | None = None
         self._cooldown_until_stable = False
 
     @property
     def active_episode(self) -> _Episode | None:
         return self._episode
+
+    @property
+    def provisional_drain(self) -> _ProvisionalDrain | None:
+        return self._provisional_drain
 
     def ingest(self, sample: ObservationSample) -> tuple[PhysicalRestartEvent, ...]:
         key = _sample_key(sample)
@@ -384,6 +479,34 @@ class PhysicalEpisodeEngine:
         return tuple(events)
 
     def _consume_idle(self, sample: ObservationSample) -> None:
+        if _is_qualifying_failure(sample):
+            self._expire_provisional_drain(sample.monotonic_at)
+            pending = self._pending_failure
+            if (
+                pending is None
+                or not self._same_continuity(sample, pending)
+                or not pending_strike_is_recent(
+                    pending.monotonic_at,
+                    sample.monotonic_at,
+                    self.config.online_poll_interval,
+                )
+            ):
+                self._pending_failure = sample
+                self._normal_since_mono = None
+                return
+            self._pending_failure = None
+            self._cooldown_until_stable = False
+            self._open_episode(pending, "outage")
+            self._inherit_provisional_drain(pending)
+            self._record_failure(pending)
+            self._append_episode_sample(sample)
+            self._consume_active(sample)
+            return
+
+        if sample.info_status is InfoStatus.HEALTHY:
+            self._pending_failure = None
+            self._observe_player_history(sample)
+
         if self._cooldown_until_stable:
             if _is_healthy_normal(sample):
                 if self._normal_since_mono is None:
@@ -392,41 +515,24 @@ class PhysicalEpisodeEngine:
                     self._cooldown_until_stable = False
             else:
                 self._normal_since_mono = None
-            self._remember_pre_roll(sample)
             return
 
-        drain = self._drain_details(sample)
-        if drain is not None:
-            self._open_episode(sample, "drain")
-            self._apply_drain(sample, drain)
+        if not _is_detector_evidence(sample):
             return
-        if sample.info_status is not InfoStatus.HEALTHY:
-            self._open_episode(sample, "outage")
-            self._record_failure(sample)
-            return
-        self._remember_pre_roll(sample)
+
+        return
 
     def _consume_active(self, sample: ObservationSample) -> list[PhysicalRestartEvent]:
         episode = self._episode
         assert episode is not None
         completed: list[PhysicalRestartEvent] = []
 
-        if (
-            sample.info_status is not InfoStatus.HEALTHY
-            and episode.drain_mono is not None
-            and episode.first_failure_mono is None
-            and sample.monotonic_at - episode.drain_mono > self.config.drain_to_outage_merge
-        ):
-            completed.append(
-                self._finalize(EventOutcome.AMBIGUOUS_DRAIN, sample.wall_at, "outage_beyond_drain_merge_window")
-            )
-            self._open_episode(sample, "outage")
-            self._record_failure(sample)
+        if not _is_detector_evidence(sample):
             return completed
 
         if sample.info_status is InfoStatus.HEALTHY:
             episode.healthy_samples += 1
-        else:
+        elif _is_qualifying_failure(sample):
             episode.failed_samples += 1
 
         if sample.player_status is not FieldStatus.PRESENT:
@@ -439,11 +545,15 @@ class PhysicalEpisodeEngine:
                 episode.coverage_complete = False
                 episode.reason_codes.add("player_data_missing_during_visible_episode")
 
-        if sample.info_status is not InfoStatus.HEALTHY:
+        if _is_qualifying_failure(sample):
             self._record_failure(sample)
             return completed
 
-        if episode.first_failure_mono is not None and episode.confirmed_offline_mono is None:
+        if (
+            episode.first_failure_mono is not None
+            and episode.confirmed_offline_mono is None
+            and episode.info_return_mono is None
+        ):
             self._record_info_return(sample)
             episode.recovery_snapshot_unchanged = self._population_substantially_unchanged(sample)
             episode.stable_recovery_wall = sample.wall_at
@@ -452,10 +562,6 @@ class PhysicalEpisodeEngine:
             return completed
 
         if episode.confirmed_offline_mono is not None and episode.info_return_mono is None:
-            if episode.drain_mono is None:
-                late_drain = self._drain_details(sample)
-                if late_drain is not None:
-                    self._apply_drain(sample, late_drain)
             self._record_info_return(sample)
             episode.recovery_snapshot_unchanged = self._population_substantially_unchanged(sample)
             episode.stable_recovery_wall = sample.wall_at
@@ -468,28 +574,46 @@ class PhysicalEpisodeEngine:
     def _record_failure(self, sample: ObservationSample) -> None:
         episode = self._episode
         assert episode is not None
+        assert _is_qualifying_failure(sample)
         if episode.first_failure_mono is None:
             episode.first_failure_wall = sample.wall_at
             episode.first_failure_mono = sample.monotonic_at
+            episode.last_failure_mono = sample.monotonic_at
             episode.failure_count = 1
             _append_bounded(episode.failure_statuses, sample.info_status, 16)
             episode.sources.add(SignalSource.INFO_OUTAGE)
             self.state = EpisodeState.OBSERVING
             return
-        gap = sample.monotonic_at - episode.first_failure_mono
+
+        if episode.confirmed_offline_mono is not None:
+            if sample.monotonic_at != episode.last_failure_mono:
+                episode.failure_count += 1
+                _append_bounded(episode.failure_statuses, sample.info_status, 16)
+            episode.last_failure_mono = sample.monotonic_at
+            return
+
+        if not pending_strike_is_recent(
+            episode.first_failure_mono,
+            sample.monotonic_at,
+            self.config.online_poll_interval,
+        ):
+            episode.first_failure_wall = sample.wall_at
+            episode.first_failure_mono = sample.monotonic_at
+            episode.last_failure_mono = sample.monotonic_at
+            episode.failure_count = 1
+            episode.failure_statuses[:] = [sample.info_status]
+            episode.reason_codes.add("pending_offline_strike_expired")
+            self.state = EpisodeState.OBSERVING
+            return
+
         if sample.monotonic_at != episode.last_failure_mono:
             episode.failure_count += 1
             _append_bounded(episode.failure_statuses, sample.info_status, 16)
         episode.last_failure_mono = sample.monotonic_at
-        if (
-            episode.failure_count >= 2
-            and self.config.offline_confirmation_minimum <= gap <= self.config.offline_confirmation_maximum
-        ):
+        if episode.failure_count >= 2:
             episode.confirmed_offline_wall = sample.wall_at
             episode.confirmed_offline_mono = sample.monotonic_at
             self.state = EpisodeState.OFFLINE
-        elif gap > self.config.offline_confirmation_maximum:
-            episode.reason_codes.add("offline_confirmation_window_missed")
 
     def _record_info_return(self, sample: ObservationSample) -> None:
         episode = self._episode
@@ -571,40 +695,170 @@ class PhysicalEpisodeEngine:
                 self.config.recovery_spacing_minimum <= gap <= self.config.recovery_spacing_maximum
                 for gap in gaps
             )
-        if stable:
+        if stable and episode.stable_recovery_mono is None:
             episode.stable_recovery_mono = sample.monotonic_at
             episode.stable_recovery_wall = sample.wall_at
 
-    def _drain_details(self, sample: ObservationSample) -> tuple[int, float, bool] | None:
-        if sample.info_status is not InfoStatus.HEALTHY:
-            return None
+    def _observe_player_history(self, sample: ObservationSample) -> None:
+        self._remember_pre_roll(sample)
+        self._expire_provisional_drain(sample.monotonic_at)
+        if sample.player_status is not FieldStatus.PRESENT or sample.players is None:
+            return
+
+        provisional = self._provisional_drain
+        if provisional is not None:
+            recovery_level = math.ceil(
+                provisional.baseline_players * self.config.drain_recovery_fraction
+            )
+            if sample.players >= recovery_level:
+                self._provisional_drain = None
+                return
+            if sample.players <= _low_limit(provisional.baseline_players):
+                if not provisional.low_samples or sample.monotonic_at != provisional.low_samples[-1]:
+                    provisional.low_sample_count += 1
+                    _append_bounded(provisional.low_samples, sample.monotonic_at, 32)
+                provisional.minimum_players = min(provisional.minimum_players, sample.players)
+                provisional.zero_reached = provisional.zero_reached or sample.players == 0
+                provisional.drop_fraction = (
+                    provisional.baseline_players - provisional.minimum_players
+                ) / provisional.baseline_players
+                provisional.evidence_samples = _compact_observation_samples(
+                    [*provisional.evidence_samples, sample],
+                    self.config.event_pre_roll_sample_cap,
+                )
+            elif sample.players > 0:
+                provisional.last_positive_wall = sample.wall_at
+                provisional.last_positive_mono = sample.monotonic_at
+                provisional.evidence_samples = _compact_observation_samples(
+                    [*provisional.evidence_samples, sample],
+                    self.config.event_pre_roll_sample_cap,
+                )
+            return
+
+        self._provisional_drain = self._provisional_drain_from_history(sample)
+
+    def _provisional_drain_from_history(
+        self, sample: ObservationSample
+    ) -> _ProvisionalDrain | None:
         if sample.player_status is not FieldStatus.PRESENT or sample.players is None:
             return None
-        positives = [
+        known = [
             item
             for item in self.pre_roll
             if item.info_status is InfoStatus.HEALTHY
             and item.player_status is FieldStatus.PRESENT
             and item.players is not None
-            and item.players > 0
-            and sample.monotonic_at - item.monotonic_at <= self.config.pre_roll_seconds
         ]
-        if not positives:
+        if len(known) < self.config.drain_baseline_sample_minimum + self.config.drain_low_sample_minimum:
             return None
-        # Median resists one transient spike while still adapting to population changes.
-        baseline = max(1, int(round(statistics.median(item.players for item in positives))))
-        # Measure from the latest sample that still represents the baseline,
-        # not merely the last non-zero value. This prevents a slow 10->...->1->0
-        # decline from looking abrupt because its final 1->0 step was quick.
-        baseline_samples = [item for item in positives if item.players >= baseline * 0.80]
-        if not baseline_samples:
+
+        positive_counts = sorted(item.players for item in known if item.players and item.players > 0)
+        if len(positive_counts) < self.config.drain_baseline_sample_minimum:
             return None
-        elapsed = sample.monotonic_at - baseline_samples[-1].monotonic_at
-        drop_fraction = (baseline - sample.players) / baseline
-        abrupt = elapsed <= self.config.abrupt_drain_window
-        if drop_fraction < 0.80 or sample.players > _low_limit(baseline) or not abrupt:
+        upper_half = positive_counts[len(positive_counts) // 2 :]
+        baseline = max(1, int(round(statistics.median(upper_half))))
+        if baseline < self.config.drain_baseline_minimum:
             return None
-        return baseline, drop_fraction, abrupt
+
+        low_limit = _low_limit(baseline)
+        trailing_low: list[ObservationSample] = []
+        for item in reversed(known):
+            if item.players is not None and item.players <= low_limit:
+                trailing_low.append(item)
+                continue
+            break
+        trailing_low.reverse()
+        if len(trailing_low) < self.config.drain_low_sample_minimum:
+            return None
+
+        low_start = trailing_low[0]
+        if sample.monotonic_at - low_start.monotonic_at > self.config.drain_to_outage_merge:
+            return None
+        before_low = [item for item in known if item.monotonic_at < low_start.monotonic_at]
+        baseline_support = [
+            item
+            for item in before_low
+            if item.players is not None and item.players >= baseline * self.config.drain_recovery_fraction
+        ]
+        if len(baseline_support) < self.config.drain_baseline_sample_minimum:
+            return None
+        baseline_sample = baseline_support[-1]
+        decline_duration = low_start.monotonic_at - baseline_sample.monotonic_at
+        if not 0.0 <= decline_duration <= self.config.gradual_drain_maximum:
+            return None
+
+        minimum_players = min(item.players for item in trailing_low if item.players is not None)
+        absolute_drop = baseline - minimum_players
+        drop_fraction = absolute_drop / baseline
+        if (
+            absolute_drop < self.config.drain_absolute_drop_minimum
+            or drop_fraction < self.config.drain_relative_drop_minimum
+        ):
+            return None
+        last_positive = next(
+            (
+                item
+                for item in reversed(before_low)
+                if item.players is not None and item.players > 0
+            ),
+            None,
+        )
+        evidence = [item for item in self.pre_roll if item.monotonic_at >= baseline_sample.monotonic_at]
+        return _ProvisionalDrain(
+            baseline_players=baseline,
+            baseline_wall=baseline_sample.wall_at,
+            baseline_mono=baseline_sample.monotonic_at,
+            last_positive_wall=last_positive.wall_at if last_positive else None,
+            last_positive_mono=last_positive.monotonic_at if last_positive else None,
+            low_start_wall=low_start.wall_at,
+            low_start_mono=low_start.monotonic_at,
+            minimum_players=minimum_players,
+            zero_reached=any(item.players == 0 for item in trailing_low),
+            drop_fraction=drop_fraction,
+            low_sample_count=len(trailing_low),
+            low_samples=[item.monotonic_at for item in trailing_low[-32:]],
+            abrupt=decline_duration <= self.config.abrupt_drain_window,
+            decline_duration=decline_duration,
+            expires_mono=low_start.monotonic_at + self.config.drain_to_outage_merge,
+            evidence_samples=_compact_observation_samples(
+                evidence, self.config.event_pre_roll_sample_cap
+            ),
+        )
+
+    def _expire_provisional_drain(self, monotonic_at: float) -> None:
+        provisional = self._provisional_drain
+        if provisional is not None and monotonic_at > provisional.expires_mono:
+            self._provisional_drain = None
+
+    def _inherit_provisional_drain(self, first_failure: ObservationSample) -> None:
+        episode = self._episode
+        assert episode is not None
+        provisional = self._provisional_drain
+        if provisional is None:
+            return
+        merge_age = first_failure.monotonic_at - provisional.low_start_mono
+        if not 0.0 <= merge_age <= self.config.drain_to_outage_merge:
+            self._provisional_drain = None
+            return
+        episode.baseline_players = provisional.baseline_players
+        episode.baseline_wall = provisional.baseline_wall
+        episode.baseline_mono = provisional.baseline_mono
+        episode.last_positive_wall = provisional.last_positive_wall
+        episode.last_positive_mono = provisional.last_positive_mono
+        episode.drain_wall = provisional.low_start_wall
+        episode.drain_mono = provisional.low_start_mono
+        episode.low_start_wall = provisional.low_start_wall
+        episode.low_start_mono = provisional.low_start_mono
+        episode.zero_reached = provisional.zero_reached
+        episode.minimum_players = provisional.minimum_players
+        episode.drop_fraction = provisional.drop_fraction
+        episode.abrupt_drain = provisional.abrupt
+        episode.drain_inherited = True
+        episode.low_sample_count = provisional.low_sample_count
+        episode.low_samples[:] = provisional.low_samples
+        episode.sources.update((SignalSource.PLAYER_DRAIN, SignalSource.VISIBLE_LOW))
+        episode.reason_codes.add("inherited_provisional_player_drain")
+        self._provisional_drain = None
 
     def _open_episode(self, sample: ObservationSample, trigger: str) -> None:
         self._sequence += 1
@@ -627,7 +881,9 @@ class PhysicalEpisodeEngine:
             started_mono=sample.monotonic_at,
             fingerprint=fingerprint,
             event_id=event_id,
-            samples=list(self.pre_roll[-self.config.pre_roll_sample_cap :]),
+            continuity_chain_id=sample.continuity_chain_id,
+            provenance_version=sample.provenance_version,
+            samples=self._event_history_slice(),
         )
         if sample.info_status is InfoStatus.HEALTHY:
             self._episode.healthy_samples = 1
@@ -638,30 +894,19 @@ class PhysicalEpisodeEngine:
         self.state = EpisodeState.OBSERVING
         self._append_episode_sample(sample)
 
-    def _apply_drain(self, sample: ObservationSample, details: tuple[int, float, bool]) -> None:
-        episode = self._episode
-        assert episode is not None
-        baseline, fraction, abrupt = details
-        positives = [item for item in self.pre_roll if item.players is not None and item.players > 0]
-        last_positive = positives[-1] if positives else None
-        episode.baseline_players = baseline
-        episode.last_positive_wall = last_positive.wall_at if last_positive else None
-        episode.last_positive_mono = last_positive.monotonic_at if last_positive else None
-        episode.drain_wall = sample.wall_at
-        episode.drain_mono = sample.monotonic_at
-        episode.low_start_wall = sample.wall_at
-        episode.low_start_mono = sample.monotonic_at
-        episode.zero_reached = sample.players == 0
-        episode.minimum_players = sample.players
-        episode.drop_fraction = fraction
-        episode.abrupt_drain = abrupt
-        episode.low_sample_count = 1
-        episode.low_samples.append(sample.monotonic_at)
-        episode.sources.update((SignalSource.PLAYER_DRAIN, SignalSource.VISIBLE_LOW))
+    def _event_history_slice(self) -> list[ObservationSample]:
+        provisional = self._provisional_drain
+        source = provisional.evidence_samples if provisional is not None else self.pre_roll
+        return _compact_observation_samples(source, self.config.event_pre_roll_sample_cap)
 
     def _population_substantially_unchanged(self, sample: ObservationSample) -> bool:
         if sample.player_status is not FieldStatus.PRESENT or sample.players is None:
             return False
+        episode = self._episode
+        if episode is not None and episode.baseline_players is not None:
+            baseline = float(episode.baseline_players)
+            tolerance = max(1.0, baseline * 0.20)
+            return abs(sample.players - baseline) <= tolerance
         positives = [item.players for item in self.pre_roll if item.players is not None and item.players > 0]
         if not positives:
             return False
@@ -794,6 +1039,13 @@ class PhysicalEpisodeEngine:
                 low_sample_count=episode.low_sample_count,
                 low_duration=_low_duration(episode),
                 abrupt=episode.abrupt_drain,
+                baseline_at=episode.baseline_wall,
+                decline_duration=(
+                    max(0.0, episode.low_start_mono - episode.baseline_mono)
+                    if episode.low_start_mono is not None and episode.baseline_mono is not None
+                    else 0.0
+                ),
+                inherited=episode.drain_inherited,
             ),
             outage=OutageSummary(
                 first_failure_at=episode.first_failure_wall,
@@ -819,11 +1071,23 @@ class PhysicalEpisodeEngine:
             lifecycle_interruption=episode.lifecycle_interruption,
             samples=tuple(episode.samples),
             reason_codes=tuple(sorted(episode.reason_codes)),
+            app_session_id=episode.app_session_id,
+            monitoring_session_id=episode.monitoring_session_id,
+            poll_generation=episode.poll_generation,
+            continuity_chain_id=episode.continuity_chain_id,
+            provenance_version=episode.provenance_version,
         )
         self._episode = None
         self.state = EpisodeState.IDLE
         self.pre_roll.clear()
-        self._cooldown_until_stable = True
+        self._pending_failure = None
+        self._provisional_drain = None
+        self._cooldown_until_stable = outcome in {
+            EventOutcome.CORROBORATED_OFFLINE_RESTART,
+            EventOutcome.CONFIRMED_OFFLINE_RESTART,
+            EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+            EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART,
+        }
         self._normal_since_mono = None
         return event
 
@@ -839,7 +1103,10 @@ class PhysicalEpisodeEngine:
 
     def _reset_normal_history(self) -> None:
         self.pre_roll.clear()
+        self._pending_failure = None
+        self._provisional_drain = None
         self._normal_since_mono = None
+        self._cooldown_until_stable = False
 
 
 def _authenticity(outcome: EventOutcome, episode: _Episode) -> float:
@@ -987,10 +1254,37 @@ def _is_healthy_normal(sample: ObservationSample) -> bool:
     return sample.info_status is InfoStatus.HEALTHY and sample.lifecycle is LifecycleMarker.NORMAL
 
 
+def _is_qualifying_failure(sample: ObservationSample) -> bool:
+    return sample.info_status in {InfoStatus.TIMEOUT, InfoStatus.NETWORK_ERROR}
+
+
+def _is_detector_evidence(sample: ObservationSample) -> bool:
+    return sample.info_status is InfoStatus.HEALTHY or _is_qualifying_failure(sample)
+
+
 def _append_bounded(values: list, value: object, limit: int) -> None:
     values.append(value)
     if len(values) > limit:
         values[1 : len(values) - limit + 1] = []
+
+
+def _compact_observation_samples(
+    values: list[ObservationSample], limit: int
+) -> list[ObservationSample]:
+    compacted: list[ObservationSample] = []
+    for sample in values:
+        signature = _sample_signature(sample)
+        if (
+            len(compacted) >= 2
+            and _sample_signature(compacted[-1]) == signature
+            and _sample_signature(compacted[-2]) == signature
+        ):
+            compacted[-1] = sample
+        else:
+            compacted.append(sample)
+    if len(compacted) > limit:
+        compacted[:] = [compacted[0], *compacted[-(limit - 1) :]]
+    return compacted
 
 
 def _validate_field(name: str, status: FieldStatus, value: int | None) -> None:

@@ -64,6 +64,14 @@ COMPANION_RESTART_LEARNING_PHASE2_PATH = os.path.join(
     CFG_DIR,
     "companion_restart_learning_phase2.json",
 )
+# Stage 3A backend soak switch.  It is deliberately development-only and
+# disabled until schema-4 migration and the later consumer cutover are
+# separately approved.
+AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED = True
+# Stage 3B1 consumer evaluation and future production cutover are separately
+# gated.  Neither is exposed as a user setting and both remain disabled.
+SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED = True
+SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED = True
 
 # Dead server cache (local)
 CACHE_DIR = os.path.expanduser("~/.cache/dzll")
