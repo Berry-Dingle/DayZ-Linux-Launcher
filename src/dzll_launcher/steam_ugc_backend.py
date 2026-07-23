@@ -639,6 +639,154 @@ def request_unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=12) -> t
     return bool(ok), snapshots
 
 
+def repair_ugc_item(
+    mod_id,
+    *,
+    appid=DAYZ_APPID,
+    progress_cb=None,
+    removal_timeout: float = 120.0,
+    download_timeout: float = 3600.0,
+    poll_interval: float = 1.0,
+    request_unsubscribe_fn=None,
+    query_state_fn=None,
+    install_fn=None,
+    content_exists_fn=None,
+    monotonic_fn=None,
+    sleep_fn=None,
+) -> dict:
+    """Reacquire one Workshop item through Steam UGC without deleting files."""
+    try:
+        mid = int(mod_id)
+    except Exception:
+        mid = 0
+    if mid <= 0:
+        return {"ok": False, "id": mid, "reason": "invalid_id", "error": "Invalid Workshop ID."}
+
+    request_unsubscribe_fn = request_unsubscribe_fn or request_unsubscribe_ugc_items
+    query_state_fn = query_state_fn or query_ugc_state_checked
+    install_fn = install_fn or run_ugc_install
+    monotonic_fn = monotonic_fn or time.monotonic
+    sleep_fn = sleep_fn or time.sleep
+
+    def content_exists(state: dict) -> bool:
+        if callable(content_exists_fn):
+            return bool(content_exists_fn(mid, dict(state or {})))
+        return _has_real_native_workshop_folder(mid, appid=int(appid), states=[dict(state or {})])
+
+    def emit_stage(stage: str, **extra) -> None:
+        event = {"type": "repair", "id": mid, "stage": str(stage)}
+        event.update(extra)
+        _progress(progress_cb, event)
+
+    def query() -> tuple[bool, dict]:
+        ok, states = query_state_fn([mid], appid=int(appid), timeout=10)
+        return bool(ok), dict((states or {}).get(mid) or (states or {}).get(str(mid)) or {})
+
+    emit_stage("unsubscribing")
+    try:
+        request_ok, _snapshots = request_unsubscribe_fn([mid], appid=int(appid), timeout=12)
+    except Exception as exc:
+        return {"ok": False, "id": mid, "reason": "unsubscribe_failed", "error": f"Steam could not unsubscribe the mod: {exc}"}
+    if not request_ok:
+        return {"ok": False, "id": mid, "reason": "unsubscribe_failed", "error": "Steam did not accept the unsubscribe request."}
+
+    deadline = monotonic_fn() + max(0.0, float(removal_timeout))
+    unsubscribed = False
+    while monotonic_fn() <= deadline:
+        emit_stage("waiting_removal")
+        try:
+            state_ok, state = query()
+        except Exception:
+            state_ok, state = False, {}
+        if state_ok and state:
+            unsubscribed = not bool(state.get("subscribed", False))
+            if unsubscribed and not content_exists(state):
+                break
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            reason = "removal_timeout" if unsubscribed else "unsubscribe_failed"
+            error = (
+                "Steam unsubscribed the mod but did not finish removing its local content in time."
+                if unsubscribed
+                else "Steam still reports the mod subscribed."
+            )
+            return {"ok": False, "id": mid, "reason": reason, "error": error, "not_installed": unsubscribed}
+        sleep_fn(min(max(0.01, float(poll_interval)), remaining))
+
+    emit_stage("subscribing")
+
+    def install_progress(event: dict) -> None:
+        forwarded = dict(event or {})
+        forwarded.setdefault("id", mid)
+        forwarded["type"] = "repair_progress"
+        forwarded["stage"] = "downloading"
+        _progress(progress_cb, forwarded)
+
+    try:
+        install_ok = bool(
+            install_fn(
+                [mid],
+                appid=int(appid),
+                cancel_event=None,
+                progress_cb=install_progress,
+                allow_start_steam=False,
+                timeout=float(download_timeout),
+            )
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "id": mid,
+            "reason": "download_failed",
+            "error": f"Steam could not reinstall the mod: {exc}",
+            "not_installed": True,
+        }
+
+    emit_stage("verifying")
+    try:
+        state_ok, terminal = query()
+    except Exception:
+        state_ok, terminal = False, {}
+    if not state_ok or not terminal:
+        return {
+            "ok": False,
+            "id": mid,
+            "reason": "terminal_unresolved",
+            "error": "Steam finished without returning a verifiable final mod state.",
+            "not_installed": True,
+        }
+    if not bool(terminal.get("subscribed", False)):
+        return {
+            "ok": False,
+            "id": mid,
+            "reason": "subscribe_failed",
+            "error": "Steam did not resubscribe the mod.",
+            "not_installed": True,
+            "state": terminal,
+        }
+    if not install_ok or not ugc_item_ready(terminal):
+        return {
+            "ok": False,
+            "id": mid,
+            "reason": "download_failed",
+            "error": "Steam did not finish installing the repaired mod.",
+            "not_installed": not bool(terminal.get("installed", False)),
+            "state": terminal,
+        }
+    if not content_exists(terminal):
+        return {
+            "ok": False,
+            "id": mid,
+            "reason": "missing_directory",
+            "error": "Steam reports the mod ready, but its Workshop content directory is missing.",
+            "not_installed": True,
+            "state": terminal,
+        }
+
+    emit_stage("success", fraction=1.0, percent=100)
+    return {"ok": True, "id": mid, "reason": "success", "state": terminal}
+
+
 def _native_steam_roots() -> list[Path]:
     roots: list[Path] = []
     try:

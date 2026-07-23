@@ -362,6 +362,85 @@ def test_mod_manager_row_hover_has_no_fill_change():
     assert "@dzll_control_hover" not in hover
 
 
+def test_mod_manager_row_divider_is_owned_by_row_bottom_border():
+    css = app_css()
+    row_border = css.split(".mods-card .mods-list row.mods-row {", 1)[1].split("}", 1)[0]
+    assert "border-top: 0;" in row_border
+    assert "border-right: 0;" in row_border
+    assert "border-bottom: 1px solid @dzll_divider;" in row_border
+    assert "border-left: 0;" in row_border
+    assert ".mods-card row separator" not in css
+    assert ".mods-card .mods-column-separator" in css
+
+    source = Path(__file__).resolve().parents[1] / "src" / "dzll_launcher" / "mods_ui.py"
+    body = source.read_text(encoding="utf-8")
+    row_source = body.split("    def _make_row(", 1)[1].split("    def _loaded_item_id_set", 1)[0]
+    assert "Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)" not in row_source
+    assert 'add_css_class("mods-row-divider-spacer")' in row_source
+
+
+def test_mod_manager_row_spacing_and_border_inset_preserve_content_geometry():
+    source = Path(__file__).resolve().parents[1] / "src" / "dzll_launcher" / "mods_ui.py"
+    body = source.read_text(encoding="utf-8")
+    row_source = body.split("    def _make_row(", 1)[1].split("    def _loaded_item_id_set", 1)[0]
+    assert "row.set_margin_start(MOD_ROW_BORDER_INSET)" in row_source
+    assert "row.set_margin_end(MOD_ROW_BORDER_INSET)" in row_source
+    assert "Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)" in row_source
+    assert "outer.set_margin_top(9)" in row_source
+    assert "outer.set_margin_bottom(9)" in row_source
+    assert "outer.set_margin_start(MOD_ROW_CONTENT_INSET)" in row_source
+    assert "outer.set_margin_end(MOD_ROW_CONTENT_INSET)" in row_source
+
+
+def test_mod_manager_header_uses_finalized_row_column_geometry():
+    source = Path(__file__).resolve().parents[1] / "src" / "dzll_launcher" / "mods_ui.py"
+    body = source.read_text(encoding="utf-8")
+    header_source = body.split("    def _make_column_header", 1)[1].split("    def _make_sort_header_label", 1)[0]
+    assert "header.set_margin_start(MOD_ROW_BORDER_INSET + 5)" in header_source
+    assert "header.set_margin_end(MOD_ROW_BORDER_INSET + 5)" in header_source
+    assert "header_tail.set_margin_start(0)" in header_source
+    assert "spacing=8" in header_source
+    assert "MOD_WORKSHOP_COLUMN_CHARS" in header_source
+    assert "MOD_ID_COLUMN_WIDTH" in header_source
+    assert "MOD_SIZE_COLUMN_CHARS" in header_source
+    assert "MOD_LAST_USED_COLUMN_CHARS" in header_source
+    assert "MOD_REPAIR_COLUMN_WIDTH" in header_source
+    assert 'Gtk.Label(label="")' in header_source
+
+
+def test_mod_manager_repair_column_is_inactive_and_narrow():
+    source = Path(__file__).resolve().parents[1] / "src" / "dzll_launcher" / "mods_ui.py"
+    body = source.read_text(encoding="utf-8")
+    assert "MOD_REPAIR_COLUMN_WIDTH = 48" in body
+    repair_source = body.split("    def _make_repair_control", 1)[1].split("    def _current_row_for_mod", 1)[0]
+    assert '"tools-symbolic"' in repair_source
+    assert 'set_tooltip_text("Repair Mod")' in repair_source
+    row_source = body.split("    def _make_row(", 1)[1].split("    def _loaded_item_id_set", 1)[0]
+    assert "self._make_repair_control(int(mod_id))" in row_source
+
+
+def test_mod_manager_repair_icon_is_unboxed_and_orange():
+    css = app_css()
+    assert "button.flat.mods-repair-icon-btn" in css
+    assert "color: @dzll_repair_orange;" in css
+    assert "color: @dzll_repair_orange_hover;" in css
+    repair = css.split("button.flat.mods-repair-icon-btn", 1)[1]
+    assert "background: transparent;" in repair
+    assert "border: none;" in repair
+    assert "box-shadow: none;" in repair
+    assert "outline: none;" in repair
+    assert "button.flat.mods-repair-icon-btn:hover" in css
+    assert "button.flat.mods-repair-icon-btn:active" in css
+
+    source = Path(__file__).resolve().parents[1] / "src" / "dzll_launcher" / "mods_ui.py"
+    body = source.read_text(encoding="utf-8")
+    repair_source = body.split("    def _make_repair_control", 1)[1].split("    def _current_row_for_mod", 1)[0]
+    assert '"tools-symbolic"' in repair_source
+    assert 'add_css_class("mods-repair-icon-btn")' in repair_source
+    assert 'set_tooltip_text("Repair Mod")' in repair_source
+    assert "attach_pointer_cursor(btn)" in repair_source
+
+
 def test_mod_manager_workshop_link_states_target_symbolic_image():
     css = app_css()
     normal = css.split(

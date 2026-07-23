@@ -76,6 +76,8 @@ def get_app_css(
         @define-color dzll_ping_greeny #9ad43a;
         @define-color dzll_ping_yellow #e3c84a;
         @define-color dzll_ping_orange #e19a3a;
+        @define-color dzll_repair_orange #f28c28;
+        @define-color dzll_repair_orange_hover #ffad45;
         @define-color dzll_ping_bad #e04b4b;
         @define-color dzll_monitor_idle #4aa3ff;
         @define-color dzll_monitor_active #ff4d4d;
@@ -1972,6 +1974,50 @@ def get_app_css(
         .mods-card .mods-column-separator {{
           background: @dzll_divider;
         }}
+
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:hover,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:active,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn image,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:hover image,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:active image {{
+          background: transparent;
+          background-image: none;
+          border: none;
+          box-shadow: none;
+          outline: none;
+        }}
+
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn image {{
+          color: @dzll_repair_orange;
+          padding: 0;
+        }}
+
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:hover,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:hover image {{
+          color: @dzll_repair_orange_hover;
+        }}
+
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:active,
+        .dzll-app-root .mods-card button.flat.mods-repair-icon-btn:active image {{
+          color: @dzll_repair_orange_hover;
+        }}
+
+        .mods-card .mods-repair-percent {{
+          color: @dzll_text_primary;
+          font-size: 0.82em;
+          font-weight: 700;
+        }}
+
+        .mods-card .mods-repair-success {{
+          color: @dzll_success;
+        }}
+
+        .mods-card row.mods-row.mods-repair-active > * {{
+          background: transparent;
+          background-image: none;
+        }}
         
         .dzll-app-root .mods-card button.flat.mod-workshop-link-btn,
         .dzll-app-root .mods-card button.flat.mod-workshop-link-btn image {{
@@ -2040,10 +2086,13 @@ def get_app_css(
         .dzll-app-root .mods-card row.mods-row:hover > * {{
           background: @dzll_surface_content;
         }}
-        
-        /* Keep the separator line visible */
-        .mods-card row separator {{
-          background: @dzll_divider;
+
+        /* Own each data-row divider at the true bottom edge. */
+        .mods-card .mods-list row.mods-row {{
+          border-top: 0;
+          border-right: 0;
+          border-bottom: 1px solid @dzll_divider;
+          border-left: 0;
         }}
         
         .mods-card .mods-list {{
@@ -2059,5 +2108,24 @@ def get_app_css(
           background: @dzll_surface_content;
         }}
         """.encode("utf-8")
+
+    repair_progress_rules = []
+    for percent in range(101):
+        repair_progress_rules.append(
+            f"""
+        .mods-card .mods-list row.mods-row.mods-repair-progress-{percent},
+        .dzll-app-root .mods-card .mods-list row.mods-row.mods-repair-progress-{percent}:hover {{
+          background-color: @dzll_surface_content;
+          background-image: linear-gradient(
+            to right,
+            alpha(@dzll_accent, 0.34) 0%,
+            alpha(@dzll_accent, 0.34) {percent}%,
+            @dzll_surface_content {percent}%,
+            @dzll_surface_content 100%
+          );
+        }}
+        """
+        )
+    css += "\n".join(repair_progress_rules).encode("utf-8")
 
     return css

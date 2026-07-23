@@ -12,7 +12,9 @@ from .config import CACHE_DIR
 from .settings import autodetect_workshop_dir, save_settings
 from .steam_ugc_backend import delete_ugc_mod_local_files_after_unsubscribe
 from .steam_ugc_backend import query_ugc_state_checked
+from .steam_ugc_backend import repair_ugc_item
 from .steam_ugc_backend import request_unsubscribe_ugc_items
+from .background_prepare import preparation_operation_gate
 from .steam_native import dayz_steam_library, dayz_workshop_content_dir, is_native_steam_running, native_steam_libraries, resolve_native_steam_cmd
 from .steamcmd_mods import remove_dzll_symlinks_for_mod
 from .mod_metadata import clean_display_mod_name, load_mod_metadata
@@ -25,7 +27,11 @@ MOD_ID_COLUMN_WIDTH = 132
 MOD_SIZE_COLUMN_CHARS = 9
 MOD_LAST_USED_COLUMN_CHARS = 12
 MOD_SELECT_COLUMN_WIDTH = 42
-MOD_MANAGER_CARD_WIDTH = 960
+# Shared horizontal geometry for the data rows and their column header.
+MOD_ROW_BORDER_INSET = 12
+MOD_ROW_CONTENT_INSET = 2
+MOD_REPAIR_COLUMN_WIDTH = 48
+MOD_MANAGER_CARD_WIDTH = 960 + MOD_REPAIR_COLUMN_WIDTH
 BATCH_UNSUBSCRIBE_ITEM_TIMEOUT_S = 45
 BATCH_UNSUBSCRIBE_VERIFY_TIMEOUT_S = 12
 BATCH_UNSUBSCRIBE_REQUEST_TIMEOUT_S = 12
@@ -482,6 +488,11 @@ class ModsManagerOverlay:
         self._batch_unsubscribe_stop_requested = False
         self._batch_unsubscribe_queue_count = 0
         self._mod_operation_pending = False
+        self._repair_generation = 0
+        self._repair_state_by_id = {}
+        self._repair_lease = None
+        self._repair_ui_attached = True
+        self._repair_refresh_needed = False
         self._steam_management_verified = False
         self._last_mod_state_query_ok = False
         self._host_close_request_handler_id = 0
@@ -572,6 +583,7 @@ class ModsManagerOverlay:
 
     def _on_host_close_request(self, *_):
         self._stop_passive_steam_watch()
+        self._repair_ui_attached = False
         return False
 
     def _show_legacy_pending_delete_migration_status(self):
@@ -645,6 +657,7 @@ class ModsManagerOverlay:
             self._set_mod_operation_status("", running=False)
 
     def show(self):
+        self._repair_ui_attached = True
         self.scrim.set_visible(True)
         self.card.set_visible(True)
         self._clear_one_shot_action_status_if_idle()
@@ -653,6 +666,11 @@ class ModsManagerOverlay:
         except Exception:
             pass
         self._maybe_start_passive_steam_watch()
+        if bool(getattr(self, "_repair_refresh_needed", False)):
+            self._repair_refresh_needed = False
+            self.refresh(completion_status="Repair complete.")
+        else:
+            self._sync_repair_presentations()
 
     def hide(self):
         self._hide_now()
@@ -660,6 +678,7 @@ class ModsManagerOverlay:
 
     def _hide_now(self):
         self._stop_passive_steam_watch()
+        self._repair_ui_attached = False
         self.scrim.set_visible(False)
         self.card.set_visible(False)
         return False
@@ -1237,8 +1256,8 @@ class ModsManagerOverlay:
     def _make_column_header(self) -> Gtk.Box:
         header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         header.set_hexpand(True)
-        header.set_margin_start(7)
-        header.set_margin_end(7)
+        header.set_margin_start(MOD_ROW_BORDER_INSET + 5)
+        header.set_margin_end(MOD_ROW_BORDER_INSET + 5)
         header.add_css_class("mods-column-header")
 
         select_lbl = Gtk.Label(label="")
@@ -1251,7 +1270,7 @@ class ModsManagerOverlay:
         header.append(name_lbl)
 
         header_tail = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        header_tail.set_margin_start(-3)
+        header_tail.set_margin_start(0)
         header.append(header_tail)
 
         header_tail.append(self._make_column_separator())
@@ -1277,6 +1296,12 @@ class ModsManagerOverlay:
         used_lbl = self._make_sort_header_label("Last Used", "last_used", xalign=0.0)
         used_lbl.set_width_chars(MOD_LAST_USED_COLUMN_CHARS)
         header_tail.append(used_lbl)
+
+        header_tail.append(self._make_column_separator())
+
+        repair_header_lbl = Gtk.Label(label="")
+        repair_header_lbl.set_size_request(MOD_REPAIR_COLUMN_WIDTH, -1)
+        header_tail.append(repair_header_lbl)
 
         return header
 
@@ -1670,6 +1695,294 @@ class ModsManagerOverlay:
         btn.connect("clicked", lambda *_: self._open_workshop_page(mod_id))
         return btn
 
+    def _make_repair_control(self, mod_id: int) -> Gtk.Stack:
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        stack.set_size_request(MOD_REPAIR_COLUMN_WIDTH, 24)
+        stack.set_halign(Gtk.Align.CENTER)
+        stack.set_valign(Gtk.Align.CENTER)
+
+        btn = Gtk.Button()
+        btn.add_css_class("flat")
+        btn.add_css_class("mods-repair-icon-btn")
+        btn.set_size_request(MOD_REPAIR_COLUMN_WIDTH, 24)
+        btn.set_halign(Gtk.Align.CENTER)
+        btn.set_valign(Gtk.Align.CENTER)
+        btn.set_can_focus(False)
+        btn.set_focus_on_click(False)
+        btn.set_tooltip_text("Repair Mod")
+        btn.set_child(Gtk.Image.new_from_icon_name("tools-symbolic"))
+        attach_pointer_cursor(btn)
+        btn.connect("clicked", lambda *_: self._on_repair_clicked(int(mod_id)))
+        stack.add_named(btn, "repair")
+
+        spinner = Gtk.Spinner()
+        spinner.set_halign(Gtk.Align.CENTER)
+        spinner.set_valign(Gtk.Align.CENTER)
+        spinner.set_size_request(18, 18)
+        stack.add_named(spinner, "spinner")
+
+        percent = Gtk.Label(label="")
+        percent.add_css_class("mods-repair-percent")
+        percent.set_halign(Gtk.Align.CENTER)
+        percent.set_valign(Gtk.Align.CENTER)
+        stack.add_named(percent, "percent")
+
+        success = Gtk.Image.new_from_icon_name("emblem-ok-symbolic")
+        success.add_css_class("mods-repair-success")
+        success.set_halign(Gtk.Align.CENTER)
+        success.set_valign(Gtk.Align.CENTER)
+        stack.add_named(success, "success")
+
+        stack._dzll_repair_button = btn
+        stack._dzll_repair_spinner = spinner
+        stack._dzll_repair_percent = percent
+        stack.set_visible_child_name("repair")
+        return stack
+
+    def _current_row_for_mod(self, mod_id: int):
+        child = self.lb.get_first_child()
+        while child is not None:
+            if int(getattr(child, "_dzll_mod_id", 0) or 0) == int(mod_id):
+                return child
+            child = child.get_next_sibling()
+        return None
+
+    def _apply_repair_state_to_row(self, row, state: dict | None) -> None:
+        if row is None:
+            return
+        old_class = str(getattr(row, "_dzll_repair_progress_class", "") or "")
+        if old_class:
+            row.remove_css_class(old_class)
+            row._dzll_repair_progress_class = ""
+
+        control = getattr(row, "_dzll_repair_control", None)
+        checkbox = getattr(row, "_dzll_select_check", None)
+        active = bool(state)
+        if checkbox is not None:
+            checkbox.set_sensitive(not active)
+        if control is None:
+            return
+
+        button = getattr(control, "_dzll_repair_button", None)
+        spinner = getattr(control, "_dzll_repair_spinner", None)
+        percent_label = getattr(control, "_dzll_repair_percent", None)
+        if button is not None:
+            button.set_sensitive(not active)
+        if not active:
+            row.remove_css_class("mods-repair-active")
+            if spinner is not None:
+                spinner.stop()
+            control.set_visible_child_name("repair")
+            return
+
+        row.add_css_class("mods-repair-active")
+        fraction = max(0.0, min(1.0, float(state.get("fraction", 0.0) or 0.0)))
+        percent_value = max(0, min(100, int(state.get("percent", round(fraction * 100.0)) or 0)))
+        progress_class = f"mods-repair-progress-{percent_value}"
+        row.add_css_class(progress_class)
+        row._dzll_repair_progress_class = progress_class
+        phase = str(state.get("phase") or "spinner")
+        if phase == "percent":
+            if spinner is not None:
+                spinner.stop()
+            if percent_label is not None:
+                percent_label.set_text(f"{percent_value}%")
+            control.set_visible_child_name("percent")
+        elif phase == "success":
+            if spinner is not None:
+                spinner.stop()
+            control.set_visible_child_name("success")
+        else:
+            if spinner is not None:
+                spinner.start()
+            control.set_visible_child_name("spinner")
+
+    def _sync_repair_presentations(self) -> None:
+        for mid, state in list(getattr(self, "_repair_state_by_id", {}).items()):
+            self._apply_repair_state_to_row(self._current_row_for_mod(int(mid)), state)
+
+    def _dayz_running_for_repair(self) -> bool:
+        checker = getattr(self._app_session_owner(), "_dayz_game_running", None)
+        try:
+            return bool(checker()) if callable(checker) else False
+        except Exception:
+            return False
+
+    def _on_repair_clicked(self, mod_id: int) -> bool:
+        mid = int(mod_id)
+        if (
+            bool(getattr(self, "_mod_operation_running", False))
+            or bool(getattr(self, "_mod_operation_pending", False))
+            or bool(getattr(self, "_batch_unsubscribe_running", False))
+        ):
+            self._set_mod_operation_status("Another mod operation is already running.", running=False)
+            return False
+        if self._dayz_running_for_repair():
+            self._confirm_show(
+                "Close DayZ before repairing",
+                "Repair cannot run while DayZ is running. Close the game, then try Repair Mod again.",
+                "Close",
+                lambda _ok: None,
+                show_cancel=False,
+            )
+            return False
+
+        self._set_mod_operation_pending(True)
+
+        def after_confirm(ok: bool) -> None:
+            if not ok:
+                self._set_mod_operation_pending(False)
+                self._set_mod_operation_status("Repair cancelled.", running=False)
+                return
+            if self._dayz_running_for_repair():
+                self._set_mod_operation_pending(False)
+                self._confirm_show(
+                    "Close DayZ before repairing",
+                    "Repair cannot run while DayZ is running. Close the game, then try Repair Mod again.",
+                    "Close",
+                    lambda _ok: None,
+                    show_cancel=False,
+                )
+                return
+            if not self._steam_management_is_verified():
+                self._set_mod_operation_pending(False)
+                self._show_start_steam_manage_prompt()
+                return
+            gate = preparation_operation_gate(self._app_session_owner())
+            lease = gate.try_acquire("mod_repair")
+            if lease is None:
+                self._set_mod_operation_pending(False)
+                self._set_mod_operation_status("Another Steam mod operation is already running.", running=False)
+                return
+            self._repair_lease = lease
+            self._set_mod_operation_pending(False)
+            self._start_repair(mid)
+
+        self._confirm_show(
+            "Repair this mod?",
+            "Repair fully reacquires only this mod from Steam. Use it for a stale or corrupt mod "
+            "that Steam incorrectly reports as current.",
+            "Repair Mod",
+            after_confirm,
+            show_cancel=True,
+            cancel_label="Cancel",
+        )
+        return False
+
+    def _start_repair(self, mod_id: int) -> None:
+        self._repair_generation += 1
+        generation = int(self._repair_generation)
+        mid = int(mod_id)
+        state = {"generation": generation, "phase": "spinner", "fraction": 0.0}
+        self._repair_state_by_id = {mid: state}
+        self._set_mod_operation_status("Repairing mod...", running=True)
+        self._apply_repair_state_to_row(self._current_row_for_mod(mid), state)
+
+        def progress(event: dict) -> None:
+            GLib.idle_add(self._on_repair_progress, mid, generation, dict(event or {}))
+
+        def worker() -> None:
+            try:
+                result = repair_ugc_item(mid, appid=int(APPID), progress_cb=progress)
+            except Exception as exc:
+                result = {
+                    "ok": False,
+                    "id": mid,
+                    "reason": "unexpected_error",
+                    "error": f"Repair failed: {exc}",
+                    "not_installed": True,
+                }
+            GLib.idle_add(self._finish_repair, mid, generation, result)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_repair_progress(self, mod_id: int, generation: int, event: dict) -> bool:
+        state = self._repair_state_by_id.get(int(mod_id))
+        if not state or int(state.get("generation", 0)) != int(generation):
+            return False
+
+        payload = dict(event or {})
+        nested = payload.get("event")
+        if isinstance(nested, dict):
+            if "download_bytes" not in payload:
+                payload["download_bytes"] = nested.get("download_bytes")
+            if "total_bytes" not in payload:
+                payload["total_bytes"] = nested.get("total_bytes")
+        try:
+            downloaded = int(payload.get("download_bytes") or 0)
+        except (TypeError, ValueError, OverflowError):
+            downloaded = 0
+        try:
+            total = int(payload.get("total_bytes") or 0)
+        except (TypeError, ValueError, OverflowError):
+            total = 0
+
+        if downloaded > 0 and total > 0:
+            measured = max(0.0, min(1.0, downloaded / total))
+            measured_percent = max(1, min(100, int(measured * 100.0)))
+            previous_percent = max(0, min(100, int(state.get("percent", 0) or 0)))
+            percent = max(previous_percent, measured_percent)
+            state["percent"] = percent
+            state["fraction"] = percent / 100.0
+            state["phase"] = "percent"
+        elif str(payload.get("stage") or "") == "success":
+            state["percent"] = 100
+            state["fraction"] = 1.0
+            state["phase"] = "success"
+        elif str(state.get("phase") or "spinner") not in ("percent", "success"):
+            state["phase"] = "spinner"
+        if bool(getattr(self, "_repair_ui_attached", True)):
+            self._apply_repair_state_to_row(self._current_row_for_mod(int(mod_id)), state)
+        return False
+
+    def _release_repair_lease(self) -> None:
+        lease = getattr(self, "_repair_lease", None)
+        self._repair_lease = None
+        if lease is not None:
+            try:
+                preparation_operation_gate(self._app_session_owner()).release(lease)
+            except Exception:
+                pass
+
+    def _finish_repair(self, mod_id: int, generation: int, result: dict) -> bool:
+        state = self._repair_state_by_id.get(int(mod_id))
+        if not state or int(state.get("generation", 0)) != int(generation):
+            return False
+        self._release_repair_lease()
+        if bool(result.get("ok", False)):
+            state["fraction"] = 1.0
+            state["percent"] = 100
+            state["phase"] = "success"
+            self._set_mod_operation_status("Repair complete.", running=False)
+            if bool(getattr(self, "_repair_ui_attached", True)):
+                self._apply_repair_state_to_row(self._current_row_for_mod(int(mod_id)), state)
+            GLib.timeout_add(900, self._finalize_repair_success, int(mod_id), int(generation))
+            return False
+
+        self._repair_state_by_id.pop(int(mod_id), None)
+        self._set_mod_operation_status(str(result.get("error") or "Repair failed. Try Repair Mod again."), running=False)
+        if bool(getattr(self, "_repair_ui_attached", True)):
+            self._apply_repair_state_to_row(self._current_row_for_mod(int(mod_id)), None)
+        body = str(result.get("error") or "Repair failed. Check Steam and try Repair Mod again.")
+        if bool(result.get("not_installed", False)):
+            body = f"{body} The mod is not currently installed; Repair can be tried again."
+        if self._mod_manager_is_visible():
+            self._confirm_show("Repair failed", body, "Close", lambda _ok: None, show_cancel=False)
+        return False
+
+    def _finalize_repair_success(self, mod_id: int, generation: int) -> bool:
+        state = self._repair_state_by_id.get(int(mod_id))
+        if not state or int(state.get("generation", 0)) != int(generation):
+            return False
+        self._repair_state_by_id.pop(int(mod_id), None)
+        if bool(getattr(self, "_repair_ui_attached", True)):
+            self._apply_repair_state_to_row(self._current_row_for_mod(int(mod_id)), None)
+            self.refresh(completion_status="Repair complete.")
+        else:
+            self._repair_refresh_needed = True
+        return False
+
     def _open_workshop_page(self, mod_id: int):
         steam_cmd = resolve_native_steam_cmd()
         if not steam_cmd:
@@ -1704,12 +2017,15 @@ class ModsManagerOverlay:
     ) -> Gtk.ListBoxRow:
         row = Gtk.ListBoxRow()
         row.add_css_class("mods-row")
+        row._dzll_mod_id = int(mod_id)
+        row.set_margin_start(MOD_ROW_BORDER_INSET)
+        row.set_margin_end(MOD_ROW_BORDER_INSET)
 
-        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        outer.set_margin_top(6)
-        outer.set_margin_bottom(6)
-        outer.set_margin_start(7)
-        outer.set_margin_end(7)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        outer.set_margin_top(9)
+        outer.set_margin_bottom(9)
+        outer.set_margin_start(MOD_ROW_CONTENT_INSET)
+        outer.set_margin_end(MOD_ROW_CONTENT_INSET)
 
         line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         line.set_hexpand(True)
@@ -1724,6 +2040,7 @@ class ModsManagerOverlay:
         select_check.set_active(int(mod_id) in getattr(self, "_selected_mod_ids", set()))
         attach_pointer_cursor(select_check)
         select_check.connect("toggled", self._on_mod_selection_toggled, int(mod_id))
+        row._dzll_select_check = select_check
         line.append(select_check)
 
         name_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
@@ -1788,9 +2105,21 @@ class ModsManagerOverlay:
         used_lbl.add_css_class("mods-metadata")
         line.append(used_lbl)
 
+        line.append(self._make_column_separator())
+        repair_control = self._make_repair_control(int(mod_id))
+        row._dzll_repair_control = repair_control
+        line.append(repair_control)
+
         outer.append(line)
-        outer.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+
+        # Retain the existing inter-child allocation while the divider is
+        # owned by the full row container's bottom border (see styles.py).
+        divider_spacer = Gtk.Box()
+        divider_spacer.add_css_class("mods-row-divider-spacer")
+        divider_spacer.set_size_request(-1, 0)
+        outer.append(divider_spacer)
         row.set_child(outer)
+        self._apply_repair_state_to_row(row, self._repair_state_by_id.get(int(mod_id)))
 
         return row
 
