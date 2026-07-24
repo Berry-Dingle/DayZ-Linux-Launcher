@@ -16,9 +16,11 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -27,6 +29,25 @@ DAYZ_APPID = 221100
 UGC_PREFLIGHT_TIMEOUT_S = 60.0
 UGC_PREFLIGHT_RETRY_S = 3.0
 UGC_PREFLIGHT_PROBE_TIMEOUT_S = 8.0
+
+
+class SteamLaunchPolicy(Enum):
+    BACKEND_ALLOWED = "backend_allowed"
+    WAIT_ONLY = "wait_only"
+    REQUIRE_RUNNING = "require_running"
+
+
+def _steam_launch_policy(value, allow_start_steam: bool) -> SteamLaunchPolicy:
+    if isinstance(value, SteamLaunchPolicy):
+        return value
+    try:
+        return SteamLaunchPolicy(str(value))
+    except (TypeError, ValueError):
+        return (
+            SteamLaunchPolicy.BACKEND_ALLOWED
+            if bool(allow_start_steam)
+            else SteamLaunchPolicy.REQUIRE_RUNNING
+        )
 
 
 @dataclass
@@ -127,6 +148,8 @@ def _dedupe_sorted_ids(mod_ids: Iterable[int]) -> list[int]:
 
 def _helper_env() -> dict:
     env = dict(os.environ)
+    for name in ("SteamAppId", "SteamGameId", "SteamOverlayGameId"):
+        env.pop(name, None)
     package_root = str(Path(__file__).resolve().parents[1])
     current = env.get("PYTHONPATH", "")
     env["PYTHONPATH"] = package_root if not current else f"{package_root}:{current}"
@@ -149,33 +172,602 @@ def _helper_cmd(command: str, *, appid: int, timeout: float | None, mod_ids: lis
 
 
 def _log_event(progress_cb, message: str, **extra) -> None:
-    eprint(message)
+    diagnostic = (
+        f"{message} {json.dumps(extra, sort_keys=True, default=str)}"
+        if extra else message
+    )
+    eprint(diagnostic)
     event = {"type": "log", "message": message}
     event.update(extra)
     _progress(progress_cb, event)
 
 
+class UGCHelperReapError(RuntimeError):
+    """Raised when DZLL's own UGC helper cannot be confirmed exited."""
+
+
+class UGCSessionError(RuntimeError):
+    """Raised when the cooperative helper protocol fails closed."""
+
+
+_ACTIVE_UGC_SESSION = threading.local()
+
+
+class _NeverCancelled:
+    @staticmethod
+    def is_set() -> bool:
+        return False
+
+
+_CLEANUP_CANCEL_EVENT = _NeverCancelled()
+
+
+def activate_ugc_session(session) -> None:
+    if getattr(_ACTIVE_UGC_SESSION, "value", None) is not None:
+        raise UGCSessionError("a Steam UGC session is already active on this worker")
+    _ACTIVE_UGC_SESSION.value = session
+
+
+def deactivate_ugc_session(session) -> None:
+    if getattr(_ACTIVE_UGC_SESSION, "value", None) is session:
+        _ACTIVE_UGC_SESSION.value = None
+
+
+def active_ugc_session():
+    return getattr(_ACTIVE_UGC_SESSION, "value", None)
+
+
 def _stop_helper_process(proc: subprocess.Popen, *, command: str, progress_cb=None) -> None:
+    pid = int(getattr(proc, "pid", 0) or 0)
     if proc.poll() is not None:
+        _log_event(
+            progress_cb, "[Steam UGC] Helper already exited",
+            command=command, helper_pid=pid, returncode=proc.poll(),
+        )
         return
+    stop_started = time.monotonic()
     try:
         proc.terminate()
-    except Exception:
-        pass
+    except Exception as exc:
+        _log_event(
+            progress_cb, "[Steam UGC] Helper terminate failed",
+            command=command, helper_pid=pid, error=str(exc),
+        )
     try:
         proc.wait(timeout=5.0)
     except subprocess.TimeoutExpired:
+        _log_event(
+            progress_cb, "[Steam UGC] Helper terminate timed out; killing",
+            command=command, helper_pid=pid,
+        )
         try:
             proc.kill()
-        except Exception:
-            pass
+        except Exception as exc:
+            _log_event(
+                progress_cb, "[Steam UGC] Helper kill failed",
+                command=command, helper_pid=pid, error=str(exc),
+            )
         try:
             proc.wait(timeout=2.0)
-        except Exception:
-            pass
-    except Exception:
-        pass
-    _log_event(progress_cb, "[Steam UGC] Stopped helper subprocess", command=command)
+        except Exception as exc:
+            elapsed = time.monotonic() - stop_started
+            _log_event(
+                progress_cb, "[Steam UGC] Helper failure-to-reap",
+                command=command, helper_pid=pid, elapsed=f"{elapsed:.3f}s",
+                error=str(exc),
+            )
+            raise UGCHelperReapError(
+                f"UGC helper pid {pid} for {command} could not be reaped"
+            ) from exc
+    except Exception as exc:
+        elapsed = time.monotonic() - stop_started
+        _log_event(
+            progress_cb, "[Steam UGC] Helper failure-to-reap",
+            command=command, helper_pid=pid, elapsed=f"{elapsed:.3f}s",
+            error=str(exc),
+        )
+        raise UGCHelperReapError(
+            f"UGC helper pid {pid} for {command} could not be reaped"
+        ) from exc
+    returncode = proc.poll()
+    elapsed = time.monotonic() - stop_started
+    if returncode is None:
+        _log_event(
+            progress_cb, "[Steam UGC] Helper failure-to-reap",
+            command=command, helper_pid=pid, elapsed=f"{elapsed:.3f}s",
+        )
+        raise UGCHelperReapError(
+            f"UGC helper pid {pid} for {command} remained alive after stop"
+        )
+    _log_event(
+        progress_cb, "[Steam UGC] Stopped helper subprocess",
+        command=command, helper_pid=pid, returncode=returncode,
+        cleanup_elapsed=f"{elapsed:.3f}s",
+    )
+
+
+class CooperativeUGCSession:
+    """One sequential SteamAPI helper process for one preparation operation."""
+
+    def __init__(self, *, appid: int = DAYZ_APPID, cancel_event=None, progress_cb=None):
+        self.appid = int(appid)
+        self.cancel_event = cancel_event
+        self.progress_cb = progress_cb
+        self._proc = None
+        self._stdout_q: queue.Queue = queue.Queue()
+        self._stderr_tail: list[str] = []
+        self._stdout_thread = None
+        self._stderr_thread = None
+        self._request_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._next_request_id = 0
+        self._temp_dir = ""
+        self._ready = False
+        self._closed = False
+        self._shutdown_complete = False
+        self._stdin_closed = False
+        self._fatal = False
+
+    @property
+    def helper_pid(self) -> int:
+        return int(getattr(self._proc, "pid", 0) or 0)
+
+    @property
+    def usable(self) -> bool:
+        return bool(
+            not self._closed
+            and not self._fatal
+            and (self._proc is None or self._proc.poll() is None)
+        )
+
+    def _start(self) -> None:
+        if self._proc is not None:
+            return
+        cmd = _helper_cmd("session", appid=self.appid, timeout=None, mod_ids=[])
+        self._proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+            env=_helper_env(),
+        )
+        _log_event(
+            self.progress_cb, "[Steam UGC] Cooperative helper session started",
+            command="session", helper_pid=self.helper_pid,
+        )
+
+        def read_stdout():
+            try:
+                for line in self._proc.stdout or []:
+                    self._stdout_q.put(str(line or ""))
+            finally:
+                self._stdout_q.put(None)
+                _log_event(
+                    self.progress_cb,
+                    "[Steam UGC] Cooperative protocol reader exited",
+                    command="session", helper_pid=self.helper_pid,
+                )
+
+        def read_stderr():
+            try:
+                for line in self._proc.stderr or []:
+                    text = str(line or "").rstrip()
+                    if text:
+                        self._stderr_tail.append(text)
+                        del self._stderr_tail[:-16]
+            except Exception:
+                pass
+            finally:
+                _log_event(
+                    self.progress_cb,
+                    "[Steam UGC] Cooperative stderr reader exited",
+                    command="session", helper_pid=self.helper_pid,
+                )
+
+        self._stdout_thread = threading.Thread(target=read_stdout, daemon=True)
+        self._stderr_thread = threading.Thread(target=read_stderr, daemon=True)
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def _send(self, message: dict) -> None:
+        proc = self._proc
+        if proc is None or proc.poll() is not None or proc.stdin is None:
+            raise UGCSessionError("Steam UGC helper session is not running")
+        payload = json.dumps(message, sort_keys=True, separators=(",", ":"))
+        with self._write_lock:
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+
+    def _next_id(self, prefix: str) -> str:
+        self._next_request_id += 1
+        return f"{prefix}-{self._next_request_id}"
+
+    def _event(self, timeout: float) -> dict:
+        try:
+            raw = self._stdout_q.get(timeout=max(0.01, float(timeout)))
+        except queue.Empty as exc:
+            raise TimeoutError("timed out waiting for Steam UGC helper protocol") from exc
+        if raw is None:
+            raise UGCSessionError("Steam UGC helper closed its protocol stream")
+        try:
+            event = json.loads(str(raw).strip())
+        except Exception as exc:
+            raise UGCSessionError("Steam UGC helper emitted malformed protocol data") from exc
+        if not isinstance(event, dict):
+            raise UGCSessionError("Steam UGC helper emitted a non-object protocol event")
+        if event.get("type") == "session_starting":
+            self._temp_dir = str(event.get("temp_dir") or "")
+        if event.get("type") == "session_ready":
+            self._ready = True
+        if event.get("type") == "fatal_session_error":
+            self._fatal = True
+            raise UGCSessionError(str(event.get("error") or "fatal Steam UGC session error"))
+        return event
+
+    def _close_stdin(self) -> None:
+        if self._stdin_closed:
+            return
+        proc = self._proc
+        if proc is None or proc.stdin is None:
+            self._stdin_closed = True
+            return
+        with self._write_lock:
+            proc.stdin.close()
+            self._stdin_closed = True
+        _log_event(
+            self.progress_cb,
+            "[Steam UGC] Cooperative helper stdin closed",
+            command="session", helper_pid=self.helper_pid,
+        )
+
+    def _wait_until_ready(self, *, timeout: float | None, cancel_event=None) -> bool:
+        if self._ready:
+            return True
+        deadline = (
+            time.monotonic() + max(0.0, float(timeout))
+            if timeout is not None else None
+        )
+        while not self._ready:
+            selected_cancel = cancel_event if cancel_event is not None else self.cancel_event
+            if selected_cancel is not None and selected_cancel.is_set():
+                return False
+            if deadline is not None and time.monotonic() >= deadline:
+                return False
+            try:
+                event = self._event(0.1)
+            except TimeoutError:
+                if self._proc.poll() is not None:
+                    raise UGCSessionError(
+                        "Steam UGC helper exited before the session became ready"
+                    )
+                continue
+            event_type = str(event.get("type") or "")
+            if event_type in ("session_starting", "session_waiting", "session_ready"):
+                continue
+            raise UGCSessionError(
+                f"unexpected Steam UGC startup event: {event_type or '<missing>'}"
+            )
+        return True
+
+    def run_command(
+        self,
+        command: str,
+        *,
+        timeout: float | None,
+        mod_ids: list[int],
+        cancel_event=None,
+        on_event=None,
+        progress_cb=None,
+    ) -> tuple[bool, int | None]:
+        command_name = {
+            "state": "query_state",
+            "subscribe-download": "subscribe_download",
+            "unsubscribe": "unsubscribe",
+        }.get(str(command))
+        if command_name is None:
+            raise UGCSessionError(f"unsupported cooperative command: {command}")
+        with self._request_lock:
+            if self._closed:
+                raise UGCSessionError("Steam UGC helper session is closed")
+            self._start()
+            if not self._wait_until_ready(
+                timeout=timeout,
+                cancel_event=cancel_event,
+            ):
+                return False, self._proc.poll()
+            request_id = self._next_id(command_name)
+            self._send(
+                {
+                    "command": command_name,
+                    "request_id": request_id,
+                    "item_ids": list(mod_ids),
+                    "timeout": float(timeout if timeout is not None else 120.0),
+                }
+            )
+            deadline = (
+                time.monotonic() + float(timeout)
+                if timeout is not None else None
+            )
+            cancel_sent = False
+            cancel_id = ""
+            cancel_reason = ""
+            cancel_acknowledged = False
+            cancelled_command_result = None
+            while True:
+                selected_cancel = cancel_event if cancel_event is not None else self.cancel_event
+                if selected_cancel is not None and selected_cancel.is_set() and not cancel_sent:
+                    cancel_id = self._next_id("cancel")
+                    self._send(
+                        {
+                            "command": "cancel",
+                            "request_id": cancel_id,
+                            "target_request_id": request_id,
+                        }
+                    )
+                    cancel_sent = True
+                    cancel_reason = "user"
+                    deadline = time.monotonic() + 5.0
+                if deadline is not None and time.monotonic() >= deadline and not cancel_sent:
+                    cancel_id = self._next_id("timeout-cancel")
+                    self._send(
+                        {
+                            "command": "cancel",
+                            "request_id": cancel_id,
+                            "target_request_id": request_id,
+                        }
+                    )
+                    cancel_sent = True
+                    cancel_reason = "timeout"
+                    deadline = time.monotonic() + 5.0
+                if deadline is not None and time.monotonic() >= deadline and cancel_sent:
+                    missing = []
+                    if not cancel_acknowledged:
+                        missing.append("cancellation acknowledgement")
+                    if cancelled_command_result is None:
+                        missing.append("cancelled command result")
+                    raise UGCSessionError(
+                        "cooperative helper did not complete "
+                        f"{'cancellation' if cancel_reason == 'user' else 'timeout'} "
+                        f"for {command_name}: missing {', '.join(missing)}"
+                    )
+                try:
+                    event = self._event(0.1)
+                except TimeoutError:
+                    if self._proc.poll() is not None:
+                        raise UGCSessionError(
+                            f"Steam UGC helper exited during {command_name}"
+                        )
+                    continue
+                event_request_id = event.get("request_id")
+                event_type = str(event.get("type") or "")
+                if event_type in {
+                    "session_starting", "session_waiting", "session_ready",
+                    "shutdown_complete",
+                }:
+                    continue
+                if event_request_id not in (request_id, cancel_id):
+                    raise UGCSessionError(
+                        "Steam UGC helper response request_id did not match the active command"
+                    )
+                if event_request_id == cancel_id:
+                    if event_type == "command_accepted":
+                        continue
+                    if event_type != "cancellation_ack":
+                        raise UGCSessionError("unexpected cancellation response")
+                    if event.get("target_request_id") not in (None, request_id):
+                        raise UGCSessionError(
+                            "cancellation acknowledgement target_request_id "
+                            "did not match the active command"
+                        )
+                    cancel_acknowledged = True
+                    if cancelled_command_result is not None:
+                        return cancelled_command_result, self._proc.poll()
+                    continue
+                if callable(on_event):
+                    on_event(event)
+                if event_type == "recoverable_error":
+                    return False, self._proc.poll()
+                if event_type == "command_result":
+                    if cancel_sent:
+                        cancelled_command_result = bool(event.get("ok", False))
+                        if cancel_acknowledged:
+                            return cancelled_command_result, self._proc.poll()
+                        continue
+                    return bool(event.get("ok", False)), self._proc.poll()
+                if event_type not in (
+                    "command_accepted", "item", "request", "cancellation_ack",
+                ):
+                    raise UGCSessionError(
+                        f"unexpected Steam UGC helper event: {event_type or '<missing>'}"
+                    )
+
+    def _cleanup_temp_dir(self) -> None:
+        path_text = str(self._temp_dir or "")
+        if not path_text:
+            return
+        path = Path(path_text)
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        valid = (
+            path.is_absolute()
+            and path.parent.resolve() == temp_root
+            and path.name.startswith("dzll_steam_ugc_")
+        )
+        if not valid:
+            raise UGCSessionError("helper reported an unsafe temporary AppID path")
+        if path.exists():
+            shutil.rmtree(path)
+        if path.exists():
+            raise UGCSessionError("temporary Steam AppID directory survived session cleanup")
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        proc = self._proc
+        if proc is None:
+            return
+        shutdown_error = None
+        shutdown_acknowledged = False
+        escalated = False
+        escalation_reason = ""
+        request_id = ""
+        if proc.poll() is None:
+            request_id = self._next_id("shutdown")
+            try:
+                self._send({"command": "shutdown", "request_id": request_id})
+                _log_event(
+                    self.progress_cb,
+                    "[Steam UGC] Cooperative shutdown command sent",
+                    command="session", helper_pid=self.helper_pid,
+                    request_id=request_id,
+                )
+                # No more commands are valid after shutdown. Closing the parent's
+                # write end also releases the helper's blocking stdin reader so
+                # Python can finish interpreter shutdown naturally.
+                self._close_stdin()
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline and not self._shutdown_complete:
+                    try:
+                        event = self._event(0.1)
+                    except TimeoutError:
+                        if proc.poll() is not None and self._stdout_q.empty():
+                            break
+                        continue
+                    event_type = str(event.get("type") or "")
+                    event_request_id = event.get("request_id")
+                    if event_type == "command_accepted":
+                        if event_request_id != request_id:
+                            raise UGCSessionError(
+                                "shutdown acknowledgement request_id did not match"
+                            )
+                        shutdown_acknowledged = True
+                        _log_event(
+                            self.progress_cb,
+                            "[Steam UGC] Cooperative shutdown acknowledged",
+                            command="session", helper_pid=self.helper_pid,
+                            request_id=request_id,
+                        )
+                        continue
+                    if event_type == "shutdown_complete":
+                        if event_request_id != request_id:
+                            raise UGCSessionError(
+                                "shutdown_complete request_id did not match"
+                            )
+                        if not bool(event.get("ok", False)):
+                            raise UGCSessionError(
+                                str(event.get("error") or
+                                    "helper reported failed shutdown cleanup")
+                            )
+                        if not bool(event.get("steamapi_shutdown", False)):
+                            raise UGCSessionError(
+                                "helper did not confirm SteamAPI shutdown"
+                            )
+                        if not bool(event.get("temp_cleanup", False)):
+                            raise UGCSessionError(
+                                "helper did not confirm temporary AppID cleanup"
+                            )
+                        self._shutdown_complete = True
+                        _log_event(
+                            self.progress_cb,
+                            "[Steam UGC] Cooperative shutdown complete",
+                            command="session", helper_pid=self.helper_pid,
+                            request_id=request_id,
+                            steamapi_shutdown=True, temp_cleanup=True,
+                        )
+                        break
+                    raise UGCSessionError(
+                        f"unexpected event during helper shutdown: "
+                        f"{event_type or '<missing>'}"
+                    )
+            except Exception as exc:
+                shutdown_error = exc
+        try:
+            self._close_stdin()
+        except Exception as exc:
+            if shutdown_error is None:
+                shutdown_error = exc
+        if self._shutdown_complete and proc.poll() is None:
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                escalation_reason = (
+                    "helper acknowledged clean shutdown but did not exit "
+                    "within the natural-exit grace period"
+                )
+        elif proc.poll() is None:
+            escalation_reason = (
+                f"shutdown handshake failed: {shutdown_error}"
+                if shutdown_error is not None
+                else "helper did not emit shutdown_complete"
+            )
+        if proc.poll() is None:
+            escalated = True
+            _log_event(
+                self.progress_cb,
+                "[Steam UGC] Escalating helper shutdown",
+                command="session", helper_pid=self.helper_pid,
+                reason=escalation_reason,
+            )
+            _stop_helper_process(proc, command="session", progress_cb=self.progress_cb)
+        try:
+            proc.wait(timeout=0.1)
+        except subprocess.TimeoutExpired:
+            escalated = True
+            escalation_reason = "helper remained alive after initial reap wait"
+            _log_event(
+                self.progress_cb,
+                "[Steam UGC] Escalating helper shutdown",
+                command="session", helper_pid=self.helper_pid,
+                reason=escalation_reason,
+            )
+            _stop_helper_process(proc, command="session", progress_cb=self.progress_cb)
+        _log_event(
+            self.progress_cb,
+            "[Steam UGC] Cooperative helper process exited naturally"
+            if not escalated else
+            "[Steam UGC] Cooperative helper process exited after escalation",
+            command="session", helper_pid=self.helper_pid,
+            returncode=proc.poll(),
+        )
+        for name, thread in (
+            ("protocol", self._stdout_thread),
+            ("stderr", self._stderr_thread),
+        ):
+            if thread is not None:
+                thread.join(timeout=1.0)
+                if thread.is_alive():
+                    raise UGCHelperReapError(
+                        f"Steam UGC helper {name} reader thread survived shutdown"
+                    )
+                _log_event(
+                    self.progress_cb,
+                    f"[Steam UGC] Cooperative {name} reader exit confirmed",
+                    command="session", helper_pid=self.helper_pid,
+                )
+        self._cleanup_temp_dir()
+        _log_event(
+            self.progress_cb,
+            "[Steam UGC] Temporary AppID cleanup confirmed",
+            command="session", helper_pid=self.helper_pid,
+            temp_dir=self._temp_dir,
+        )
+        _log_event(
+            self.progress_cb, "[Steam UGC] Cooperative helper session exited",
+            command="session", helper_pid=self.helper_pid, returncode=proc.poll(),
+            shutdown_complete=bool(self._shutdown_complete),
+            shutdown_acknowledged=bool(shutdown_acknowledged),
+        )
+        if shutdown_error is not None:
+            raise UGCSessionError(f"cooperative helper shutdown failed: {shutdown_error}")
+        if escalated or proc.returncode != 0 or not self._shutdown_complete:
+            for line in self._stderr_tail:
+                eprint(f"[steam-ugc-backend][session-stderr] {line}")
+            raise UGCSessionError(
+                "Steam UGC helper session did not confirm clean SteamAPI shutdown"
+                + (f": {escalation_reason}" if escalation_reason else "")
+            )
 
 
 def _run_helper_json_lines(
@@ -188,6 +780,16 @@ def _run_helper_json_lines(
     on_event: Callable[[dict], None] | None = None,
     progress_cb=None,
 ) -> tuple[bool, int | None]:
+    session = active_ugc_session()
+    if session is not None:
+        return session.run_command(
+            command,
+            timeout=timeout,
+            mod_ids=mod_ids,
+            cancel_event=cancel_event,
+            on_event=on_event,
+            progress_cb=progress_cb,
+        )
     cmd = _helper_cmd(command, appid=appid, timeout=timeout, mod_ids=mod_ids)
     try:
         proc = subprocess.Popen(
@@ -202,6 +804,11 @@ def _run_helper_json_lines(
     except OSError as exc:
         eprint(f"[steam-ugc-backend] failed to start helper: {exc}")
         return False, None
+    helper_pid = int(getattr(proc, "pid", 0) or 0)
+    _log_event(
+        progress_cb, "[Steam UGC] Helper subprocess started",
+        command=command, helper_pid=helper_pid,
+    )
 
     stdout_q: queue.Queue[str] = queue.Queue()
     stderr_tail: list[str] = []
@@ -266,6 +873,10 @@ def _run_helper_json_lines(
                 ok = bool(event.get("ok", False))
 
         rc = proc.poll()
+        _log_event(
+            progress_cb, "[Steam UGC] Helper subprocess exited",
+            command=command, helper_pid=helper_pid, returncode=rc,
+        )
         try:
             stdout_t.join(timeout=0.5)
             stderr_t.join(timeout=0.5)
@@ -279,6 +890,17 @@ def _run_helper_json_lines(
     finally:
         if proc.poll() is None:
             _stop_helper_process(proc, command=command, progress_cb=progress_cb)
+
+
+def _cancel_aware_wait(cancel_event, timeout: float) -> bool:
+    """Wait up to timeout; return False immediately when cancellation is set."""
+    duration = max(0.0, float(timeout))
+    if duration <= 0:
+        return not bool(cancel_event is not None and cancel_event.is_set())
+    if cancel_event is None:
+        time.sleep(duration)
+        return True
+    return not bool(cancel_event.wait(timeout=duration))
 
 
 def _progress(progress_cb, event: dict) -> None:
@@ -311,6 +933,7 @@ def _run_ugc_native_steam_preflight(
     cancel_event=None,
     progress_cb=None,
     allow_start_steam: bool = True,
+    launch_policy=None,
     timeout_s: float = UGC_PREFLIGHT_TIMEOUT_S,
 ) -> bool:
     try:
@@ -345,26 +968,30 @@ def _run_ugc_native_steam_preflight(
     except Exception:
         native_running = False
 
+    policy = _steam_launch_policy(launch_policy, allow_start_steam)
     if not native_running:
-        if not bool(allow_start_steam):
+        if policy is SteamLaunchPolicy.REQUIRE_RUNNING:
             message = "Native Steam is not running. Start Steam before joining, or enable Start Steam on Join."
             _ugc_preflight_event(progress_cb, message, ok=False, reason="native_steam_not_running", error=True)
             eprint(f"[Steam UGC] {message}")
             return False
-        _ugc_preflight_event(progress_cb, "Starting Steam...")
-        try:
-            subprocess.Popen(
-                [steam_cmd, "-silent"],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception as exc:
-            message = f"Failed to start native Steam: {exc}"
-            _ugc_preflight_event(progress_cb, message, ok=False, reason="native_steam_start_failed", error=True)
-            eprint(f"[Steam UGC] {message}")
-            return False
+        if policy is SteamLaunchPolicy.BACKEND_ALLOWED:
+            _ugc_preflight_event(progress_cb, "Starting Steam...")
+            try:
+                subprocess.Popen(
+                    [steam_cmd, "-silent"],
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except Exception as exc:
+                message = f"Failed to start native Steam: {exc}"
+                _ugc_preflight_event(progress_cb, message, ok=False, reason="native_steam_start_failed", error=True)
+                eprint(f"[Steam UGC] {message}")
+                return False
+        else:
+            _ugc_preflight_event(progress_cb, "Waiting for Steam...")
     else:
         _ugc_preflight_event(progress_cb, "Checking Steam...")
 
@@ -409,8 +1036,12 @@ def _run_ugc_native_steam_preflight(
             return True
 
         sleep_for = min(UGC_PREFLIGHT_RETRY_S, max(0.0, deadline - time.monotonic()))
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+        if sleep_for > 0 and not _cancel_aware_wait(cancel_event, sleep_for):
+            _ugc_preflight_event(
+                progress_cb, "Steam startup cancelled.",
+                ok=False, reason="cancelled", error=True,
+            )
+            return False
 
     message = "Steam did not become ready. Please make sure native Steam is running and logged in."
     _ugc_preflight_event(progress_cb, message, ok=False, reason="steam_not_ready", error=True)
@@ -463,6 +1094,7 @@ def _cache_ugc_state(state_by_id: dict[int, dict], *, names_by_id=None) -> None:
 
 
 def _cleanup_subscriptions(sessions: dict[int, UGCModSession], *, appid: int, progress_cb=None) -> None:
+    cleanup_started = time.monotonic()
     cleanup_ids = sorted(
         mid
         for mid, session in sessions.items()
@@ -473,7 +1105,11 @@ def _cleanup_subscriptions(sessions: dict[int, UGCModSession], *, appid: int, pr
     _log_event(progress_cb, f"[Steam UGC] Cleanup unsubscribe ids: {cleanup_ids}", cleanup_ids=cleanup_ids)
     if not cleanup_ids:
         _progress(progress_cb, {"type": "cleanup", "ok": True, "unsubscribed": [], "skipped": True})
-        _log_event(progress_cb, "[Steam UGC] Cancel cleanup complete", ok=True, cleanup_ids=cleanup_ids)
+        _log_event(
+            progress_cb, "[Steam UGC] Cancel cleanup complete",
+            ok=True, cleanup_ids=cleanup_ids,
+            cleanup_elapsed=f"{time.monotonic() - cleanup_started:.3f}s",
+        )
         return
 
     _progress(progress_cb, {"type": "cleanup", "ok": None, "unsubscribing": cleanup_ids})
@@ -482,12 +1118,16 @@ def _cleanup_subscriptions(sessions: dict[int, UGCModSession], *, appid: int, pr
         appid=appid,
         timeout=180,
         mod_ids=cleanup_ids,
-        cancel_event=None,
+        cancel_event=_CLEANUP_CANCEL_EVENT,
         on_event=lambda event: _progress(progress_cb, {"type": "cleanup_event", "event": event}),
         progress_cb=progress_cb,
     )
     _progress(progress_cb, {"type": "cleanup", "ok": bool(ok), "unsubscribed": cleanup_ids})
-    _log_event(progress_cb, "[Steam UGC] Cancel cleanup complete", ok=bool(ok), cleanup_ids=cleanup_ids)
+    _log_event(
+        progress_cb, "[Steam UGC] Cancel cleanup complete",
+        ok=bool(ok), cleanup_ids=cleanup_ids,
+        cleanup_elapsed=f"{time.monotonic() - cleanup_started:.3f}s",
+    )
 
 
 def _refresh_current_state(sessions: dict[int, UGCModSession], *, appid: int, progress_cb=None, names_by_id=None) -> None:
@@ -516,7 +1156,7 @@ def _refresh_current_state(sessions: dict[int, UGCModSession], *, appid: int, pr
         appid=appid,
         timeout=120,
         mod_ids=ids,
-        cancel_event=None,
+        cancel_event=_CLEANUP_CANCEL_EVENT,
         on_event=on_refresh_event,
         progress_cb=progress_cb,
     )
@@ -564,6 +1204,7 @@ def wait_for_ugc_ready(
     cancel_event=None,
     progress_cb=None,
     allow_start_steam: bool = True,
+    launch_policy=None,
     timeout_s: float = UGC_PREFLIGHT_TIMEOUT_S,
 ) -> bool:
     ids = _dedupe_sorted_ids(mod_ids)
@@ -575,6 +1216,7 @@ def wait_for_ugc_ready(
         cancel_event=cancel_event,
         progress_cb=progress_cb,
         allow_start_steam=bool(allow_start_steam),
+        launch_policy=launch_policy,
         timeout_s=float(timeout_s),
     )
 
@@ -1592,6 +2234,7 @@ def run_ugc_install(
     progress_cb=None,
     names_by_id=None,
     allow_start_steam: bool = True,
+    launch_policy=None,
     timeout: float = 3600,
 ) -> bool:
     ids = _dedupe_sorted_ids(mod_ids)
@@ -1627,6 +2270,7 @@ def run_ugc_install(
             cancel_event=cancel_event,
             progress_cb=progress_cb,
             allow_start_steam=bool(allow_start_steam),
+            launch_policy=launch_policy,
             timeout_s=UGC_PREFLIGHT_TIMEOUT_S,
         ):
             _progress(progress_cb, {"type": "done", "ok": False, "reason": "preflight_failed", "sessions": [s.event() for s in sessions.values()]})
@@ -1752,8 +2396,23 @@ def run_ugc_install(
         return False
     except Exception as exc:
         _progress(progress_cb, {"type": "error", "ok": False, "message": str(exc)})
-        _refresh_current_state(sessions, appid=appid, progress_cb=progress_cb, names_by_id=names_by_id)
-        _cleanup_subscriptions(sessions, appid=appid, progress_cb=progress_cb)
+        session = active_ugc_session()
+        if isinstance(session, CooperativeUGCSession) and not session.usable:
+            _log_event(
+                progress_cb,
+                "[Steam UGC] Skipping refresh and unsubscribe after fatal "
+                "cooperative session failure",
+                helper_pid=session.helper_pid,
+                error=str(exc),
+            )
+        else:
+            _refresh_current_state(
+                sessions, appid=appid, progress_cb=progress_cb,
+                names_by_id=names_by_id,
+            )
+            _cleanup_subscriptions(
+                sessions, appid=appid, progress_cb=progress_cb,
+            )
         return False
 
 

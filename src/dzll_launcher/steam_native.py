@@ -342,6 +342,39 @@ def is_flatpak_steam_running() -> bool:
     return False
 
 
+def _is_native_steam_client_cmdline(text: str) -> bool:
+    low = str(text or "").lower()
+    if not low or "com.valvesoftware.steam" in low or "flatpak" in low:
+        return False
+    if "steamcmd" in low:
+        return False
+    parts = [part for part in str(text).split(" ") if part]
+    if not parts:
+        return False
+    return Path(parts[0]).name.lower() == "steam"
+
+
+def is_native_steam_client_running() -> bool:
+    """Return True only for the native Steam client, not surviving helpers."""
+    proc_root = Path("/proc")
+    try:
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "cmdline").read_bytes()
+            except Exception:
+                continue
+            if not raw:
+                continue
+            text = raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+            if _is_native_steam_client_cmdline(text):
+                return True
+    except Exception:
+        pass
+    return False
+
+
 def is_native_steam_running() -> bool:
     """
     Return True when native Steam client processes appear to be running.

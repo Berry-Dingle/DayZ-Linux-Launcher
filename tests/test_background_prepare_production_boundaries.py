@@ -7,6 +7,7 @@ import time
 import pytest
 
 from dzll_launcher import background_prepare, join_prepare
+from dzll_launcher.steam_ugc_backend import UGCHelperReapError
 from dzll_launcher import window as window_module
 from dzll_launcher.background_prepare import (
     BackgroundConsentResult,
@@ -188,9 +189,16 @@ class ProductionStartHarness:
             "auto_update_required": False,
         }
 
-    def _ensure_join_steam_start_consent(self, attempt_id):
+    def _ensure_join_steam_start_consent(
+            self, attempt_id, *, caller="join", progress_cb=None):
         assert attempt_id == 0
-        return True
+        assert caller == "background"
+        if callable(progress_cb):
+            progress_cb("Waiting for Steam…")
+        return BackgroundConsentResult(
+            BackgroundConsentStatus.ALLOWED,
+            steam_was_running=True,
+        )
 
 
 def snapshot(name="Production Server"):
@@ -352,7 +360,7 @@ def test_production_batch_cancel_waits_for_cleanup_and_never_dispatches_next(
 
     def engine(win, _mods, *_args, **kwargs):
         entered.set()
-        assert win._steamcmd_cancel_event.wait(timeout=2.0)
+        assert kwargs["cancel_event"].wait(timeout=2.0)
         saw_cancel.set()
         assert release_cleanup.wait(timeout=2.0)
         outcome = PreparationOutcome(
@@ -388,6 +396,42 @@ def test_production_batch_cancel_waits_for_cleanup_and_never_dispatches_next(
     assert not host._background_prepare_queue.busy
     assert host._background_prepare_queue.accepting
     assert host._background_prepare_queue.record_for("10.0.0.2:2302").state.value == "idle"
+
+
+def test_helper_failure_to_reap_blocks_fifo_and_global_owner(monkeypatch):
+    scheduler = MainThreadScheduler()
+    executor = RecordingExecutor()
+    host = ProductionStartHarness(executor)
+
+    cancel_events = []
+
+    def engine(*_args, **kwargs):
+        cancel_events.append(kwargs["cancel_event"])
+        kwargs["cancel_event"].set()
+        raise UGCHelperReapError("pid 4242 remained alive")
+
+    monkeypatch.setattr(window_module.GLib, "idle_add", scheduler.idle_add)
+    monkeypatch.setattr(background_prepare, "prepare_required_mods", engine)
+    a = SimpleNamespace(
+        ip="10.0.0.1", gport=2302, qport=27016, name="A", mods_json="[]",
+    )
+    b = SimpleNamespace(
+        ip="10.0.0.2", gport=2302, qport=27016, name="B", mods_json="[]",
+    )
+    host._background_prepare_for_obj(a)
+    scheduler.drain_until(lambda: executor.futures and executor.futures[0].done())
+    assert executor.futures[0].result().reason == "ugc_helper_failure_to_reap"
+    host._background_prepare_for_obj(b)
+    assert len(executor.futures) == 1
+    queue_snapshot = host._background_prepare_queue.snapshot()
+    assert queue_snapshot.busy
+    assert queue_snapshot.active.identity == "10.0.0.1:2302"
+    assert [request.identity for request in queue_snapshot.pending] == [
+        "10.0.0.2:2302",
+    ]
+    assert background_prepare.preparation_operation_busy(host)
+    assert len(cancel_events) == 1
+    assert cancel_events[0].is_set() is False
 
 
 def test_production_setup_exception_becomes_visible_failed_batch(monkeypatch, capsys):
@@ -427,12 +471,18 @@ class ConsentHarness:
         self.decision = decision
         self.calls = 0
 
-    def _ensure_join_steam_start_consent(self, attempt_id):
+    def _ensure_join_steam_start_consent(
+            self, attempt_id, *, caller="join", progress_cb=None):
         assert attempt_id == 0
+        assert caller == "background"
         self.calls += 1
         if isinstance(self.decision, BaseException):
             raise self.decision
-        return bool(self.decision)
+        return BackgroundConsentResult(
+            BackgroundConsentStatus.ALLOWED
+            if self.decision else BackgroundConsentStatus.DECLINED,
+            steam_was_running=bool(self.decision),
+        )
 
 
 def run_consent(scheduler, host, generation=7):
@@ -632,9 +682,12 @@ def test_background_ugc_readiness_receives_cancel_event_and_visible_progress(mon
         True, "steam_client", True, False,
         presenter=presenter, server_name="Readiness Server",
         manage_join_presence=False, manage_join_presentation=False,
+        allow_backend_steam_start=False,
     )
     assert outcome.status is PreparationStatus.READY
     assert seen["cancel_event"] is host._steamcmd_cancel_event
+    assert seen["allow_start_steam"] is False
+    assert seen["launch_policy"] == "wait_only"
     assert callable(seen["progress_cb"])
     assert any(event.kind is PreparationEventKind.STAGE for event in presenter.events)
 

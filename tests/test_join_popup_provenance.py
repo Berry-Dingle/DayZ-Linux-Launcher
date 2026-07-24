@@ -430,6 +430,53 @@ def test_run_ugc_install_preserves_initial_request_and_poll_sources(monkeypatch)
     assert sessions[3]["request_accepted"] is True
 
 
+def test_fatal_cooperative_session_skips_secondary_refresh_and_cleanup(
+        monkeypatch):
+    session = steam_ugc_backend.CooperativeUGCSession()
+    initial = {
+        "type": "item", "id": 7, "subscribed": False, "installed": False,
+        "needs_update": False, "downloading": False,
+        "download_pending": False, "download_bytes": 0,
+        "total_bytes": 100, "state_names": [],
+    }
+
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "active_ugc_session", lambda: session,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_refresh_current_state",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fatal cooperative session must not be queried again"
+        ),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cleanup_subscriptions",
+        lambda *_args, **_kwargs: pytest.fail(
+            "fatal cooperative session must not receive cleanup commands"
+        ),
+    )
+
+    def fake_helper(command, **kwargs):
+        if command == "state":
+            kwargs["on_event"](dict(initial))
+            return True, None
+        session._fatal = True
+        raise steam_ugc_backend.UGCSessionError("fatal unsubscribe")
+
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines", fake_helper,
+    )
+    assert steam_ugc_backend.run_ugc_install([7]) is False
+
+
 def test_streaming_fifteen_transient_items_never_relies_on_coalescing():
     harness = RendererHarness()
     for mid in range(1, 16):

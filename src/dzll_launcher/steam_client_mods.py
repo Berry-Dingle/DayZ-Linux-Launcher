@@ -4,7 +4,11 @@
 from typing import Callable, List
 
 from .steamcmd_mods import DAYZ_APPID
-from .steam_ugc_backend import run_ugc_install
+from .steam_ugc_backend import (
+    activate_ugc_session,
+    deactivate_ugc_session,
+    run_ugc_install,
+)
 
 STEAM_CLIENT_STALL_TIMEOUT_S = 60 * 60
 
@@ -19,6 +23,8 @@ def run_steam_client_install(
     progress_cb: Callable[[dict], None] | None = None,
     handoff_cb: Callable[[], None] | None = None,
     allow_start_steam: bool = True,
+    launch_policy=None,
+    ugc_session=None,
     log_fn=None,
 ) -> bool:
     """Queue Workshop downloads through native Steam, sequentially."""
@@ -133,15 +139,22 @@ def run_steam_client_install(
 
     log("[Steam UGC] Backend enabled")
     log(f"[Steam UGC] Checking/updating {total} required Workshop item(s)")
-    ok = run_ugc_install(
-        ids,
-        appid=DAYZ_APPID,
-        cancel_event=cancel_event,
-        progress_cb=ugc_progress,
-        names_by_id=names_by_id,
-        allow_start_steam=bool(allow_start_steam),
-        timeout=STEAM_CLIENT_STALL_TIMEOUT_S,
-    )
+    if ugc_session is not None:
+        activate_ugc_session(ugc_session)
+    try:
+        ok = run_ugc_install(
+            ids,
+            appid=DAYZ_APPID,
+            cancel_event=cancel_event,
+            progress_cb=ugc_progress,
+            names_by_id=names_by_id,
+            allow_start_steam=bool(allow_start_steam),
+            launch_policy=launch_policy,
+            timeout=STEAM_CLIENT_STALL_TIMEOUT_S,
+        )
+    finally:
+        if ugc_session is not None:
+            deactivate_ugc_session(ugc_session)
     if ok:
         log("[Steam UGC] Finished")
         return True

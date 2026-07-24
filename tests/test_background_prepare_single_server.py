@@ -186,10 +186,12 @@ def test_cancel_signals_existing_event_and_releases_owner(monkeypatch, snapshot,
     controller = SingleServerBackgroundPreparation(win)
     presenter = RecordingPreparationPresenter()
     entered = threading.Event()
+    seen_cancel_events = []
 
     def fake_prepare(*_args, **kwargs):
+        seen_cancel_events.append(kwargs["cancel_event"])
         entered.set()
-        assert win._steamcmd_cancel_event.wait(timeout=2.0)
+        assert kwargs["cancel_event"].wait(timeout=2.0)
         outcome = PreparationOutcome(
             PreparationStatus.CANCELLED, reason="cancelled",
             error="Mod download cancelled",
@@ -209,6 +211,9 @@ def test_cancel_signals_existing_event_and_releases_owner(monkeypatch, snapshot,
     assert presenter.cancelling_operation_ids
     assert presenter.terminal is result[0]
     assert controller.active is False
+    assert seen_cancel_events == [controller.cancel_event]
+    assert controller.cancel_event is not win._steamcmd_cancel_event
+    assert controller.cancel_event.is_set() is False
     assert win._steamcmd_cancel_event.is_set() is False
 
 
@@ -226,6 +231,26 @@ def test_old_operation_validity_guard_expires_after_release(monkeypatch, snapsho
     monkeypatch.setattr(background_prepare, "prepare_required_mods", fake_prepare)
     SingleServerBackgroundPreparation(win).run(snapshot, runtime, RecordingPreparationPresenter())
     assert guards[0]() is False
+
+
+def test_sequential_background_operations_have_distinct_cancel_identity(
+        monkeypatch, snapshot, runtime):
+    win = FakeWindow()
+    observed = []
+
+    def fake_prepare(*_args, **kwargs):
+        observed.append(kwargs["cancel_event"])
+        return PreparationOutcome(PreparationStatus.READY, reason="ready")
+
+    monkeypatch.setattr(background_prepare, "prepare_required_mods", fake_prepare)
+    first = SingleServerBackgroundPreparation(win)
+    second = SingleServerBackgroundPreparation(win)
+    assert first.run(snapshot, runtime).status is PreparationStatus.READY
+    first.cancel_event.set()
+    assert second.run(snapshot, runtime).status is PreparationStatus.READY
+    assert observed == [first.cancel_event, second.cancel_event]
+    assert observed[0] is not observed[1]
+    assert observed[1].is_set() is False
 
 
 def test_declined_shared_steam_consent_is_cancelled_and_releases_gate(
@@ -263,4 +288,7 @@ def test_normal_join_entry_rejects_background_gate_before_starting_attempt():
     )[0]
     assert entry.index("preparation_operation_busy(self)") < entry.index(
         "self._join_attempts.begin("
+    )
+    assert entry.index("self._join_attempts.begin(") < entry.index(
+        "self._steamcmd_cancel_event = threading.Event()"
     )

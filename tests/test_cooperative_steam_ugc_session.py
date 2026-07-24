@@ -1,0 +1,952 @@
+import io
+import json
+import queue
+import tempfile
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from dzll_launcher import steam_client_mods, steam_ugc_backend, steam_ugc_helper
+
+
+class QueueStdout:
+    def __init__(self):
+        self.lines = queue.Queue()
+
+    def push(self, event):
+        self.lines.put(json.dumps(event) + "\n")
+
+    def close(self):
+        self.lines.put(None)
+
+    def __iter__(self):
+        while True:
+            line = self.lines.get()
+            if line is None:
+                return
+            yield line
+
+
+class ProtocolProcess:
+    next_pid = 7100
+
+    def __init__(self, temp_dir):
+        type(self).next_pid += 1
+        self.pid = type(self).next_pid
+        self.returncode = None
+        self.stdout = QueueStdout()
+        self.stderr = io.StringIO("")
+        self.commands = []
+        self.signals = []
+        self.stdin_closed = False
+        self.stdin = SimpleNamespace(
+            write=self.write,
+            flush=lambda: None,
+            close=self.close_stdin,
+        )
+        self.stdout.push(
+            {
+                "type": "session_starting",
+                "request_id": None,
+                "helper_pid": self.pid,
+                "temp_dir": str(temp_dir),
+            }
+        )
+        self.stdout.push(
+            {
+                "type": "session_ready",
+                "request_id": None,
+                "helper_pid": self.pid,
+            }
+        )
+
+    def write(self, raw):
+        message = json.loads(raw)
+        self.commands.append(message)
+        request_id = message["request_id"]
+        command = message["command"]
+        if command == "shutdown":
+            self.stdout.push(
+                {
+                    "type": "command_accepted",
+                    "request_id": request_id,
+                    "command": command,
+                }
+            )
+            self.stdout.push(
+                {
+                    "type": "shutdown_complete",
+                    "request_id": request_id,
+                    "ok": True,
+                    "reason": "shutdown",
+                    "steamapi_shutdown": True,
+                    "temp_cleanup": True,
+                }
+            )
+            self.returncode = 0
+            self.stdout.close()
+        elif command == "cancel":
+            self.stdout.push(
+                {
+                    "type": "cancellation_ack",
+                    "request_id": request_id,
+                    "target_request_id": message["target_request_id"],
+                }
+            )
+            self.stdout.push(
+                {
+                    "type": "command_result",
+                    "request_id": message["target_request_id"],
+                    "ok": False,
+                    "cancelled": True,
+                }
+            )
+        else:
+            self.stdout.push(
+                {
+                    "type": "command_accepted",
+                    "request_id": request_id,
+                    "command": command,
+                }
+            )
+            for item_id in message["item_ids"]:
+                self.stdout.push(
+                    {
+                        "type": "item",
+                        "request_id": request_id,
+                        "id": item_id,
+                        "installed": True,
+                        "needs_update": False,
+                        "downloading": False,
+                        "download_pending": False,
+                    }
+                )
+            self.stdout.push(
+                {
+                    "type": "command_result",
+                    "request_id": request_id,
+                    "command": command,
+                    "ok": True,
+                }
+            )
+        return len(raw)
+
+    def close_stdin(self):
+        self.stdin_closed = True
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout):
+        if self.returncode is None:
+            raise steam_ugc_backend.subprocess.TimeoutExpired("session", timeout)
+        return self.returncode
+
+    def terminate(self):
+        self.signals.append("terminate")
+        self.returncode = -15
+        self.stdout.close()
+
+    def kill(self):
+        self.signals.append("kill")
+        self.returncode = -9
+        self.stdout.close()
+
+
+def test_parent_reuses_one_helper_for_multiple_commands_and_cleans_temp(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_test_"))
+    (appid_dir / "steam_appid.txt").write_text("221100\n")
+    processes = []
+
+    def popen(*_args, **_kwargs):
+        process = ProtocolProcess(appid_dir)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr(steam_ugc_backend.subprocess, "Popen", popen)
+    session = steam_ugc_backend.CooperativeUGCSession()
+    steam_ugc_backend.activate_ugc_session(session)
+    events = []
+    try:
+        assert steam_ugc_backend._run_helper_json_lines(
+            "state", appid=221100, timeout=2, mod_ids=[1],
+            on_event=events.append,
+        )[0]
+        assert steam_ugc_backend._run_helper_json_lines(
+            "state", appid=221100, timeout=2, mod_ids=[2],
+            on_event=events.append,
+        )[0]
+        assert steam_ugc_backend._run_helper_json_lines(
+            "subscribe-download", appid=221100, timeout=2, mod_ids=[2],
+            on_event=events.append,
+        )[0]
+        assert steam_ugc_backend._run_helper_json_lines(
+            "unsubscribe", appid=221100, timeout=2, mod_ids=[2],
+            on_event=events.append,
+        )[0]
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(session)
+        session.close()
+
+    assert len(processes) == 1
+    assert [message["command"] for message in processes[0].commands] == [
+        "query_state", "query_state", "subscribe_download", "unsubscribe", "shutdown",
+    ]
+    request_ids = [message["request_id"] for message in processes[0].commands]
+    assert len(request_ids) == len(set(request_ids))
+    assert not appid_dir.exists()
+    assert processes[0].signals == []
+    assert processes[0].stdin_closed
+    assert [event["id"] for event in events if event.get("type") == "item"] == [1, 2, 2, 2]
+
+
+def test_helper_session_initializes_and_shuts_down_steamapi_once(monkeypatch):
+    commands = (
+        '{"command":"query_state","request_id":"q-1","item_ids":[7],"timeout":2}\n'
+        '{"command":"shutdown","request_id":"s-2"}\n'
+    )
+    events = []
+    counts = {"init": 0, "shutdown": 0}
+    temp_path = []
+
+    class FakeSteam:
+        ugc_accessor_name = "SteamAPI_SteamUGC_v021"
+
+        def __init__(self, _paths):
+            pass
+
+        def init(self):
+            counts["init"] += 1
+
+        def shutdown(self):
+            counts["shutdown"] += 1
+
+        def snapshot(self, item_id):
+            return steam_ugc_helper.ItemSnapshot(
+                item_id=item_id,
+                state=5,
+                state_names=["Subscribed", "Installed"],
+                subscribed=True,
+                installed=True,
+                needs_update=False,
+                downloading=False,
+                download_pending=False,
+                download_bytes=1,
+                total_bytes=1,
+                size_on_disk=1,
+                install_folder="/workshop/7",
+            )
+
+    original_setup = steam_ugc_helper.setup_temp_appid
+
+    def setup(appid):
+        tmp = original_setup(appid)
+        temp_path.append(Path(tmp.name))
+        return tmp
+
+    monkeypatch.setattr(steam_ugc_helper.sys, "stdin", io.StringIO(commands))
+    monkeypatch.setattr(steam_ugc_helper, "detect_steam_paths", lambda: SimpleNamespace())
+    monkeypatch.setattr(steam_ugc_helper, "ensure_ld_library_path", lambda _paths: None)
+    monkeypatch.setattr(steam_ugc_helper, "setup_temp_appid", setup)
+    monkeypatch.setattr(steam_ugc_helper, "SteamUGC", FakeSteam)
+    monkeypatch.setattr(steam_ugc_helper, "emit", events.append)
+
+    args = SimpleNamespace(appid=221100)
+    assert steam_ugc_helper.command_session(args) == 0
+    assert counts == {"init": 1, "shutdown": 1}
+    assert len(temp_path) == 1
+    assert not temp_path[0].exists()
+    assert [event["type"] for event in events].count("session_ready") == 1
+    assert [event["type"] for event in events].count("shutdown_complete") == 1
+    shutdown_complete = next(
+        event for event in events if event["type"] == "shutdown_complete"
+    )
+    assert shutdown_complete["request_id"] == "s-2"
+    assert shutdown_complete["steamapi_shutdown"]
+    assert shutdown_complete["temp_cleanup"]
+    assert any(
+        event.get("type") == "command_result"
+        and event.get("request_id") == "q-1"
+        and event.get("ok")
+        for event in events
+    )
+
+
+def test_cooperative_unsubscribe_uses_canonical_snapshot_item_id(monkeypatch):
+    events = []
+    subscribed = {7: True}
+
+    class FakeSteam:
+        def unsubscribe(self, item_id):
+            subscribed[int(item_id)] = False
+            return 1
+
+        def run_callbacks(self):
+            return None
+
+        def snapshot(self, item_id):
+            return steam_ugc_helper.ItemSnapshot(
+                item_id=int(item_id),
+                state=0,
+                state_names=[],
+                subscribed=subscribed[int(item_id)],
+                installed=True,
+                needs_update=False,
+                downloading=False,
+                download_pending=False,
+                download_bytes=1,
+                total_bytes=1,
+                size_on_disk=1,
+                install_folder="/workshop/7",
+            )
+
+    monkeypatch.setattr(
+        steam_ugc_helper, "_session_emit",
+        lambda request_id, event_type, **fields: events.append(
+            {"request_id": request_id, "type": event_type, **fields}
+        ),
+    )
+    monkeypatch.setattr(steam_ugc_helper, "emit", events.append)
+    steam_ugc_helper._session_unsubscribe(
+        FakeSteam(), queue.Queue(), "u-1", [7], 2,
+    )
+    item = next(event for event in events if event.get("type") == "item")
+    result = next(
+        event for event in events
+        if event.get("type") == "command_result"
+        and event.get("request_id") == "u-1"
+    )
+    assert item["id"] == 7
+    assert result["ok"] is True
+    assert result["unsubscribed"] == [7]
+    assert result["failed"] == []
+    assert not any(event.get("type") == "fatal_session_error" for event in events)
+
+
+def test_protocol_request_id_mismatch_fails_closed(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_bad_protocol_"))
+
+    class BadProtocolProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            if message["command"] == "shutdown":
+                return super().write(raw)
+            self.stdout.push(
+                {
+                    "type": "command_result",
+                    "request_id": "wrong-request",
+                    "ok": True,
+                }
+            )
+            return len(raw)
+
+    process = BadProtocolProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    with pytest.raises(steam_ugc_backend.UGCSessionError, match="request_id"):
+        session.run_command("state", timeout=2, mod_ids=[1])
+    session.close()
+    assert not appid_dir.exists()
+
+
+def test_active_session_routes_commands_without_one_shot_process(monkeypatch):
+    calls = []
+
+    class FakeSession:
+        def run_command(self, command, **kwargs):
+            calls.append((command, tuple(kwargs["mod_ids"])))
+            return True, None
+
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: pytest.fail("one-shot helper must not start"),
+    )
+    session = FakeSession()
+    steam_ugc_backend.activate_ugc_session(session)
+    try:
+        assert steam_ugc_backend._run_helper_json_lines(
+            "state", appid=221100, timeout=2, mod_ids=[3],
+        )[0]
+        assert steam_ugc_backend._run_helper_json_lines(
+            "subscribe-download", appid=221100, timeout=2, mod_ids=[3],
+        )[0]
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(session)
+    assert calls == [("state", (3,)), ("subscribe-download", (3,))]
+
+
+def test_steam_client_boundary_activates_shared_session_on_worker(monkeypatch):
+    session = object()
+    observed = []
+
+    def run_install(_ids, **_kwargs):
+        observed.append(steam_ugc_backend.active_ugc_session())
+        return True
+
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", run_install)
+    assert steam_client_mods.run_steam_client_install(
+        workshop_dir="/unused",
+        mod_ids=[7],
+        ugc_session=session,
+    )
+    assert observed == [session]
+    assert steam_ugc_backend.active_ugc_session() is None
+
+
+def test_helper_environment_scrubs_inherited_app_identity(monkeypatch):
+    monkeypatch.setenv("SteamAppId", "999")
+    monkeypatch.setenv("SteamGameId", "999")
+    monkeypatch.setenv("SteamOverlayGameId", "999")
+    env = steam_ugc_backend._helper_env()
+    assert "SteamAppId" not in env
+    assert "SteamGameId" not in env
+    assert "SteamOverlayGameId" not in env
+
+
+def test_unset_cancel_never_sends_cancel_while_startup_waits_then_succeeds(
+        monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_delayed_"))
+    process = ProtocolProcess(appid_dir)
+    # Replace the eager ready event with repeated startup waits and delayed ready.
+    process.stdout = QueueStdout()
+    process.stdout.push(
+        {
+            "type": "session_starting",
+            "request_id": None,
+            "helper_pid": process.pid,
+            "temp_dir": str(appid_dir),
+        }
+    )
+    process.stdout.push({"type": "session_waiting", "request_id": None})
+    process.stdout.push({"type": "session_waiting", "request_id": None})
+    process.stdout.push(
+        {"type": "session_ready", "request_id": None, "helper_pid": process.pid}
+    )
+    cancel = threading.Event()
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession(cancel_event=cancel)
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    session.close()
+    assert not cancel.is_set()
+    assert [message["command"] for message in process.commands] == [
+        "query_state", "shutdown",
+    ]
+    assert not appid_dir.exists()
+
+
+def test_readiness_timeout_is_failure_without_protocol_cancel(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_wait_timeout_"))
+    process = ProtocolProcess(appid_dir)
+    process.stdout = QueueStdout()
+    process.stdout.push(
+        {
+            "type": "session_starting",
+            "request_id": None,
+            "helper_pid": process.pid,
+            "temp_dir": str(appid_dir),
+        }
+    )
+    process.stdout.push({"type": "session_waiting", "request_id": None})
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=0.01, mod_ids=[1]) == (False, None)
+    assert process.commands == []
+    session.close()
+    assert [message["command"] for message in process.commands] == ["shutdown"]
+    assert not appid_dir.exists()
+
+
+def test_cleared_previously_used_event_is_not_reused_as_cancellation(
+        monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_cleared_event_"))
+    process = ProtocolProcess(appid_dir)
+    cancel = threading.Event()
+    cancel.set()
+    cancel.clear()
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession(cancel_event=cancel)
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    session.close()
+    assert all(message["command"] != "cancel" for message in process.commands)
+    assert not appid_dir.exists()
+
+
+def test_real_cancel_targets_active_request_and_acknowledges(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_real_cancel_"))
+    cancel = threading.Event()
+
+    class CancellableProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            command = message["command"]
+            if command == "query_state":
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": message["request_id"],
+                        "command": command,
+                    }
+                )
+                cancel.set()
+                return len(raw)
+            if command == "cancel":
+                self.stdout.push(
+                    {
+                        "type": "cancellation_ack",
+                        "request_id": message["request_id"],
+                        "target_request_id": message["target_request_id"],
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "command_result",
+                        "request_id": message["target_request_id"],
+                        "ok": False,
+                        "cancelled": True,
+                    }
+                )
+                return len(raw)
+            return super().write(raw)
+
+    process = CancellableProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession(cancel_event=cancel)
+    assert not session.run_command("state", timeout=2, mod_ids=[1])[0]
+    query = next(message for message in process.commands if message["command"] == "query_state")
+    cancel_message = next(message for message in process.commands if message["command"] == "cancel")
+    assert cancel_message["target_request_id"] == query["request_id"]
+    assert len([message for message in process.commands if message["command"] == "cancel"]) == 1
+    cancel.clear()
+    session.close()
+    assert not appid_dir.exists()
+
+
+@pytest.mark.parametrize("result_first", [False, True])
+def test_cancel_drain_accepts_both_terminal_orderings_before_cleanup(
+        monkeypatch, result_first):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_cancel_drain_"))
+    cancel = threading.Event()
+
+    class OrderedCancelProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            command = message["command"]
+            if command == "query_state":
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": message["request_id"],
+                        "command": command,
+                    }
+                )
+                cancel.set()
+                return len(raw)
+            if command == "cancel":
+                acknowledgement = {
+                    "type": "cancellation_ack",
+                    "request_id": message["request_id"],
+                    "target_request_id": message["target_request_id"],
+                }
+                result = {
+                    "type": "command_result",
+                    "request_id": message["target_request_id"],
+                    "ok": False,
+                    "cancelled": True,
+                }
+                for event in (
+                    (result, acknowledgement)
+                    if result_first else (acknowledgement, result)
+                ):
+                    self.stdout.push(event)
+                return len(raw)
+            return super().write(raw)
+
+    process = OrderedCancelProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession(cancel_event=cancel)
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0] is False
+    cancel.clear()
+    assert session.run_command(
+        "unsubscribe", timeout=2, mod_ids=[1],
+    )[0] is True
+    session.close()
+    commands = [message["command"] for message in process.commands]
+    assert commands[:2] == ["query_state", "cancel"]
+    assert commands.count("unsubscribe") >= 1
+    assert commands.count("shutdown") >= 1
+    assert commands.index("unsubscribe") > commands.index("cancel")
+    assert commands.index("shutdown") > commands.index("unsubscribe")
+    assert process.signals == []
+    assert not appid_dir.exists()
+
+
+def test_missing_cancel_ack_fails_closed_then_cleans_session(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_missing_ack_"))
+    cancel = threading.Event()
+
+    class MissingAckProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            if message["command"] == "query_state":
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": message["request_id"],
+                        "command": "query_state",
+                    }
+                )
+                cancel.set()
+                return len(raw)
+            if message["command"] == "cancel":
+                return len(raw)
+            return super().write(raw)
+
+    process = MissingAckProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession(cancel_event=cancel)
+    monkeypatch.setattr(steam_ugc_backend.time, "monotonic", _fast_monotonic())
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="missing cancellation acknowledgement",
+    ):
+        session.run_command("state", timeout=20, mod_ids=[1])
+    cancel.clear()
+    session.close()
+    assert len([message for message in process.commands if message["command"] == "cancel"]) == 1
+    assert not appid_dir.exists()
+
+
+def test_helper_cooperative_cancel_still_shuts_down_once_and_removes_appid(monkeypatch):
+    commands = (
+        '{"command":"subscribe_download","request_id":"d-1","item_ids":[7],"timeout":30}\n'
+        '{"command":"cancel","request_id":"c-2","target_request_id":"d-1"}\n'
+        '{"command":"shutdown","request_id":"s-3"}\n'
+    )
+    events = []
+    counts = {"init": 0, "shutdown": 0}
+    temp_path = []
+
+    class FakeSteam:
+        ugc_accessor_name = "fake"
+
+        def __init__(self, _paths):
+            pass
+
+        def init(self):
+            counts["init"] += 1
+
+        def shutdown(self):
+            counts["shutdown"] += 1
+
+        def snapshot(self, item_id):
+            return steam_ugc_helper.ItemSnapshot(
+                item_id, 1, ["Subscribed"], True, False, False, True, False,
+                1, 10, 0, None,
+            )
+
+        def subscribe(self, _item_id):
+            return 1
+
+        def download(self, _item_id, _high_priority):
+            return True
+
+        def run_callbacks(self):
+            return None
+
+    original_setup = steam_ugc_helper.setup_temp_appid
+
+    def setup(appid):
+        tmp = original_setup(appid)
+        temp_path.append(Path(tmp.name))
+        return tmp
+
+    monkeypatch.setattr(steam_ugc_helper.sys, "stdin", io.StringIO(commands))
+    monkeypatch.setattr(steam_ugc_helper, "detect_steam_paths", lambda: SimpleNamespace())
+    monkeypatch.setattr(steam_ugc_helper, "ensure_ld_library_path", lambda _paths: None)
+    monkeypatch.setattr(steam_ugc_helper, "setup_temp_appid", setup)
+    monkeypatch.setattr(steam_ugc_helper, "SteamUGC", FakeSteam)
+    monkeypatch.setattr(steam_ugc_helper, "emit", events.append)
+
+    assert steam_ugc_helper.command_session(SimpleNamespace(appid=221100)) == 0
+    assert counts == {"init": 1, "shutdown": 1}
+    assert not temp_path[0].exists()
+    assert any(event.get("type") == "cancellation_ack" for event in events)
+    assert any(
+        event.get("type") == "command_result"
+        and event.get("request_id") == "d-1"
+        and event.get("cancelled")
+        for event in events
+    )
+
+
+def test_helper_fatal_command_error_fails_closed_and_removes_appid(monkeypatch):
+    events = []
+    counts = {"init": 0, "shutdown": 0}
+    temp_path = []
+
+    class FailingSteam:
+        ugc_accessor_name = "fake"
+
+        def __init__(self, _paths):
+            pass
+
+        def init(self):
+            counts["init"] += 1
+
+        def shutdown(self):
+            counts["shutdown"] += 1
+
+        def snapshot(self, _item_id):
+            raise RuntimeError("state exploded")
+
+    original_setup = steam_ugc_helper.setup_temp_appid
+
+    def setup(appid):
+        tmp = original_setup(appid)
+        temp_path.append(Path(tmp.name))
+        return tmp
+
+    monkeypatch.setattr(
+        steam_ugc_helper.sys,
+        "stdin",
+        io.StringIO(
+            '{"command":"query_state","request_id":"q-1","item_ids":[7],"timeout":2}\n'
+        ),
+    )
+    monkeypatch.setattr(steam_ugc_helper, "detect_steam_paths", lambda: SimpleNamespace())
+    monkeypatch.setattr(steam_ugc_helper, "ensure_ld_library_path", lambda _paths: None)
+    monkeypatch.setattr(steam_ugc_helper, "setup_temp_appid", setup)
+    monkeypatch.setattr(steam_ugc_helper, "SteamUGC", FailingSteam)
+    monkeypatch.setattr(steam_ugc_helper, "emit", events.append)
+
+    assert steam_ugc_helper.command_session(SimpleNamespace(appid=221100)) == 5
+    assert counts == {"init": 1, "shutdown": 1}
+    assert not temp_path[0].exists()
+    assert any(event.get("type") == "fatal_session_error" for event in events)
+    assert any(event.get("type") == "shutdown_complete" for event in events)
+
+
+def test_forced_helper_termination_removes_reported_appid_dir(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_forced_"))
+
+    class UnresponsiveShutdownProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            if message["command"] == "shutdown":
+                return len(raw)
+            return super().write(raw)
+
+    process = UnresponsiveShutdownProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    monkeypatch.setattr(steam_ugc_backend.time, "monotonic", _fast_monotonic())
+    with pytest.raises(steam_ugc_backend.UGCSessionError, match="clean SteamAPI shutdown"):
+        session.close()
+    assert process.signals == ["terminate"]
+    assert not appid_dir.exists()
+
+
+def test_acknowledged_shutdown_that_does_not_exit_fails_closed(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_nonexit_"))
+
+    class NonExitingProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            if message["command"] == "shutdown":
+                request_id = message["request_id"]
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": request_id,
+                        "command": "shutdown",
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "shutdown_complete",
+                        "request_id": request_id,
+                        "ok": True,
+                        "steamapi_shutdown": True,
+                        "temp_cleanup": True,
+                    }
+                )
+                return len(raw)
+            return super().write(raw)
+
+    process = NonExitingProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="natural-exit grace period",
+    ):
+        session.close()
+    assert process.stdin_closed
+    assert process.signals == ["terminate"]
+    assert not appid_dir.exists()
+
+
+def test_delayed_natural_exit_after_shutdown_is_clean(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_delayed_exit_"))
+
+    class DelayedExitProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            if message["command"] == "shutdown":
+                request_id = message["request_id"]
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": request_id,
+                        "command": "shutdown",
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "shutdown_complete",
+                        "request_id": request_id,
+                        "ok": True,
+                        "steamapi_shutdown": True,
+                        "temp_cleanup": True,
+                    }
+                )
+                return len(raw)
+            return super().write(raw)
+
+        def wait(self, timeout):
+            if self.returncode is None and timeout >= 5.0:
+                self.returncode = 0
+                self.stdout.close()
+            return super().wait(timeout)
+
+    process = DelayedExitProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    session.close()
+    assert process.stdin_closed
+    assert process.signals == []
+    assert not appid_dir.exists()
+
+
+def test_mismatched_shutdown_complete_fails_closed(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_bad_shutdown_id_"))
+
+    class MismatchedShutdownProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            if message["command"] == "shutdown":
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": message["request_id"],
+                        "command": "shutdown",
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "shutdown_complete",
+                        "request_id": "wrong-shutdown",
+                        "ok": True,
+                        "steamapi_shutdown": True,
+                        "temp_cleanup": True,
+                    }
+                )
+                return len(raw)
+            return super().write(raw)
+
+    process = MismatchedShutdownProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="shutdown_complete request_id",
+    ):
+        session.close()
+    assert process.signals == ["terminate"]
+    assert not appid_dir.exists()
+
+
+def test_appid_cleanup_failure_after_clean_shutdown_fails_closed(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_cleanup_failure_"))
+    process = ProtocolProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    monkeypatch.setattr(steam_ugc_backend.shutil, "rmtree", lambda _path: None)
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="temporary Steam AppID directory survived",
+    ):
+        session.close()
+    assert process.signals == []
+    assert appid_dir.exists()
+    appid_dir.rmdir()
+
+
+def test_reader_thread_survival_after_clean_shutdown_fails_closed(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_reader_failure_"))
+    process = ProtocolProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    assert session.run_command("state", timeout=2, mod_ids=[1])[0]
+
+    class SurvivingThread:
+        def join(self, timeout):
+            assert timeout == 1.0
+
+        def is_alive(self):
+            return True
+
+    session._stderr_thread = SurvivingThread()
+    with pytest.raises(
+        steam_ugc_backend.UGCHelperReapError,
+        match="stderr reader thread survived",
+    ):
+        session.close()
+    assert process.signals == []
+
+
+def _fast_monotonic():
+    values = iter(range(100))
+    return lambda: float(next(values))

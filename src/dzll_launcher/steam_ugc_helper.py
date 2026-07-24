@@ -12,10 +12,12 @@ import argparse
 import ctypes
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,6 +32,7 @@ EXIT_TIMEOUT = 4
 EXIT_UNEXPECTED = 5
 
 DAYZ_APPID = 221100
+SESSION_INIT_RETRY_S = 0.25
 
 ITEM_STATE_BITS = (
     (1, "Subscribed"),
@@ -459,6 +462,331 @@ def emit_snapshots(steam: SteamUGC, item_ids: list[int], last_seen: dict[int, tu
         emit(snap.event())
 
 
+def _session_emit(request_id, event_type: str, **values) -> None:
+    event = {"type": str(event_type), "request_id": request_id}
+    event.update(values)
+    emit(event)
+
+
+def _session_item_event(request_id, snap: ItemSnapshot) -> None:
+    event = snap.event()
+    event["request_id"] = request_id
+    emit(event)
+
+
+class _SessionCancelled(Exception):
+    pass
+
+
+def _session_check_control(
+    commands: queue.Queue,
+    *,
+    active_request_id,
+) -> None:
+    """Consume cancellation/shutdown controls while a long command is active."""
+    while True:
+        try:
+            message = commands.get_nowait()
+        except queue.Empty:
+            return
+        if message is None:
+            _session_emit(active_request_id, "cancellation_ack", reason="parent_eof")
+            raise _SessionCancelled("parent_eof")
+        if not isinstance(message, dict):
+            _session_emit(None, "recoverable_error", error="malformed command")
+            continue
+        command = str(message.get("command") or "")
+        request_id = message.get("request_id")
+        if command == "cancel":
+            target = message.get("target_request_id")
+            if target in (None, active_request_id):
+                _session_emit(request_id, "cancellation_ack", target_request_id=active_request_id)
+                raise _SessionCancelled("cancelled")
+            _session_emit(request_id, "recoverable_error", error="cancel target is not active")
+        elif command == "shutdown":
+            _session_emit(request_id, "command_accepted", command="shutdown")
+            _session_emit(active_request_id, "cancellation_ack", reason="shutdown")
+            raise _SessionCancelled("shutdown")
+        else:
+            _session_emit(request_id, "recoverable_error", error="another command is active")
+
+
+def _session_query_state(steam: SteamUGC, request_id, item_ids: list[int]) -> None:
+    for item_id in item_ids:
+        _session_item_event(request_id, steam.snapshot(item_id))
+    _session_emit(request_id, "command_result", ok=True, command="query_state", items=item_ids)
+
+
+def _session_subscribe_download(
+    steam: SteamUGC,
+    commands: queue.Queue,
+    request_id,
+    item_ids: list[int],
+    timeout: float,
+) -> None:
+    last_seen: dict[int, tuple] = {}
+    for item_id in item_ids:
+        snap = steam.snapshot(item_id)
+        subscribe_call_result = None
+        if not snap.subscribed:
+            subscribe_call_result = steam.subscribe(item_id)
+        download_requested = steam.download(item_id, True)
+        event = snap.event()
+        event.update(
+            {
+                "type": "request",
+                "request_id": request_id,
+                "subscribe_call_result": subscribe_call_result,
+                "download_requested": bool(download_requested),
+                "high_priority": True,
+            }
+        )
+        emit(event)
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        _session_check_control(commands, active_request_id=request_id)
+        steam.run_callbacks()
+        ready = []
+        installed = []
+        for item_id in item_ids:
+            snap = steam.snapshot(item_id)
+            key = snap.progress_key()
+            if last_seen.get(item_id) != key:
+                last_seen[item_id] = key
+                _session_item_event(request_id, snap)
+            if snap.installed:
+                installed.append(item_id)
+            if snap.ready:
+                ready.append(item_id)
+        failed = [item_id for item_id in item_ids if item_id not in ready]
+        if not failed:
+            _session_emit(
+                request_id, "command_result", ok=True,
+                command="subscribe_download", installed=installed, ready=ready, failed=[],
+            )
+            return
+        if time.monotonic() >= deadline:
+            _session_emit(
+                request_id, "command_result", ok=False,
+                command="subscribe_download", installed=installed, ready=ready,
+                failed=failed, reason="timeout",
+            )
+            return
+        time.sleep(0.1)
+
+
+def _session_unsubscribe(
+    steam: SteamUGC,
+    commands: queue.Queue,
+    request_id,
+    item_ids: list[int],
+    timeout: float,
+) -> None:
+    for item_id in item_ids:
+        if steam.snapshot(item_id).subscribed:
+            steam.unsubscribe(item_id)
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        _session_check_control(commands, active_request_id=request_id)
+        steam.run_callbacks()
+        snapshots = [steam.snapshot(item_id) for item_id in item_ids]
+        for snap in snapshots:
+            _session_item_event(request_id, snap)
+        failed = [snap.item_id for snap in snapshots if snap.subscribed]
+        if not failed:
+            _session_emit(
+                request_id, "command_result", ok=True,
+                command="unsubscribe", unsubscribed=item_ids, failed=[],
+            )
+            return
+        if time.monotonic() >= deadline:
+            _session_emit(
+                request_id, "command_result", ok=False,
+                command="unsubscribe",
+                unsubscribed=[
+                    snap.item_id for snap in snapshots if not snap.subscribed
+                ],
+                failed=failed, reason="timeout",
+            )
+            return
+        time.sleep(0.1)
+
+
+def command_session(args) -> int:
+    """Serve sequential JSON-line requests under one SteamAPI initialization."""
+    commands: queue.Queue = queue.Queue()
+
+    def read_commands() -> None:
+        try:
+            for raw in sys.stdin:
+                try:
+                    value = json.loads(raw)
+                except Exception:
+                    commands.put({"command": "__malformed__", "request_id": None})
+                    continue
+                commands.put(value)
+        finally:
+            commands.put(None)
+
+    threading.Thread(target=read_commands, daemon=True).start()
+    original_cwd = os.getcwd()
+    paths = detect_steam_paths()
+    ensure_ld_library_path(paths)
+    tmp = setup_temp_appid(args.appid)
+    _session_emit(
+        None, "session_starting", appid=int(args.appid),
+        temp_dir=str(tmp.name), helper_pid=int(os.getpid()),
+    )
+    steam = None
+    shutdown_reason = "normal"
+    shutdown_request_id = None
+    pending_messages: list[dict] = []
+    accepted_request_ids: set = set()
+    try:
+        steam = SteamUGC(paths)
+        while True:
+            try:
+                steam.init()
+                break
+            except SteamInitError:
+                try:
+                    message = commands.get(timeout=SESSION_INIT_RETRY_S)
+                except queue.Empty:
+                    _session_emit(None, "session_waiting", reason="steam_not_ready")
+                    continue
+                if message is None:
+                    shutdown_reason = "parent_eof"
+                    return EXIT_OK
+                if not isinstance(message, dict):
+                    _session_emit(None, "recoverable_error", error="malformed command")
+                    continue
+                command = str(message.get("command") or "")
+                request_id = message.get("request_id")
+                if command == "shutdown":
+                    _session_emit(request_id, "cancellation_ack", reason=command)
+                    shutdown_reason = command
+                    shutdown_request_id = request_id
+                    return EXIT_OK
+                if command == "cancel":
+                    target = message.get("target_request_id")
+                    removed = False
+                    for pending in list(pending_messages):
+                        if pending.get("request_id") == target:
+                            pending_messages.remove(pending)
+                            removed = True
+                    _session_emit(
+                        request_id, "cancellation_ack",
+                        target_request_id=target, pending=removed,
+                    )
+                    if removed:
+                        _session_emit(
+                            target, "command_result", ok=False, cancelled=True,
+                            reason="cancelled_before_session_ready",
+                        )
+                    continue
+                if not any(
+                    pending.get("request_id") == request_id
+                    for pending in pending_messages
+                ):
+                    pending_messages.append(message)
+                    _session_emit(request_id, "command_accepted", command=command)
+                    accepted_request_ids.add(request_id)
+        _session_emit(
+            None, "session_ready", appid=int(args.appid),
+            helper_pid=int(os.getpid()), ugc_accessor=steam.ugc_accessor_name,
+        )
+
+        while True:
+            message = pending_messages.pop(0) if pending_messages else commands.get()
+            if message is None:
+                shutdown_reason = "parent_eof"
+                break
+            if not isinstance(message, dict):
+                _session_emit(None, "recoverable_error", error="malformed command")
+                continue
+            command = str(message.get("command") or "")
+            request_id = message.get("request_id")
+            if not request_id:
+                _session_emit(None, "recoverable_error", error="request_id is required")
+                continue
+            if command == "__malformed__":
+                _session_emit(request_id, "recoverable_error", error="malformed JSON")
+                continue
+            if command == "shutdown":
+                _session_emit(request_id, "command_accepted", command=command)
+                shutdown_reason = "shutdown"
+                shutdown_request_id = request_id
+                break
+            if command == "cancel":
+                _session_emit(request_id, "cancellation_ack", reason="no_active_command")
+                continue
+            if command not in {"query_state", "subscribe_download", "unsubscribe"}:
+                _session_emit(request_id, "recoverable_error", error=f"unknown command: {command}")
+                continue
+            try:
+                item_ids = dedupe_sorted_item_ids(message.get("item_ids") or [])
+                timeout = max(0.0, float(message.get("timeout", 120.0)))
+            except Exception as exc:
+                _session_emit(request_id, "command_result", ok=False, error=str(exc))
+                continue
+            if request_id not in accepted_request_ids:
+                _session_emit(request_id, "command_accepted", command=command)
+                accepted_request_ids.add(request_id)
+            try:
+                if command == "query_state":
+                    _session_query_state(steam, request_id, item_ids)
+                elif command == "subscribe_download":
+                    _session_subscribe_download(
+                        steam, commands, request_id, item_ids, timeout,
+                    )
+                else:
+                    _session_unsubscribe(steam, commands, request_id, item_ids, timeout)
+            except _SessionCancelled as exc:
+                _session_emit(
+                    request_id, "command_result", ok=False, cancelled=True,
+                    command=command, reason=str(exc),
+                )
+                if str(exc) in ("shutdown", "parent_eof"):
+                    shutdown_reason = str(exc)
+                    break
+            except Exception as exc:
+                _session_emit(
+                    request_id, "fatal_session_error", ok=False,
+                    command=command, error=str(exc),
+                )
+                return EXIT_UNEXPECTED
+        return EXIT_OK
+    finally:
+        steamapi_shutdown = False
+        temp_cleanup = False
+        shutdown_error = ""
+        try:
+            if steam is not None:
+                steam.shutdown()
+            steamapi_shutdown = True
+        except Exception as exc:
+            shutdown_error = f"SteamAPI shutdown failed: {exc}"
+        try:
+            os.chdir(original_cwd)
+            tmp.cleanup()
+            temp_cleanup = not Path(tmp.name).exists()
+        except Exception as exc:
+            if not shutdown_error:
+                shutdown_error = f"temporary AppID cleanup failed: {exc}"
+        _session_emit(
+            shutdown_request_id,
+            "shutdown_complete",
+            ok=bool(steamapi_shutdown and temp_cleanup and not shutdown_error),
+            reason=shutdown_reason,
+            steamapi_shutdown=steamapi_shutdown,
+            temp_cleanup=temp_cleanup,
+            error=shutdown_error,
+        )
+        if shutdown_error:
+            raise RuntimeError(shutdown_error)
+
+
 def command_state(args) -> int:
     steam = None
     tmp = None
@@ -695,6 +1023,10 @@ def build_parser() -> argparse.ArgumentParser:
     unsubscribe_request.add_argument("--appid", type=int, default=DAYZ_APPID)
     unsubscribe_request.add_argument("item_ids", nargs="+", type=parse_item_id)
     unsubscribe_request.set_defaults(func=command_unsubscribe_request)
+
+    session = sub.add_parser("session", help="serve cooperative UGC requests over JSON lines")
+    session.add_argument("--appid", type=int, default=DAYZ_APPID)
+    session.set_defaults(func=command_session)
 
     return parser
 

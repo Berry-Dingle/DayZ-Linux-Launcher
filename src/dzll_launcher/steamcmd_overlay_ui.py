@@ -1120,9 +1120,12 @@ class SteamCMDOverlayUI:
         except Exception:
             pass
 
-        # IMPORTANT: new cancel event every run (never reuse old one)
-        import threading
-        self.win._steamcmd_cancel_event = threading.Event()
+        # The operation boundary owns cancellation identity and reset state.
+        # Presentation reset must neither replace nor clear it: a Cancel click
+        # racing this GTK callback must remain observable by the worker.
+        if not hasattr(self.win, "_steamcmd_cancel_event"):
+            import threading
+            self.win._steamcmd_cancel_event = threading.Event()
 
         # IMPORTANT: reset “in progress” gate
         self.win._steamcmd_install_in_progress = False

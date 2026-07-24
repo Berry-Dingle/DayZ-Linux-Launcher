@@ -6,6 +6,7 @@ import pytest
 
 from dzll_launcher import join_prepare
 from dzll_launcher import window as window_module
+from dzll_launcher.steamcmd_overlay_ui import SteamCMDOverlayUI
 from dzll_launcher.preparation_contracts import (
     JoinPopupPreparationPresenter,
     PreparationStatus,
@@ -27,6 +28,49 @@ class ImmediateGLib:
 class Widget:
     def __getattr__(self, _name):
         return lambda *_args, **_kwargs: None
+
+
+def test_overlay_reset_preserves_join_cancel_event_identity():
+    cancel_event = threading.Event()
+    cancel_event.set()
+    win = SimpleNamespace(
+        _steamcmd_cancel_event=cancel_event,
+        _steamcmd_form_widgets=[],
+        _steamcmd_heading="old",
+        _steamcmd_l1="old",
+        _steamcmd_l2="old",
+        _steamcmd_install_in_progress=True,
+        steamcmd_spinner=Widget(),
+        steamcmd_task_heading=Widget(),
+        steamcmd_line1=Widget(),
+        steamcmd_line2=Widget(),
+        _set_steamcmd_busy=lambda _busy: None,
+    )
+    overlay = object.__new__(SteamCMDOverlayUI)
+    overlay.win = win
+    overlay._steamcmd_reset_state_for_new_run()
+    assert win._steamcmd_cancel_event is cancel_event
+    assert cancel_event.is_set() is True
+
+
+def test_join_cancel_sets_only_matching_active_attempt_event():
+    cancel_event = threading.Event()
+    active = SimpleNamespace(attempt_id=9)
+    win = SimpleNamespace(
+        _join_attempts=SimpleNamespace(active=active),
+        _steamcmd_cancel_event=cancel_event,
+        _steam_client_safe_cancel_requested=False,
+        _steam_client_set_cancel_buttons=lambda **_kwargs: None,
+        _steam_ugc_render_cancelling=lambda: None,
+    )
+    window_module.DZLLWindow._steam_client_download_cancel_clicked(
+        win, attempt_id=8,
+    )
+    assert cancel_event.is_set() is False
+    window_module.DZLLWindow._steam_client_download_cancel_clicked(
+        win, attempt_id=9,
+    )
+    assert cancel_event.is_set() is True
 
 
 class CharacterizationHarness:
@@ -316,6 +360,32 @@ def test_backend_failure_or_cancel_never_reaches_symlinks_or_launch(
     assert any(expected in error for error in win.errors)
 
 
+def test_late_ready_result_after_join_cancel_cannot_continue(monkeypatch):
+    win = CharacterizationHarness()
+    obj = SimpleNamespace(name="Cancelled", ip="127.0.0.1", gport=2302)
+
+    def late_ready(_win, *_args, **_kwargs):
+        win._steamcmd_cancel_event.set()
+        return join_prepare.PreparationOutcome(
+            PreparationStatus.READY,
+            reason="ready",
+            effective_workshop_path="/workshop",
+            verified_mods=[(101, "Required")],
+        )
+
+    monkeypatch.setattr(join_prepare, "prepare_required_mods", late_ready)
+    join_prepare.join_prepare_and_launch(
+        win, obj, [(101, "Required")], "/workshop", "/steamcmd", "",
+        False, False, "/prefix", "/watch", True, "steam_client",
+        True, False, attempt_id=1,
+    )
+    assert "symlinks" not in event_names(win)
+    assert "preset" not in event_names(win)
+    assert "launch" not in event_names(win)
+    assert win.launches == 0
+    assert any("cancel" in error.lower() for error in win.errors)
+
+
 def test_final_filesystem_verification_failure_suppresses_continuation(monkeypatch):
     win = run_characterized(monkeypatch, final_missing=True)
     assert win.events.count(("verify", "/before")) == 1
@@ -352,7 +422,8 @@ class ConsentHarness:
     def _join_log(self, *_args, **_kwargs):
         return True
 
-    def _show_start_steam_join_consent_blocking(self):
+    def _show_start_steam_join_consent_blocking(self, *, caller="join"):
+        assert caller == "join"
         return self.decision
 
     def _start_native_steam_for_join(self):
@@ -368,10 +439,12 @@ class ConsentHarness:
 
 @pytest.mark.parametrize("accepted", [True, False])
 def test_existing_steam_start_consent_accept_and_decline(monkeypatch, accepted):
-    monkeypatch.setattr(window_module, "is_native_steam_running", lambda: False)
+    monkeypatch.setattr(window_module, "is_native_steam_client_running", lambda: False)
     monkeypatch.setattr(window_module, "save_settings", lambda _settings: None)
     harness = ConsentHarness((accepted, False))
-    assert harness._ensure_join_steam_start_consent(1) is accepted
+    result = harness._ensure_join_steam_start_consent(1)
+    assert bool(result) is accepted
+    assert result.steam_start_submitted is accepted
     assert harness.started == (1 if accepted else 0)
     assert harness._join_steam_start_allowed is accepted
 

@@ -13,6 +13,7 @@ from .preparation_contracts import (
     PreparationPresenter,
     PreparationStatus,
 )
+from .steam_ugc_backend import UGCHelperReapError
 
 
 _GATE_CREATION_LOCK = threading.Lock()
@@ -70,10 +71,34 @@ class BackgroundConsentStatus(Enum):
 class BackgroundConsentResult:
     status: BackgroundConsentStatus
     error: str = ""
+    steam_was_running: bool = False
+    steam_start_submitted: bool = False
+    backend_may_launch: bool = False
 
     @property
     def allowed(self) -> bool:
         return self.status is BackgroundConsentStatus.ALLOWED
+
+    @property
+    def startup_state(self) -> str:
+        if self.steam_was_running:
+            return "already_running"
+        if self.steam_start_submitted:
+            return "start_submitted"
+        if self.backend_may_launch:
+            return "backend_allowed"
+        return self.status.value
+
+    @property
+    def startup_confirmed(self) -> bool:
+        return bool(
+            self.steam_was_running
+            or self.steam_start_submitted
+            or self.backend_may_launch
+        )
+
+    def __bool__(self) -> bool:
+        return self.allowed
 
 
 def _coerce_background_consent_result(value) -> BackgroundConsentResult:
@@ -81,6 +106,7 @@ def _coerce_background_consent_result(value) -> BackgroundConsentResult:
         return value
     return BackgroundConsentResult(
         BackgroundConsentStatus.ALLOWED if bool(value) else BackgroundConsentStatus.DECLINED,
+        backend_may_launch=bool(value),
     )
 
 
@@ -145,6 +171,7 @@ class SingleServerBackgroundPreparation:
         self._win = win
         self._gate = preparation_operation_gate(win)
         self._state_lock = threading.Lock()
+        self._cancel_event = threading.Event()
         self._lease: _OperationLease | None = None
         self._presenter: PreparationPresenter | None = None
         self._cancel_requested = False
@@ -154,6 +181,10 @@ class SingleServerBackgroundPreparation:
         with self._state_lock:
             lease = self._lease
         return lease is not None and self._gate.owns(lease)
+
+    @property
+    def cancel_event(self):
+        return self._cancel_event
 
     def cancel(self) -> bool:
         with self._state_lock:
@@ -166,7 +197,7 @@ class SingleServerBackgroundPreparation:
             return False
         if presenter is not None:
             presenter.on_cancelling(lease.generation)
-        self._win._steamcmd_cancel_event.set()
+        self._cancel_event.set()
         return True
 
     def run(self, snapshot: BackgroundServerPreparationSnapshot,
@@ -190,8 +221,9 @@ class SingleServerBackgroundPreparation:
             self._presenter = presenter
             cancel_requested = self._cancel_requested
 
-        cancel_event = self._win._steamcmd_cancel_event
+        cancel_event = self._cancel_event
         cancel_event.clear()
+        helper_reap_failed = False
         if cancel_requested:
             cancel_event.set()
         try:
@@ -243,6 +275,18 @@ class SingleServerBackgroundPreparation:
                     )
                     presenter.on_terminal(outcome)
                     return outcome
+                if not consent_result.startup_confirmed:
+                    outcome = PreparationOutcome(
+                        PreparationStatus.FAILED,
+                        reason="steam_start_not_submitted",
+                        error=(
+                            "Steam start permission completed without confirming that "
+                            "native Steam was running or that startup was submitted."
+                        ),
+                        backend=runtime.mod_download_backend,
+                    )
+                    presenter.on_terminal(outcome)
+                    return outcome
 
             return prepare_required_mods(
                 self._win,
@@ -263,14 +307,23 @@ class SingleServerBackgroundPreparation:
                 is_operation_current=lambda: self._gate.owns(lease),
                 manage_join_presence=False,
                 manage_join_presentation=False,
+                allow_backend_steam_start=bool(
+                    consent_result.backend_may_launch
+                    if snapshot.required_mods else False
+                ),
+                cancel_event=cancel_event,
             )
+        except UGCHelperReapError:
+            helper_reap_failed = True
+            raise
         finally:
             cancel_event.clear()
             self._win._join_steam_start_allowed = False
-            with self._state_lock:
-                self._lease = None
-                self._presenter = None
-            self._gate.release(lease)
+            if not helper_reap_failed:
+                with self._state_lock:
+                    self._lease = None
+                    self._presenter = None
+                self._gate.release(lease)
 
 
 def prepare_server_mods_without_joining(

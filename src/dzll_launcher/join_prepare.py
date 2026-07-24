@@ -14,7 +14,15 @@ from .preparation_contracts import (
     PreparationStatus,
 )
 from .steam_native import dayz_paths_summary, dayz_workshop_content_dir
-from .steam_ugc_backend import query_ugc_state_checked, ugc_item_ready, wait_for_ugc_ready
+from .steam_ugc_backend import (
+    CooperativeUGCSession,
+    UGCHelperReapError,
+    activate_ugc_session,
+    deactivate_ugc_session,
+    query_ugc_state_checked,
+    ugc_item_ready,
+    wait_for_ugc_ready,
+)
 
 
 def _resolve_path(path):
@@ -111,11 +119,17 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                           use_steamcmd, mod_download_backend, auto_install_missing,
                           auto_update_required, *, operation_id=0, presenter=None,
                           server_name="", server_identity="", is_operation_current=None,
-                          manage_join_presence=True, manage_join_presentation=True):
+                          manage_join_presence=True, manage_join_presentation=True,
+                          allow_backend_steam_start=True, cancel_event=None):
     """Run the existing Join preparation and stop before Join-only continuation."""
     attempt_id = int(operation_id or 0)
     presenter = presenter or NoOpPreparationPresenter()
     is_operation_current = is_operation_current or (lambda: True)
+    operation_cancel_event = (
+        cancel_event
+        if cancel_event is not None
+        else win._steamcmd_cancel_event
+    )
 
     def deliver_event(event):
         if is_operation_current():
@@ -127,6 +141,8 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
     effective_workshop_dir = _resolve_path(workshop_dir)
     mods_for_launch = list(mods or [])
     did_work = False
+    ugc_session = None
+    helper_reap_error = None
 
     if not mods:
         outcome = PreparationOutcome(
@@ -150,6 +166,11 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             if mid_i > 0 and mid_i not in required_ids_seen:
                 required_ids.append(mid_i)
                 required_ids_seen.add(mid_i)
+        if use_steamcmd and backend == "steam_client":
+            ugc_session = CooperativeUGCSession(
+                cancel_event=operation_cancel_event,
+            )
+            activate_ugc_session(ugc_session)
         if attempt_id:
             win._join_log(attempt_id, "chosen backend", backend="Steam client UGC" if backend == "steam_client" else "SteamCMD")
         configured_workshop_dir = _resolve_path(workshop_dir)
@@ -207,9 +228,12 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                 readiness_started = time.monotonic()
                 readiness_ok = wait_for_ugc_ready(
                     required_ids,
-                    cancel_event=win._steamcmd_cancel_event,
+                    cancel_event=operation_cancel_event,
                     progress_cb=_steam_ready_progress if report_readiness else None,
-                    allow_start_steam=bool(getattr(win, "_join_steam_start_allowed", False)),
+                    allow_start_steam=bool(allow_backend_steam_start),
+                    launch_policy=(
+                        "backend_allowed" if allow_backend_steam_start else "wait_only"
+                    ),
                 )
                 readiness_elapsed = time.monotonic() - readiness_started
                 print(
@@ -218,7 +242,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     f"elapsed={readiness_elapsed:.3f}s success={bool(readiness_ok)}"
                 )
                 if not readiness_ok:
-                    if win._steamcmd_cancel_event.is_set():
+                    if operation_cancel_event.is_set():
                         err_msg = (
                             "Steam readiness check cancelled for "
                             f"{server_name or server_identity or 'server'}."
@@ -504,7 +528,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                                 dry_run=dry,
                                 log_fn=None,
                                 line_cb=win._steamcmd_install_line_from_worker,
-                                cancel_event=win._steamcmd_cancel_event,
+                                cancel_event=operation_cancel_event,
                             )
                         else:
                             mod_names_by_id = {}
@@ -553,11 +577,16 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             ok = win.run_steam_client_install(
                                 workshop_dir=effective_workshop_dir,
                                 mod_ids=download_ids,
-                                cancel_event=win._steamcmd_cancel_event,
+                                cancel_event=operation_cancel_event,
                                 state_cb=_steam_client_state,
                                 progress_cb=_steam_ugc_progress,
                                 handoff_cb=None,
-                                allow_start_steam=bool(getattr(win, "_join_steam_start_allowed", False)),
+                                allow_start_steam=bool(allow_backend_steam_start),
+                                launch_policy=(
+                                    "backend_allowed"
+                                    if allow_backend_steam_start else "wait_only"
+                                ),
+                                ugc_session=ugc_session,
                                 log_fn=(lambda message: win._join_log(attempt_id, "UGC backend", message=message)) if attempt_id else None,
                             )
                             if attempt_id:
@@ -572,7 +601,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                 win._mod_download_backend_active = ""
 
                 if not ok:
-                    if bool(win._steamcmd_cancel_event.is_set()):
+                    if bool(operation_cancel_event.is_set()):
                         err_msg = "Mod download cancelled"
                     else:
                         err_msg = "Mod download failed"
@@ -706,13 +735,18 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         retry_ok = win.run_steam_client_install(
                             workshop_dir=effective_workshop_dir,
                             mod_ids=unresolved_ids,
-                            cancel_event=win._steamcmd_cancel_event,
+                            cancel_event=operation_cancel_event,
                             state_cb=_retry_state,
                             progress_cb=_retry_progress,
                             handoff_cb=None,
                             allow_start_steam=bool(
-                                getattr(win, "_join_steam_start_allowed", False)
+                                allow_backend_steam_start
                             ),
+                            launch_policy=(
+                                "backend_allowed"
+                                if allow_backend_steam_start else "wait_only"
+                            ),
+                            ugc_session=ugc_session,
                             log_fn=(
                                 lambda message: win._join_log(
                                     attempt_id, "UGC retry backend", message=message,
@@ -725,7 +759,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
 
                     if not retry_ok:
                         ok = False
-                        if win._steamcmd_cancel_event.is_set():
+                        if operation_cancel_event.is_set():
                             err_msg = "Mod download cancelled"
                         else:
                             err_msg = terminal_failure_message
@@ -733,7 +767,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             win._join_log(
                                 attempt_id,
                                 "terminal UGC retry backend failed",
-                                cancelled=bool(win._steamcmd_cancel_event.is_set()),
+                                cancelled=bool(operation_cancel_event.is_set()),
                                 unresolved=list(unresolved_ids),
                             )
                     else:
@@ -779,6 +813,10 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         mods_for_launch = [pair for pair in mods if int(pair[0]) not in denied_ids]
                         print(f"[JOIN] Skipping inaccessible mods: {sorted(denied_ids)}")
 
+    except UGCHelperReapError as exc:
+        helper_reap_error = exc
+        ok = False
+        err_msg = str(exc)
     except Exception as e:
         if not manage_join_presentation:
             print(
@@ -790,6 +828,18 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
         ok = False
         err_msg = str(e)
 
+    if ugc_session is not None:
+        deactivate_ugc_session(ugc_session)
+        try:
+            ugc_session.close()
+        except UGCHelperReapError:
+            raise
+        except Exception as exc:
+            ok = False
+            err_msg = f"Steam UGC session shutdown failed: {exc}"
+    if helper_reap_error is not None:
+        raise helper_reap_error
+
     if ok:
         outcome = PreparationOutcome(
             PreparationStatus.READY,
@@ -800,7 +850,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             did_work=did_work,
         )
     else:
-        cancelled = bool(win._steamcmd_cancel_event.is_set())
+        cancelled = bool(operation_cancel_event.is_set())
         outcome = PreparationOutcome(
             PreparationStatus.CANCELLED if cancelled else PreparationStatus.FAILED,
             reason="cancelled" if cancelled else "failed",
@@ -820,27 +870,59 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
     if consume_event is None:
         consume_event = win._steam_ugc_progress_from_worker
     join_presenter = JoinPopupPreparationPresenter(consume_event=consume_event)
+    operation_cancel_event = win._steamcmd_cancel_event
+
+    def continuation_cancelled() -> bool:
+        if operation_cancel_event.is_set():
+            return True
+        return bool(
+            attempt_id and not win._join_attempt_is_active(attempt_id)
+        )
+
     outcome = prepare_required_mods(
         win, mods, workshop_dir, steamcmd_path, steam_user, validate, dry,
         use_steamcmd, mod_download_backend, auto_install_missing, auto_update_required,
         operation_id=attempt_id,
         presenter=join_presenter,
         server_name=str(getattr(obj, "name", "") or ""),
+        allow_backend_steam_start=bool(
+            getattr(
+                getattr(win, "_steam_start_consent_result", None),
+                "backend_may_launch",
+                False,
+            )
+        ),
+        cancel_event=operation_cancel_event,
     )
     ok = outcome.status in (PreparationStatus.READY, PreparationStatus.NO_REQUIRED_MODS)
     err_msg = outcome.error or None
     selected_mod_win_paths_for_launch = []
 
     try:
+        if continuation_cancelled():
+            ok = False
+            err_msg = err_msg or "Join cancelled."
         if outcome.status is PreparationStatus.READY:
-            mods_for_launch = list(outcome.verified_mods)
-            effective_workshop_dir = outcome.effective_workshop_path
-            link_info = win.ensure_watch_symlinks(
-                workshop_dir=effective_workshop_dir,
-                mods=mods_for_launch,
-                watch_folder=watch_folder_linux,
-                cleanup_stale=True,
-            )
+            if not ok or continuation_cancelled():
+                ok = False
+                err_msg = err_msg or "Join cancelled."
+                link_info = {
+                    "created": [], "updated": [], "kept": [], "removed": [],
+                    "errors": [], "selected_paths": [],
+                }
+                mods_for_launch = []
+            else:
+                mods_for_launch = list(outcome.verified_mods)
+                effective_workshop_dir = outcome.effective_workshop_path
+                link_info = win.ensure_watch_symlinks(
+                    workshop_dir=effective_workshop_dir,
+                    mods=mods_for_launch,
+                    watch_folder=watch_folder_linux,
+                    cleanup_stale=True,
+                )
+            if continuation_cancelled():
+                ok = False
+                err_msg = err_msg or "Join cancelled."
             print(
                 f"[JOIN] symlink result: created={len(link_info['created'])} "
                 f"updated={len(link_info['updated'])} kept={len(link_info['kept'])} "
@@ -859,7 +941,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                 else:
                     print(f"[JOIN] Symlink warnings: {link_info.get('errors')}")
 
-            if ok:
+            if ok and not continuation_cancelled():
                 validation_errors = steamcmd_mods.validate_selected_watch_symlinks(
                     selected_paths=(link_info or {}).get("selected_paths", []),
                     mods=mods_for_launch,
@@ -870,44 +952,87 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     ok = False
                     err_msg = "Invalid required mod path(s) before launch: " + "; ".join(validation_errors)
 
-            if ok:
+            if continuation_cancelled():
+                ok = False
+                err_msg = err_msg or "Join cancelled."
+
+            if ok and not continuation_cancelled():
                 installed_mods_for_local = win.scan_installed_mods_in_watch_folder(watch_folder_linux)
                 selected_mods_for_preset = (link_info or {}).get("selected_paths", [])
-                paths = win.bootstrap_launcher_state(
-                    proton_prefix=proton_prefix,
-                    watch_folder_linux=watch_folder_linux,
-                    installed_mod_linux_paths=installed_mods_for_local,
-                    selected_mod_linux_paths=selected_mods_for_preset,
-                )
-                print(f"[JOIN] launcher state written: {paths}")
-                if attempt_id:
-                    win._join_log(attempt_id, "preset/launcher-state preparation completed")
-
-                selected_mod_win_paths_for_launch = [
-                    wp
-                    for wp in (
-                        linux_to_win_path_under_prefix(p, proton_prefix=proton_prefix)
-                        for p in selected_mods_for_preset
+                if continuation_cancelled():
+                    ok = False
+                    err_msg = err_msg or "Join cancelled."
+                else:
+                    paths = win.bootstrap_launcher_state(
+                        proton_prefix=proton_prefix,
+                        watch_folder_linux=watch_folder_linux,
+                        installed_mod_linux_paths=installed_mods_for_local,
+                        selected_mod_linux_paths=selected_mods_for_preset,
                     )
-                    if wp
-                ]
+                    print(f"[JOIN] launcher state written: {paths}")
+                    if attempt_id:
+                        win._join_log(
+                            attempt_id,
+                            "preset/launcher-state preparation completed",
+                        )
+
+                    selected_mod_win_paths_for_launch = [
+                        wp
+                        for wp in (
+                            linux_to_win_path_under_prefix(
+                                p, proton_prefix=proton_prefix,
+                            )
+                            for p in selected_mods_for_preset
+                        )
+                        if wp
+                    ]
         elif outcome.status is PreparationStatus.NO_REQUIRED_MODS:
-            installed_mods_for_local = win.scan_installed_mods_in_watch_folder(watch_folder_linux)
-            paths = win.bootstrap_launcher_state(
-                proton_prefix=proton_prefix,
-                watch_folder_linux=watch_folder_linux,
-                installed_mod_linux_paths=installed_mods_for_local,
-                selected_mod_linux_paths=[],
-            )
-            print(f"[JOIN] launcher state cleared for no-mod server: {paths}")
-            if attempt_id:
-                win._join_log(attempt_id, "preset/launcher-state preparation completed")
+            if continuation_cancelled():
+                ok = False
+                err_msg = err_msg or "Join cancelled."
+            else:
+                installed_mods_for_local = win.scan_installed_mods_in_watch_folder(watch_folder_linux)
+                if continuation_cancelled():
+                    ok = False
+                    err_msg = err_msg or "Join cancelled."
+                else:
+                    paths = win.bootstrap_launcher_state(
+                        proton_prefix=proton_prefix,
+                        watch_folder_linux=watch_folder_linux,
+                        installed_mod_linux_paths=installed_mods_for_local,
+                        selected_mod_linux_paths=[],
+                    )
+                    print(
+                        f"[JOIN] launcher state cleared for no-mod server: {paths}"
+                    )
+                    if attempt_id:
+                        win._join_log(
+                            attempt_id,
+                            "preset/launcher-state preparation completed",
+                        )
     except Exception as e:
         ok = False
         err_msg = str(e)
 
     def after():
         if attempt_id and not win._join_attempt_is_active(attempt_id):
+            return False
+        if continuation_cancelled():
+            try:
+                win._steam_ugc_render_status(
+                    err_msg or "Join cancelled.", error=True,
+                )
+                win._mod_download_backend_active = ""
+                win.steamcmd_cancel_btn.set_label("Close")
+                win.steamcmd_cancel_btn.set_visible(True)
+            except Exception:
+                pass
+            if attempt_id:
+                win._cleanup_join_attempt(
+                    attempt_id, "cancelled before launch continuation",
+                )
+            win._set_updating(False)
+            win._on_filter_changed()
             return False
         if attempt_id:
             win._join_log(attempt_id, "continuation executed")
@@ -932,7 +1057,11 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             win._on_filter_changed()
             return False
 
+        if continuation_cancelled():
+            return False
         win._join_popup_show_launching(attempt_id)
+        if continuation_cancelled():
+            return False
         result = win._launch_direct_steam_url(obj, selected_mod_win_paths_for_launch, attempt_id=attempt_id)
         win._on_filter_changed()
         return False

@@ -24,6 +24,7 @@ from .steam_native import (
     dayz_compatdata_dir,
     dayz_paths_summary,
     dayz_workshop_content_dir,
+    is_native_steam_client_running,
     is_native_steam_running,
     resolve_native_steam_cmd,
 )
@@ -133,6 +134,7 @@ from .steamcmd_mods import (
     fetch_workshop_sizes_bytes,
 )
 from .steam_client_mods import run_steam_client_install
+from .steam_ugc_backend import UGCHelperReapError
 from .steamcmd_overlay_ui import SteamCMDOverlayUI
 from .launcher_state import bootstrap_launcher_state
 from .blocklist_utils import bl_normalize_key, bl_load_local, bl_status
@@ -1665,7 +1667,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 except Exception:
                     pass
             self.steamcmd_login_btn.set_visible(False)
-            self.steamcmd_cancel_btn.set_visible(False)
+            self.steamcmd_cancel_btn.set_label("Cancel")
+            self.steamcmd_cancel_btn.set_tooltip_text(
+                "Cancel this Join preparation."
+            )
+            self.steamcmd_cancel_btn.set_visible(True)
             self.steamcmd_auth_scrim.set_visible(True)
             self.steamcmd_auth_box.set_visible(True)
         except Exception:
@@ -1693,8 +1699,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return result
 
     def _steamcmd_auth_cancel(self):
-        if getattr(self, "_mod_download_backend_active", "") == "steam_client":
-            return self._steam_client_download_cancel_clicked()
+        active_join = getattr(getattr(self, "_join_attempts", None), "active", None)
+        if (
+            getattr(self, "_mod_download_backend_active", "") == "steam_client"
+            or active_join is not None
+        ):
+            return self._steam_client_download_cancel_clicked(
+                attempt_id=(
+                    int(active_join.attempt_id)
+                    if active_join is not None else None
+                )
+            )
         try:
             return self._steamcmd_overlay_ui._steamcmd_auth_cancel()
         finally:
@@ -1771,7 +1786,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-    def _steam_client_download_cancel_clicked(self):
+    def _steam_client_download_cancel_clicked(self, attempt_id: int | None = None):
+        active = getattr(getattr(self, "_join_attempts", None), "active", None)
+        if attempt_id is not None and (
+            active is None or int(active.attempt_id) != int(attempt_id)
+        ):
+            print(
+                f"[join:{int(attempt_id)}] stale Cancel callback rejected",
+                flush=True,
+            )
+            return None
         if bool(getattr(self, "_steam_client_safe_cancel_requested", False)):
             return self._steam_client_stop_waiting()
 
@@ -8236,11 +8260,22 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False, f"Failed to start native Steam: {exc}"
         return True, ""
 
-    def _show_start_steam_join_consent_blocking(self) -> tuple[bool, bool]:
+    def _show_start_steam_join_consent_blocking(
+            self, *, caller: str = "join") -> tuple[bool, bool]:
         try:
             self._start_steam_join_decision = None
             self._start_steam_join_loop = GLib.MainLoop()
             try:
+                background = str(caller) == "background"
+                self.start_steam_join_title.set_text(
+                    "Start Steam to download server mods?"
+                    if background else "Start Steam to join server?"
+                )
+                self.start_steam_join_text.set_text(
+                    "DZLL needs native Steam to download this server's Workshop mods."
+                    if background else
+                    "DZLL needs native Steam running before it can prepare mods and join."
+                )
                 self.start_steam_join_check.set_active(False)
                 self.start_steam_join_scrim.set_visible(True)
                 self.start_steam_join_box.set_visible(True)
@@ -8271,13 +8306,38 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-    def _ensure_join_steam_start_consent(self, attempt_id: int = 0) -> bool:
+    def _ensure_join_steam_start_consent(
+            self, attempt_id: int = 0, *, caller: str = "join",
+            progress_cb=None) -> BackgroundConsentResult:
         self._join_steam_start_allowed = False
+        self._steam_start_consent_result = BackgroundConsentResult(
+            BackgroundConsentStatus.ERROR,
+            error="Steam start permission did not complete.",
+        )
+
+        def finish(result: BackgroundConsentResult) -> BackgroundConsentResult:
+            self._steam_start_consent_result = result
+            return result
+
+        def progress(message: str) -> None:
+            if callable(progress_cb):
+                progress_cb(str(message))
+
+        def submit_native_start() -> tuple[bool, str]:
+            try:
+                return self._start_native_steam_for_join()
+            except Exception as exc:
+                return False, f"Failed to start native Steam: {exc}"
+
         try:
-            if is_native_steam_running():
+            if is_native_steam_client_running():
                 if attempt_id:
                     self._join_log(attempt_id, "Steam-running detection", running=True)
-                return True
+                return finish(BackgroundConsentResult(
+                    BackgroundConsentStatus.ALLOWED,
+                    steam_was_running=True,
+                    backend_may_launch=False,
+                ))
             if attempt_id:
                 self._join_log(attempt_id, "Steam-running detection", running=False)
         except Exception as exc:
@@ -8286,20 +8346,37 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         if bool(self.settings.get("start_steam_on_join", False)):
             self._join_steam_start_allowed = True
-            ok, error = self._start_native_steam_for_join()
+            progress("Starting Steam…")
+            ok, error = submit_native_start()
             if not ok:
+                self._join_steam_start_allowed = False
                 print(f"[JOIN] Could not start Steam: {error}")
                 self._set_updating(False, "Steam could not be started.")
-                return False
+                return finish(BackgroundConsentResult(
+                    BackgroundConsentStatus.ERROR,
+                    error=error or "Steam could not be started.",
+                ))
             if attempt_id:
                 self._join_log(attempt_id, "native Steam start submitted")
-            return True
+            progress("Waiting for Steam…")
+            return finish(BackgroundConsentResult(
+                BackgroundConsentStatus.ALLOWED,
+                steam_start_submitted=True,
+                backend_may_launch=False,
+            ))
 
-        start_now, always = self._show_start_steam_join_consent_blocking()
+        start_now, always = self._show_start_steam_join_consent_blocking(caller=caller)
         if not start_now:
-            print("[JOIN] Join cancelled.")
-            self._set_updating(False, "Join cancelled.")
-            return False
+            cancelled_text = (
+                "Server mod download cancelled."
+                if str(caller) == "background" else "Join cancelled."
+            )
+            print(f"[JOIN] {cancelled_text}")
+            self._set_updating(False, cancelled_text)
+            return finish(BackgroundConsentResult(
+                BackgroundConsentStatus.DECLINED,
+                error=cancelled_text,
+            ))
 
         self._join_steam_start_allowed = True
         if always:
@@ -8310,14 +8387,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
             self._sync_start_steam_on_join_setting_widget()
 
-        ok, error = self._start_native_steam_for_join()
+        progress("Starting Steam…")
+        ok, error = submit_native_start()
         if not ok:
+            self._join_steam_start_allowed = False
             print(f"[JOIN] Could not start Steam: {error}")
             self._set_updating(False, "Steam could not be started.")
-            return False
+            return finish(BackgroundConsentResult(
+                BackgroundConsentStatus.ERROR,
+                error=error or "Steam could not be started.",
+            ))
         if attempt_id:
             self._join_log(attempt_id, "native Steam start submitted")
-        return True
+        progress("Waiting for Steam…")
+        return finish(BackgroundConsentResult(
+            BackgroundConsentStatus.ALLOWED,
+            steam_start_submitted=True,
+            backend_may_launch=False,
+        ))
 
     # ----------------------------
     # Watch Steam Game State
@@ -8906,10 +8993,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         request.runtime,
                         presenter,
                         ensure_steam_consent=lambda: self._background_prepare_steam_consent_blocking(
-                            generation,
+                            generation, controller.cancel_event,
                         ),
                         controller=controller,
                     )
+                except UGCHelperReapError as exc:
+                    outcome = PreparationOutcome(
+                        PreparationStatus.FAILED,
+                        reason="ugc_helper_failure_to_reap",
+                        error=(
+                            "DZLL could not confirm that its Steam UGC helper exited. "
+                            "Preparation remains blocked to prevent overlapping Steam "
+                            f"API work: {exc}"
+                        ),
+                        backend=request.runtime.mod_download_backend,
+                    )
+                    presenter.on_terminal(outcome)
+                    self._background_prepare_log_request(
+                        request,
+                        "helper-reap-failed-blocked",
+                        elapsed=f"{time.monotonic() - started:.3f}s",
+                        error=str(exc),
+                    )
+                    return outcome
                 except Exception as exc:
                     print(
                         "[BACKGROUND PREPARE] Worker exception "
@@ -9071,7 +9177,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 runtime,
                 presenter,
                 ensure_steam_consent=lambda: self._background_prepare_steam_consent_blocking(
-                    generation,
+                    generation, controller.cancel_event,
                 ),
                 controller=controller,
             )
@@ -9086,7 +9192,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             ))
 
     def _background_prepare_steam_consent_blocking(
-            self, generation: int) -> BackgroundConsentResult:
+            self, generation: int, cancel_event=None) -> BackgroundConsentResult:
+        operation_cancel_event = (
+            cancel_event
+            if cancel_event is not None
+            else self._steamcmd_cancel_event
+        )
         consent_started = time.monotonic()
         completed = threading.Event()
         result_lock = threading.Lock()
@@ -9110,7 +9221,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             try:
                 if completed.is_set():
                     return False
-                if self._steamcmd_cancel_event.is_set():
+                if operation_cancel_event.is_set():
                     settle(BackgroundConsentResult(
                         BackgroundConsentStatus.CANCELLED,
                         f"Steam start permission cancelled for {server_label}.",
@@ -9121,18 +9232,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         f"Steam start permission expired for {server_label}.",
                     ))
                 else:
-                    allowed = bool(self._ensure_join_steam_start_consent(0))
-                    if self._steamcmd_cancel_event.is_set():
+                    consent_result = self._ensure_join_steam_start_consent(
+                        0,
+                        caller="background",
+                        progress_cb=lambda message: (
+                            self.background_prepare_detail_label.set_text(message)
+                        ),
+                    )
+                    if operation_cancel_event.is_set():
                         settle(BackgroundConsentResult(
                             BackgroundConsentStatus.CANCELLED,
                             f"Steam start permission cancelled for {server_label}.",
                         ))
                     else:
-                        status = (
-                            BackgroundConsentStatus.ALLOWED
-                            if allowed else BackgroundConsentStatus.DECLINED
-                        )
-                        settle(BackgroundConsentResult(status))
+                        settle(consent_result)
             except Exception as exc:
                 print(
                     "[BACKGROUND PREPARE] Steam consent callback failed "
@@ -9172,7 +9285,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         deadline = time.monotonic() + timeout_s
         while not completed.wait(timeout=min(0.05, max(0.0, deadline - time.monotonic()))):
-            if self._steamcmd_cancel_event.is_set():
+            if operation_cancel_event.is_set():
                 settle(BackgroundConsentResult(
                     BackgroundConsentStatus.CANCELLED,
                     f"Steam start permission cancelled for {server_label}.",
@@ -9186,10 +9299,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 break
         with result_lock:
             value = result["value"]
-        value = value or BackgroundConsentResult(
-            BackgroundConsentStatus.ERROR,
-            f"Steam start permission did not complete for {server_label}.",
-        )
+        if value is None:
+            value = BackgroundConsentResult(
+                BackgroundConsentStatus.ERROR,
+                f"Steam start permission did not complete for {server_label}.",
+            )
         queue = getattr(self, "_background_prepare_queue", None)
         request = queue.snapshot().active if queue is not None else None
         elapsed = time.monotonic() - consent_started
@@ -9200,13 +9314,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 "consent-return",
                 elapsed=f"{elapsed:.3f}s",
                 result=value.status.value,
+                startup_state=value.startup_state,
+                steam_was_running=value.steam_was_running,
+                steam_start_submitted=value.steam_start_submitted,
+                backend_may_launch=value.backend_may_launch,
                 error=value.error,
             )
         else:
             print(
                 "[BACKGROUND PREPARE] Steam consent returned "
                 f"server={server_label!r} elapsed={elapsed:.3f}s "
-                f"result={value.status.value}",
+                f"result={value.status.value} "
+                f"startup_state={value.startup_state}",
                 flush=True,
             )
         return value
@@ -9478,6 +9597,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         if attempt is None:
             return
+        # Cancellation belongs to this Join attempt. Background preparation and
+        # earlier Join attempts must never donate a set event to a new attempt.
+        self._steamcmd_cancel_event = threading.Event()
         self._refresh_background_prepare_action_states()
         attempt_id = attempt.attempt_id
         self._join_popup_enter_checking(attempt_id)
