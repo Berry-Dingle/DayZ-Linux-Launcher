@@ -446,6 +446,40 @@ class Phase2RestartRuntime:
         self._persist_server(server, force=True, now=wall_at)
         return server.monitoring_session_id
 
+    def ensure_monitoring_session(
+        self,
+        server_key: str,
+        *,
+        wall_at: float,
+        monotonic_at: float,
+        poll_generation: int,
+    ) -> tuple[str, bool]:
+        """Return a matching active session, creating one only when required."""
+
+        if not self.persistence_enabled:
+            return "", False
+        server = self._servers.get(str(server_key))
+        generation = _nonnegative_int(poll_generation, 0)
+        if (
+            server is not None
+            and server.monitoring_session_id
+            and server.poll_generation == generation
+        ):
+            return server.monitoring_session_id, False
+        return (
+            self.begin_monitoring(
+                server_key,
+                wall_at=wall_at,
+                monotonic_at=monotonic_at,
+                poll_generation=generation,
+            ),
+            True,
+        )
+
+    def active_monitoring_session_id(self, server_key: str) -> str:
+        server = self._servers.get(str(server_key))
+        return "" if server is None else server.monitoring_session_id
+
     def end_monitoring(
         self,
         server_key: str,

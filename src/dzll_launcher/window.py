@@ -1183,6 +1183,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = None
         self._server_companion_observation_samples = deque(maxlen=5000)
+        self._server_companion_phase2_first_accept_session_id = ""
+        self._server_companion_phase2_logged_rejections = set()
         self._server_companion_visible_zero_state = None
         self._pending_server_companion_obj = None
         self._server_companion_docked = True
@@ -3045,6 +3047,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.server_companion_revealer.set_visible(True)
             self.server_companion_revealer.set_reveal_child(True)
             self._restore_server_companion_if_enabled()
+            if getattr(self, "_server_companion_snapshot", None) is not None:
+                self._debug_server_companion_alert(
+                    "visible Companion polling preparing: "
+                    f"server={self._server_companion_restart_learning_key()!r} "
+                    f"generation={int(getattr(self, '_server_companion_poll_token', 0) or 0)}"
+                )
+                self._record_server_companion_monitor_started()
             self._start_server_companion_polling()
         else:
             self._cancel_server_companion_post_undock_shrink()
@@ -3614,14 +3623,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not key:
             return
         try:
-            self._companion_restart_phase2.begin_monitoring(
-                key,
-                wall_at=time.time(),
-                monotonic_at=time.monotonic(),
-                poll_generation=int(getattr(self, "_server_companion_poll_token", 0) or 0),
+            generation = int(
+                getattr(self, "_server_companion_poll_token", 0) or 0
             )
-        except Exception:
-            pass
+            session_id, created = (
+                self._companion_restart_phase2.ensure_monitoring_session(
+                    key,
+                    wall_at=time.time(),
+                    monotonic_at=time.monotonic(),
+                    poll_generation=generation,
+                )
+            )
+            self._debug_server_companion_alert(
+                "restart-learning session "
+                f"{'created' if created else 'reused'}: "
+                f"server={key!r} generation={generation} session={session_id!r}"
+            )
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                "restart-learning session ensure failed: "
+                f"server={key!r} "
+                f"generation={int(getattr(self, '_server_companion_poll_token', 0) or 0)} "
+                f"error={exc!r}"
+            )
 
     def _record_server_companion_monitor_heartbeat(self, key: str | None = None) -> None:
         # Phase 2 persists dense coverage from actual poll results.  A coarse
@@ -4140,6 +4164,45 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_last_online = new_online
         self._server_companion_snapshot = snapshot
         if phase2_update is not None:
+            session_id = self._companion_restart_phase2.active_monitoring_session_id(
+                key
+            )
+            if bool(getattr(phase2_update, "accepted", False)):
+                if (
+                    session_id
+                    and session_id
+                    != str(
+                        getattr(
+                            self,
+                            "_server_companion_phase2_first_accept_session_id",
+                            "",
+                        )
+                        or ""
+                    )
+                ):
+                    self._server_companion_phase2_first_accept_session_id = session_id
+                    self._debug_server_companion_alert(
+                        "restart-learning first observation accepted: "
+                        f"server={key!r} generation={token} session={session_id!r}"
+                    )
+            else:
+                reason = str(
+                    getattr(phase2_update, "rejected_reason", None) or "unknown"
+                )
+                rejection_key = (key, token, session_id, reason)
+                logged = getattr(
+                    self, "_server_companion_phase2_logged_rejections", None
+                )
+                if not isinstance(logged, set):
+                    logged = set()
+                    self._server_companion_phase2_logged_rejections = logged
+                if rejection_key not in logged:
+                    logged.add(rejection_key)
+                    self._debug_server_companion_alert(
+                        "restart-learning observation rejected: "
+                        f"server={key!r} generation={token} "
+                        f"session={session_id!r} reason={reason!r}"
+                    )
             self._handle_phase2_finalized_events(phase2_update, snapshot)
         self._maybe_play_server_companion_restart_warning(snapshot)
         panel = getattr(self, "server_companion_panel", None)
