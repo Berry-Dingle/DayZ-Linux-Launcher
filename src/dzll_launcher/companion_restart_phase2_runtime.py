@@ -480,6 +480,40 @@ class Phase2RestartRuntime:
         server = self._servers.get(str(server_key))
         return "" if server is None else server.monitoring_session_id
 
+    def end_monitoring_if_current(
+        self,
+        server_key: str,
+        *,
+        marker: LifecycleMarker,
+        wall_at: float,
+        monotonic_at: float,
+        expected_session_id: str,
+        expected_poll_generation: int,
+    ) -> RuntimeUpdate:
+        """End only the exact session/generation that requested the lifecycle."""
+
+        server = self._servers.get(str(server_key))
+        if server is None or not server.monitoring_session_id:
+            return RuntimeUpdate(
+                accepted=False,
+                rejected_reason="no_active_monitoring_session",
+            )
+        if (
+            server.monitoring_session_id != str(expected_session_id)
+            or server.poll_generation
+            != _nonnegative_int(expected_poll_generation, 0)
+        ):
+            return RuntimeUpdate(
+                accepted=False,
+                rejected_reason="stale_monitoring_lifecycle",
+            )
+        return self.end_monitoring(
+            server_key,
+            marker=marker,
+            wall_at=wall_at,
+            monotonic_at=monotonic_at,
+        )
+
     def end_monitoring(
         self,
         server_key: str,

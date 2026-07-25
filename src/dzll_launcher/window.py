@@ -2956,7 +2956,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
-            self._record_server_companion_monitor_ended("shutdown")
+            self._record_server_companion_monitor_ended(
+                "shutdown", source="application_shutdown"
+            )
         except Exception:
             pass
 
@@ -3047,13 +3049,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.server_companion_revealer.set_visible(True)
             self.server_companion_revealer.set_reveal_child(True)
             self._restore_server_companion_if_enabled()
-            if getattr(self, "_server_companion_snapshot", None) is not None:
-                self._debug_server_companion_alert(
-                    "visible Companion polling preparing: "
-                    f"server={self._server_companion_restart_learning_key()!r} "
-                    f"generation={int(getattr(self, '_server_companion_poll_token', 0) or 0)}"
-                )
-                self._record_server_companion_monitor_started()
             self._start_server_companion_polling()
         else:
             self._cancel_server_companion_post_undock_shrink()
@@ -3062,7 +3057,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.server_companion_revealer.set_reveal_child(False)
             self.server_companion_revealer.set_visible(False)
             self._collapse_server_companion_dock_space()
-            self._record_server_companion_monitor_ended("paused")
+            self._record_server_companion_monitor_ended(
+                "paused", source="companion_visibility_hidden"
+            )
             self._stop_server_companion_polling()
         self._refresh_server_companion_monitor_highlight()
         self._refresh_server_companion_power_controls()
@@ -3652,10 +3649,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # Phase 1 heartbeat would overstate monitoring and is intentionally gone.
         return
 
-    def _record_server_companion_monitor_ended(self, reason: str, key: str | None = None) -> None:
+    def _record_server_companion_monitor_ended(
+        self,
+        reason: str,
+        key: str | None = None,
+        *,
+        source: str = "direct",
+        expected_generation: int | None = None,
+        expected_session_id: str | None = None,
+    ) -> None:
         key = key or self._server_companion_restart_learning_key()
         if not key:
             return
+        generation = (
+            int(getattr(self, "_server_companion_poll_token", 0) or 0)
+            if expected_generation is None
+            else int(expected_generation)
+        )
+        session_id = (
+            self._companion_restart_phase2.active_monitoring_session_id(key)
+            if expected_session_id is None
+            else str(expected_session_id)
+        )
         marker = {
             "paused": LifecycleMarker.PAUSE,
             "server_switch": LifecycleMarker.SERVER_SWITCH,
@@ -3663,14 +3678,32 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "shutdown": LifecycleMarker.SHUTDOWN,
         }.get(str(reason), LifecycleMarker.PAUSE)
         try:
-            self._companion_restart_phase2.end_monitoring(
+            polling_active = bool(
+                getattr(self, "_server_companion_poll_timer_id", 0)
+                or getattr(self, "_server_companion_poll_inflight", False)
+            )
+            update = self._companion_restart_phase2.end_monitoring_if_current(
                 key,
                 marker=marker,
                 wall_at=time.time(),
                 monotonic_at=time.monotonic(),
+                expected_session_id=session_id,
+                expected_poll_generation=generation,
             )
-        except Exception:
-            pass
+            self._debug_server_companion_alert(
+                "restart-learning lifecycle end "
+                f"{'accepted' if update.accepted else 'rejected'}: "
+                f"source={source!r} reason={reason!r} server={key!r} "
+                f"generation={generation} session={session_id!r} "
+                f"polling_active={polling_active} "
+                f"rejection={getattr(update, 'rejected_reason', None)!r}"
+            )
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                "restart-learning lifecycle end failed: "
+                f"source={source!r} reason={reason!r} server={key!r} "
+                f"generation={generation} session={session_id!r} error={exc!r}"
+            )
 
     def _server_companion_restart_learning_summary(self):
         key = self._server_companion_restart_learning_key()
@@ -3835,7 +3868,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         gport = self._safe_positive_int(getattr(obj, "gport", 0))
         new_key = f"{ip}:{gport}" if ip and gport > 0 else None
         if old_key and old_key != new_key:
-            self._record_server_companion_monitor_ended("server_switch", old_key)
+            self._record_server_companion_monitor_ended(
+                "server_switch", old_key, source="server_selection_changed"
+            )
         self._server_companion_poll_token += 1
         self._server_companion_poll_paused = False
         self._server_companion_last_online = None
@@ -3867,8 +3902,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._start_server_companion_polling()
 
     def clear_server_companion(self):
+        self._record_server_companion_monitor_ended(
+            "clear", source="companion_server_cleared"
+        )
         self._server_companion_poll_token += 1
-        self._record_server_companion_monitor_ended("clear")
         self._server_companion_snapshot = None
         self._server_companion_obj = None
         self._last_server_companion_saved = {}
@@ -3931,6 +3968,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _start_server_companion_polling(self):
         if not self._server_companion_should_poll():
             return
+        key = self._server_companion_restart_learning_key()
+        if key:
+            self._debug_server_companion_alert(
+                "Companion polling start ensuring learner ownership: "
+                f"server={key!r} "
+                f"generation={int(getattr(self, '_server_companion_poll_token', 0) or 0)}"
+            )
+            self._record_server_companion_monitor_started(key)
         if not self._server_companion_poll_timer_id:
             self._server_companion_poll_timer_id = GLib.timeout_add_seconds(
                 self._server_companion_poll_interval_secs,
@@ -4331,7 +4376,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if panel is not None:
             panel.set_polling_paused(self._server_companion_poll_paused)
         if self._server_companion_poll_paused:
-            self._record_server_companion_monitor_ended("paused")
+            self._record_server_companion_monitor_ended(
+                "paused", source="companion_play_pause_button"
+            )
             self._stop_server_companion_polling()
         else:
             self._record_server_companion_monitor_started()

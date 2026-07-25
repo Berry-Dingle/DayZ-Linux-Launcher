@@ -156,14 +156,13 @@ def visibility_host(tmp_path):
         _server_companion_restart_learning_key=lambda: A,
         _dock_server_companion=lambda: calls.append("dock"),
         _restore_server_companion_if_enabled=lambda: calls.append("restore"),
-        _start_server_companion_polling=lambda: calls.append("poll"),
         _cancel_server_companion_post_undock_shrink=lambda: None,
         _collapse_server_companion_dock_space=lambda: None,
         _refresh_server_companion_monitor_highlight=lambda: None,
         _refresh_server_companion_power_controls=lambda: None,
         _debug_server_companion_alert=lambda message: calls.append(message),
     )
-    def end(reason):
+    def end(reason, **_kwargs):
         calls.append(f"end:{reason}")
         learner.end_monitoring(
             A,
@@ -181,6 +180,11 @@ def visibility_host(tmp_path):
     host._record_server_companion_monitor_started = MethodType(
         DZLLWindow._record_server_companion_monitor_started, host
     )
+    def start():
+        host._record_server_companion_monitor_started(A)
+        calls.append("poll")
+
+    host._start_server_companion_polling = start
     return host, learner, calls
 
 
@@ -227,3 +231,112 @@ def test_pause_resume_and_dock_neutrality_do_not_duplicate_session(tmp_path):
     assert learner.active_monitoring_session_id(A) == session
     assert len(learner._servers[A].monitoring_sessions) == 1
     assert calls.count("dock") >= 3
+
+
+def test_stale_pause_cannot_end_newer_session(tmp_path):
+    value, _active = make_runtime(tmp_path)
+    old_session, _ = value.ensure_monitoring_session(
+        A, wall_at=BASE, monotonic_at=0, poll_generation=1
+    )
+    replacement, _ = value.ensure_monitoring_session(
+        A, wall_at=BASE + 1, monotonic_at=1, poll_generation=2
+    )
+
+    stale = value.end_monitoring_if_current(
+        A,
+        marker=detection.LifecycleMarker.PAUSE,
+        wall_at=BASE + 2,
+        monotonic_at=2,
+        expected_session_id=old_session,
+        expected_poll_generation=1,
+    )
+
+    assert not stale.accepted
+    assert stale.rejected_reason == "stale_monitoring_lifecycle"
+    assert value.active_monitoring_session_id(A) == replacement
+    assert value._servers[A].monitoring_sessions[-1]["ended_at"] is None
+
+
+def test_stale_generation_cannot_pause_matching_session_id(tmp_path):
+    value, _active = make_runtime(tmp_path)
+    session, _ = value.ensure_monitoring_session(
+        A, wall_at=BASE, monotonic_at=0, poll_generation=8
+    )
+
+    stale = value.end_monitoring_if_current(
+        A,
+        marker=detection.LifecycleMarker.PAUSE,
+        wall_at=BASE + 1,
+        monotonic_at=1,
+        expected_session_id=session,
+        expected_poll_generation=7,
+    )
+
+    assert stale.rejected_reason == "stale_monitoring_lifecycle"
+    assert value.active_monitoring_session_id(A) == session
+
+
+def test_polling_start_boundary_repairs_missing_ownership_before_submit(
+    tmp_path, monkeypatch
+):
+    learner, _active = make_runtime(tmp_path)
+    calls = []
+    host = SimpleNamespace(
+        _companion_restart_phase2=learner,
+        _server_companion_poll_token=12,
+        _server_companion_poll_timer_id=0,
+        _server_companion_should_poll=lambda: True,
+        _server_companion_restart_learning_key=lambda: A,
+        _debug_server_companion_alert=lambda message: calls.append(message),
+        _submit_server_companion_poll=lambda: calls.append("submit"),
+        _server_companion_poll_tick=lambda: True,
+    )
+    host._record_server_companion_monitor_started = MethodType(
+        DZLLWindow._record_server_companion_monitor_started, host
+    )
+
+    class FakeGLib:
+        @staticmethod
+        def timeout_add_seconds(_interval, _callback):
+            calls.append("timer")
+            return 99
+
+    host._server_companion_poll_interval_secs = 10
+    from dzll_launcher import window as window_module
+
+    monkeypatch.setattr(window_module, "GLib", FakeGLib)
+    DZLLWindow._start_server_companion_polling(host)
+
+    assert learner.active_monitoring_session_id(A)
+    assert learner._servers[A].poll_generation == 12
+    assert calls[-1] == "submit"
+    assert next(i for i, item in enumerate(calls) if "session created" in item) < (
+        calls.index("submit")
+    )
+
+
+def test_repeated_current_pause_is_idempotent(tmp_path):
+    value, _active = make_runtime(tmp_path)
+    session, _ = value.ensure_monitoring_session(
+        A, wall_at=BASE, monotonic_at=0, poll_generation=4
+    )
+    first = value.end_monitoring_if_current(
+        A,
+        marker=detection.LifecycleMarker.PAUSE,
+        wall_at=BASE + 1,
+        monotonic_at=1,
+        expected_session_id=session,
+        expected_poll_generation=4,
+    )
+    second = value.end_monitoring_if_current(
+        A,
+        marker=detection.LifecycleMarker.PAUSE,
+        wall_at=BASE + 2,
+        monotonic_at=2,
+        expected_session_id=session,
+        expected_poll_generation=4,
+    )
+
+    assert first.accepted
+    assert second.rejected_reason == "no_active_monitoring_session"
+    assert len(value._servers[A].monitoring_sessions) == 1
