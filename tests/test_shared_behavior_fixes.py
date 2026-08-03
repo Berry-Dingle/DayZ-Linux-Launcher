@@ -131,7 +131,7 @@ def test_css_has_no_max_width_and_supported_widget_constraints_remain():
 
 
 @pytest.mark.parametrize("initial", [False, True])
-def test_favorite_toggle_without_pin_or_favorites_filter_preserves_order_and_scroll(monkeypatch, initial):
+def test_favorite_toggle_without_pin_or_favorites_filter_refreshes_visibility_and_preserves_scroll(monkeypatch, initial):
     saved = []
     monkeypatch.setattr(window_module, "save_favorites", lambda value: saved.append(dict(value)))
     host, adjustment, filter_calls = favorite_host()
@@ -144,7 +144,7 @@ def test_favorite_toggle_without_pin_or_favorites_filter_preserves_order_and_scr
     assert bool(obj.fav) is (not initial)
     assert id(obj) == identity_before
     assert visible_order[1] is obj
-    assert filter_calls == []
+    assert filter_calls == [{"reason": "favourites"}]
     assert adjustment.value == 137.0
     assert adjustment.set_calls == []
     assert len(saved) == 1

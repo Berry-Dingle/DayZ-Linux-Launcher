@@ -160,6 +160,7 @@ class ServerCompanionPanel(Gtk.Box):
         self._on_clear = None
         self._on_dock_toggle = None
         self._on_power_off = None
+        self._join_sensitivity_resolver = None
         self._alert_sound_value = "female"
         self._restart_alert_usable = False
         self._empty_breathe_timer_id = 0
@@ -828,7 +829,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.empty_label.set_visible(False)
         self.server_box.set_visible(True)
         self.play_pause_btn.set_sensitive(True)
-        self.join_btn.set_sensitive(True)
+        self.refresh_join_sensitivity()
 
     def clear_server(self):
         self._snapshot = None
@@ -841,4 +842,19 @@ class ServerCompanionPanel(Gtk.Box):
         self._start_empty_clock()
         self.play_pause_btn.set_label("Pause")
         self.play_pause_btn.set_sensitive(False)
-        self.join_btn.set_sensitive(False)
+        self.refresh_join_sensitivity()
+
+    def set_join_sensitivity_resolver(self, callback):
+        self._join_sensitivity_resolver = callback if callable(callback) else None
+        self.refresh_join_sensitivity()
+
+    def refresh_join_sensitivity(self):
+        joinable = self._snapshot is not None
+        resolver = getattr(self, "_join_sensitivity_resolver", None)
+        if callable(resolver):
+            try:
+                joinable = bool(resolver(joinable))
+            except Exception:
+                joinable = False
+        self.join_btn.set_sensitive(bool(joinable))
+        return bool(joinable)

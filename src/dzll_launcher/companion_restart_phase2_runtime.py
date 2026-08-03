@@ -95,6 +95,7 @@ from .companion_restart_phase2_storage import (
     atomic_write_phase2_state,
     initialize_phase2_state,
     normalize_phase2_state,
+    new_phase2_state,
 )
 
 
@@ -347,6 +348,26 @@ class Phase2RestartRuntime:
             if schema4_backend is not None:
                 schema4_backend.close(flush=False)
             raise
+
+    @classmethod
+    def disabled_for_startup_failure(
+        cls, *, active_path: str | Path, error: str
+    ) -> "Phase2RestartRuntime":
+        """Create a non-persisting learner without reading or writing disk."""
+
+        migration = Phase2MigrationResult(
+            state=new_phase2_state(now=0),
+            status=Phase2InitializationStatus.FAILED,
+            reset_performed=False,
+            recovery_performed=False,
+            active_path=Path(active_path),
+            backup_path=None,
+            legacy_checksum=None,
+            persistence_enabled=False,
+            error_kind="PendingImportRollbackFailure",
+            error=str(error),
+        )
+        return cls(migration, now=0)
 
     @property
     def persistence_enabled(self) -> bool:
@@ -729,6 +750,14 @@ class Phase2RestartRuntime:
         if not self.authoritative_schema4_runtime_enabled or backend is None:
             return None
         return backend.snapshot()
+
+    def export_authoritative_schema4_snapshot(self) -> object:
+        """Expose the backend's locked, validated export without lifecycle changes."""
+
+        backend = self._authoritative_schema4_backend
+        if not self.authoritative_schema4_runtime_enabled or backend is None:
+            raise RuntimeError("authoritative schema-4 learning export is unavailable")
+        return backend.export_snapshot()
 
     def authority_consumer_shadow_snapshot(self, server_key: str) -> object | None:
         """Return an in-memory Stage 3B1 comparison; never a production input."""

@@ -6,10 +6,17 @@ from .exceptions import BufferExhaustedError
 
 
 class ByteReader():
-    def __init__(self, stream, endian="=", encoding=None):
+    def __init__(self, stream, endian="=", encoding=None, trace=None):
         self.stream = stream
         self.endian = endian
         self.encoding = encoding
+        self.trace = trace
+        self.stage = "field-decode"
+
+    def set_stage(self, stage):
+        self.stage = str(stage)
+        if self.trace is not None:
+            self.trace.note_parser(self, self.stage)
 
     def read(self, size=-1):
         data = self.stream.read(size)

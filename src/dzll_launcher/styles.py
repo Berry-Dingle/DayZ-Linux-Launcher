@@ -269,6 +269,19 @@ def get_app_css(
           background: @dzll_accent_pressed;
         }}
 
+        .dzll-app-root button.suggested-action:disabled,
+        .server-companion-panel button.suggested-action:disabled {{
+          background: @dzll_control_disabled;
+          color: @dzll_text_disabled;
+          border-color: @dzll_divider;
+        }}
+
+        .dzll-app-root button.suggested-action:disabled label,
+        .server-companion-panel button.suggested-action:disabled label {{
+          color: @dzll_text_disabled;
+          opacity: 0.55;
+        }}
+
         .dzll-app-root dropdown > button,
         .dzll-app-root menubutton > button,
         .dzll-app-root dropdown.dzll-dropdown > button {{
@@ -336,7 +349,6 @@ def get_app_css(
 
         .dzll-app-root popover > contents,
         .required-mods-popover > contents,
-        .companion-sound-popover,
         .companion-sound-popover > contents {{
           background: @dzll_surface_content;
           color: @dzll_text_primary;
@@ -581,21 +593,144 @@ def get_app_css(
         .dzll-app-root progressbar trough,
         .server-companion-panel progressbar trough {{
           background: @dzll_surface_control;
+          background-color: @dzll_surface_control;
+          background-image: none;
         }}
 
         .dzll-app-root progressbar progress,
-        .server-companion-panel progressbar progress {{
+        .dzll-app-root progressbar:hover progress,
+        .dzll-app-root progressbar:active progress,
+        .dzll-app-root progressbar:focus progress,
+        .dzll-app-root progressbar:focus-within progress,
+        .dzll-app-root progressbar:backdrop progress,
+        .dzll-app-root progressbar:disabled progress,
+        .dzll-app-root progressbar progress:hover,
+        .dzll-app-root progressbar progress:active,
+        .dzll-app-root progressbar progress:focus,
+        .dzll-app-root progressbar progress:backdrop,
+        .dzll-app-root progressbar progress:disabled,
+        .server-companion-panel progressbar progress,
+        .server-companion-panel progressbar:hover progress,
+        .server-companion-panel progressbar:active progress,
+        .server-companion-panel progressbar:focus progress,
+        .server-companion-panel progressbar:focus-within progress,
+        .server-companion-panel progressbar:backdrop progress,
+        .server-companion-panel progressbar:disabled progress,
+        .server-companion-panel progressbar progress:hover,
+        .server-companion-panel progressbar progress:active,
+        .server-companion-panel progressbar progress:focus,
+        .server-companion-panel progressbar progress:backdrop,
+        .server-companion-panel progressbar progress:disabled {{
           background: @dzll_accent;
+          background-color: @dzll_accent;
+          background-image: none;
+          border-color: transparent;
+          border-image: none;
+          box-shadow: none;
+          outline: none;
+          text-shadow: none;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .dzll-app-root .dzll-background-prepare-status {{
+          background: transparent;
+          background-color: transparent;
+          border: 1px solid @dzll_border;
+          border-radius: 8px;
+        }}
+
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-server,
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-count,
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-percent {{
+          font-weight: 600;
+        }}
+
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-queue {{
+          color: @dzll_text_secondary;
+          font-size: 0.92em;
+        }}
+
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-bullet {{
+          color: @dzll_text_secondary;
+          font-size: 1.25em;
+          font-weight: 600;
+        }}
+
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-right-status {{
+          color: @dzll_text_muted;
+          font-weight: 600;
+        }}
+
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-progress trough,
+        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-progress progress {{
+          min-height: 5px;
+          border-radius: 4px;
+        }}
+
+        .dzll-app-root .status-refresh-progress {{
+          min-width: 0;
+        }}
+
+        .dzll-app-root .status-refresh-slot {{
+          min-width: 0;
+        }}
+
+        .dzll-app-root .dzll-sidebar-toolbar-row {{
+          min-width: 0;
+        }}
+
+        .dzll-app-root .status-refresh-progress-label {{
+          min-width: 0;
+          font-size: 10px;
+        }}
+
+        .dzll-app-root .status-refresh-progress-bar trough,
+        .dzll-app-root .status-refresh-progress-bar progress {{
+          min-height: 3px;
         }}
 
         .dzll-app-root scale trough,
         .server-companion-panel scale trough {{
           background: @dzll_surface_control;
+          background-color: @dzll_surface_control;
+          background-image: none;
         }}
 
         .dzll-app-root scale highlight,
-        .server-companion-panel scale highlight {{
+        .dzll-app-root scale:hover highlight,
+        .dzll-app-root scale:active highlight,
+        .dzll-app-root scale:focus highlight,
+        .dzll-app-root scale:focus-within highlight,
+        .dzll-app-root scale:backdrop highlight,
+        .dzll-app-root scale:disabled highlight,
+        .dzll-app-root scale highlight:hover,
+        .dzll-app-root scale highlight:active,
+        .dzll-app-root scale highlight:focus,
+        .dzll-app-root scale highlight:backdrop,
+        .dzll-app-root scale highlight:disabled,
+        .server-companion-panel scale highlight,
+        .server-companion-panel scale:hover highlight,
+        .server-companion-panel scale:active highlight,
+        .server-companion-panel scale:focus highlight,
+        .server-companion-panel scale:focus-within highlight,
+        .server-companion-panel scale:backdrop highlight,
+        .server-companion-panel scale:disabled highlight,
+        .server-companion-panel scale highlight:hover,
+        .server-companion-panel scale highlight:active,
+        .server-companion-panel scale highlight:focus,
+        .server-companion-panel scale highlight:backdrop,
+        .server-companion-panel scale highlight:disabled {{
           background: @dzll_accent;
+          background-color: @dzll_accent;
+          background-image: none;
+          border-color: transparent;
+          border-image: none;
+          box-shadow: none;
+          outline: none;
+          text-shadow: none;
+          opacity: 1;
+          filter: none;
         }}
 
         .dzll-app-root scale slider,
@@ -719,6 +854,16 @@ def get_app_css(
           -gtk-icon-filter: none;
           opacity: 1;
           filter: none;
+        }}
+
+        .dzll-app-root .dzll-column-view button.flat.dzll-download-mods-button,
+        .dzll-app-root .dzll-column-view button.flat.dzll-download-mods-button image {{
+          color: #d946ef;
+        }}
+
+        .dzll-app-root .dzll-column-view button.flat.dzll-download-mods-button:hover,
+        .dzll-app-root .dzll-column-view button.flat.dzll-download-mods-button:hover image {{
+          color: #e879f9;
         }}
 
         .players-cell {{
@@ -914,6 +1059,17 @@ def get_app_css(
 
         .companion-sound-popover {{
           margin: 10px;
+          background: transparent;
+          background-color: transparent;
+          background-image: none;
+          border-color: transparent;
+          box-shadow: none;
+        }}
+
+        .companion-sound-popover > arrow {{
+          background: @dzll_surface_content;
+          color: @dzll_text_primary;
+          border-color: @dzll_border;
         }}
 
         .required-mods-popover {{
@@ -1193,6 +1349,15 @@ def get_app_css(
           box-shadow: none;
         }}
 
+        columnview.dzll-column-view > header > button.dzll-column-title-join,
+        columnview.dzll-column-view > header > button.dzll-column-title-join:hover,
+        columnview.dzll-column-view > header > button.dzll-column-title-join:active,
+        columnview.dzll-column-view > header > button.dzll-column-title-join:checked,
+        columnview.dzll-column-view > header > button.dzll-column-title-join:focus,
+        columnview.dzll-column-view > header > button.dzll-column-title-join:focus-visible {{
+          border-right: 0;
+        }}
+
         columnview.dzll-column-view > header.server-list-header-with-top-border,
         columnview.dzll-column-view > header.server-list-header-with-top-border:hover {{
           border-top: 1px solid @dzll_divider;
@@ -1392,11 +1557,15 @@ def get_app_css(
 
         .server-companion-panel:backdrop scale trough {{
           background: @dzll_surface_control;
+          background-color: @dzll_surface_control;
+          background-image: none;
           opacity: 1;
         }}
 
         .server-companion-panel:backdrop scale highlight {{
           background: @dzll_accent;
+          background-color: @dzll_accent;
+          background-image: none;
           opacity: 1;
         }}
 
@@ -1636,12 +1805,26 @@ def get_app_css(
         .server-companion-panel .companion-restart-confidence-value.ping-greeny {{
           color: @dzll_restart_confidence_learning;
         }}
+        .server-companion-panel .companion-restart-confidence-value.ping-yellow {{
+          color: @dzll_ping_yellow;
+        }}
+        .server-companion-panel .companion-restart-confidence-value.ping-orange {{
+          color: @dzll_ping_orange;
+        }}
         .server-companion-panel:backdrop .companion-restart-confidence-value.ping-good {{
           color: @dzll_restart_confidence_high;
           opacity: 1;
         }}
         .server-companion-panel:backdrop .companion-restart-confidence-value.ping-greeny {{
           color: @dzll_restart_confidence_learning;
+          opacity: 1;
+        }}
+        .server-companion-panel:backdrop .companion-restart-confidence-value.ping-yellow {{
+          color: @dzll_ping_yellow;
+          opacity: 1;
+        }}
+        .server-companion-panel:backdrop .companion-restart-confidence-value.ping-orange {{
+          color: @dzll_ping_orange;
           opacity: 1;
         }}
         
@@ -1676,6 +1859,10 @@ def get_app_css(
         .settings-section-title {{
           font-weight: 700;
           font-size: 1.05em;
+        }}
+        .settings-section-title.companion-learning-data-title {{
+          font-weight: 400;
+          font-size: 1em;
         }}
 
         .dzll-app-root .settings-warning-label {{
@@ -1812,6 +1999,27 @@ def get_app_css(
         }}
         .warning-btn {{
           min-width: 160px;
+        }}
+        .settings-panel label.companion-pending-import-warning,
+        .settings-panel image.companion-pending-import-warning {{
+          color: #ff9f1c;
+        }}
+        .settings-panel button.companion-pending-import-cancel,
+        .settings-panel button.companion-pending-import-cancel label {{
+          color: #35a7ff;
+          font-weight: 400;
+        }}
+        .dzll-app-root button.companion-pending-import-cancel {{
+          background: transparent;
+          border: none;
+          box-shadow: none;
+          min-width: 0;
+          min-height: 0;
+          padding: 0;
+        }}
+        .settings-panel button.companion-pending-import-cancel:hover,
+        .settings-panel button.companion-pending-import-cancel:hover label {{
+          color: #69bdff;
         }}
         
         /* Keep progressbar visible when unfocused */

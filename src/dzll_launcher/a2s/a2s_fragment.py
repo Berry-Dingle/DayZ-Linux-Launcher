@@ -20,20 +20,26 @@ class A2SFragment:
     def is_compressed(self):
         return bool(self.message_id & (1 << 15))
 
-def decode_fragment(data):
+def decode_fragment(data, trace=None):
     reader = ByteReader(
-        io.BytesIO(data), endian="<", encoding="utf-8")
+        io.BytesIO(data), endian="<", encoding="utf-8", trace=trace)
+    reader.set_stage("split-header")
     frag = A2SFragment(
         message_id=reader.read_uint32(),
         fragment_count=reader.read_uint8(),
         fragment_id=reader.read_uint8(),
         mtu=reader.read_uint16()
     )
+    if trace is not None:
+        trace.note_split(frag.message_id, frag.fragment_count, frag.fragment_id)
     if frag.is_compressed:
+        reader.set_stage("split-compression-header")
         frag.decompressed_size = reader.read_uint32()
         frag.crc = reader.read_uint32()
+        reader.set_stage("split-decompression")
         frag.payload = bz2.decompress(reader.read())
     else:
+        reader.set_stage("split-payload")
         frag.payload = reader.read()
 
     return frag

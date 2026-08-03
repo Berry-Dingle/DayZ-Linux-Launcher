@@ -89,6 +89,7 @@ from .storage import (
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
 from .live import query_server_live, is_valid_hhmm
+from .a2s_status_diagnostics import STATUS_DIAGNOSTICS, result_classification
 from .maps import standardize_map, map_choices_from_db_rows
 from .ui_row import ServerObject, hr, attach_pointer_cursor
 from .column_view import (
@@ -119,6 +120,8 @@ from .styles import add_platform_css_classes, get_app_css
 from .update_ui import UpdateUI
 from .restart_learning_notice_ui import RestartLearningNoticeUI
 from .startup_presentation import StartupPresentationCoordinator
+from .companion_learning_transfer import apply_pending_import_at_startup
+from .companion_learning_transfer_ui import CompanionLearningTransferController
 from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
 from .startup_ui import build_startup_overlay
@@ -145,9 +148,9 @@ from .background_prepare import (
     BackgroundPreparationRuntime,
     BackgroundServerPreparationSnapshot,
     SingleServerBackgroundPreparation,
-    preparation_operation_busy,
     prepare_server_mods_without_joining,
 )
+from .join_preparation_busy import shared_join_preparation_busy
 from .background_prepare_queue import (
     BackgroundBatchEntry,
     BackgroundPreparationQueue,
@@ -200,10 +203,15 @@ from .companion_restart_phase2_detection import LifecycleMarker, pending_strike_
 from .companion_restart_phase2_runtime import (
     LiveResultDisposition,
     Phase2RestartRuntime,
+    RuntimeNotice,
     live_result_disposition,
     phase2_alert_usability,
     phase2_learning_summary,
 )
+
+BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET = 10
+BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING = 8
+
 
 SERVER_COMPANION_ALERT_SOUNDS = {
     "online": {
@@ -242,6 +250,7 @@ PERF_STALL_LATE_MS = 250
 BROWSER_LIVE_SCROLL_PAUSE_SECONDS = 1.0
 SCROLLBAR_INTERACTION_WATCHDOG_MS = 15000
 SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS = 200
+STATUS_REFRESH_PROGRESS_UPDATE_MS = 125
 
 
 def enable_incremental_model_if_available(model, label: str) -> None:
@@ -413,6 +422,23 @@ def fav_key(ip: str, gport: int) -> str:
     return f"{ip}:{int(gport)}"
 
 
+def _a2s_live_field_snapshot(obj) -> dict:
+    return {
+        "players": int(getattr(obj, "players", 0) or 0),
+        "max_players": int(getattr(obj, "max_players", 0) or 0),
+        "queue": int(getattr(obj, "queue", -1)),
+        "ping": int(getattr(obj, "ping", -1)),
+        "time": str(getattr(obj, "time", "") or ""),
+        "timewarp": float(getattr(obj, "timewarp", 1.0) or 1.0),
+        "password": bool(getattr(obj, "password", False)),
+        "status": ("ONLINE" if int(getattr(obj, "ping", -1)) >= 0 else "OFFLINE"),
+    }
+
+
+def _a2s_changed_live_fields(before: dict, proposed: dict) -> list[str]:
+    return [name for name in proposed if before.get(name) != proposed.get(name)]
+
+
 def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
     """
     Returns:
@@ -561,19 +587,31 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.favorites = load_favorites()
         self.last_played = load_last_played()
         self._last_server_companion_saved = load_last_companion_server()
-        self._companion_restart_phase2 = Phase2RestartRuntime.initialize(
-            active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
-            legacy_path=COMPANION_RESTART_LEARNING_PATH,
-            authoritative_schema4_runtime_enabled=(
-                AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED
-            ),
-            schema4_authority_consumer_shadow_enabled=(
-                SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED
-            ),
-            schema4_authority_production_cutover_enabled=(
-                SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
-            ),
+        self._companion_import_startup_result = apply_pending_import_at_startup(
+            config_dir=Path(COMPANION_RESTART_LEARNING_PHASE2_PATH).parent,
+            live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
         )
+        if self._companion_import_startup_result.safe_to_initialize:
+            self._companion_restart_phase2 = Phase2RestartRuntime.initialize(
+                active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+                legacy_path=COMPANION_RESTART_LEARNING_PATH,
+                authoritative_schema4_runtime_enabled=(
+                    AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED
+                ),
+                schema4_authority_consumer_shadow_enabled=(
+                    SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED
+                ),
+                schema4_authority_production_cutover_enabled=(
+                    SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
+                ),
+            )
+        else:
+            self._companion_restart_phase2 = (
+                Phase2RestartRuntime.disabled_for_startup_failure(
+                    active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+                    error=self._companion_import_startup_result.error or "unsafe learning state",
+                )
+            )
         self._pending_last_played_obj = None
         self._pending_join_mod_ids = []
         self._pending_join_mod_names_by_id = {}
@@ -637,6 +675,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._status_refresh_completed = 0
         self._status_refresh_started_at = 0.0
         self._status_refresh_last_log_completed = 0
+        self._status_refresh_progress_update_id = 0
+        self._status_refresh_progress_last_rendered = 0
 
         self._col_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(7)]
 
@@ -706,7 +746,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._background_prepare_terminal_handled = False
         self._background_prepare_controller = None
         self._background_prepare_snapshot = None
-        self._background_prepare_pulse_id = 0
         self._background_prepare_queue = BackgroundPreparationQueue()
 
         css = get_app_css(
@@ -736,6 +775,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self.restart_learning_notice_ui = RestartLearningNoticeUI(self)
         self.restart_learning_notice_revealer = self.restart_learning_notice_ui.build(overlay)
+        self.companion_learning_transfer = CompanionLearningTransferController(self)
 
         # SETTINGS SLIDE-OUT
         self.settings_scrim = Gtk.Box()
@@ -973,7 +1013,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # startup overlay (extracted)
         build_startup_overlay(self, overlay)
         self._startup_presentation = StartupPresentationCoordinator(
-            pending_notice=self._companion_restart_phase2.pending_notice,
+            pending_notice=(
+                self._server_companion_import_startup_notice()
+                or self._companion_restart_phase2.pending_notice
+            ),
             hide_startup=lambda: self._set_updating(False),
             maybe_show_update=lambda: self.update_ui.maybe_show(),
             blockers_visible=self._startup_notice_blockers_visible,
@@ -1100,6 +1143,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 else None
             ),
         )
+        self._set_background_download_column_visible(
+            bool(self.settings.get("show_background_download_buttons", False))
+        )
         refresh_column_view_sort_header_handlers(self.list_view)
         if PERF_LOG_ENABLED:
             enabled = []
@@ -1211,6 +1257,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.server_companion_panel.set_on_clear(self.clear_server_companion)
         self.server_companion_panel.set_on_play_pause(self.toggle_server_companion_polling)
         self.server_companion_panel.set_on_join(self.join_server_companion)
+        self.server_companion_panel.set_join_sensitivity_resolver(
+            self._server_companion_join_sensitive,
+        )
         self.server_companion_panel.set_on_restart_alert_toggled(self.set_server_companion_restart_alert_enabled)
         self.server_companion_panel.set_on_alert_sound_changed(self.set_server_companion_alert_sound)
         self.server_companion_panel.set_on_alert_volume_changed(self.set_server_companion_alert_volume)
@@ -1449,6 +1498,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
         panel = getattr(self, "server_companion_panel", None)
         if panel is not None and hasattr(panel, "set_join_status"):
             panel.set_join_status(message, flash=flash)
+
+    def _server_companion_join_sensitive(self, otherwise_joinable: bool) -> bool:
+        return bool(
+            otherwise_joinable
+            and not shared_join_preparation_busy(self)
+        )
+
+    def _refresh_server_companion_join_sensitivity(self) -> bool:
+        panel = getattr(self, "server_companion_panel", None)
+        refresh = getattr(panel, "refresh_join_sensitivity", None)
+        if not callable(refresh):
+            return False
+        refresh()
+        return False
 
     def _show_steamcmd_auth_overlay(self, username_prefill: str = "", status: str = ""):
         self._set_server_companion_join_status(
@@ -2933,10 +2996,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 controller.cancel()
             except Exception:
                 pass
-        try:
-            self._background_prepare_stop_pulse()
-        except Exception:
-            pass
         self._settle_browser_scrollbar_interaction("shutdown")
         drag_light = getattr(self, "_scroll_drag_light", None)
         if drag_light is not None:
@@ -2983,6 +3042,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
+            generation = int(getattr(self, "_status_refresh_generation", 0) or 0)
+            tid = int(getattr(self, "_status_refresh_flush_id", 0) or 0)
+            if tid:
+                try:
+                    GLib.source_remove(tid)
+                except Exception:
+                    pass
+            self._status_refresh_flush_id = 0
+            self._clear_status_refresh_progress(generation)
+            self._status_refresh_running = False
+            self._status_refresh_queue = deque()
+            self._status_refresh_buffer = []
+            self._status_refresh_inflight = 0
+            self._set_status_refresh_slot_running(False, generation=generation)
             self._status_refresh_generation = int(getattr(self, "_status_refresh_generation", 0) or 0) + 1
         except Exception:
             pass
@@ -4558,6 +4631,21 @@ class DZLLWindow(Gtk.ApplicationWindow):
             coordinator.blocker_visibility_changed()
         return False
 
+    def _server_companion_import_startup_notice(self):
+        result = getattr(self, "_companion_import_startup_result", None)
+        if result is None or not result.notice_title:
+            return None
+        return RuntimeNotice(
+            kind=(
+                "corrupt_state_recovered"
+                if result.status in {"applied", "rolled_back"}
+                else "initialization_failed"
+            ),
+            title=result.notice_title,
+            body=result.notice_body or "",
+            backup_path=str(result.backup_path) if result.backup_path else None,
+        )
+
     def _on_update_ui_visibility_changed(self, visible: bool):
         coordinator = getattr(self, "_startup_presentation", None)
         if coordinator is not None:
@@ -5314,6 +5402,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
         post_splice_elapsed = (time.perf_counter() - post_splice_start) if post_splice_start is not None else 0.0
         replace_elapsed = (time.perf_counter() - replace_start) if replace_start is not None else 0.0
 
+        if STATUS_DIAGNOSTICS.enabled:
+            included_ids = {id(obj) for obj in rows}
+            for index in range(n):
+                obj = self.store.get_item(index)
+                if not isinstance(obj, ServerObject):
+                    continue
+                STATUS_DIAGNOSTICS.emit(
+                    "row-lifecycle",
+                    ip=obj.ip,
+                    gport=obj.gport,
+                    qport=obj.qport,
+                    generation=getattr(self, "_browser_live_token", "-"),
+                    cycle=f"model-rebuild:{reason}",
+                    query="none",
+                    row_id=id(obj),
+                    model_id=id(display_store),
+                    classification="ignored",
+                    disposition=("applied" if id(obj) in included_ids else "ignored"),
+                    row_lifecycle=("rebound" if id(obj) in included_ids else "filtered"),
+                    reason=reason,
+                )
+
         if timing_enabled:
             timing_ctx["rebuild"] = {
                 "total_ms": ((time.perf_counter() - total_start) * 1000.0) if total_start is not None else 0.0,
@@ -5555,8 +5665,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return False
 
     def _query_startup_rest_one(self, generation: int, k, ip: str, qport: int):
+        obj = self._obj_by_key.get(k)
         try:
-            info = query_server_live(ip, qport, timeout=STARTUP_LIVE_REST_TIMEOUT_SECS)
+            info = query_server_live(
+                ip,
+                qport,
+                timeout=STARTUP_LIVE_REST_TIMEOUT_SECS,
+                gport=(obj.gport if obj is not None else qport),
+                cycle_id=f"startup-rest:{generation}:{k}",
+                generation=generation,
+                row_id=(id(obj) if obj is not None else "missing"),
+                model_id=id(getattr(self, "column_view_store", None)),
+            )
         except Exception as e:
             info = {"ok": False, "err": str(e)}
         return generation, (k, info)
@@ -5722,43 +5842,149 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         return False
 
-    def _set_status_refresh_button_busy(self, busy: bool, generation: int | None = None):
+    def _cancel_status_refresh_progress_update(self, generation: int | None = None):
+        if generation is not None and generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        source_id = int(getattr(self, "_status_refresh_progress_update_id", 0) or 0)
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+        self._status_refresh_progress_update_id = 0
+        return False
+
+    def _set_status_refresh_progress_visible(self, visible: bool, generation: int | None = None):
+        if generation is not None and generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        box = getattr(self, "status_refresh_progress_box", None)
+        count_label = getattr(self, "status_refresh_progress_count_label", None)
+        bar = getattr(self, "status_refresh_progress_bar", None)
+        slot = getattr(self, "status_refresh_slot", None)
+        refresh_btn = getattr(self, "refresh_status_btn", None)
+        if not visible:
+            self._status_refresh_progress_last_rendered = 0
+            try:
+                if count_label is not None:
+                    count_label.set_text("")
+                    count_label.set_tooltip_text(None)
+                if bar is not None:
+                    bar.set_fraction(0.0)
+                if box is not None:
+                    box.set_visible(False)
+                if slot is not None and refresh_btn is not None:
+                    slot.set_visible_child(refresh_btn)
+            except Exception:
+                pass
+            return False
+        try:
+            if box is not None:
+                box.set_visible(True)
+            if slot is not None and box is not None:
+                slot.set_visible_child(box)
+        except Exception:
+            pass
+        return False
+
+    def _render_status_refresh_progress(self, generation: int, force: bool = False):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        self._status_refresh_progress_update_id = 0
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        if not force and not bool(getattr(self, "_status_refresh_running", False)):
+            return False
+        total = max(0, int(getattr(self, "_status_refresh_total", 0) or 0))
+        if total <= 0:
+            self._set_status_refresh_progress_visible(False, generation=generation)
+            return False
+        current = max(0, int(getattr(self, "_status_refresh_completed", 0) or 0))
+        previous = max(0, int(getattr(self, "_status_refresh_progress_last_rendered", 0) or 0))
+        completed = min(total, max(previous, current))
+        self._status_refresh_progress_last_rendered = completed
+        count_text = f"{completed:,} / {total:,}"
+        tooltip_text = f"Refreshing: {count_text}"
+        count_label = getattr(self, "status_refresh_progress_count_label", None)
+        bar = getattr(self, "status_refresh_progress_bar", None)
+        try:
+            if count_label is not None:
+                count_label.set_text(count_text)
+                count_label.set_tooltip_text(tooltip_text)
+            if bar is not None:
+                bar.set_fraction(completed / total)
+            self._set_status_refresh_progress_visible(True, generation=generation)
+        except Exception:
+            pass
+        return False
+
+    def _schedule_status_refresh_progress_update(self, generation: int):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        if not bool(getattr(self, "_status_refresh_running", False)):
+            return False
+        if int(getattr(self, "_status_refresh_progress_update_id", 0) or 0):
+            return False
+        try:
+            self._status_refresh_progress_update_id = GLib.timeout_add(
+                STATUS_REFRESH_PROGRESS_UPDATE_MS,
+                self._render_status_refresh_progress,
+                generation,
+            )
+        except Exception:
+            self._status_refresh_progress_update_id = 0
+        return False
+
+    def _clear_status_refresh_progress(self, generation: int | None = None):
+        if generation is not None and generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        self._cancel_status_refresh_progress_update(generation)
+        self._set_status_refresh_progress_visible(False, generation=generation)
+        return False
+
+    def _status_refresh_attempt_finished(self, generation: int, result=None):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        if not bool(getattr(self, "_status_refresh_running", False)):
+            return False
+        total = max(0, int(getattr(self, "_status_refresh_total", 0) or 0))
+        completed = max(0, int(getattr(self, "_status_refresh_completed", 0) or 0))
+        self._status_refresh_completed = min(total, completed + 1)
+        if result:
+            self._status_refresh_buffer.append(result)
+            if len(self._status_refresh_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
+                self._flush_status_refresh_results(generation)
+            elif not int(getattr(self, "_status_refresh_flush_id", 0) or 0):
+                try:
+                    self._status_refresh_flush_id = GLib.timeout_add(
+                        int(STARTUP_LIVE_FLUSH_MS),
+                        self._flush_status_refresh_results,
+                        generation,
+                    )
+                except Exception:
+                    self._status_refresh_flush_id = 0
+        self._schedule_status_refresh_progress_update(generation)
+        return True
+
+    def _set_status_refresh_slot_running(self, running: bool, generation: int | None = None):
         if generation is not None and generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         btn = getattr(self, "refresh_status_btn", None)
-        if btn is None:
+        progress = getattr(self, "status_refresh_progress_box", None)
+        slot = getattr(self, "status_refresh_slot", None)
+        if btn is None or progress is None or slot is None:
             return False
         self._ensure_status_refresh_cursor_controller(btn)
-
-        icon = getattr(self, "status_refresh_icon", None)
-        if icon is None:
-            icon = Gtk.Image.new_from_icon_name("view-refresh-symbolic")
-            self.status_refresh_icon = icon
-
-        spinner = getattr(self, "status_refresh_spinner", None)
-        if spinner is None:
-            spinner = Gtk.Spinner()
-            try:
-                spinner.set_size_request(16, 16)
-            except Exception:
-                pass
-            self.status_refresh_spinner = spinner
-
         try:
-            if busy:
-                spinner.start()
-                btn.set_child(spinner)
-                btn.set_sensitive(True)
-                btn.set_tooltip_text("Refreshing server status...")
+            if running:
+                progress.set_visible(True)
+                slot.set_visible_child(progress)
                 self._apply_status_refresh_cursor_for_state(btn)
             else:
-                try:
-                    spinner.stop()
-                except Exception:
-                    pass
-                btn.set_child(icon)
-                btn.set_sensitive(True)
-                btn.set_tooltip_text("Refresh all server status")
+                slot.set_visible_child(btn)
                 self._apply_status_refresh_cursor_for_state(btn)
         except Exception:
             return False
@@ -5769,6 +5995,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         keys = list(getattr(self, "_obj_by_key", {}) or {})
         if not keys:
+            self._clear_status_refresh_progress()
             return
 
         self._status_refresh_generation = int(getattr(self, "_status_refresh_generation", 0) or 0) + 1
@@ -5781,6 +6008,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._status_refresh_completed = 0
         self._status_refresh_started_at = time.monotonic()
         self._status_refresh_last_log_completed = 0
+        self._status_refresh_progress_last_rendered = 0
         self._status_refresh_scroll_value = None
         try:
             vadj = self.scroller.get_vadjustment()
@@ -5797,7 +6025,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
         self._status_refresh_flush_id = 0
 
-        self._set_status_refresh_button_busy(True, generation=generation)
+        self._set_status_refresh_slot_running(True, generation=generation)
+        self._render_status_refresh_progress(generation, force=True)
 
         if DEBUG_STARTUP_LIVE:
             print(
@@ -5808,8 +6037,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._pump_status_refresh(generation)
 
     def _query_status_refresh_one(self, generation: int, k, ip: str, qport: int):
+        obj = self._obj_by_key.get(k)
         try:
-            info = query_server_live(ip, qport, timeout=STARTUP_LIVE_REST_TIMEOUT_SECS)
+            info = query_server_live(
+                ip,
+                qport,
+                timeout=STARTUP_LIVE_REST_TIMEOUT_SECS,
+                gport=(obj.gport if obj is not None else qport),
+                cycle_id=f"manual-status:{generation}:{k}",
+                generation=generation,
+                row_id=(id(obj) if obj is not None else "missing"),
+                model_id=id(getattr(self, "column_view_store", None)),
+            )
         except Exception as e:
             info = {"ok": False, "err": str(e)}
         return generation, (k, info)
@@ -5828,13 +6067,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 break
             obj = self._obj_by_key.get(k)
             if not obj:
-                self._status_refresh_completed = int(getattr(self, "_status_refresh_completed", 0) or 0) + 1
+                self._status_refresh_attempt_finished(generation)
                 continue
             try:
                 ip = str(obj.ip)
                 qport = int(obj.qport)
             except Exception:
-                self._status_refresh_completed = int(getattr(self, "_status_refresh_completed", 0) or 0) + 1
+                self._status_refresh_attempt_finished(generation)
                 continue
 
             self._status_refresh_inflight = int(getattr(self, "_status_refresh_inflight", 0) or 0) + 1
@@ -5849,7 +6088,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
             except Exception:
                 self._status_refresh_inflight = max(0, int(getattr(self, "_status_refresh_inflight", 0) or 0) - 1)
-                self._status_refresh_completed = int(getattr(self, "_status_refresh_completed", 0) or 0) + 1
+                self._status_refresh_attempt_finished(generation)
 
         self._maybe_finish_status_refresh(generation)
         return False
@@ -5858,24 +6097,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         self._status_refresh_inflight = max(0, int(getattr(self, "_status_refresh_inflight", 0) or 0) - 1)
-        self._status_refresh_completed = int(getattr(self, "_status_refresh_completed", 0) or 0) + 1
         try:
             result_generation, result = fut.result()
         except Exception:
             result_generation, result = generation, None
-        if result_generation == generation and result:
-            self._status_refresh_buffer.append(result)
-            if len(self._status_refresh_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
-                self._flush_status_refresh_results(generation)
-            elif not int(getattr(self, "_status_refresh_flush_id", 0) or 0):
-                try:
-                    self._status_refresh_flush_id = GLib.timeout_add(
-                        int(STARTUP_LIVE_FLUSH_MS),
-                        self._flush_status_refresh_results,
-                        generation,
-                    )
-                except Exception:
-                    self._status_refresh_flush_id = 0
+        self._status_refresh_attempt_finished(
+            generation,
+            result=(result if result_generation == generation else None),
+        )
 
         if DEBUG_STARTUP_LIVE:
             completed = int(getattr(self, "_status_refresh_completed", 0) or 0)
@@ -5925,6 +6154,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._flush_status_refresh_results(generation)
             return False
 
+        self._cancel_status_refresh_progress_update(generation)
+        self._render_status_refresh_progress(generation, force=True)
         self._status_refresh_running = False
         try:
             combined_filter = getattr(self, "combined_filter", None)
@@ -5960,7 +6191,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 return False
 
             GLib.idle_add(restore_status_refresh_scroll)
-        self._set_status_refresh_button_busy(False, generation=generation)
+        self._set_status_refresh_slot_running(False, generation=generation)
+        self._clear_status_refresh_progress(generation)
         if DEBUG_STARTUP_LIVE:
             total = int(getattr(self, "_status_refresh_total", 0) or 0)
             completed = int(getattr(self, "_status_refresh_completed", 0) or 0)
@@ -5985,7 +6217,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 obj = self._obj_by_key.get(k)
                 if not obj:
                     return None
-                return (k, query_server_live(obj.ip, obj.qport))
+                generation = int(getattr(self, "_startup_live_generation", 0) or 0)
+                return (
+                    k,
+                    query_server_live(
+                        obj.ip,
+                        obj.qport,
+                        gport=obj.gport,
+                        cycle_id=f"startup-first:{generation}:{k}",
+                        generation=generation,
+                        row_id=id(obj),
+                        model_id=id(getattr(self, "column_view_store", None)),
+                    ),
+                )
             except Exception as e:
                 return (k, {"ok": False, "err": str(e)})
 
@@ -6037,7 +6281,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 obj = self._obj_by_key.get(k)
                 if not obj:
                     continue
-                info = query_server_live(obj.ip, obj.qport)
+                cycle = f"{reason}:{time.monotonic_ns()}:{k}"
+                info = query_server_live(
+                    obj.ip,
+                    obj.qport,
+                    gport=obj.gport,
+                    cycle_id=cycle,
+                    generation="untokened",
+                    row_id=id(obj),
+                    model_id=id(getattr(self, "column_view_store", None)),
+                )
                 results.append((k, info))
             GLib.idle_add(self._apply_live_results, results, reason)
 
@@ -6207,10 +6460,40 @@ class DZLLWindow(Gtk.ApplicationWindow):
         for k in target_keys:
             self._browser_live_last_refresh[k] = now
 
+        for k, ip, qport in candidates:
+            obj = self._obj_by_key.get(k)
+            if obj is None:
+                continue
+            STATUS_DIAGNOSTICS.emit(
+                "refresh-scheduled",
+                ip=ip,
+                gport=obj.gport,
+                qport=qport,
+                generation=token,
+                cycle=f"browser:{token}:{k}",
+                query="INFO",
+                row_id=id(obj),
+                model_id=id(getattr(self, "column_view_store", None)),
+                disposition="submitted",
+            )
+
         def query_one(item):
             k, ip, qport = item
+            obj = self._obj_by_key.get(k)
             try:
-                return (k, query_server_live(ip, qport, timeout=BROWSER_LIVE_TIMEOUT_SECS))
+                return (
+                    k,
+                    query_server_live(
+                        ip,
+                        qport,
+                        timeout=BROWSER_LIVE_TIMEOUT_SECS,
+                        gport=(obj.gport if obj is not None else qport),
+                        cycle_id=f"browser:{token}:{k}",
+                        generation=token,
+                        row_id=(id(obj) if obj is not None else "missing"),
+                        model_id=id(getattr(self, "column_view_store", None)),
+                    ),
+                )
             except Exception as e:
                 return (k, {"ok": False, "err": str(e)})
 
@@ -6219,7 +6502,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             not_done = set()
             deadline = max(2.0, float(BROWSER_LIVE_TIMEOUT_SECS) + 1.0)
             try:
-                futures = [self._browser_live_executor.submit(query_one, item) for item in candidates]
+                futures = {self._browser_live_executor.submit(query_one, item): item for item in candidates}
                 done, not_done = wait(futures, timeout=deadline)
                 for fut in done:
                     try:
@@ -6230,9 +6513,34 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         pass
                 for fut in not_done:
                     try:
-                        fut.cancel()
+                        cancelled = fut.cancel()
                     except Exception:
-                        pass
+                        cancelled = False
+                    k, ip, qport = futures[fut]
+                    obj = self._obj_by_key.get(k)
+                    if obj is not None:
+                        STATUS_DIAGNOSTICS.emit(
+                            "query-cancel",
+                            ip=ip,
+                            gport=obj.gport,
+                            qport=qport,
+                            generation=token,
+                            cycle=f"browser:{token}:{k}",
+                            query="INFO",
+                            classification="cancelled",
+                            elapsed_ms=f">={deadline * 1000.0:.1f}",
+                            row_id=id(obj),
+                            model_id=id(getattr(self, "column_view_store", None)),
+                            previous_streak=getattr(self, "_browser_live_offline_streaks", {}).get(k, 0),
+                            new_streak=getattr(self, "_browser_live_offline_streaks", {}).get(k, 0),
+                            streak_action="unchanged",
+                            visible_before=("ONLINE" if int(getattr(obj, "ping", -1)) >= 0 else "OFFLINE"),
+                            requested_status="unchanged",
+                            final_status=("ONLINE" if int(getattr(obj, "ping", -1)) >= 0 else "OFFLINE"),
+                            applied=False,
+                            disposition="ignored",
+                            reason=("future-cancelled" if cancelled else "future-still-running"),
+                        )
             finally:
                 GLib.idle_add(self._apply_browser_live_results, token, target_keys, results)
 
@@ -6273,10 +6581,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             current_token = int(getattr(self, "_browser_live_token", 0) or 0)
             token_stale = token != current_token
             if token_stale:
+                self._diagnose_rejected_browser_results(token, target_keys, results, "stale", "newer-generation")
                 return False
             current_targets = set(getattr(self, "_browser_live_target_keys", set()) or set())
             target_stale = set(target_keys or set()) != current_targets
             if target_stale:
+                self._diagnose_rejected_browser_results(token, target_keys, results, "stale", "targets-superseded")
                 return False
             filtered = []
             for k, info in (results or []):
@@ -6303,6 +6613,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 print(f"[PERF] browser-live apply: rows={applied_rows} duration={duration_ms:.1f}ms", flush=True)
             self._browser_live_inflight = False
         return False
+
+    def _diagnose_rejected_browser_results(self, token, target_keys, results, classification, reason):
+        result_keys = {k for k, _info in (results or [])}
+        for k in set(target_keys or set()):
+            obj = self._obj_by_key.get(k)
+            if obj is None:
+                continue
+            STATUS_DIAGNOSTICS.emit(
+                "result-rejected",
+                ip=obj.ip,
+                gport=obj.gport,
+                qport=obj.qport,
+                generation=token,
+                cycle=f"browser:{token}:{k}",
+                query="INFO",
+                classification=classification,
+                row_id=id(obj),
+                model_id=id(getattr(self, "column_view_store", None)),
+                applied=False,
+                disposition="rejected-as-stale",
+                reason=reason,
+                result_present=(k in result_keys),
+            )
 
     def _offline_recheck_tick(self):
         self._debug_browser_reorder("offline-recheck-tick", fired=True)
@@ -6374,6 +6707,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
             obj = self._obj_by_key.get(k)
             if not obj:
                 continue
+            diag = dict((info or {}).get("_a2s_diag") or {})
+            cycle_id = str(diag.get("cycle_id") or f"{reason}:untracked:{k}")
+            result_generation = diag.get("generation", getattr(self, "_browser_live_token", "-"))
+            classification = str(
+                diag.get("classification")
+                or result_classification((info or {}).get("err"), ok=bool((info or {}).get("ok")))
+            )
+            try:
+                visible_before = "ONLINE" if int(getattr(obj, "ping", -1)) >= 0 else "OFFLINE"
+            except Exception:
+                visible_before = "OFFLINE"
             visible_before_live_update = None
             if live_filter_active:
                 try:
@@ -6381,9 +6725,42 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 except Exception:
                     visible_before_live_update = None
 
+            if bool((info or {}).get("neutral")):
+                previous_streak = int(
+                    getattr(self, "_browser_live_offline_streaks", {}).get(k, 0) or 0
+                )
+                STATUS_DIAGNOSTICS.emit(
+                    "status-observation",
+                    ip=obj.ip,
+                    gport=obj.gport,
+                    qport=obj.qport,
+                    generation=result_generation,
+                    cycle=cycle_id,
+                    query="INFO",
+                    classification="alive-but-info-unavailable",
+                    final_logical_outcome="alive-but-info-unavailable",
+                    row_id=id(obj),
+                    model_id=id(getattr(self, "column_view_store", None)),
+                    previous_streak=previous_streak,
+                    new_streak=previous_streak,
+                    streak_action="unchanged",
+                    cycle_failure="none",
+                    visible_before=visible_before,
+                    requested_status="unchanged",
+                    final_status=visible_before,
+                    applied=False,
+                    disposition="neutral-preserved",
+                    reason="alive-but-info-unavailable",
+                    status_preserved=True,
+                    streak_preserved=True,
+                    row_lifecycle="retained",
+                )
+                continue
+
             if not info or not info.get("ok"):
                 streaks = getattr(self, "_browser_live_offline_streaks", {})
-                streak = int(streaks.get(k, 0) or 0) + 1
+                previous_streak = int(streaks.get(k, 0) or 0)
+                streak = previous_streak + 1
                 streaks[k] = streak
                 self._browser_live_offline_streaks = streaks
                 try:
@@ -6391,6 +6768,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 except Exception:
                     was_visibly_online = False
                 if was_visibly_online and streak < 2:
+                    STATUS_DIAGNOSTICS.emit(
+                        "status-observation",
+                        ip=obj.ip,
+                        gport=obj.gport,
+                        qport=obj.qport,
+                        generation=result_generation,
+                        cycle=cycle_id,
+                        query="INFO",
+                        classification=classification,
+                        row_id=id(obj),
+                        model_id=id(getattr(self, "column_view_store", None)),
+                        previous_streak=previous_streak,
+                        new_streak=streak,
+                        streak_action="incremented",
+                        cycle_failure="first",
+                        visible_before=visible_before,
+                        requested_status="unchanged",
+                        final_status=visible_before,
+                        applied=False,
+                        disposition="coalesced-by-debounce",
+                        reason="first-consecutive-failure",
+                        row_lifecycle="retained",
+                    )
                     continue
 
                 obj.ping = -1
@@ -6398,6 +6798,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 debug_row_notifications += 1
                 debug_ping_updates += 1
                 self.live.setdefault(k, {})["offline"] = True
+                STATUS_DIAGNOSTICS.emit(
+                    "status-observation",
+                    ip=obj.ip,
+                    gport=obj.gport,
+                    qport=obj.qport,
+                    generation=result_generation,
+                    cycle=cycle_id,
+                    query="INFO",
+                    classification=classification,
+                    row_id=id(obj),
+                    model_id=id(getattr(self, "column_view_store", None)),
+                    previous_streak=previous_streak,
+                    new_streak=streak,
+                    streak_action="incremented",
+                    cycle_failure=("first" if streak == 1 else "second"),
+                    visible_before=visible_before,
+                    requested_status="OFFLINE",
+                    final_status="OFFLINE",
+                    applied=True,
+                    disposition="applied",
+                    reason=f"failure-streak-{streak}",
+                    row_lifecycle="retained",
+                )
                 if live_filter_active:
                     self.live.setdefault(k, {})["hide_high_ping"] = False
 
@@ -6426,6 +6849,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         pass
                 continue
 
+            previous_streak = int(getattr(self, "_browser_live_offline_streaks", {}).get(k, 0) or 0)
+            debug_success = STATUS_DIAGNOSTICS.enabled and STATUS_DIAGNOSTICS.matches(
+                obj.ip, obj.gport
+            )
+            before_fields = _a2s_live_field_snapshot(obj) if debug_success else {}
             try:
                 self._browser_live_offline_streaks.pop(k, None)
             except Exception:
@@ -6435,7 +6863,59 @@ class DZLLWindow(Gtk.ApplicationWindow):
             players = int(info.get("players", obj.players) or 0)
             maxp = int(info.get("max_players", obj.max_players) or 0)
             t = (info.get("time") or "").strip()
-            obj.time = t if is_valid_hhmm(t) else "--:--"
+            proposed_time = t if is_valid_hhmm(t) else "--:--"
+            queue = info.get("queue")
+            proposed_fields = {}
+            changed_fields = []
+            notify_emitted = []
+            apply_tracker = None
+            notify_ids = []
+            if debug_success:
+                proposed_fields = {
+                    "players": players,
+                    "max_players": maxp,
+                    "queue": (-1 if queue is None else int(queue)),
+                    "ping": ping_ms,
+                    "time": proposed_time,
+                    "timewarp": before_fields["timewarp"],
+                    "password": bool(info.get("password", obj.password)),
+                    "status": "ONLINE",
+                }
+                changed_fields = _a2s_changed_live_fields(before_fields, proposed_fields)
+                parsed = dict(diag.get("parsed_info") or {})
+                STATUS_DIAGNOSTICS.emit(
+                    "live-fields-before-apply",
+                    ip=obj.ip,
+                    gport=obj.gport,
+                    qport=obj.qport,
+                    generation=result_generation,
+                    cycle=cycle_id,
+                    query="INFO",
+                    previous_values=before_fields,
+                    proposed_values=proposed_fields,
+                    raw_parsed_values=(parsed or "unavailable"),
+                    changed_fields=(",".join(changed_fields) if changed_fields else "none"),
+                    unchanged_fields=(
+                        ",".join(name for name in proposed_fields if name not in changed_fields)
+                        or "none"
+                    ),
+                    ping_dampened=(
+                        parsed.get("ping_ms") != ping_ms if parsed else "unknown"
+                    ),
+                )
+                apply_tracker = {"refreshed_cells": []}
+                obj._a2s_status_apply_tracker = apply_tracker
+
+                def record_notify(_changed_obj, pspec):
+                    notify_emitted.append(str(getattr(pspec, "name", "unknown")))
+
+                for prop_name in ("time", "players", "max-players", "queue", "password", "ping"):
+                    try:
+                        notify_ids.append(obj.connect(f"notify::{prop_name}", record_notify))
+                    except Exception:
+                        pass
+
+            obj.time = proposed_time
             debug_row_notifications += 1
 
             obj.players = players
@@ -6444,7 +6924,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._update_row_sort_players(obj)
             obj.max_players = maxp
             debug_row_notifications += 1
-            queue = info.get("queue")
             obj.queue = -1 if queue is None else int(queue)
             debug_row_notifications += 1
             try:
@@ -6453,11 +6932,85 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
 
-            obj.ping = ping_ms
-            self._update_row_sort_ping(obj)
-            debug_row_notifications += 1
-            debug_ping_updates += 1
+            ping_written = int(getattr(obj, "ping", -1)) != ping_ms
+            if ping_written:
+                obj.ping = ping_ms
+                self._update_row_sort_ping(obj)
+                debug_row_notifications += 1
+                debug_ping_updates += 1
             self.live.setdefault(k, {})["offline"] = False
+            if debug_success:
+                for notify_id in notify_ids:
+                    try:
+                        obj.disconnect(notify_id)
+                    except Exception:
+                        pass
+                final_fields = _a2s_live_field_snapshot(obj)
+                written_fields = ["time", "players", "max_players", "queue", "password"]
+                if ping_written:
+                    written_fields.append("ping")
+                refreshed_cells = list((apply_tracker or {}).get("refreshed_cells", []))
+                STATUS_DIAGNOSTICS.emit(
+                    "live-fields-after-apply",
+                    ip=obj.ip,
+                    gport=obj.gport,
+                    qport=obj.qport,
+                    generation=result_generation,
+                    cycle=cycle_id,
+                    query="INFO",
+                    written_fields=",".join(written_fields),
+                    notify_signals=(",".join(notify_emitted) if notify_emitted else "none"),
+                    final_model_values=final_fields,
+                    changed_fields=(",".join(changed_fields) if changed_fields else "none"),
+                )
+                STATUS_DIAGNOSTICS.emit(
+                    "visible-row-after-apply",
+                    ip=obj.ip,
+                    gport=obj.gport,
+                    qport=obj.qport,
+                    generation=result_generation,
+                    cycle=cycle_id,
+                    query="INFO",
+                    row_id=id(obj),
+                    model_id=id(getattr(self, "column_view_store", None)),
+                    row_rebound=False,
+                    row_replaced=False,
+                    row_recreated=False,
+                    refreshed_cells=(",".join(refreshed_cells) if refreshed_cells else "none"),
+                    players_cell_refreshed=("players" in refreshed_cells),
+                    ping_cell_refreshed=("ping" in refreshed_cells),
+                    time_cell_refreshed=("time" in refreshed_cells),
+                    time_column_notify_binding=False,
+                    visible_readback_source="model",
+                    final_visible_values=final_fields,
+                )
+                try:
+                    del obj._a2s_status_apply_tracker
+                except Exception:
+                    pass
+            STATUS_DIAGNOSTICS.emit(
+                "status-observation",
+                ip=obj.ip,
+                gport=obj.gport,
+                qport=obj.qport,
+                generation=result_generation,
+                cycle=cycle_id,
+                query="INFO",
+                classification="success",
+                row_id=id(obj),
+                model_id=id(getattr(self, "column_view_store", None)),
+                previous_streak=previous_streak,
+                new_streak=0,
+                streak_action="reset",
+                cycle_failure="none",
+                visible_before=visible_before,
+                requested_status="ONLINE",
+                final_status="ONLINE",
+                applied=True,
+                disposition="applied",
+                reason=("success-recovery" if visible_before == "OFFLINE" else "success-refresh"),
+                row_lifecycle="retained",
+            )
 
             if trigger_filter or live_filter_active:
                 cut = int(getattr(self, "_ping_cutoff_ms", 250) or 250)
@@ -6577,10 +7130,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             state = self._build_filter_state()
             self._filter_state = state
         k = getattr(obj, "filter_key", None) or fav_key(obj.ip, obj.gport)
-        is_fav = bool(obj.fav)
+        is_fav = bool(getattr(self, "favorites", {}).get(k, False))
 
         live = state.get("live", {}).get(k)
-        if (not is_fav) and live and bool(live.get("hide_high_ping", False)):
+        if not is_fav and live and bool(live.get("hide_high_ping", False)):
             try:
                 if int(obj.ping) >= 0:
                     return False
@@ -6590,14 +7143,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         q = str(state.get("query") or "")
         ipport = getattr(obj, "ipport_lc", "") or f"{obj.ip}:{obj.gport}".lower()
 
-        if (not is_fav) and bool(state.get("hide_test_servers", True)) and bool(getattr(obj, "is_likely_test_server", False)):
+        if bool(state.get("hide_test_servers", True)) and bool(getattr(obj, "is_likely_test_server", False)):
             return False
 
         max_players_cutoff = int(state.get("max_players_cutoff", 0) or 0)
-        if (not is_fav) and max_players_cutoff > 0 and int(obj.max_players) < max_players_cutoff:
+        if not is_fav and max_players_cutoff > 0 and int(obj.max_players) < max_players_cutoff:
             return False
 
-        if bool(state.get("show_fav", False)) and not bool(obj.fav):
+        if bool(state.get("show_fav", False)) and not is_fav:
             return False
 
         # 1PP Only: reject servers that allow 3PP
@@ -6610,7 +7163,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         if bool(state.get("no_password", False)) and bool(obj.password):
             return False
-        if bool(state.get("online_only", False)):
+        if not is_fav and bool(state.get("online_only", False)):
             try:
                 if int(obj.ping) < 0:
                     return False
@@ -8161,18 +8714,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             save_favorites(self.favorites)
         except Exception:
             pass
-        pin_favorites = bool(self.settings.get("pin_favorite_servers", False))
-        favorites_filter = False
-        try:
-            favorites_filter = bool(self.cb_show_fav.get_active())
-        except Exception:
-            favorites_filter = False
-
-        # The star cell already observes notify::fav. Rebuild only when the
-        # explicit pinning or favourites-only filter semantics require it.
-        if not pin_favorites and not favorites_filter:
-            return
-
+        # Favourite membership is part of the visibility predicate: refresh so
+        # the three ordinary-filter exemptions take effect (or are removed)
+        # immediately. The existing row object and sort semantics are retained.
         self._on_filter_changed(reason="favourites")
         if scroll_value is not None:
             def restore_favourite_scroll(value=scroll_value):
@@ -8185,6 +8729,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 return False
 
             GLib.idle_add(restore_favourite_scroll)
+
+    def _set_background_download_column_visible(self, visible: bool) -> None:
+        column = getattr(getattr(self, "list_view", None), "background_download_column", None)
+        if column is not None:
+            column.set_visible(bool(visible))
 
     # ----------------------------
     # Manual Refresh
@@ -8199,7 +8748,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._refresh_rl[k] = now
 
         def worker():
-            info = query_server_live(obj.ip, obj.qport)
+            info = query_server_live(
+                obj.ip,
+                obj.qport,
+                gport=obj.gport,
+                cycle_id=f"manual-row:{time.monotonic_ns()}:{k}",
+                generation="untokened",
+                row_id=id(obj),
+                model_id=id(getattr(self, "column_view_store", None)),
+            )
             GLib.idle_add(self._apply_live_results, [(k, info)], "manual-refresh")
 
         self._hi_executor.submit(worker)
@@ -8812,29 +9369,87 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # Join server
     # ----------------------------
     def _build_background_prepare_status_block(self):
-        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.set_hexpand(True)
+        root.set_vexpand(False)
+        root.set_valign(Gtk.Align.START)
         root.set_visible(False)
         root.add_css_class("dzll-background-prepare-status")
 
+        grid = Gtk.Grid()
+        grid.set_hexpand(True)
+        grid.set_vexpand(False)
+        grid.set_row_spacing(2)
+        grid.set_margin_top(4)
+        grid.set_margin_bottom(4)
+        grid.set_margin_start(8)
+        grid.set_margin_end(8)
+        self.background_prepare_grid = grid
+        root.append(grid)
+
         info = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        info.set_margin_start(8)
-        info.set_margin_end(8)
-        info.set_margin_top(4)
-        root.append(info)
+        self.background_prepare_info = info
+        info.add_css_class("dzll-background-prepare-info")
+        info.set_vexpand(False)
+        info.set_valign(Gtk.Align.CENTER)
+        grid.attach(info, 0, 0, 2, 1)
+
+        server_block = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        server_block.set_size_request(240, -1)
+        server_block.add_css_class("dzll-background-prepare-server-block")
+        info.append(server_block)
 
         self.background_prepare_server_label = Gtk.Label(xalign=0.0)
+        self.background_prepare_server_label.set_hexpand(True)
+        self.background_prepare_server_label.set_wrap(False)
+        self.background_prepare_server_label.set_single_line_mode(True)
+        self.background_prepare_server_label.set_width_chars(30)
+        self.background_prepare_server_label.set_max_width_chars(30)
         self.background_prepare_server_label.set_ellipsize(Pango.EllipsizeMode.END)
-        info.append(self.background_prepare_server_label)
+        self.background_prepare_server_label.add_css_class(
+            "dzll-background-prepare-server"
+        )
+        server_block.append(self.background_prepare_server_label)
+
+        server_divider = Gtk.Label(label="•")
+        server_divider.set_valign(Gtk.Align.CENTER)
+        server_divider.add_css_class("dzll-background-prepare-bullet")
+        info.append(server_divider)
 
         self.background_prepare_detail_label = Gtk.Label(xalign=0.0)
         self.background_prepare_detail_label.set_hexpand(True)
+        self.background_prepare_detail_label.set_wrap(False)
+        self.background_prepare_detail_label.set_single_line_mode(True)
         self.background_prepare_detail_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.background_prepare_detail_label.add_css_class(
+            "dzll-background-prepare-mod"
+        )
         info.append(self.background_prepare_detail_label)
 
-        self.background_prepare_count_label = Gtk.Label(xalign=1.0)
-        self.background_prepare_count_label.set_visible(False)
-        info.append(self.background_prepare_count_label)
+        self.background_prepare_queue_divider = Gtk.Label(label="•")
+        self.background_prepare_queue_divider.set_valign(Gtk.Align.CENTER)
+        self.background_prepare_queue_divider.set_visible(False)
+        self.background_prepare_queue_divider.add_css_class(
+            "dzll-background-prepare-bullet"
+        )
+        info.append(self.background_prepare_queue_divider)
+
+        self.background_prepare_queue_label = Gtk.Label(xalign=0.0)
+        self.background_prepare_queue_label.set_wrap(False)
+        self.background_prepare_queue_label.set_single_line_mode(True)
+        self.background_prepare_queue_label.set_visible(False)
+        self.background_prepare_queue_label.add_css_class(
+            "dzll-background-prepare-queue"
+        )
+        info.append(self.background_prepare_queue_label)
+
+        self.background_prepare_failed_label = Gtk.Label(xalign=0.0)
+        self.background_prepare_failed_label.set_hexpand(True)
+        self.background_prepare_failed_label.set_wrap(False)
+        self.background_prepare_failed_label.set_single_line_mode(True)
+        self.background_prepare_failed_label.set_ellipsize(Pango.EllipsizeMode.END)
+        self.background_prepare_failed_label.set_visible(False)
+        info.append(self.background_prepare_failed_label)
 
         self.background_prepare_retry_btn = Gtk.Button(label="Retry Failed")
         self.background_prepare_retry_btn.add_css_class("flat")
@@ -8845,29 +9460,169 @@ class DZLLWindow(Gtk.ApplicationWindow):
         attach_pointer_cursor(self.background_prepare_retry_btn)
         info.append(self.background_prepare_retry_btn)
 
+        right = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        right.set_size_request(108, -1)
+        right.set_halign(Gtk.Align.END)
+        right.add_css_class("dzll-background-prepare-actions")
+        info.append(right)
+
+        self.background_prepare_count_label = Gtk.Label(xalign=1.0)
+        self.background_prepare_count_label.set_wrap(False)
+        self.background_prepare_count_label.set_single_line_mode(True)
+        self.background_prepare_count_label.set_width_chars(5)
+        self.background_prepare_count_label.set_visible(False)
+        self.background_prepare_count_label.add_css_class(
+            "dzll-background-prepare-count"
+        )
+        right.append(self.background_prepare_count_label)
+
         self.background_prepare_action_btn = Gtk.Button(label="Cancel")
         self.background_prepare_action_btn.add_css_class("flat")
+        self.background_prepare_action_btn.set_hexpand(True)
+        self.background_prepare_action_btn.set_halign(Gtk.Align.END)
         self.background_prepare_action_btn.connect(
             "clicked", self._background_prepare_action_clicked,
         )
         attach_pointer_cursor(self.background_prepare_action_btn)
-        info.append(self.background_prepare_action_btn)
+        right.append(self.background_prepare_action_btn)
 
-        self.background_prepare_failed_label = Gtk.Label(xalign=0.0)
-        self.background_prepare_failed_label.set_hexpand(True)
-        self.background_prepare_failed_label.set_ellipsize(Pango.EllipsizeMode.END)
-        self.background_prepare_failed_label.set_margin_start(8)
-        self.background_prepare_failed_label.set_margin_end(8)
-        self.background_prepare_failed_label.set_visible(False)
-        root.append(self.background_prepare_failed_label)
+        self.background_prepare_right_status_label = Gtk.Label(xalign=1.0)
+        self.background_prepare_right_status_label.set_wrap(False)
+        self.background_prepare_right_status_label.set_single_line_mode(True)
+        self.background_prepare_right_status_label.set_ellipsize(
+            Pango.EllipsizeMode.END
+        )
+        self.background_prepare_right_status_label.set_max_width_chars(16)
+        self.background_prepare_right_status_label.set_visible(False)
+        self.background_prepare_right_status_label.add_css_class(
+            "dzll-background-prepare-right-status"
+        )
+        right.append(self.background_prepare_right_status_label)
+
+        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self.background_prepare_progress_row = progress_row
+        progress_row.set_hexpand(True)
+        progress_row.set_halign(Gtk.Align.FILL)
+        progress_row.set_vexpand(False)
+        progress_row.set_valign(Gtk.Align.CENTER)
+        progress_row.set_opacity(0.0)
+        progress_row.set_sensitive(False)
+        grid.attach(progress_row, 0, 1, 2, 1)
 
         self.background_prepare_progress = Gtk.ProgressBar()
         self.background_prepare_progress.set_show_text(False)
-        self.background_prepare_progress.set_margin_start(8)
-        self.background_prepare_progress.set_margin_end(8)
-        self.background_prepare_progress.set_margin_bottom(4)
-        root.append(self.background_prepare_progress)
+        self.background_prepare_progress.set_hexpand(True)
+        self.background_prepare_progress.set_valign(Gtk.Align.CENTER)
+        self.background_prepare_progress.set_margin_end(20)
+        self.background_prepare_progress.add_css_class(
+            "dzll-background-prepare-progress"
+        )
+        progress_row.append(self.background_prepare_progress)
+
+        self.background_prepare_percent_label = Gtk.Label(label="", xalign=1.0)
+        self.background_prepare_percent_label.set_size_request(44, -1)
+        self.background_prepare_percent_label.set_width_chars(4)
+        self.background_prepare_percent_label.set_max_width_chars(4)
+        self.background_prepare_percent_label.set_halign(Gtk.Align.FILL)
+        self.background_prepare_percent_label.set_valign(Gtk.Align.CENTER)
+        self.background_prepare_percent_label.set_single_line_mode(True)
+        self.background_prepare_percent_label.add_css_class(
+            "dzll-background-prepare-percent"
+        )
+        progress_row.append(self.background_prepare_percent_label)
         return root
+
+    def _background_prepare_set_status_container(
+            self, present: bool, *, active: bool = False) -> None:
+        root = self.background_prepare_status
+        for class_name, enabled in (
+            ("dzll-background-prepare-present", present),
+            ("dzll-background-prepare-active", present and active),
+        ):
+            method = getattr(root, "add_css_class" if enabled else "remove_css_class", None)
+            if callable(method):
+                method(class_name)
+        margin = BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET if present else 0
+        bottom = BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING if present else 0
+        for method_name, value in (
+            ("set_margin_start", margin),
+            ("set_margin_end", margin),
+            ("set_margin_bottom", bottom),
+        ):
+            setter = getattr(root, method_name, None)
+            if callable(setter):
+                setter(value)
+
+    def _background_prepare_set_active_presentation(
+            self, active: bool, *, server_name: str = "", queued_count: int = 0) -> None:
+        DZLLWindow._background_prepare_set_status_container(
+            self, active, active=active,
+        )
+
+        queue_label = getattr(self, "background_prepare_queue_label", None)
+        queue_divider = getattr(self, "background_prepare_queue_divider", None)
+        right_status = getattr(self, "background_prepare_right_status_label", None)
+        if active:
+            self.background_prepare_server_label.set_text(str(server_name or "Server"))
+            tooltip = getattr(
+                self.background_prepare_server_label, "set_tooltip_text", None,
+            )
+            if callable(tooltip):
+                tooltip(str(server_name or "Server"))
+            if queue_label is not None:
+                queue_label.set_text(
+                    f"Queued Servers: {queued_count}" if queued_count > 0 else ""
+                )
+                queue_label.set_visible(queued_count > 0)
+            if queue_divider is not None:
+                queue_divider.set_visible(queued_count > 0)
+            if right_status is not None:
+                right_status.set_visible(False)
+            DZLLWindow._background_prepare_set_action_presentation(self, True)
+        else:
+            if queue_label is not None:
+                queue_label.set_text("")
+                queue_label.set_visible(False)
+            if queue_divider is not None:
+                queue_divider.set_visible(False)
+            if right_status is not None:
+                right_status.set_visible(False)
+
+    def _background_prepare_set_action_presentation(
+            self, actionable: bool) -> None:
+        button = self.background_prepare_action_btn
+        button.set_visible(True)
+        button.set_opacity(1.0 if actionable else 0.0)
+        button.set_sensitive(bool(actionable))
+
+    def _background_prepare_present_cancelling(self) -> None:
+        DZLLWindow._background_prepare_set_status_container(self, True)
+        self.background_prepare_server_label.set_text(
+            "Cancelling background mod preparation…"
+        )
+        self.background_prepare_detail_label.set_text(
+            "Waiting for active Steam cleanup to finish."
+        )
+        self.background_prepare_queue_label.set_text("")
+        self.background_prepare_queue_label.set_visible(False)
+        self.background_prepare_queue_divider.set_visible(False)
+        self.background_prepare_count_label.set_text("")
+        self.background_prepare_count_label.set_visible(False)
+        self.background_prepare_retry_btn.set_visible(False)
+        self.background_prepare_failed_label.set_visible(False)
+        DZLLWindow._background_prepare_set_action_presentation(self, False)
+        self.background_prepare_right_status_label.set_text("Cancelling…")
+        self.background_prepare_right_status_label.set_visible(True)
+        DZLLWindow._background_prepare_set_progress_presentation(self, False)
+        self.background_prepare_status.set_visible(True)
+
+    def _background_prepare_set_progress_presentation(
+            self, active: bool) -> None:
+        row = self.background_prepare_progress_row
+        row.set_opacity(1.0 if active else 0.0)
+        row.set_sensitive(bool(active))
+        if not active:
+            self.background_prepare_percent_label.set_text("")
 
     def _background_prepare_download_available(self, obj=None) -> bool:
         queue = self._background_prepare_queue
@@ -8885,7 +9640,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         }
 
     def _background_prepare_join_available(self, _obj=None) -> bool:
-        return not self._background_prepare_queue.busy
+        return not shared_join_preparation_busy(self)
 
     def _background_prepare_download_presentation(self, obj=None) -> dict:
         if not isinstance(obj, ServerObject):
@@ -8931,6 +9686,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             refresh = getattr(view, name, None)
             if callable(refresh):
                 refresh()
+        refresh_companion = getattr(
+            self, "_refresh_server_companion_join_sensitivity", None,
+        )
+        if callable(refresh_companion):
+            refresh_companion()
 
     def _background_prepare_is_current(self, generation: int) -> bool:
         return bool(
@@ -9005,34 +9765,23 @@ class DZLLWindow(Gtk.ApplicationWindow):
             snapshot = current
         self._background_prepare_active = snapshot.busy
         if snapshot.cancelling:
-            self._background_prepare_stop_pulse()
-            self.background_prepare_server_label.set_text(
-                "Cancelling background mod preparation…"
-            )
-            self.background_prepare_detail_label.set_text(
-                "Waiting for active Steam cleanup to finish."
-            )
-            self.background_prepare_count_label.set_text("")
-            self.background_prepare_count_label.set_visible(False)
-            self.background_prepare_retry_btn.set_visible(False)
-            self.background_prepare_failed_label.set_visible(False)
-            self.background_prepare_action_btn.set_label("Cancelling…")
-            self.background_prepare_action_btn.set_sensitive(False)
-            self.background_prepare_status.set_visible(True)
+            DZLLWindow._background_prepare_present_cancelling(self)
         elif snapshot.active is not None:
             pending_count = len(snapshot.pending)
-            suffix = f" ({pending_count} queued)" if pending_count else ""
-            self.background_prepare_server_label.set_text(
-                f"Downloading Required Mods: {snapshot.active.display_name}{suffix}"
+            DZLLWindow._background_prepare_set_active_presentation(
+                self,
+                True,
+                server_name=snapshot.active.display_name,
+                queued_count=pending_count,
             )
             self.background_prepare_retry_btn.set_visible(False)
             self.background_prepare_failed_label.set_visible(False)
             self.background_prepare_action_btn.set_label("Cancel")
-            self.background_prepare_action_btn.set_sensitive(True)
             self.background_prepare_status.set_visible(True)
         elif snapshot.completed_batch is not None:
             self._background_prepare_render_batch_summary(snapshot.completed_batch)
         elif not snapshot.busy:
+            DZLLWindow._background_prepare_set_active_presentation(self, False)
             self.background_prepare_status.set_visible(False)
         self._refresh_background_prepare_action_states()
 
@@ -9078,7 +9827,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
             self._background_prepare_presenter = presenter
 
-            self._background_prepare_stop_pulse()
             if previous is not None and previous.state is BackgroundServerState.FAILED:
                 self.background_prepare_detail_label.set_text(
                     f"{previous.display_name} failed: "
@@ -9089,7 +9837,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.background_prepare_count_label.set_text("")
             self.background_prepare_count_label.set_visible(False)
             self.background_prepare_progress.set_fraction(0.0)
-            self.background_prepare_progress.set_visible(True)
+            DZLLWindow._background_prepare_set_progress_presentation(self, False)
             self._background_prepare_apply_queue_snapshot(queue.snapshot())
             self._background_prepare_log_request(request, "worker-submit")
 
@@ -9264,17 +10012,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         self._background_prepare_presenter = presenter
 
-        self._background_prepare_stop_pulse()
-        self.background_prepare_server_label.set_text(
-            f"Downloading Required Mods: {snapshot.name}"
+        DZLLWindow._background_prepare_set_active_presentation(
+            self,
+            True, server_name=snapshot.name,
         )
         self.background_prepare_detail_label.set_text("Preparing…")
         self.background_prepare_count_label.set_text("")
         self.background_prepare_count_label.set_visible(False)
         self.background_prepare_progress.set_fraction(0.0)
-        self.background_prepare_progress.set_visible(True)
+        DZLLWindow._background_prepare_set_progress_presentation(self, False)
         self.background_prepare_action_btn.set_label("Cancel")
-        self.background_prepare_action_btn.set_sensitive(True)
         self.background_prepare_status.set_visible(True)
         self._refresh_background_prepare_action_states()
 
@@ -9458,7 +10205,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _background_prepare_render_snapshot(self, generation: int, snapshot) -> None:
         if not self._background_prepare_is_current(generation):
             return
-        detail = snapshot.current_mod_name or snapshot.stage_text
+        if snapshot.current_mod_name:
+            detail = f"Downloading Mod: {snapshot.current_mod_name}"
+            if snapshot.item_total_bytes > 0:
+                detail += f" ({self._steam_ugc_format_size(snapshot.item_total_bytes)})"
+        else:
+            detail = snapshot.stage_text
         if detail:
             self.background_prepare_detail_label.set_text(detail)
 
@@ -9472,44 +10224,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.background_prepare_count_label.set_visible(False)
 
         if snapshot.progress_mode is PreparationProgressMode.INDETERMINATE:
-            self._background_prepare_start_pulse()
+            DZLLWindow._background_prepare_set_progress_presentation(self, False)
         elif snapshot.progress_mode is PreparationProgressMode.DETERMINATE:
-            self._background_prepare_stop_pulse()
-            self.background_prepare_progress.set_visible(True)
-            self.background_prepare_progress.set_fraction(snapshot.fraction or 0.0)
-
-    def _background_prepare_start_pulse(self) -> None:
-        if self._background_prepare_pulse_id:
-            return
-
-        def pulse():
-            if not self._background_prepare_active:
-                self._background_prepare_pulse_id = 0
-                return False
-            self.background_prepare_progress.pulse()
-            return True
-
-        self._background_prepare_pulse_id = GLib.timeout_add(100, pulse)
-
-    def _background_prepare_stop_pulse(self) -> None:
-        pulse_id = int(getattr(self, "_background_prepare_pulse_id", 0) or 0)
-        if pulse_id:
-            try:
-                GLib.source_remove(pulse_id)
-            except Exception:
-                pass
-        self._background_prepare_pulse_id = 0
+            DZLLWindow._background_prepare_set_progress_presentation(self, True)
+            fraction = max(0.0, min(1.0, float(snapshot.fraction or 0.0)))
+            self.background_prepare_progress.set_fraction(fraction)
+            self.background_prepare_percent_label.set_text(
+                f"{int(fraction * 100)}%"
+            )
 
     def _background_prepare_render_cancelling(
             self, generation: int, _operation_id: int) -> None:
         if not self._background_prepare_is_current(generation):
             return
-        self.background_prepare_action_btn.set_label("Cancelling…")
-        self.background_prepare_action_btn.set_sensitive(False)
+        DZLLWindow._background_prepare_present_cancelling(self)
 
     def _background_prepare_render_batch_summary(self, batch) -> None:
         self._background_prepare_active = False
-        self._background_prepare_stop_pulse()
+        DZLLWindow._background_prepare_set_status_container(self, True)
         self.background_prepare_server_label.set_text(
             "Background mod preparation finished"
         )
@@ -9523,7 +10255,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.background_prepare_count_label.set_text("")
         self.background_prepare_count_label.set_visible(False)
         self.background_prepare_progress.set_fraction(0.0)
-        self.background_prepare_progress.set_visible(False)
+        DZLLWindow._background_prepare_set_progress_presentation(self, False)
         failed = batch.failed_entries
         if failed:
             prefix = "Failed server" if len(failed) == 1 else "Failed servers"
@@ -9542,7 +10274,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.background_prepare_failed_label.set_visible(False)
             self.background_prepare_retry_btn.set_visible(False)
         self.background_prepare_action_btn.set_label("Close")
-        self.background_prepare_action_btn.set_sensitive(True)
+        DZLLWindow._background_prepare_set_action_presentation(self, True)
+        right_status = getattr(self, "background_prepare_right_status_label", None)
+        if right_status is not None:
+            right_status.set_visible(False)
         self.background_prepare_status.set_visible(True)
         self._background_prepare_controller = None
 
@@ -9566,16 +10301,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         self._background_prepare_queue.clear_completed_batch()
         self._background_prepare_ui_generation += 1
-        self._background_prepare_stop_pulse()
         self._background_prepare_snapshot = None
         self._background_prepare_controller = None
         self._background_prepare_cancel_requested = False
         self._background_prepare_terminal_handled = False
+        DZLLWindow._background_prepare_set_active_presentation(self, False)
         self.background_prepare_failed_label.set_text("")
         self.background_prepare_failed_label.set_tooltip_text(None)
         self.background_prepare_failed_label.set_visible(False)
         self.background_prepare_retry_btn.set_visible(False)
-        self.background_prepare_progress.set_visible(True)
         self.background_prepare_status.set_visible(False)
         self._refresh_background_prepare_action_states()
 
@@ -9686,16 +10420,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         }
 
     def _join_server_for_obj(self, obj: ServerObject):
-        if preparation_operation_busy(self):
-            self._set_server_companion_join_status(
-                "Mod preparation already in progress…", flash=True,
-            )
-            return
         active = self._join_attempts.active
-        if active is not None:
-            self._join_log(active.attempt_id, "duplicate Join click blocked",
-                           requested_server=f"{obj.ip}:{int(obj.gport)}")
-            self._set_server_companion_join_status("Join already in progress…", flash=True)
+        if shared_join_preparation_busy(self):
+            if active is not None:
+                self._join_log(
+                    active.attempt_id,
+                    "duplicate Join click blocked",
+                    requested_server=f"{obj.ip}:{int(obj.gport)}",
+                )
+                message = "Join already in progress…"
+            else:
+                message = "Mod preparation already in progress…"
+            self._set_server_companion_join_status(message, flash=True)
             return
 
         attempt = self._join_attempts.begin(

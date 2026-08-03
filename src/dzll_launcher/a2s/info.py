@@ -196,9 +196,10 @@ def info(address: tuple[str, int], timeout: float, encoding: None) -> Union[Sour
 def info(
     address: tuple[str, int],
     timeout: float = DEFAULT_TIMEOUT,
-    encoding: Union[str, None] = DEFAULT_ENCODING
+    encoding: Union[str, None] = DEFAULT_ENCODING,
+    _trace=None,
 ) -> Union[SourceInfo[str], SourceInfo[bytes], GoldSrcInfo[str], GoldSrcInfo[bytes]]:
-    return request_sync(address, timeout, encoding, InfoProtocol)
+    return request_sync(address, timeout, encoding, InfoProtocol, trace=_trace)
 
 @overload
 async def ainfo(address: tuple[str, int], timeout: float, encoding: str) -> Union[SourceInfo[str], GoldSrcInfo[str]]:
@@ -217,6 +218,9 @@ async def ainfo(
 
 
 class InfoProtocol:
+    fixed_info_deadline = True
+    ignore_valid_unrelated = True
+
     @staticmethod
     def validate_response_type(response_type):
         return response_type in (A2S_INFO_RESPONSE, A2S_INFO_RESPONSE_LEGACY)
@@ -240,11 +244,17 @@ class InfoProtocol:
         return resp
 
 def parse_source(reader, ping):
+    reader.set_stage("info-source-protocol")
     protocol = reader.read_uint8()
+    reader.set_stage("info-source-server-name")
     server_name = reader.read_cstring()
+    reader.set_stage("info-source-map")
     map_name = reader.read_cstring()
+    reader.set_stage("info-source-folder")
     folder = reader.read_cstring()
+    reader.set_stage("info-source-game")
     game = reader.read_cstring()
+    reader.set_stage("info-source-fixed-fields")
     app_id = reader.read_uint16()
     player_count = reader.read_uint8()
     max_players = reader.read_uint8()
@@ -255,9 +265,11 @@ def parse_source(reader, ping):
         platform = "m"
     password_protected = reader.read_bool()
     vac_enabled = reader.read_bool()
+    reader.set_stage("info-source-version")
     version = reader.read_cstring()
 
     try:
+        reader.set_stage("info-source-edf")
         edf = reader.read_uint8()
     except BufferExhaustedError:
         edf = 0
@@ -267,25 +279,36 @@ def parse_source(reader, ping):
         bot_count, server_type, platform, password_protected, vac_enabled, version, edf, ping
     )
     if resp.has_port:
+        reader.set_stage("info-source-edf-port")
         resp.port = reader.read_uint16()
     if resp.has_steam_id:
+        reader.set_stage("info-source-edf-steam-id")
         resp.steam_id = reader.read_uint64()
     if resp.has_stv:
+        reader.set_stage("info-source-edf-stv")
         resp.stv_port = reader.read_uint16()
         resp.stv_name = reader.read_cstring()
     if resp.has_keywords:
+        reader.set_stage("info-source-edf-keywords")
         resp.keywords = reader.read_cstring()
     if resp.has_game_id:
+        reader.set_stage("info-source-edf-game-id")
         resp.game_id = reader.read_uint64()
 
     return resp
 
 def parse_goldsrc(reader, ping):
+    reader.set_stage("info-goldsrc-address")
     address = reader.read_cstring()
+    reader.set_stage("info-goldsrc-server-name")
     server_name = reader.read_cstring()
+    reader.set_stage("info-goldsrc-map")
     map_name = reader.read_cstring()
+    reader.set_stage("info-goldsrc-folder")
     folder = reader.read_cstring()
+    reader.set_stage("info-goldsrc-game")
     game = reader.read_cstring()
+    reader.set_stage("info-goldsrc-fixed-fields")
     player_count = reader.read_uint8()
     max_players = reader.read_uint8()
     protocol = reader.read_uint8()
@@ -296,6 +319,7 @@ def parse_goldsrc(reader, ping):
 
     # Some games don't send this section
     if is_mod and len(reader.peek()) > 2:
+        reader.set_stage("info-goldsrc-mod-fields")
         mod_website = reader.read_cstring()
         mod_download = reader.read_cstring()
         reader.read(1) # Skip a NULL byte
@@ -311,6 +335,7 @@ def parse_goldsrc(reader, ping):
         multiplayer_only = None
         uses_custom_dll = None
 
+    reader.set_stage("info-goldsrc-tail")
     vac_enabled = reader.read_bool()
     bot_count = reader.read_uint8()
 

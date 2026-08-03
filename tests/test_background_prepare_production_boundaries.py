@@ -43,6 +43,9 @@ class Widget:
     def set_sensitive(self, value):
         self.sensitive = bool(value)
 
+    def set_opacity(self, value):
+        self.opacity = float(value)
+
     def set_tooltip_text(self, value):
         self.tooltip = value
 
@@ -142,8 +145,6 @@ class ProductionStartHarness:
     _background_prepare_render_cancelling = (
         window_module.DZLLWindow._background_prepare_render_cancelling
     )
-    _background_prepare_start_pulse = window_module.DZLLWindow._background_prepare_start_pulse
-    _background_prepare_stop_pulse = window_module.DZLLWindow._background_prepare_stop_pulse
     _refresh_background_prepare_action_states = (
         window_module.DZLLWindow._refresh_background_prepare_action_states
     )
@@ -159,16 +160,20 @@ class ProductionStartHarness:
         self._background_prepare_terminal_handled = False
         self._background_prepare_controller = None
         self._background_prepare_snapshot = None
-        self._background_prepare_pulse_id = 0
         self._shutdown_cleanup_done = False
         self._start_steam_join_loop = None
         self._background_prepare_queue = BackgroundPreparationQueue()
         self.list_view = None
         self.background_prepare_server_label = Widget()
         self.background_prepare_detail_label = Widget()
+        self.background_prepare_queue_label = Widget()
+        self.background_prepare_queue_divider = Widget()
         self.background_prepare_count_label = Widget()
         self.background_prepare_progress = Widget()
+        self.background_prepare_progress_row = Widget()
+        self.background_prepare_percent_label = Widget()
         self.background_prepare_action_btn = Widget()
+        self.background_prepare_right_status_label = Widget()
         self.background_prepare_retry_btn = Widget()
         self.background_prepare_failed_label = Widget()
         self.background_prepare_status = Widget()

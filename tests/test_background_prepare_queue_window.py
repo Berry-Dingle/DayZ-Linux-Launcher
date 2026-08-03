@@ -40,6 +40,9 @@ class Widget:
     def set_sensitive(self, value):
         self.sensitive = bool(value)
 
+    def set_opacity(self, value):
+        self.opacity = float(value)
+
     def set_tooltip_text(self, value):
         self.tooltip = value
 
@@ -83,17 +86,17 @@ def state_host(queue):
 def summary_host(queue):
     host = state_host(queue)
     host._background_prepare_active = False
-    host._background_prepare_pulse_id = 0
     host._background_prepare_controller = None
     host.background_prepare_server_label = Widget()
     host.background_prepare_detail_label = Widget()
     host.background_prepare_count_label = Widget()
     host.background_prepare_progress = Widget()
+    host.background_prepare_progress_row = Widget()
+    host.background_prepare_percent_label = Widget()
     host.background_prepare_failed_label = Widget()
     host.background_prepare_retry_btn = Widget()
     host.background_prepare_action_btn = Widget()
     host.background_prepare_status = Widget()
-    host._background_prepare_stop_pulse = lambda: None
     return host
 
 

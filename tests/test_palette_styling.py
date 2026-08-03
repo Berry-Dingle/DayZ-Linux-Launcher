@@ -87,6 +87,40 @@ def test_root_and_feature_styling_hooks_are_applied():
     assert 'add_css_class("companion-sound-popover")' in sources["companion"]
 
 
+def test_companion_voice_popover_only_makes_its_outer_surface_transparent():
+    css = app_css()
+    outer = css.split(".companion-sound-popover {", 1)[1].split("}", 1)[0]
+    contents = css.split(".companion-sound-popover > contents {", 1)[1].split("}", 1)[0]
+    arrow = css.split(".companion-sound-popover > arrow {", 1)[1].split("}", 1)[0]
+
+    assert "background: transparent;" in outer
+    assert "border-color: transparent;" in outer
+    assert "box-shadow: none;" in outer
+    assert "background: @dzll_surface_content;" in contents
+    assert "border-color: @dzll_border;" in contents
+    assert "background: @dzll_surface_content;" in arrow
+    assert "border-color: @dzll_border;" in arrow
+    assert "popover {" not in outer
+
+
+def test_server_companion_adjacent_join_header_has_no_right_border():
+    css = app_css()
+    source = (ROOT / "src" / "dzll_launcher" / "column_view.py").read_text(
+        encoding="utf-8",
+    )
+    rule = css.split(
+        "columnview.dzll-column-view > header > button.dzll-column-title-join,",
+        1,
+    )[1].split("}", 1)[0]
+
+    assert 'if column_index == len(title_buttons) - 1:' in source
+    assert '_add_css_classes(button, "dzll-column-title-join")' in source
+    assert "border-right: 0;" in rule
+    assert "border-top" not in rule
+    assert "border-bottom" not in rule
+    assert "border-left" not in rule
+
+
 def test_sidebar_no_longer_installs_a_second_css_provider():
     source = (ROOT / "src/dzll_launcher/sidebar_ui.py").read_text(encoding="utf-8")
     assert "Gtk.CssProvider" not in source
@@ -240,6 +274,8 @@ def test_restart_learning_text_is_primary_and_confidence_has_own_hook():
     assert 'add_css_class("companion-restart-confidence-value")' in companion
     assert ".companion-restart-confidence-value.ping-good" in css
     assert ".companion-restart-confidence-value.ping-greeny" in css
+    assert ".companion-restart-confidence-value.ping-yellow" in css
+    assert ".companion-restart-confidence-value.ping-orange" in css
 
 
 def _relative_luminance(hex_value: str) -> float:
@@ -439,6 +475,30 @@ def test_mod_manager_repair_icon_is_unboxed_and_orange():
     assert 'add_css_class("mods-repair-icon-btn")' in repair_source
     assert 'set_tooltip_text("Repair Mod")' in repair_source
     assert "attach_pointer_cursor(btn)" in repair_source
+
+
+def test_server_background_download_icon_is_folder_download_and_magenta():
+    css = app_css()
+    assert "button.flat.dzll-download-mods-button" in css
+    assert "color: #d946ef;" in css
+    assert "button.flat.dzll-download-mods-button:hover" in css
+    assert "color: #e879f9;" in css
+
+    source = ROOT / "src" / "dzll_launcher" / "column_view.py"
+    body = source.read_text(encoding="utf-8")
+    icon_helper = body.split("def _download_icon_name", 1)[1].split(
+        "def ", 1,
+    )[0]
+    assert 'return "folder-download-symbolic"' in icon_helper
+    assert 'return "document-save-symbolic"' not in icon_helper
+    assert 'return "go-down-symbolic"' not in icon_helper
+    factory = body.split("download_factory = _make_action_factory", 1)[1].split(
+        "_append_column", 1,
+    )[0]
+    assert '"dzll-download-mods-button"' in factory
+    assert '"Subscribe and download required\\n"' in factory
+    assert '"mods without joining\\n"' in factory
+    assert '"Servers can be queued"' in factory
 
 
 def test_mod_manager_workshop_link_states_target_symbolic_image():

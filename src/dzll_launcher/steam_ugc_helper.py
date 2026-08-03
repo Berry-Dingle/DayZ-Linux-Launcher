@@ -34,6 +34,10 @@ EXIT_UNEXPECTED = 5
 DAYZ_APPID = 221100
 SESSION_INIT_RETRY_S = 0.25
 
+
+_protocol_stdout = None
+_protocol_write_lock = threading.Lock()
+
 ITEM_STATE_BITS = (
     (1, "Subscribed"),
     (2, "LegacyItem"),
@@ -128,7 +132,46 @@ def eprint(message: str) -> None:
 
 
 def emit(event: dict) -> None:
-    print(json.dumps(event, sort_keys=True, separators=(",", ":")), flush=True)
+    payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    stream = _protocol_stdout if _protocol_stdout is not None else sys.stdout
+    with _protocol_write_lock:
+        stream.write(payload + "\n")
+        stream.flush()
+
+
+_default_emit = emit
+
+
+def _isolate_protocol_stdout() -> None:
+    """Reserve the original stdout pipe for protocol frames only.
+
+    Steamworks and any accidentally inherited process output continue to use
+    file descriptor 1, which is redirected to stderr after a private duplicate
+    of the parent protocol pipe has been retained for :func:`emit`.
+    """
+    global _protocol_stdout
+    if _protocol_stdout is not None:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        ctypes.CDLL(None).fflush(None)
+    except Exception:
+        pass
+    protocol_fd = os.dup(sys.stdout.fileno())
+    os.set_inheritable(protocol_fd, False)
+    try:
+        os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+        _protocol_stdout = os.fdopen(
+            protocol_fd,
+            "w",
+            encoding=getattr(sys.stdout, "encoding", None) or "utf-8",
+            errors="backslashreplace",
+            buffering=1,
+        )
+    except Exception:
+        os.close(protocol_fd)
+        raise
 
 
 def emit_error(code: str, message: str) -> None:
@@ -262,12 +305,35 @@ def find_ugc_accessor(lib, lib_path: Path) -> str:
     return max(candidates)[1]
 
 
+def find_steam_user_accessor(lib, lib_path: Path) -> str | None:
+    symbols = nm_symbols(lib_path)
+    candidates = []
+    for name in symbols:
+        match = re.fullmatch(r"SteamAPI_SteamUser_v(\d+)", name)
+        if match:
+            candidates.append((int(match.group(1)), name))
+    if not candidates:
+        for version in range(99, 0, -1):
+            name = f"SteamAPI_SteamUser_v{version:03d}"
+            try:
+                getattr(lib, name)
+                candidates.append((version, name))
+                break
+            except AttributeError:
+                continue
+    return max(candidates)[1] if candidates else None
+
+
 class SteamUGC:
     def __init__(self, paths: SteamPaths):
         self.paths = paths
         self.lib = ctypes.CDLL(str(paths.libsteam_api))
         self.ugc_accessor_name = find_ugc_accessor(self.lib, paths.libsteam_api)
+        self.steam_user_accessor_name = find_steam_user_accessor(
+            self.lib, paths.libsteam_api,
+        )
         self.ugc = None
+        self.steam_user = None
         self.init_ok = False
         self._bind_required()
         self._bind_optional()
@@ -318,6 +384,39 @@ class SteamUGC:
         self.DownloadItem.restype = ctypes.c_bool
 
     def _bind_optional(self) -> None:
+        self.GetNumSubscribedItems = self._optional(
+            "SteamAPI_ISteamUGC_GetNumSubscribedItems"
+        )
+        if self.GetNumSubscribedItems is not None:
+            self.GetNumSubscribedItems.argtypes = [ctypes.c_void_p]
+            self.GetNumSubscribedItems.restype = ctypes.c_uint32
+
+        self.GetSubscribedItems = self._optional(
+            "SteamAPI_ISteamUGC_GetSubscribedItems"
+        )
+        if self.GetSubscribedItems is not None:
+            self.GetSubscribedItems.argtypes = [
+                ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_uint32,
+            ]
+            self.GetSubscribedItems.restype = ctypes.c_uint32
+
+        self.SteamUser = None
+        self.BLoggedOn = self._optional("SteamAPI_ISteamUser_BLoggedOn")
+        self.GetSteamID = self._optional("SteamAPI_ISteamUser_GetSteamID")
+        if self.steam_user_accessor_name:
+            self.SteamUser = self._optional(self.steam_user_accessor_name)
+        if self.SteamUser is not None:
+            self.SteamUser.argtypes = []
+            self.SteamUser.restype = ctypes.c_void_p
+        if self.BLoggedOn is not None:
+            self.BLoggedOn.argtypes = [ctypes.c_void_p]
+            self.BLoggedOn.restype = ctypes.c_bool
+        if self.GetSteamID is not None:
+            self.GetSteamID.argtypes = [ctypes.c_void_p]
+            self.GetSteamID.restype = ctypes.c_uint64
+
         self.GetItemDownloadInfo = self._optional("SteamAPI_ISteamUGC_GetItemDownloadInfo")
         if self.GetItemDownloadInfo is not None:
             self.GetItemDownloadInfo.argtypes = [
@@ -347,6 +446,8 @@ class SteamUGC:
         self.ugc = self.SteamUGC()
         if not self.ugc:
             raise MissingSymbolsError(f"{self.ugc_accessor_name} returned null")
+        if self.SteamUser is not None:
+            self.steam_user = self.SteamUser()
 
     def shutdown(self) -> None:
         if self.init_ok:
@@ -369,6 +470,43 @@ class SteamUGC:
 
     def download(self, item_id: int, high_priority: bool = True) -> bool:
         return bool(self.DownloadItem(self.ugc, ctypes.c_uint64(int(item_id)), ctypes.c_bool(bool(high_priority))))
+
+    def is_logged_on(self) -> bool:
+        if self.BLoggedOn is None or not self.steam_user:
+            return False
+        try:
+            return bool(self.BLoggedOn(self.steam_user))
+        except Exception:
+            return False
+
+    def steam_id(self) -> int:
+        if self.GetSteamID is None or not self.steam_user:
+            return 0
+        try:
+            return int(self.GetSteamID(self.steam_user))
+        except Exception:
+            return 0
+
+    def subscribed_item_ids(self) -> list[int]:
+        if self.GetNumSubscribedItems is None or self.GetSubscribedItems is None:
+            raise MissingSymbolsError(
+                "Steam UGC subscription enumeration symbols are unavailable"
+            )
+        count = int(self.GetNumSubscribedItems(self.ugc))
+        if count <= 0:
+            return []
+        values = (ctypes.c_uint64 * count)()
+        returned = int(
+            self.GetSubscribedItems(
+                self.ugc, values, ctypes.c_uint32(count),
+            )
+        )
+        if returned != count:
+            raise SteamInitError(
+                "Steam returned a partial subscription inventory "
+                f"({returned}/{count})"
+            )
+        return sorted({int(values[index]) for index in range(returned) if int(values[index]) > 0})
 
     def snapshot(self, item_id: int) -> ItemSnapshot:
         state = int(self.GetItemState(self.ugc, ctypes.c_uint64(int(item_id))))
@@ -439,8 +577,14 @@ def init_steam(appid: int) -> tuple[SteamUGC, SteamPaths, tempfile.TemporaryDire
                 "type": "init",
                 "ok": True,
                 "appid": int(appid),
+                "steam_root": str(paths.root),
                 "lib": str(paths.libsteam_api),
                 "ugc_accessor": steam.ugc_accessor_name,
+                "flatpak_environment": any(
+                    "com.valvesoftware.steam" in f"{key}={value}".casefold()
+                    or str(key).upper().startswith("FLATPAK_")
+                    for key, value in os.environ.items()
+                ),
             }
         )
         return steam, paths, tmp
@@ -474,8 +618,81 @@ def _session_item_event(request_id, snap: ItemSnapshot) -> None:
     emit(event)
 
 
+def _capture_subscription_inventory(steam: SteamUGC) -> tuple[bool, bool, list[int], int]:
+    """Require stable account identity and three matching full enumerations."""
+    run_callbacks = getattr(steam, "run_callbacks", None)
+    is_logged_on = getattr(steam, "is_logged_on", None)
+    steam_id_fn = getattr(steam, "steam_id", None)
+    subscribed_item_ids = getattr(steam, "subscribed_item_ids", None)
+    if not all(
+        callable(fn)
+        for fn in (run_callbacks, is_logged_on, steam_id_fn, subscribed_item_ids)
+    ):
+        return False, False, [], 0
+    previous: tuple[int, ...] | None = None
+    previous_steam_id = 0
+    matching_samples = 0
+    logged_on = False
+    for attempt in range(5):
+        run_callbacks()
+        logged_on = bool(is_logged_on())
+        steam_id = int(steam_id_fn() or 0)
+        if not logged_on or steam_id <= 0:
+            previous = None
+            previous_steam_id = 0
+            matching_samples = 0
+        else:
+            try:
+                current = tuple(subscribed_item_ids())
+            except Exception:
+                return logged_on, False, [], steam_id
+            if previous == current and previous_steam_id == steam_id:
+                matching_samples += 1
+                if matching_samples >= 2:
+                    return True, True, list(current), steam_id
+            else:
+                matching_samples = 0
+            previous = current
+            previous_steam_id = steam_id
+        if attempt < 4:
+            time.sleep(0.35)
+    return logged_on, False, list(previous or ()), previous_steam_id
+
+
+def _capture_native_readiness(steam: SteamUGC) -> tuple[bool, bool, int]:
+    """Prove a stable logged-on Steam identity without querying Workshop IDs."""
+    run_callbacks = getattr(steam, "run_callbacks", None)
+    is_logged_on = getattr(steam, "is_logged_on", None)
+    steam_id_fn = getattr(steam, "steam_id", None)
+    if not all(callable(fn) for fn in (run_callbacks, is_logged_on, steam_id_fn)):
+        return False, False, 0
+    previous_steam_id = 0
+    matching_samples = 0
+    logged_on = False
+    for attempt in range(4):
+        run_callbacks()
+        logged_on = bool(is_logged_on())
+        steam_id = int(steam_id_fn() or 0)
+        if not logged_on or steam_id <= 0:
+            previous_steam_id = 0
+            matching_samples = 0
+        elif steam_id == previous_steam_id:
+            matching_samples += 1
+            if matching_samples >= 2:
+                return True, True, steam_id
+        else:
+            previous_steam_id = steam_id
+            matching_samples = 0
+        if attempt < 3:
+            time.sleep(0.35)
+    return logged_on, False, previous_steam_id
+
+
 class _SessionCancelled(Exception):
-    pass
+    def __init__(self, reason: str, *, control_request_id=None):
+        super().__init__(reason)
+        self.reason = str(reason)
+        self.control_request_id = control_request_id
 
 
 def _session_check_control(
@@ -490,7 +707,6 @@ def _session_check_control(
         except queue.Empty:
             return
         if message is None:
-            _session_emit(active_request_id, "cancellation_ack", reason="parent_eof")
             raise _SessionCancelled("parent_eof")
         if not isinstance(message, dict):
             _session_emit(None, "recoverable_error", error="malformed command")
@@ -505,8 +721,9 @@ def _session_check_control(
             _session_emit(request_id, "recoverable_error", error="cancel target is not active")
         elif command == "shutdown":
             _session_emit(request_id, "command_accepted", command="shutdown")
-            _session_emit(active_request_id, "cancellation_ack", reason="shutdown")
-            raise _SessionCancelled("shutdown")
+            raise _SessionCancelled(
+                "shutdown", control_request_id=request_id,
+            )
         else:
             _session_emit(request_id, "recoverable_error", error="another command is active")
 
@@ -633,6 +850,10 @@ def command_session(args) -> int:
     original_cwd = os.getcwd()
     paths = detect_steam_paths()
     ensure_ld_library_path(paths)
+    # Tests which replace emit with an in-process collector do not own a real
+    # protocol pipe.  The executable helper always uses the default emitter.
+    if emit is _default_emit:
+        _isolate_protocol_stdout()
     tmp = setup_temp_appid(args.appid)
     _session_emit(
         None, "session_starting", appid=int(args.appid),
@@ -664,7 +885,7 @@ def command_session(args) -> int:
                 command = str(message.get("command") or "")
                 request_id = message.get("request_id")
                 if command == "shutdown":
-                    _session_emit(request_id, "cancellation_ack", reason=command)
+                    _session_emit(request_id, "command_accepted", command=command)
                     shutdown_reason = command
                     shutdown_request_id = request_id
                     return EXIT_OK
@@ -743,13 +964,14 @@ def command_session(args) -> int:
                 else:
                     _session_unsubscribe(steam, commands, request_id, item_ids, timeout)
             except _SessionCancelled as exc:
+                if exc.reason in ("shutdown", "parent_eof"):
+                    shutdown_reason = exc.reason
+                    shutdown_request_id = exc.control_request_id
+                    break
                 _session_emit(
                     request_id, "command_result", ok=False, cancelled=True,
-                    command=command, reason=str(exc),
+                    command=command, reason=exc.reason,
                 )
-                if str(exc) in ("shutdown", "parent_eof"):
-                    shutdown_reason = str(exc)
-                    break
             except Exception as exc:
                 _session_emit(
                     request_id, "fatal_session_error", ok=False,
@@ -793,9 +1015,46 @@ def command_state(args) -> int:
     try:
         item_ids = dedupe_sorted_item_ids(args.item_ids)
         steam, _paths, tmp = init_steam(args.appid)
+        logged_on, inventory_complete, subscribed_ids, steam_id = (
+            _capture_subscription_inventory(steam)
+        )
         emit_snapshots(steam, item_ids)
-        emit({"type": "done", "ok": True, "items": item_ids, "failed": []})
+        emit({
+            "type": "done",
+            "ok": True,
+            "items": item_ids,
+            "failed": [],
+            "logged_on": logged_on,
+            "steam_id": steam_id,
+            "subscription_inventory_complete": inventory_complete,
+            "subscription_count": len(subscribed_ids),
+            "subscribed_item_ids": subscribed_ids,
+        })
         return EXIT_OK
+    finally:
+        if steam is not None:
+            steam.shutdown()
+        if tmp is not None:
+            tmp.cleanup()
+
+
+def command_readiness(args) -> int:
+    """Check native SteamAPI/UGC and account readiness without an item query."""
+    steam = None
+    tmp = None
+    try:
+        steam, _paths, tmp = init_steam(args.appid)
+        logged_on, identity_stable, steam_id = _capture_native_readiness(steam)
+        ok = bool(logged_on and identity_stable and steam_id > 0)
+        emit({
+            "type": "done",
+            "ok": ok,
+            "logged_on": logged_on,
+            "identity_stable": identity_stable,
+            "steam_id": steam_id,
+            "ugc_ready": bool(steam.ugc),
+        })
+        return EXIT_OK if ok else EXIT_STEAM_INIT_FAILED
     finally:
         if steam is not None:
             steam.shutdown()
@@ -1000,6 +1259,12 @@ def build_parser() -> argparse.ArgumentParser:
     state.add_argument("--appid", type=int, default=DAYZ_APPID)
     state.add_argument("item_ids", nargs="+", type=parse_item_id)
     state.set_defaults(func=command_state)
+
+    readiness = sub.add_parser(
+        "readiness", help="check native Steam login and UGC readiness",
+    )
+    readiness.add_argument("--appid", type=int, default=DAYZ_APPID)
+    readiness.set_defaults(func=command_readiness)
 
     subscribe = sub.add_parser("subscribe", help="subscribe and wait until installed")
     subscribe.add_argument("--appid", type=int, default=DAYZ_APPID)

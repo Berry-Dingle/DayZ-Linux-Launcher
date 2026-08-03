@@ -524,6 +524,31 @@ def test_shared_preparation_final_verification_failure_is_failed(monkeypatch):
     assert "symlinks" not in event_names(win)
 
 
+@pytest.mark.parametrize("backend_ok", [False, True], ids=["operation-failed", "ready"])
+def test_ugc_teardown_error_is_secondary_to_operation_or_confirmed_success(
+        monkeypatch, capsys, backend_ok):
+    class TeardownFailingSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            raise RuntimeError("synthetic teardown failure")
+
+    monkeypatch.setattr(join_prepare, "CooperativeUGCSession", TeardownFailingSession)
+    win, outcome = prepare_characterized(
+        monkeypatch, backend_ok=backend_ok,
+    )
+    captured = capsys.readouterr()
+    assert "Secondary cleanup diagnostic" in captured.err
+    if backend_ok:
+        assert outcome.status is PreparationStatus.READY
+        assert not outcome.error
+    else:
+        assert outcome.status is PreparationStatus.FAILED
+        assert outcome.error == "Mod download failed"
+    assert "shutdown failed" not in str(outcome.error or "").lower()
+
+
 def test_shared_preparation_source_has_no_join_only_operations():
     shared_source = JOIN_SOURCE.split("def prepare_required_mods", 1)[1].split(
         "def join_prepare_and_launch", 1

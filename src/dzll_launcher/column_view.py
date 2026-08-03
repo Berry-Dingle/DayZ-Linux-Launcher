@@ -65,17 +65,7 @@ def _monitor_icon_name() -> str:
 
 
 def _download_icon_name() -> str:
-    candidates = ("folder-download-symbolic", "document-save-symbolic", "go-down-symbolic")
-    try:
-        display = Gdk.Display.get_default()
-        if display is not None:
-            icon_theme = Gtk.IconTheme.get_for_display(display)
-            for candidate in candidates:
-                if icon_theme.has_icon(candidate):
-                    return candidate
-    except Exception:
-        pass
-    return candidates[-1]
+    return "folder-download-symbolic"
 
 
 def set_sort_debug_bind_hook(hook) -> None:
@@ -428,6 +418,8 @@ def _normalize_column_view_header(view: Gtk.ColumnView) -> None:
 
     for column_index, button in enumerate(title_buttons):
         _add_css_classes(button, "dzll-column-title-flat")
+        if column_index == len(title_buttons) - 1:
+            _add_css_classes(button, "dzll-column-title-join")
         try:
             button.set_halign(Gtk.Align.FILL)
             button.set_hexpand(True)
@@ -645,6 +637,9 @@ def _make_label_factory(
             if not _notify_is_current(cell, changed_obj):
                 return
             binder(cell, changed_obj)
+            tracker = getattr(changed_obj, "_a2s_status_apply_tracker", None)
+            if isinstance(tracker, dict):
+                tracker.setdefault("refreshed_cells", []).append(factory_name)
             if perf_metrics is not None and factory_name == "ping":
                 perf_metrics.count("ping_format_calls")
                 perf_metrics.count("ping_label_writes")
@@ -729,7 +724,7 @@ def _make_label_factory(
 
 def _bind_time(label: Gtk.Label, obj: ServerObject) -> None:
     time_text, timewarp_text = row_time_display(obj)
-    label.set_text(f"{time_text} {timewarp_text}".strip())
+    _set_text_if_changed(label, f"{time_text} {timewarp_text}".strip())
 
 
 def _bind_time_light(label: Gtk.Label, obj: ServerObject, perf_metrics=None) -> None:
@@ -867,6 +862,9 @@ def _make_players_factory(
             if not _notify_is_current(widget, changed_obj):
                 return
             _bind_players_cell(widget, changed_obj, perf_metrics)
+            tracker = getattr(changed_obj, "_a2s_status_apply_tracker", None)
+            if isinstance(tracker, dict):
+                tracker.setdefault("refreshed_cells", []).append("players")
 
         for prop in notify_props:
             try:
@@ -2200,6 +2198,7 @@ def build_server_column_view(
             perf_metrics=perf_metrics,
             drag_light=drag_light,
             light_binder=_bind_time_light,
+            notify_props=("time",),
             max_chars=11,
             cell_css_classes=right_border,
         ),
@@ -2281,7 +2280,11 @@ def build_server_column_view(
         _download_icon_name(),
         on_download_mods,
         "dzll-download-mods-button",
-        tooltip_text="Subscribe to and download required mods\nwithout joining",
+        tooltip_text=(
+            "Subscribe and download required\n"
+            "mods without joining\n"
+            "Servers can be queued"
+        ),
         accessible_label="Subscribe to and download required mods without joining",
         is_sensitive=can_download_mods,
         presentation=download_presentation,
@@ -2289,7 +2292,7 @@ def build_server_column_view(
         perf_metrics=perf_metrics,
         drag_light=drag_light,
     )
-    _append_column(
+    download_column = _append_column(
         view,
         "",
         download_factory,
@@ -2297,6 +2300,7 @@ def build_server_column_view(
         header_title="",
         header_css_classes="dzll-column-header-action",
     )
+    view.background_download_column = download_column
     view.refresh_download_mods_states = getattr(
         download_factory, "_dzll_refresh_active_states", lambda: None,
     )

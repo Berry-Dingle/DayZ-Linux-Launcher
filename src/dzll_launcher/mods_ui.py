@@ -5,17 +5,30 @@ import threading
 import time
 from pathlib import Path
 from datetime import datetime, timezone
+from enum import Enum
 from .ui_row import attach_pointer_cursor
 from gi.repository import Gtk, GLib, Pango
 
 from .config import CACHE_DIR
 from .settings import autodetect_workshop_dir, save_settings
 from .steam_ugc_backend import delete_ugc_mod_local_files_after_unsubscribe
+from .steam_ugc_backend import query_ugc_inventory_checked
+from .steam_ugc_backend import probe_native_mod_manager_readiness
 from .steam_ugc_backend import query_ugc_state_checked
+from .steam_ugc_backend import UGCSubscriptionSnapshot
 from .steam_ugc_backend import repair_ugc_item
 from .steam_ugc_backend import request_unsubscribe_ugc_items
 from .background_prepare import preparation_operation_gate
-from .steam_native import dayz_steam_library, dayz_workshop_content_dir, is_native_steam_running, native_steam_libraries, resolve_native_steam_cmd
+from .steam_native import (
+    SteamClientState,
+    dayz_steam_library,
+    dayz_workshop_content_dir,
+    detect_steam_client_state,
+    launch_native_steam_silent,
+    native_steam_libraries,
+    resolve_native_steam_cmd,
+    resolve_steam_runtime_state,
+)
 from .steamcmd_mods import remove_dzll_symlinks_for_mod
 from .mod_metadata import clean_display_mod_name, load_mod_metadata
 from .mod_name_resolver import resolve_best_mod_names
@@ -41,43 +54,70 @@ BATCH_UNSUBSCRIBE_SETTLE_TIMEOUT_S = 4.0
 PASSIVE_STEAM_WATCH_INTERVAL_S = 4
 PASSIVE_STEAM_WATCH_READY_TIMEOUT_S = 90
 PASSIVE_STEAM_WATCH_SAMPLE_SIZE = 3
+INVENTORY_NATIVE_QUERY_ATTEMPTS = 3
+INVENTORY_NATIVE_QUERY_TIMEOUT_S = 12
+INVENTORY_NATIVE_RETRY_DELAY_S = 1.0
 PENDING_MOD_DELETES_PATH = os.path.join(CACHE_DIR, "pending_mod_deletes.json")
 LEGACY_PENDING_DELETE_STATUS = "Old cleanup state cleared · Use Clean Up Local Files if needed"
+
+
+def _mod_manager_steam_state() -> SteamClientState:
+    try:
+        return detect_steam_client_state()
+    except Exception:
+        return SteamClientState.UNKNOWN
+
+
+def _supported_native_steam_running() -> bool:
+    return _mod_manager_steam_state() is SteamClientState.NATIVE
+
+
+class _LoadedModItems(list):
+    def __init__(self, values=(), *, steam_state=SteamClientState.UNKNOWN,
+                 state_query_ok=False, inventory_validity=None,
+                 subscription_snapshot=None, observed_end_state=None):
+        super().__init__(values)
+        self.steam_state = steam_state
+        self.state_query_ok = bool(state_query_ok)
+        self.inventory_validity = (
+            inventory_validity
+            if isinstance(inventory_validity, InventoryValidity)
+            else (
+                InventoryValidity.VALID
+                if state_query_ok else InventoryValidity.FAILED
+            )
+        )
+        self.subscription_snapshot = subscription_snapshot
+        self.observed_end_state = observed_end_state or steam_state
+
+
+class InventoryValidity(str, Enum):
+    STALE = "stale"
+    LOADING = "loading"
+    VALID = "valid"
+    FAILED = "failed"
 
 
 def _wait_for_native_steam_stopped(timeout_s: float = 45.0) -> bool:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
-        if not is_native_steam_running():
+        if not _supported_native_steam_running():
             return True
         time.sleep(0.5)
-    return not is_native_steam_running()
+    return not _supported_native_steam_running()
 
 
 def _wait_for_native_steam_running(timeout_s: float = 45.0) -> bool:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
-        if is_native_steam_running():
+        if _supported_native_steam_running():
             return True
         time.sleep(0.5)
-    return is_native_steam_running()
+    return _supported_native_steam_running()
 
 
 def _launch_native_steam_silent() -> tuple[bool, str]:
-    steam_cmd = resolve_native_steam_cmd()
-    if not steam_cmd:
-        return False, "Native Steam executable was not found."
-    try:
-        subprocess.Popen(
-            [steam_cmd, "-silent"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception as exc:
-        return False, str(exc)
-    return True, ""
+    return launch_native_steam_silent()
 
 
 def _migrate_legacy_pending_delete_file() -> tuple[bool, str]:
@@ -494,7 +534,23 @@ class ModsManagerOverlay:
         self._repair_ui_attached = True
         self._repair_refresh_needed = False
         self._steam_management_verified = False
+        self._native_session_handoff_valid = False
         self._last_mod_state_query_ok = False
+        self._authoritative_steam_state = SteamClientState.UNKNOWN
+        self._steam_state_generation = 0
+        self._steam_state_probe_running = False
+        self._steam_state_probe_refresh_on_change = False
+        self._inventory_refresh_generation = 0
+        self._inventory_refresh_active = False
+        self._inventory_refresh_pending = False
+        self._inventory_refresh_pending_status = None
+        self._inventory_refresh_pending_preserve_status = False
+        self._inventory_refresh_callbacks = []
+        self._inventory_refresh_cancel_event = None
+        self._inventory_refresh_idle_event = threading.Event()
+        self._inventory_refresh_idle_event.set()
+        self._inventory_validity = InventoryValidity.STALE
+        self._subscription_snapshot = None
         self._host_close_request_handler_id = 0
         self._passive_steam_watch_timer_id = 0
         self._passive_steam_watch_probe_running = False
@@ -503,6 +559,7 @@ class ModsManagerOverlay:
         self._passive_steam_was_ready_this_session = False
         self._passive_steam_shutdown_status_shown = False
         self._suppress_start_steam_manage_prompt_for_operation = False
+        self._recovery_inventory_handoff_active = False
         self._steam_status_pill_state = "checking"
         self.sort_key = "name"
         self.sort_ascending = True
@@ -660,17 +717,18 @@ class ModsManagerOverlay:
         self._repair_ui_attached = True
         self.scrim.set_visible(True)
         self.card.set_visible(True)
+        self._request_authoritative_steam_state_probe(refresh_on_change=True)
         self._clear_one_shot_action_status_if_idle()
         try:
             self.search.grab_focus()
         except Exception:
             pass
-        self._maybe_start_passive_steam_watch()
         if bool(getattr(self, "_repair_refresh_needed", False)):
             self._repair_refresh_needed = False
             self.refresh(completion_status="Repair complete.")
         else:
             self._sync_repair_presentations()
+        self._maybe_start_passive_steam_watch()
 
     def hide(self):
         self._hide_now()
@@ -688,6 +746,171 @@ class ModsManagerOverlay:
             return bool(self.card.get_visible())
         except Exception:
             return False
+
+    def _set_authoritative_steam_state(self, state: SteamClientState) -> bool:
+        current = state if isinstance(state, SteamClientState) else SteamClientState.UNKNOWN
+        previous = getattr(self, "_authoritative_steam_state", None)
+        if previous is current:
+            return False
+        self._authoritative_steam_state = current
+        self._steam_state_generation = int(
+            getattr(self, "_steam_state_generation", 0) or 0
+        ) + 1
+        self._last_mod_state_query_ok = False
+        self._steam_management_verified = False
+        self._native_session_handoff_valid = False
+        self._inventory_validity = InventoryValidity.STALE
+        self._subscription_snapshot = None
+        self._passive_steam_was_ready_this_session = False
+        self._passive_steam_watch_check_started_at = 0.0
+        self._passive_steam_watch_checking_status_shown = False
+        self._set_steam_status_pill(
+            "checking" if current is SteamClientState.NATIVE else "offline"
+        )
+        self._update_batch_action_buttons()
+        return True
+
+    def _request_authoritative_steam_state_probe(
+        self,
+        *,
+        refresh_on_change: bool,
+    ) -> bool:
+        """Run the /proc resolver off GTK's main thread and coalesce requests."""
+        if refresh_on_change:
+            self._steam_state_probe_refresh_on_change = True
+        if bool(getattr(self, "_steam_state_probe_running", False)):
+            return False
+        self._steam_state_probe_running = True
+        probe_generation = int(getattr(self, "_steam_state_generation", 0) or 0)
+
+        def worker():
+            try:
+                runtime = resolve_steam_runtime_state()
+                state = runtime.state
+                flatpak_running = bool(runtime.flatpak_process_running)
+            except Exception:
+                runtime = None
+                state = SteamClientState.UNKNOWN
+                flatpak_running = False
+
+            def done():
+                self._steam_state_probe_running = False
+                if probe_generation != int(
+                    getattr(self, "_steam_state_generation", 0) or 0
+                ):
+                    self._steam_state_probe_refresh_on_change = False
+                    return False
+                should_refresh = bool(
+                    getattr(self, "_steam_state_probe_refresh_on_change", False)
+                )
+                self._steam_state_probe_refresh_on_change = False
+                if flatpak_running:
+                    self._set_authoritative_steam_state(SteamClientState.UNKNOWN)
+                    handler = getattr(
+                        self.host, "_on_mod_manager_flatpak_detected", None,
+                    )
+                    if callable(handler):
+                        handler(runtime)
+                    else:
+                        self.block_for_flatpak()
+                    return False
+                changed = self._set_authoritative_steam_state(state)
+                if changed and should_refresh and self._mod_manager_is_visible():
+                    self.refresh(preserve_status=True)
+                return False
+
+            GLib.idle_add(done)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def block_for_flatpak(self):
+        """Invalidate and remove Mod Manager before showing the entry warning."""
+        self.reset_for_steam_recovery()
+        try:
+            self.confirm_box.set_visible(False)
+            self.confirm_scrim.set_visible(False)
+        except Exception:
+            pass
+        self._hide_now()
+        return False
+
+    def reset_for_steam_recovery(self):
+        """Invalidate every Mod Manager result tied to the previous Steam session."""
+        cancel_event = getattr(self, "_inventory_refresh_cancel_event", None)
+        if cancel_event is not None:
+            try:
+                cancel_event.set()
+            except Exception:
+                pass
+        self._steam_state_generation = int(
+            getattr(self, "_steam_state_generation", 0) or 0
+        ) + 1
+        self._inventory_refresh_generation = int(
+            getattr(self, "_inventory_refresh_generation", 0) or 0
+        ) + 1
+        self._authoritative_steam_state = SteamClientState.UNKNOWN
+        self._steam_state_probe_refresh_on_change = False
+        self._inventory_refresh_pending = False
+        self._inventory_refresh_pending_status = None
+        self._inventory_refresh_pending_preserve_status = False
+        self._inventory_refresh_callbacks = []
+        self._last_mod_state_query_ok = False
+        self._steam_management_verified = False
+        self._native_session_handoff_valid = False
+        self._subscription_snapshot = None
+        self._inventory_validity = InventoryValidity.STALE
+        self._loaded_items = []
+        self._selected_mod_ids = set()
+        self._passive_steam_was_ready_this_session = False
+        self._passive_steam_watch_check_started_at = 0.0
+        self._passive_steam_watch_checking_status_shown = False
+        self._passive_steam_shutdown_status_shown = False
+        self._recovery_inventory_handoff_active = False
+        self._suppress_start_steam_manage_prompt_for_operation = False
+        try:
+            self._clear_list()
+        except Exception:
+            pass
+        try:
+            self._set_loading(False)
+            self._set_steam_status_pill("offline")
+            self._set_mod_operation_status("", running=False)
+            self._update_batch_action_buttons()
+        except Exception:
+            pass
+        idle_event = getattr(self, "_inventory_refresh_idle_event", None)
+        if idle_event is None:
+            idle_event = threading.Event()
+            if not bool(getattr(self, "_inventory_refresh_active", False)):
+                idle_event.set()
+            self._inventory_refresh_idle_event = idle_event
+        return idle_event
+
+    def accept_recovered_native_authority(self):
+        """Seed only runtime authority; inventory remains stale until refreshed."""
+        self._set_authoritative_steam_state(SteamClientState.NATIVE)
+        self._last_mod_state_query_ok = False
+        self._steam_management_verified = False
+        self._native_session_handoff_valid = False
+        self._subscription_snapshot = None
+        self._inventory_validity = InventoryValidity.STALE
+        return False
+
+    def prepare_recovered_inventory(self, completion_cb) -> bool:
+        """Load authoritative data without exposing transitional inventory UI."""
+        self._recovery_inventory_handoff_active = True
+        self._suppress_start_steam_manage_prompt_for_operation = True
+        self.refresh(preserve_status=True, completion_cb=completion_cb)
+        return True
+
+    def show_recovered_inventory(self) -> bool:
+        """Reveal an already validated recovery inventory without reloading it."""
+        self._recovery_inventory_handoff_active = False
+        self._suppress_start_steam_manage_prompt_for_operation = False
+        self._repair_refresh_needed = False
+        self.show()
+        return False
 
     def _app_session_owner(self):
         return getattr(self.host, "_win", None) or self.host
@@ -736,6 +959,13 @@ class ModsManagerOverlay:
             self._suppress_start_steam_manage_prompt_for_operation = False
 
     def _maybe_show_start_steam_manage_reminder(self) -> None:
+        if bool(getattr(self, "_recovery_inventory_handoff_active", False)):
+            return
+        if (
+            getattr(self, "_authoritative_steam_state", SteamClientState.UNKNOWN)
+            is not SteamClientState.OFFLINE
+        ):
+            return
         if not self._mod_manager_is_visible():
             return
         if self._steam_management_is_verified():
@@ -795,10 +1025,15 @@ class ModsManagerOverlay:
         return False
 
     def _steam_status_from_loaded_items(self) -> str:
+        if (
+            getattr(self, "_authoritative_steam_state", SteamClientState.UNKNOWN)
+            is not SteamClientState.NATIVE
+        ):
+            return "offline"
         items = list(getattr(self, "_loaded_items", []) or [])
         if not items:
             try:
-                return "online" if is_native_steam_running() else "offline"
+                return "online"
             except Exception:
                 return "offline"
         has_issue = False
@@ -817,16 +1052,20 @@ class ModsManagerOverlay:
                 return "online"
         if has_issue:
             return "issue"
-        try:
-            return "offline" if not is_native_steam_running() else "issue"
-        except Exception:
-            return "offline"
+        return "issue"
 
     def _compute_steam_management_verified(self) -> bool:
-        try:
-            if not bool(is_native_steam_running()):
-                return False
-        except Exception:
+        if (
+            getattr(self, "_authoritative_steam_state", SteamClientState.UNKNOWN)
+            is not SteamClientState.NATIVE
+        ):
+            return False
+        if getattr(self, "_inventory_validity", InventoryValidity.STALE) is not InventoryValidity.VALID:
+            return False
+        if not isinstance(
+            getattr(self, "_subscription_snapshot", None),
+            UGCSubscriptionSnapshot,
+        ) or not bool(self._subscription_snapshot.valid):
             return False
         if not bool(getattr(self, "_last_mod_state_query_ok", False)):
             return False
@@ -837,7 +1076,36 @@ class ModsManagerOverlay:
         return self._has_steam_checked_rows()
 
     def _steam_management_is_verified(self) -> bool:
-        return bool(getattr(self, "_steam_management_verified", False))
+        cached_verified = bool(
+            getattr(self, "_steam_management_verified", False)
+        )
+        return bool(
+            cached_verified
+            and getattr(
+                self,
+                "_native_session_handoff_valid",
+                cached_verified,
+            )
+            and getattr(
+                self, "_authoritative_steam_state", SteamClientState.UNKNOWN,
+            ) is SteamClientState.NATIVE
+            and getattr(
+                self, "_inventory_validity", InventoryValidity.STALE,
+            ) is InventoryValidity.VALID
+        )
+
+    def _require_supported_native_steam(self) -> bool:
+        if self._steam_management_is_verified():
+            return True
+        self._last_mod_state_query_ok = False
+        self._steam_management_verified = False
+        self._native_session_handoff_valid = False
+        self._set_steam_status_pill("offline")
+        self._update_batch_action_buttons()
+        self._set_mod_operation_status(
+            "Start native Steam to manage Workshop mods.", running=False,
+        )
+        return False
 
     def _set_steam_status_pill(self, status: str) -> None:
         status_key = str(status or "issue").strip().lower()
@@ -902,13 +1170,7 @@ class ModsManagerOverlay:
         return sample
 
     def _maybe_start_passive_steam_watch(self) -> None:
-        should_watch = (
-            self._mod_manager_is_visible()
-            and (
-                self._has_steam_offline_rows()
-                or bool(getattr(self, "_passive_steam_was_ready_this_session", False))
-            )
-        )
+        should_watch = self._mod_manager_is_visible()
         if not should_watch:
             self._stop_passive_steam_watch()
             return
@@ -966,108 +1228,10 @@ class ModsManagerOverlay:
         if not self._mod_manager_is_visible():
             self._stop_passive_steam_watch(remove_source=False)
             return False
-
-        try:
-            steam_running = bool(is_native_steam_running())
-        except Exception:
-            steam_running = False
-        if not steam_running:
-            if bool(getattr(self, "_passive_steam_was_ready_this_session", False)) and not bool(
-                getattr(self, "_passive_steam_shutdown_status_shown", False)
-            ):
-                self._passive_steam_shutdown_status_shown = True
-                self._last_mod_state_query_ok = False
-                self._steam_management_verified = False
-                self._set_steam_status_pill("offline")
-                self._update_batch_action_buttons()
-                if not self._operation_status_is_protected():
-                    self._set_mod_operation_status("Steam closed.", running=False)
-            self._passive_steam_watch_check_started_at = 0.0
-            self._passive_steam_watch_checking_status_shown = False
-            return True
-
-        steam_was_observed_closed = bool(getattr(self, "_passive_steam_shutdown_status_shown", False))
-        self._passive_steam_shutdown_status_shown = False
-        if bool(getattr(self, "_passive_steam_was_ready_this_session", False)) and not self._has_steam_offline_rows():
-            if not steam_was_observed_closed:
-                verified = self._compute_steam_management_verified()
-                self._steam_management_verified = verified
-                self._update_batch_action_buttons()
-                if verified:
-                    self._clear_operation_start_steam_prompt_suppression_if_ready()
-                    self._set_steam_status_pill("online")
-                    self._passive_steam_watch_check_started_at = 0.0
-                    self._passive_steam_watch_checking_status_shown = False
-                    return True
-
-        if not float(getattr(self, "_passive_steam_watch_check_started_at", 0.0) or 0.0):
-            self._passive_steam_watch_check_started_at = time.monotonic()
-        if not bool(getattr(self, "_passive_steam_watch_checking_status_shown", False)):
-            self._passive_steam_watch_checking_status_shown = True
-            self._set_steam_status_pill("checking")
-            if not self._operation_status_is_protected():
-                self._set_mod_operation_status("Steam started. Checking mods...", running=False)
-
-        started_at = float(getattr(self, "_passive_steam_watch_check_started_at", 0.0) or time.monotonic())
-        if time.monotonic() - started_at >= PASSIVE_STEAM_WATCH_READY_TIMEOUT_S:
-            self._steam_management_verified = False
-            self._set_steam_status_pill("issue")
-            self._update_batch_action_buttons()
-            if not self._operation_status_is_protected():
-                self._set_mod_operation_status("Could not check mods with Steam.", running=False)
-            self._stop_passive_steam_watch(remove_source=False)
-            return False
-
-        if bool(getattr(self, "_passive_steam_watch_probe_running", False)):
-            return True
-
-        sample_ids = self._passive_steam_watch_sample_ids()
-        if not sample_ids:
-            self._last_mod_state_query_ok = True
-            self._set_steam_status_pill("online")
-            self._steam_management_verified = True
-            self._clear_operation_start_steam_prompt_suppression_if_ready()
-            self._update_batch_action_buttons()
-            self._passive_steam_was_ready_this_session = True
-            self._stop_passive_steam_watch(remove_source=False)
-            return False
-
-        self._passive_steam_watch_probe_running = True
-
-        def worker(ids: list[int]):
-            try:
-                ok, states = query_ugc_state_checked(ids, appid=int(APPID), timeout=8)
-            except Exception:
-                ok = False
-                states = {}
-            ready = bool(ok) and bool(states)
-
-            def done():
-                self._passive_steam_watch_probe_running = False
-                if not self._mod_manager_is_visible():
-                    self._stop_passive_steam_watch()
-                    return False
-                if ready:
-                    protected_status = self._operation_status_is_protected()
-                    self._stop_passive_steam_watch()
-                    self.refresh(
-                        completion_status=None if protected_status else "Mod Manager refreshed.",
-                        preserve_status=protected_status,
-                    )
-                    return False
-                started = float(getattr(self, "_passive_steam_watch_check_started_at", 0.0) or time.monotonic())
-                if time.monotonic() - started >= PASSIVE_STEAM_WATCH_READY_TIMEOUT_S:
-                    self._steam_management_verified = False
-                    self._set_steam_status_pill("issue")
-                    self._update_batch_action_buttons()
-                    if not self._operation_status_is_protected():
-                        self._set_mod_operation_status("Could not check mods with Steam.", running=False)
-                    self._stop_passive_steam_watch()
-                return False
-
-            GLib.idle_add(done)
-
-        threading.Thread(target=worker, args=(sample_ids,), daemon=True).start()
+        # The timer only requests the lightweight runtime resolver.  Steam UGC,
+        # filesystem inventory work, and readiness waits belong exclusively to
+        # the single background inventory worker.
+        self._request_authoritative_steam_state_probe(refresh_on_change=True)
         return True
 
     def _build(self):
@@ -1382,25 +1546,95 @@ class ModsManagerOverlay:
             self._set_empty_state(False)
         self._update_batch_action_buttons()
 
-    def refresh(self, completion_status: str | None = None, *, preserve_status: bool = False):
-        workshop_dir = self._workshop_dir()
-        proton_prefix = self._proton_prefix()
+    def refresh(
+        self,
+        completion_status: str | None = None,
+        *,
+        preserve_status: bool = False,
+        completion_cb=None,
+    ):
+        if callable(completion_cb):
+            self._inventory_refresh_callbacks.append(completion_cb)
+        if bool(getattr(self, "_inventory_refresh_active", False)):
+            self._inventory_refresh_pending = True
+            if completion_status:
+                self._inventory_refresh_pending_status = str(completion_status)
+            self._inventory_refresh_pending_preserve_status = bool(
+                getattr(self, "_inventory_refresh_pending_preserve_status", False)
+                or preserve_status
+            )
+            return False
+
+        start_state = getattr(
+            self, "_authoritative_steam_state", SteamClientState.UNKNOWN,
+        )
+        start_state_generation = int(
+            getattr(self, "_steam_state_generation", 0) or 0
+        )
+        self._inventory_refresh_generation = int(
+            getattr(self, "_inventory_refresh_generation", 0) or 0
+        ) + 1
+        refresh_generation = self._inventory_refresh_generation
+        self._inventory_refresh_active = True
+        idle_event = getattr(self, "_inventory_refresh_idle_event", None)
+        if idle_event is None:
+            idle_event = threading.Event()
+            self._inventory_refresh_idle_event = idle_event
+        idle_event.clear()
+        refresh_cancel_event = threading.Event()
+        self._inventory_refresh_cancel_event = refresh_cancel_event
         self._steam_management_verified = False
+        self._native_session_handoff_valid = False
+        self._last_mod_state_query_ok = False
+        self._subscription_snapshot = None
+        self._inventory_validity = InventoryValidity.LOADING
         self._set_steam_status_pill("checking")
-        self._clear_list()
+        if list(getattr(self, "_loaded_items", []) or []):
+            self._render_loaded_items()
         self._set_loading(True)
 
         def worker():
             try:
-                items = self._load_installed_items(workshop_dir, proton_prefix)
+                workshop_dir = self._workshop_dir()
+                proton_prefix = self._proton_prefix()
+                items = self._load_installed_items(
+                    workshop_dir,
+                    proton_prefix,
+                    steam_state=start_state,
+                    cancel_event=refresh_cancel_event,
+                )
+                items.observed_end_state = _mod_manager_steam_state()
             except Exception as exc:
-                GLib.idle_add(self._apply_load_error, str(exc), bool(completion_status))
+                GLib.idle_add(
+                    self._apply_load_error_if_current,
+                    str(exc),
+                    bool(completion_status),
+                    refresh_generation,
+                    start_state,
+                    start_state_generation,
+                )
                 return
-            GLib.idle_add(self._apply_items, items, completion_status, preserve_status)
+            GLib.idle_add(
+                self._apply_items_if_current,
+                items,
+                completion_status,
+                preserve_status,
+                refresh_generation,
+                start_state,
+                start_state_generation,
+            )
 
         threading.Thread(target=worker, daemon=True).start()
+        return False
 
-    def _load_installed_items(self, workshop_dir: str, proton_prefix: str):
+    def _load_installed_items(
+        self,
+        workshop_dir: str,
+        proton_prefix: str,
+        *,
+        steam_state: SteamClientState,
+        cancel_event=None,
+    ):
         workshop_roots = _candidate_workshop_roots(workshop_dir=workshop_dir)
         try:
             print(f"[MOD MANAGER] workshop roots: {[str(root) for root in workshop_roots]}", flush=True)
@@ -1412,16 +1646,92 @@ class ModsManagerOverlay:
             metadata = load_mod_metadata().get("mods") or {}
         except Exception:
             metadata = {}
-        try:
-            steam_running_for_status = bool(is_native_steam_running())
-        except Exception:
-            steam_running_for_status = False
-        try:
-            state_query_ok, state_by_id = query_ugc_state_checked(ids) if ids else (True, {})
-        except Exception:
+        steam_running_for_status = steam_state is SteamClientState.NATIVE
+        subscription_snapshot = None
+        if steam_running_for_status:
+            previous_snapshot_key = None
+            observed_steam_id = 0
+            matching_snapshots = 0
             state_query_ok = False
             state_by_id = {}
-        self._last_mod_state_query_ok = bool(state_query_ok)
+            for attempt in range(INVENTORY_NATIVE_QUERY_ATTEMPTS):
+                if cancel_event is not None and cancel_event.is_set():
+                    break
+                if _mod_manager_steam_state() is not SteamClientState.NATIVE:
+                    break
+                try:
+                    candidate = (
+                        query_ugc_inventory_checked(
+                            ids,
+                            timeout=INVENTORY_NATIVE_QUERY_TIMEOUT_S,
+                            cancel_event=cancel_event,
+                        )
+                        if ids else probe_native_mod_manager_readiness(
+                            timeout=INVENTORY_NATIVE_QUERY_TIMEOUT_S,
+                            cancel_event=cancel_event,
+                        )
+                    )
+                except Exception:
+                    candidate = None
+                if isinstance(candidate, UGCSubscriptionSnapshot) and candidate.valid:
+                    if observed_steam_id and int(candidate.steam_id) != observed_steam_id:
+                        break
+                    observed_steam_id = int(candidate.steam_id)
+                    candidate_key = (
+                        int(candidate.steam_id),
+                        candidate.subscribed_ids,
+                        tuple(
+                            (mid, bool((candidate.states.get(mid) or {}).get("subscribed", False)))
+                            for mid in sorted(candidate.requested_ids)
+                        ),
+                    )
+                    if candidate_key == previous_snapshot_key:
+                        matching_snapshots += 1
+                    else:
+                        previous_snapshot_key = candidate_key
+                        matching_snapshots = 1
+                    if matching_snapshots >= 2:
+                        subscription_snapshot = candidate
+                        state_query_ok = True
+                        state_by_id = dict(candidate.states)
+                        break
+                elif not ids and bool(getattr(candidate, "valid", False)):
+                    candidate_steam_id = int(getattr(candidate, "steam_id", 0) or 0)
+                    if observed_steam_id and candidate_steam_id != observed_steam_id:
+                        break
+                    observed_steam_id = candidate_steam_id
+                    candidate_key = (candidate_steam_id, frozenset(), ())
+                    if candidate_key == previous_snapshot_key:
+                        matching_snapshots += 1
+                    else:
+                        previous_snapshot_key = candidate_key
+                        matching_snapshots = 1
+                    if matching_snapshots >= 2:
+                        subscription_snapshot = UGCSubscriptionSnapshot(
+                            valid=True,
+                            requested_ids=frozenset(),
+                            subscribed_ids=frozenset(),
+                            states={},
+                            logged_on=True,
+                            steam_id=candidate_steam_id,
+                            native_attachment_verified=True,
+                            created_monotonic=time.monotonic(),
+                        )
+                        state_query_ok = True
+                        state_by_id = {}
+                        break
+                else:
+                    previous_snapshot_key = None
+                    matching_snapshots = 0
+                if attempt + 1 < INVENTORY_NATIVE_QUERY_ATTEMPTS:
+                    if cancel_event is not None:
+                        if cancel_event.wait(INVENTORY_NATIVE_RETRY_DELAY_S):
+                            break
+                    else:
+                        time.sleep(INVENTORY_NATIVE_RETRY_DELAY_S)
+        else:
+            state_query_ok = False
+            state_by_id = {}
         try:
             resolved_names = resolve_best_mod_names(
                 ids,
@@ -1450,7 +1760,16 @@ class ModsManagerOverlay:
                 or clean_display_mod_name("", mid)
             )
 
-            subscribed = bool(state.get("subscribed", False))
+            subscribed = bool(
+                state_query_ok
+                and isinstance(subscription_snapshot, UGCSubscriptionSnapshot)
+                and mid in subscription_snapshot.subscribed_ids
+            )
+            positively_unsubscribed = bool(
+                state_query_ok
+                and isinstance(subscription_snapshot, UGCSubscriptionSnapshot)
+                and subscription_snapshot.proves_unsubscribed(mid)
+            )
             installed = bool(state.get("installed", False)) or bool(local_folder_exists)
             unchecked_status = "Could not check" if steam_running_for_status else "Steam Offline"
             unchecked_category = "check_failed" if steam_running_for_status else "steam_offline"
@@ -1463,12 +1782,12 @@ class ModsManagerOverlay:
             }
             if not state_query_ok:
                 workshop_status = unchecked_status
-            elif state:
+            elif state and (subscribed or positively_unsubscribed):
                 workshop_status = "Subscribed" if subscribed else "Local only"
                 selection_state = {
                     "category": "workshop" if subscribed else "local_only",
                     "workshop_confirmed": subscribed,
-                    "local_delete_candidate": not subscribed,
+                    "local_delete_candidate": positively_unsubscribed,
                     "requires_verification": False,
                     "has_error": False,
                 }
@@ -1507,17 +1826,140 @@ class ModsManagerOverlay:
                 workshop_status,
                 selection_state,
             ))
-        return items
+        return _LoadedModItems(
+            items,
+            steam_state=steam_state,
+            state_query_ok=state_query_ok,
+            inventory_validity=(
+                InventoryValidity.VALID
+                if state_query_ok else InventoryValidity.FAILED
+            ),
+            subscription_snapshot=subscription_snapshot if state_query_ok else None,
+        )
+
+    def _refresh_result_is_current(
+        self,
+        refresh_generation: int,
+        start_state: SteamClientState,
+        start_state_generation: int | None = None,
+    ) -> bool:
+        if int(refresh_generation) != int(
+            getattr(self, "_inventory_refresh_generation", 0) or 0
+        ):
+            return False
+        expected_state_generation = (
+            int(getattr(self, "_steam_state_generation", 0) or 0)
+            if start_state_generation is None else int(start_state_generation)
+        )
+        return bool(
+            expected_state_generation == int(
+                getattr(self, "_steam_state_generation", 0) or 0
+            )
+            and getattr(
+                self, "_authoritative_steam_state", SteamClientState.UNKNOWN,
+            ) is start_state
+        )
+
+    def _finish_inventory_refresh(self, *, success: bool | None = None) -> None:
+        self._inventory_refresh_active = False
+        self._inventory_refresh_cancel_event = None
+        idle_event = getattr(self, "_inventory_refresh_idle_event", None)
+        if idle_event is not None:
+            idle_event.set()
+        if bool(getattr(self, "_inventory_refresh_pending", False)):
+            self._inventory_refresh_pending = False
+            status = getattr(self, "_inventory_refresh_pending_status", None)
+            preserve = bool(
+                getattr(self, "_inventory_refresh_pending_preserve_status", False)
+            )
+            self._inventory_refresh_pending_status = None
+            self._inventory_refresh_pending_preserve_status = False
+            if self._mod_manager_is_visible():
+                self.refresh(completion_status=status, preserve_status=preserve)
+                return
+            success = False
+        callbacks = list(getattr(self, "_inventory_refresh_callbacks", []) or [])
+        self._inventory_refresh_callbacks = []
+        for callback in callbacks:
+            try:
+                callback(bool(success))
+            except Exception:
+                pass
+
+    def _apply_items_if_current(
+        self,
+        items,
+        completion_status,
+        preserve_status,
+        refresh_generation: int,
+        start_state: SteamClientState,
+        start_state_generation: int | None = None,
+    ):
+        end_state = getattr(items, "observed_end_state", start_state)
+        if end_state is not start_state:
+            changed = self._set_authoritative_steam_state(end_state)
+            if changed and self._mod_manager_is_visible():
+                self._inventory_refresh_pending = True
+                self._inventory_refresh_pending_preserve_status = True
+        if not self._refresh_result_is_current(
+            refresh_generation, start_state, start_state_generation,
+        ):
+            self._set_loading(False)
+            self._finish_inventory_refresh(success=False)
+            return False
+        loaded_state = getattr(items, "steam_state", start_state)
+        if loaded_state is not start_state:
+            self._set_authoritative_steam_state(loaded_state)
+            if self._mod_manager_is_visible():
+                self.refresh(preserve_status=True)
+            else:
+                self._set_loading(False)
+            self._finish_inventory_refresh(success=False)
+            return False
+        result = self._apply_items(items, completion_status, preserve_status)
+        self._finish_inventory_refresh(
+            success=(
+                getattr(items, "inventory_validity", InventoryValidity.FAILED)
+                is InventoryValidity.VALID
+            ),
+        )
+        return result
+
+    def _apply_load_error_if_current(
+        self,
+        message: str,
+        started_from_start_steam: bool,
+        refresh_generation: int,
+        start_state: SteamClientState,
+        start_state_generation: int | None = None,
+    ):
+        if not self._refresh_result_is_current(
+            refresh_generation, start_state, start_state_generation,
+        ):
+            self._set_loading(False)
+            self._finish_inventory_refresh(success=False)
+            return False
+        self._inventory_validity = InventoryValidity.FAILED
+        result = self._apply_load_error(message, started_from_start_steam)
+        self._finish_inventory_refresh(success=False)
+        return result
 
     def _apply_items(self, items, completion_status: str | None = None, preserve_status: bool = False):
         self._set_loading(False)
+        if hasattr(items, "state_query_ok"):
+            self._last_mod_state_query_ok = bool(items.state_query_ok)
+        self._inventory_validity = getattr(
+            items, "inventory_validity", InventoryValidity.FAILED,
+        )
+        self._subscription_snapshot = getattr(items, "subscription_snapshot", None)
         self._loaded_items = list(items or [])
         self._prune_selected_mod_ids(self._loaded_items)
-        self._render_loaded_items()
         if self._has_steam_checked_rows():
             self._passive_steam_was_ready_this_session = True
         self._set_steam_status_pill(self._steam_status_from_loaded_items())
         self._steam_management_verified = self._compute_steam_management_verified()
+        self._native_session_handoff_valid = self._steam_management_verified
+        self._render_loaded_items()
         self._clear_operation_start_steam_prompt_suppression_if_ready()
         self._update_batch_action_buttons()
         self._maybe_show_start_steam_manage_reminder()
@@ -1549,6 +1991,16 @@ class ModsManagerOverlay:
                 size_text = "—"
                 last_used_text = "Never"
                 workshop_status = "Subscribed" if bool(subscribed) else "Steam Offline"
+            rendered_state = self._selection_state_for_item(item)
+            if str(rendered_state.get("category") or "") == "steam_offline":
+                workshop_status = "Steam Offline"
+            elif bool(rendered_state.get("requires_verification", False)):
+                workshop_status = (
+                    "Checking..."
+                    if getattr(self, "_inventory_validity", InventoryValidity.STALE)
+                    is InventoryValidity.LOADING
+                    else "Could not check"
+                )
             row = self._make_row(
                 nm,
                 mid,
@@ -1664,6 +2116,7 @@ class ModsManagerOverlay:
         self._stop_passive_steam_watch()
         self._last_mod_state_query_ok = False
         self._steam_management_verified = False
+        self._native_session_handoff_valid = False
         self._set_steam_status_pill("issue")
         if started_from_start_steam:
             self._set_mod_operation_status("Mod Manager refresh failed.", running=False)
@@ -1673,6 +2126,7 @@ class ModsManagerOverlay:
             "OK",
             lambda _ok: None,
         )
+        self._maybe_start_passive_steam_watch()
         return False
 
     def _filter_row(self, row: Gtk.ListBoxRow) -> bool:
@@ -1768,7 +2222,9 @@ class ModsManagerOverlay:
         spinner = getattr(control, "_dzll_repair_spinner", None)
         percent_label = getattr(control, "_dzll_repair_percent", None)
         if button is not None:
-            button.set_sensitive(not active)
+            button.set_sensitive(
+                (not active) and self._steam_management_is_verified()
+            )
         if not active:
             row.remove_css_class("mods-repair-active")
             if spinner is not None:
@@ -1817,6 +2273,8 @@ class ModsManagerOverlay:
             or bool(getattr(self, "_batch_unsubscribe_running", False))
         ):
             self._set_mod_operation_status("Another mod operation is already running.", running=False)
+            return False
+        if not self._require_supported_native_steam():
             return False
         if self._dayz_running_for_repair():
             self._confirm_show(
@@ -1871,6 +2329,9 @@ class ModsManagerOverlay:
         return False
 
     def _start_repair(self, mod_id: int) -> None:
+        if not self._require_supported_native_steam():
+            self._release_repair_lease()
+            return
         self._repair_generation += 1
         generation = int(self._repair_generation)
         mid = int(mod_id)
@@ -2144,6 +2605,25 @@ class ModsManagerOverlay:
         self._sync_selection_ui()
 
     def _selection_state_for_item(self, item) -> dict:
+        if (
+            getattr(self, "_authoritative_steam_state", SteamClientState.UNKNOWN)
+            is not SteamClientState.NATIVE
+        ):
+            return {
+                "category": "steam_offline",
+                "workshop_confirmed": False,
+                "local_delete_candidate": False,
+                "requires_verification": True,
+                "has_error": False,
+            }
+        if getattr(self, "_inventory_validity", InventoryValidity.STALE) is not InventoryValidity.VALID:
+            return {
+                "category": "check_failed",
+                "workshop_confirmed": False,
+                "local_delete_candidate": False,
+                "requires_verification": True,
+                "has_error": False,
+            }
         try:
             state = item[9]
         except Exception:
@@ -2312,6 +2792,15 @@ class ModsManagerOverlay:
             self.btn_unsubscribe_all_workshop.set_sensitive(unsubscribe_all_enabled)
         except Exception:
             pass
+        for row, _nm_lc, _mid_s in list(getattr(self, "_rows_cache", []) or []):
+            try:
+                mid = int(getattr(row, "_dzll_mod_id", 0) or 0)
+                self._apply_repair_state_to_row(
+                    row,
+                    getattr(self, "_repair_state_by_id", {}).get(mid),
+                )
+            except Exception:
+                pass
         self._update_batch_unsubscribe_stop_button()
         return False
 
@@ -2441,6 +2930,7 @@ class ModsManagerOverlay:
         result = {
             "safe_ids": [],
             "rejected_ids": [],
+            "subscription_snapshot": None,
         }
         ids = []
         seen = set()
@@ -2456,13 +2946,19 @@ class ModsManagerOverlay:
 
         if not ids:
             return True, result, ""
+        if not _supported_native_steam_running():
+            return False, result, "Start native Steam to manage Workshop mods."
 
         try:
-            ok, states = query_ugc_state_checked(ids, appid=int(APPID), timeout=int(timeout))
+            snapshot = query_ugc_inventory_checked(
+                ids, appid=int(APPID), timeout=int(timeout),
+            )
         except Exception:
             return False, result, "DZLL could not check the selected mods with Steam."
-        if not ok:
+        if not isinstance(snapshot, UGCSubscriptionSnapshot) or not snapshot.valid:
             return False, result, "DZLL could not check the selected mods with Steam."
+        states = snapshot.states
+        result["subscription_snapshot"] = snapshot
 
         workshop_roots = _candidate_workshop_roots(workshop_dir=self._workshop_dir())
         for mid in ids:
@@ -2470,7 +2966,10 @@ class ModsManagerOverlay:
             if not state:
                 result["rejected_ids"].append(int(mid))
                 continue
-            if bool(state.get("subscribed", False)):
+            if mid in snapshot.subscribed_ids or bool(state.get("subscribed", False)):
+                result["rejected_ids"].append(int(mid))
+                continue
+            if not snapshot.proves_unsubscribed(mid):
                 result["rejected_ids"].append(int(mid))
                 continue
             if not _has_local_workshop_state(workshop_roots, int(mid)):
@@ -2523,7 +3022,7 @@ class ModsManagerOverlay:
             deadline = time.monotonic() + 90.0
             while time.monotonic() < deadline:
                 try:
-                    if not is_native_steam_running():
+                    if not _supported_native_steam_running():
                         time.sleep(2.0)
                         continue
                 except Exception:
@@ -2606,7 +3105,7 @@ class ModsManagerOverlay:
                     return False
 
                 try:
-                    steam_running = bool(is_native_steam_running())
+                    steam_running = _supported_native_steam_running()
                 except Exception:
                     steam_running = False
 
@@ -2660,6 +3159,8 @@ class ModsManagerOverlay:
         threading.Thread(target=worker, daemon=True).start()
 
     def _run_batch_local_cleanup(self, mod_ids: list[int], *, close_steam: bool, restart_steam: bool = False) -> None:
+        if not self._require_supported_native_steam():
+            return
         ids = []
         seen = set()
         for raw_mid in list(mod_ids or []):
@@ -2690,14 +3191,19 @@ class ModsManagerOverlay:
                 failures.append((0, error or "DZLL could not check the selected mods with Steam."))
             else:
                 ids[:] = list(plan.get("safe_ids") or [])
+                subscription_snapshot = plan.get("subscription_snapshot")
                 if not ids:
                     failures.append((0, "Selected mods are no longer safe to clean up."))
+            if not ready:
+                subscription_snapshot = None
 
             if not failures and close_steam:
+                if not _supported_native_steam_running():
+                    failures.append((0, "Supported native Steam is unavailable. Local files were preserved."))
                 steam_cmd = resolve_native_steam_cmd()
-                if not steam_cmd:
+                if not failures and not steam_cmd:
                     failures.append((0, "Native Steam could not be found. Local files were preserved."))
-                else:
+                elif not failures:
                     try:
                         subprocess.run(
                             [steam_cmd, "-shutdown"],
@@ -2714,7 +3220,7 @@ class ModsManagerOverlay:
                         steam_closed_by_cleanup = True
 
             try:
-                steam_running_now = bool(is_native_steam_running())
+                steam_running_now = _supported_native_steam_running()
             except Exception:
                 steam_running_now = True
             if not failures and steam_running_now:
@@ -2725,7 +3231,7 @@ class ModsManagerOverlay:
                 cleanup_attempted = True
                 for index, mid in enumerate(ids, start=1):
                     try:
-                        if is_native_steam_running():
+                        if _supported_native_steam_running():
                             failures.append((mid, "Steam is running. Local files were preserved."))
                             break
                     except Exception:
@@ -2734,7 +3240,13 @@ class ModsManagerOverlay:
 
                     GLib.idle_add(self._set_mod_operation_status, f"Cleaning up {index}/{total}...", True)
                     try:
-                        result = delete_ugc_mod_local_files_after_unsubscribe(int(mid), appid=int(APPID), log_fn=print)
+                        result = delete_ugc_mod_local_files_after_unsubscribe(
+                            int(mid),
+                            appid=int(APPID),
+                            log_fn=print,
+                            native_session_verified=steam_closed_by_cleanup,
+                            subscription_snapshot=subscription_snapshot,
+                        )
                     except Exception as exc:
                         result = {"ok": False, "error": str(exc)}
                     if bool(result.get("ok", False)):
@@ -2802,6 +3314,8 @@ class ModsManagerOverlay:
             "unknown_ids": [],
         }
         ids_to_query = []
+        if not _supported_native_steam_running():
+            return False, result, "Start native Steam to manage Workshop mods."
         for mid in selected_ids:
             result["total"] += 1
             ids_to_query.append(int(mid))
@@ -2948,6 +3462,8 @@ class ModsManagerOverlay:
             ids.append(mid)
         if not ids:
             return True, result, ""
+        if not _supported_native_steam_running():
+            return False, result, "Start native Steam to manage Workshop mods."
 
         try:
             ok, states = query_ugc_state_checked(ids, appid=int(APPID), timeout=int(timeout))
@@ -3012,7 +3528,7 @@ class ModsManagerOverlay:
             deadline = time.monotonic() + 90.0
             while time.monotonic() < deadline:
                 try:
-                    if not is_native_steam_running():
+                    if not _supported_native_steam_running():
                         time.sleep(2.0)
                         continue
                 except Exception:
@@ -3046,48 +3562,42 @@ class ModsManagerOverlay:
 
     def _refresh_then_confirm_unsubscribe_all_workshop(self) -> None:
         self._set_mod_operation_status("Refreshing Mod Manager...", running=False)
-        workshop_dir = self._workshop_dir()
-        proton_prefix = self._proton_prefix()
-        self._set_loading(True)
 
-        def worker():
-            try:
-                items = self._load_installed_items(workshop_dir, proton_prefix)
-            except Exception as exc:
-                GLib.idle_add(self._set_mod_operation_pending, False)
-                GLib.idle_add(self._apply_load_error, str(exc), False)
+        def after_refresh(success: bool):
+            if not success:
+                self._set_mod_operation_pending(False)
+                self._set_mod_operation_status("DZLL could not check mods with Steam.", running=False)
                 return
+            loaded_ids = self._loaded_mod_ids()
 
-            def done():
-                self._apply_items(items, "Steam checked Workshop mods.")
-                loaded_ids = self._loaded_mod_ids()
+            def plan_worker():
+                ready, plan, error = self._build_unsubscribe_all_workshop_plan(
+                    loaded_ids, timeout=20,
+                )
 
-                def plan_worker():
-                    ready, plan, error = self._build_unsubscribe_all_workshop_plan(loaded_ids, timeout=20)
+                def plan_done():
+                    if ready:
+                        self._confirm_unsubscribe_all_workshop(plan)
+                    else:
+                        self._set_mod_operation_pending(False)
+                        self._set_mod_operation_status("DZLL could not check mods with Steam.", running=False)
+                        self._confirm_show(
+                            "Could not check with Steam",
+                            error or "DZLL could not check mods with Steam. No mods were unsubscribed.",
+                            "OK",
+                            lambda _ok: None,
+                            show_cancel=False,
+                        )
+                    return False
 
-                    def plan_done():
-                        if ready:
-                            self._confirm_unsubscribe_all_workshop(plan)
-                        else:
-                            self._set_mod_operation_pending(False)
-                            self._set_mod_operation_status("DZLL could not check mods with Steam.", running=False)
-                            self._confirm_show(
-                                "Could not check with Steam",
-                                error or "DZLL could not check mods with Steam. No mods were unsubscribed.",
-                                "OK",
-                                lambda _ok: None,
-                                show_cancel=False,
-                            )
-                        return False
+                GLib.idle_add(plan_done)
 
-                    GLib.idle_add(plan_done)
+            threading.Thread(target=plan_worker, daemon=True).start()
 
-                threading.Thread(target=plan_worker, daemon=True).start()
-                return False
-
-            GLib.idle_add(done)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self.refresh(
+            completion_status="Steam checked Workshop mods.",
+            completion_cb=after_refresh,
+        )
 
     def _confirm_unsubscribe_all_workshop(self, plan: dict) -> None:
         workshop_ids = [int(mid) for mid in plan.get("workshop_ids", []) if int(mid) > 0]
@@ -3163,7 +3673,7 @@ class ModsManagerOverlay:
             deadline = time.monotonic() + 90.0
             while time.monotonic() < deadline:
                 try:
-                    if not is_native_steam_running():
+                    if not _supported_native_steam_running():
                         time.sleep(2.0)
                         continue
                 except Exception:
@@ -3196,38 +3706,30 @@ class ModsManagerOverlay:
 
     def _refresh_then_confirm_batch_unsubscribe(self, selected_ids: list[int]) -> None:
         self._set_mod_operation_status("Refreshing Mod Manager...", running=False)
-        workshop_dir = self._workshop_dir()
-        proton_prefix = self._proton_prefix()
-        self._set_loading(True)
 
-        def worker():
-            try:
-                items = self._load_installed_items(workshop_dir, proton_prefix)
-            except Exception as exc:
-                GLib.idle_add(self._set_mod_operation_pending, False)
-                GLib.idle_add(self._apply_load_error, str(exc), False)
+        def after_refresh(success: bool):
+            if not success:
+                self._set_mod_operation_pending(False)
+                self._set_mod_operation_status("Could not check with Steam.", running=False)
                 return
+            ok, plan, error = self._unsubscribe_plan_from_loaded_selection(selected_ids)
+            if ok:
+                self._confirm_batch_unsubscribe(plan)
+            else:
+                self._set_mod_operation_pending(False)
+                self._set_mod_operation_status("Could not check with Steam.", running=False)
+                self._confirm_show(
+                    "Could not check with Steam",
+                    error or "DZLL could not check the selected mods with Steam. No mods were unsubscribed.",
+                    "OK",
+                    lambda _ok: None,
+                    show_cancel=False,
+                )
 
-            def done():
-                self._apply_items(items, "Steam checked Workshop mods.")
-                ok, plan, error = self._unsubscribe_plan_from_loaded_selection(selected_ids)
-                if ok:
-                    self._confirm_batch_unsubscribe(plan)
-                else:
-                    self._set_mod_operation_pending(False)
-                    self._set_mod_operation_status("Could not check with Steam.", running=False)
-                    self._confirm_show(
-                        "Could not check with Steam",
-                        error or "DZLL could not check the selected mods with Steam. No mods were unsubscribed.",
-                        "OK",
-                        lambda _ok: None,
-                        show_cancel=False,
-                    )
-                return False
-
-            GLib.idle_add(done)
-
-        threading.Thread(target=worker, daemon=True).start()
+        self.refresh(
+            completion_status="Steam checked Workshop mods.",
+            completion_cb=after_refresh,
+        )
 
     def _confirm_batch_unsubscribe(self, verification: dict) -> None:
         workshop_ids = [int(mid) for mid in verification.get("workshop_ids", [])]
@@ -3266,7 +3768,7 @@ class ModsManagerOverlay:
 
         had_local_state_before = _has_local_workshop_state(workshop_roots, mid)
         try:
-            steam_running = bool(is_native_steam_running())
+            steam_running = _supported_native_steam_running()
         except Exception:
             steam_running = False
         if not steam_running:
@@ -3280,13 +3782,13 @@ class ModsManagerOverlay:
             )
         except Exception:
             try:
-                steam_running = bool(is_native_steam_running())
+                steam_running = _supported_native_steam_running()
             except Exception:
                 steam_running = False
             return "steam_issue" if steam_running else "steam_closed_unconfirmed"
         if not request_ok:
             try:
-                steam_running = bool(is_native_steam_running())
+                steam_running = _supported_native_steam_running()
             except Exception:
                 steam_running = False
             return "steam_issue" if steam_running else "steam_closed_unconfirmed"
@@ -3295,7 +3797,7 @@ class ModsManagerOverlay:
         while time.monotonic() < deadline:
             local_state_present = _has_local_workshop_state(workshop_roots, mid)
             try:
-                steam_running = bool(is_native_steam_running())
+                steam_running = _supported_native_steam_running()
             except Exception:
                 steam_running = False
             if not steam_running:
@@ -3313,7 +3815,7 @@ class ModsManagerOverlay:
                 states = {}
             if not ok:
                 try:
-                    steam_running = bool(is_native_steam_running())
+                    steam_running = _supported_native_steam_running()
                 except Exception:
                     steam_running = False
                 if not steam_running:
@@ -3348,7 +3850,7 @@ class ModsManagerOverlay:
             if not _has_local_workshop_state(workshop_roots, mid):
                 return "removed"
             try:
-                steam_running = bool(is_native_steam_running())
+                steam_running = _supported_native_steam_running()
             except Exception:
                 steam_running = False
             if not steam_running:
@@ -3360,6 +3862,8 @@ class ModsManagerOverlay:
         return "removed" if not _has_local_workshop_state(workshop_roots, mid) else "unsubscribed"
 
     def _remove_dzll_symlinks_after_unsubscribe(self, mod_id: int) -> bool:
+        if not _supported_native_steam_running():
+            return False
         try:
             remove_dzll_symlinks_for_mod(int(mod_id), proton_prefix=self._proton_prefix(), log_fn=print)
             return True
@@ -3372,6 +3876,8 @@ class ModsManagerOverlay:
 
     def _run_batch_unsubscribe(self, workshop_ids: list[int], skip_count: int) -> None:
         if bool(getattr(self, "_batch_unsubscribe_running", False)):
+            return
+        if not self._require_supported_native_steam():
             return
         ids = [int(mid) for mid in workshop_ids if int(mid) > 0]
         if not ids:
@@ -3449,6 +3955,7 @@ class ModsManagerOverlay:
                     self._suppress_start_steam_manage_prompt_for_current_operation()
                     self._last_mod_state_query_ok = False
                     self._steam_management_verified = False
+                    self._native_session_handoff_valid = False
                     self._set_steam_status_pill("offline")
                     self._selected_mod_ids.difference_update(set(confirmed_ids))
                     self._update_batch_action_buttons()
@@ -3471,6 +3978,7 @@ class ModsManagerOverlay:
                     self._suppress_start_steam_manage_prompt_for_current_operation()
                     self._last_mod_state_query_ok = False
                     self._steam_management_verified = False
+                    self._native_session_handoff_valid = False
                     self._set_steam_status_pill("issue")
                     self._selected_mod_ids.difference_update(set(confirmed_ids))
                     self._update_batch_action_buttons()

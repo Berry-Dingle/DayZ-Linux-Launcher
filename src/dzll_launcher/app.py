@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -12,6 +15,11 @@ class DZLLApp(Gtk.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID)
         self.window = None
+        self.restart_requested = False
+
+    def request_restart(self):
+        self.restart_requested = True
+        self.quit()
 
     def do_activate(self):
         if not self.window:
@@ -35,7 +43,14 @@ class DZLLApp(Gtk.Application):
 
 def main():
     app = DZLLApp()
-    raise SystemExit(app.run(None))
+    original_argv = list(sys.argv)
+    status = app.run(original_argv)
+    if app.restart_requested:
+        args = original_argv[1:]
+        if Path(original_argv[0]).name == "__main__.py":
+            os.execv(sys.executable, [sys.executable, "-m", "dzll_launcher", *args])
+        os.execv(sys.executable, [sys.executable, original_argv[0], *args])
+    raise SystemExit(status)
 
 
 if __name__ == "__main__":

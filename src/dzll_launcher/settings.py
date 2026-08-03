@@ -10,6 +10,7 @@ SETTINGS_PATH = os.path.join(CFG_DIR, "settings.json")
 DEFAULTS: Dict[str, Any] = {
     # General
     "show_server_companion": False,
+    "show_background_download_buttons": False,
     "ingame_name": "",
     "high_ping_cutoff_ms": 250,
     "hide_below_max_players": 0,

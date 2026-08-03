@@ -170,7 +170,9 @@ def test_row_action_order_tooltip_snapshot_and_background_caller_wiring():
     build = COLUMN_SOURCE.split("def build_server_column_view", 1)[1]
     assert build.index("monitor_factory =") < build.index("download_factory =")
     assert build.index("download_factory =") < build.index("join_factory =")
-    assert "Subscribe to and download required mods\\nwithout joining" in build
+    assert '"Subscribe and download required\\n"' in build
+    assert '"mods without joining\\n"' in build
+    assert '"Servers can be queued"' in build
     assert "Gtk.AccessibleProperty.LABEL" in COLUMN_SOURCE
     handler = WINDOW_SOURCE.split("def _background_prepare_for_obj", 1)[1].split(
         "def _background_prepare_apply_queue_snapshot", 1
@@ -192,7 +194,7 @@ def test_sensitivity_cancel_terminal_close_and_fifo_ownership_are_explicit():
     assert "refresh_download_mods_states" in WINDOW_SOURCE
     assert "refresh_join_states" in WINDOW_SOURCE
     assert "_background_prepare_cancel_requested" in WINDOW_SOURCE
-    assert 'set_label("Cancelling…")' in WINDOW_SOURCE
+    assert 'set_text("Cancelling…")' in WINDOW_SOURCE
     assert "_background_prepare_terminal_handled" in WINDOW_SOURCE
     assert 'set_label("Close")' in WINDOW_SOURCE
     assert "background_prepare_status.set_visible(False)" in WINDOW_SOURCE

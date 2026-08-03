@@ -1,6 +1,9 @@
 import io
 import json
+import os
 import queue
+import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -945,6 +948,360 @@ def test_reader_thread_survival_after_clean_shutdown_fails_closed(monkeypatch):
     ):
         session.close()
     assert process.signals == []
+
+
+def test_native_and_python_diagnostics_cannot_enter_protocol_stdout():
+    project_root = Path(__file__).resolve().parents[1]
+    env = dict(os.environ)
+    prior_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(project_root / "src") + (
+        os.pathsep + prior_pythonpath if prior_pythonpath else ""
+    )
+    script = (
+        "import os\n"
+        "from dzll_launcher import steam_ugc_helper as helper\n"
+        "helper._isolate_protocol_stdout()\n"
+        "os.write(1, b'native Steamworks diagnostic\\n')\n"
+        "print('ordinary Python diagnostic', flush=True)\n"
+        "helper.emit({'type': 'probe', 'request_id': 'p-1'})\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert json.loads(result.stdout) == {
+        "type": "probe", "request_id": "p-1",
+    }
+    assert result.stdout.count("\n") == 1
+    assert "native Steamworks diagnostic" in result.stderr
+    assert "ordinary Python diagnostic" in result.stderr
+
+
+def test_malformed_active_command_is_finalized_once_then_shutdown_quarantines_stale_events(
+        monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_malformed_"))
+
+    class MalformedActiveProcess(ProtocolProcess):
+        def __init__(self, temp_dir):
+            super().__init__(temp_dir)
+            self.active_request_id = ""
+
+        def write(self, raw):
+            message = json.loads(raw)
+            self.commands.append(message)
+            command = message["command"]
+            request_id = message["request_id"]
+            if command == "shutdown":
+                self.stdout.push(
+                    {
+                        "type": "item", "request_id": self.active_request_id,
+                        "id": 1, "installed": True,
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "command_result",
+                        "request_id": self.active_request_id,
+                        "ok": True,
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": request_id,
+                        "command": "shutdown",
+                    }
+                )
+                self.stdout.push(
+                    {
+                        "type": "shutdown_complete", "request_id": request_id,
+                        "ok": True, "steamapi_shutdown": True,
+                        "temp_cleanup": True,
+                    }
+                )
+                self.returncode = 0
+                self.stdout.close()
+            else:
+                self.active_request_id = request_id
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": request_id,
+                        "command": command,
+                    }
+                )
+                self.stdout.lines.put("native output on protocol fd\n")
+            return len(raw)
+
+    process = MalformedActiveProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    delivered = []
+    session = steam_ugc_backend.CooperativeUGCSession()
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="malformed protocol data",
+    ):
+        session.run_command(
+            "state", timeout=2, mod_ids=[1], on_event=delivered.append,
+        )
+    assert session._active_request_id == ""
+    assert session._abandoned_request_ids == {process.active_request_id}
+    assert not session.usable
+
+    session.close()
+    commands_after_close = list(process.commands)
+    session.close()
+    assert process.commands == commands_after_close
+    assert [event["type"] for event in delivered] == ["command_accepted"]
+    assert process.commands[-1]["command"] == "shutdown"
+    assert process.commands[-1]["request_id"].startswith("shutdown-")
+    assert process.signals == []
+    assert not appid_dir.exists()
+
+
+def test_partial_protocol_message_followed_by_eof_fails_the_session():
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._stdout_q.put('{"type":"item"')
+    session._stdout_q.put(None)
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="partial protocol message",
+    ):
+        session._event(0.1)
+    assert session._fatal
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="closed its protocol stream",
+    ):
+        session._event(0.1)
+
+
+@pytest.mark.parametrize(
+    ("bad_response", "message"),
+    [
+        ("duplicate", "duplicate command acceptance"),
+        ("unexpected", "unexpected Steam UGC helper event"),
+        ("concatenated", "malformed protocol data"),
+    ],
+)
+def test_duplicated_concatenated_and_unexpected_command_data_fail_the_session(
+        monkeypatch, bad_response, message):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_bad_frame_"))
+
+    class BadFrameProcess(ProtocolProcess):
+        def write(self, raw):
+            command = json.loads(raw)
+            if command["command"] == "shutdown":
+                return super().write(raw)
+            self.commands.append(command)
+            accepted = {
+                "type": "command_accepted",
+                "request_id": command["request_id"],
+                "command": command["command"],
+            }
+            self.stdout.push(accepted)
+            if bad_response == "duplicate":
+                self.stdout.push(accepted)
+            elif bad_response == "unexpected":
+                self.stdout.push(
+                    {
+                        "type": "not_a_protocol_event",
+                        "request_id": command["request_id"],
+                    }
+                )
+            else:
+                first = json.dumps(
+                    {"type": "item", "request_id": command["request_id"]}
+                )
+                second = json.dumps(
+                    {"type": "command_result", "request_id": command["request_id"]}
+                )
+                self.stdout.lines.put(first + second + "\n")
+            return len(raw)
+
+    process = BadFrameProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    with pytest.raises(steam_ugc_backend.UGCSessionError, match=message):
+        session.run_command("state", timeout=2, mod_ids=[1])
+    assert not session.usable
+    session.close()
+    assert not appid_dir.exists()
+
+
+def test_multiple_json_lines_from_one_buffer_are_independent_messages():
+    session = steam_ugc_backend.CooperativeUGCSession()
+    combined = (
+        '{"type":"session_waiting","request_id":null}\n'
+        '{"type":"session_ready","request_id":null}\n'
+    )
+    for line in io.StringIO(combined):
+        session._stdout_q.put(line)
+    assert session._event(0.1)["type"] == "session_waiting"
+    assert session._event(0.1)["type"] == "session_ready"
+    assert session._ready
+
+
+def test_shutdown_waits_for_active_command_cancellation_and_reaps_once(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_active_close_"))
+    command_started = threading.Event()
+
+    class ActiveUntilCancelledProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            if message["command"] not in {"cancel", "shutdown"}:
+                self.commands.append(message)
+                self.stdout.push(
+                    {
+                        "type": "command_accepted",
+                        "request_id": message["request_id"],
+                        "command": message["command"],
+                    }
+                )
+                command_started.set()
+                return len(raw)
+            return super().write(raw)
+
+    process = ActiveUntilCancelledProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    results = []
+    failures = []
+
+    def run_command():
+        try:
+            results.append(session.run_command("state", timeout=30, mod_ids=[1]))
+        except Exception as exc:
+            failures.append(exc)
+
+    worker = threading.Thread(target=run_command)
+    worker.start()
+    assert command_started.wait(timeout=2.0)
+    session.close()
+    worker.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert failures == []
+    assert results and results[0][0] is False
+    assert [message["command"] for message in process.commands] == [
+        "query_state", "cancel", "shutdown",
+    ]
+    assert session._active_request_id == ""
+    assert process.signals == []
+    assert not appid_dir.exists()
+
+
+def test_helper_active_shutdown_preserves_id_without_old_command_terminal_events(
+        monkeypatch):
+    commands = (
+        '{"command":"subscribe_download","request_id":"d-1",'
+        '"item_ids":[7],"timeout":30}\n'
+        '{"command":"shutdown","request_id":"s-2"}\n'
+    )
+    events = []
+
+    class BusySteam:
+        ugc_accessor_name = "fake"
+
+        def __init__(self, _paths):
+            pass
+
+        def init(self):
+            return None
+
+        def shutdown(self):
+            return None
+
+        def snapshot(self, item_id):
+            return steam_ugc_helper.ItemSnapshot(
+                item_id, 1, ["Subscribed"], True, False, False, True, False,
+                1, 10, 0, None,
+            )
+
+        def subscribe(self, _item_id):
+            return 1
+
+        def download(self, _item_id, _high_priority):
+            return True
+
+        def run_callbacks(self):
+            return None
+
+    monkeypatch.setattr(steam_ugc_helper.sys, "stdin", io.StringIO(commands))
+    monkeypatch.setattr(
+        steam_ugc_helper, "detect_steam_paths", lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        steam_ugc_helper, "ensure_ld_library_path", lambda _paths: None,
+    )
+    monkeypatch.setattr(steam_ugc_helper, "SteamUGC", BusySteam)
+    monkeypatch.setattr(steam_ugc_helper, "emit", events.append)
+
+    assert steam_ugc_helper.command_session(SimpleNamespace(appid=221100)) == 0
+    shutdown_complete = next(
+        event for event in events if event["type"] == "shutdown_complete"
+    )
+    assert shutdown_complete["request_id"] == "s-2"
+    assert any(
+        event.get("type") == "command_accepted"
+        and event.get("request_id") == "s-2"
+        for event in events
+    )
+    assert not any(
+        event.get("request_id") == "d-1"
+        and event.get("type") in {"command_result", "cancellation_ack"}
+        for event in events
+    )
+
+
+def test_retry_after_failed_helper_session_starts_clean_process(monkeypatch):
+    first_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_retry_first_"))
+    second_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_retry_second_"))
+
+    class FirstFailedProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            if message["command"] == "shutdown":
+                return super().write(raw)
+            self.commands.append(message)
+            self.stdout.push(
+                {
+                    "type": "command_accepted",
+                    "request_id": message["request_id"],
+                    "command": message["command"],
+                }
+            )
+            self.stdout.lines.put("broken frame\n")
+            return len(raw)
+
+    processes = [FirstFailedProcess(first_dir), ProtocolProcess(second_dir)]
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess,
+        "Popen",
+        lambda *_args, **_kwargs: processes.pop(0),
+    )
+
+    failed = steam_ugc_backend.CooperativeUGCSession()
+    with pytest.raises(steam_ugc_backend.UGCSessionError):
+        failed.run_command("state", timeout=2, mod_ids=[1])
+    failed.close()
+
+    retry = steam_ugc_backend.CooperativeUGCSession()
+    assert retry.run_command("state", timeout=2, mod_ids=[1])[0]
+    retry.close()
+    assert retry._next_request_id == 2
+    assert retry._fatal is False
+    assert not first_dir.exists()
+    assert not second_dir.exists()
 
 
 def _fast_monotonic():

@@ -835,8 +835,18 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
         except UGCHelperReapError:
             raise
         except Exception as exc:
-            ok = False
-            err_msg = f"Steam UGC session shutdown failed: {exc}"
+            secondary_error = f"Steam UGC session shutdown failed: {exc}"
+            print(f"[JOIN] Secondary cleanup diagnostic: {secondary_error}", file=sys.stderr)
+            if attempt_id:
+                win._join_log(
+                    attempt_id,
+                    "secondary Steam UGC cleanup failure",
+                    error=str(exc),
+                    preparation_ok=bool(ok),
+                )
+            # The helper has already been reaped here.  Preserve a substantive
+            # operation failure, and do not turn confirmed preparation success
+            # into a false failure solely because teardown diagnostics failed.
     if helper_reap_error is not None:
         raise helper_reap_error
 

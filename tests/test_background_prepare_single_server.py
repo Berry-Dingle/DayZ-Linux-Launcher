@@ -286,7 +286,7 @@ def test_normal_join_entry_rejects_background_gate_before_starting_attempt():
     entry = WINDOW_SOURCE.split("def _join_server_for_obj", 1)[1].split(
         "def _preflight_block_warning_ui_blocking", 1
     )[0]
-    assert entry.index("preparation_operation_busy(self)") < entry.index(
+    assert entry.index("shared_join_preparation_busy(self)") < entry.index(
         "self._join_attempts.begin("
     )
     assert entry.index("self._join_attempts.begin(") < entry.index(

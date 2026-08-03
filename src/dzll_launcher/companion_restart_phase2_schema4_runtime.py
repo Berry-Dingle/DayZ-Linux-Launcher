@@ -103,6 +103,14 @@ class Schema4WriteResult:
 
 
 @dataclass(frozen=True)
+class Schema4ExportSnapshot:
+    canonical_bytes: bytes
+    schema_version: int
+    server_count: int
+    sha256: str
+
+
+@dataclass(frozen=True)
 class Schema4SoakResult:
     start_count: int
     healthy_poll_count: int
@@ -264,6 +272,27 @@ class AuthoritativeSchema4Runtime:
             if isinstance(legacy, Mapping):
                 projected_servers[key] = copy.deepcopy(dict(legacy))
         return projected
+
+    def export_snapshot(self) -> Schema4ExportSnapshot:
+        """Return one validated canonical view of current authoritative memory."""
+
+        self._ensure_open()
+        with self._mutex:
+            assert self._state is not None
+            payload = serialize_schema4_state(self._state)
+            loaded = deserialize_schema4_bytes(
+                payload, quarantine_invalid_servers=False
+            )
+            if not loaded.report.valid:
+                raise Schema4ValidationError(
+                    "authoritative export snapshot failed strict validation"
+                )
+            return Schema4ExportSnapshot(
+                canonical_bytes=payload,
+                schema_version=SCHEMA4_ROOT_VERSION,
+                server_count=len(loaded.state.get("servers", {})),
+                sha256=_sha256(payload),
+            )
 
     def authority_decision(self, server_key: str):
         """Return a copied immutable decision for a validated server only."""

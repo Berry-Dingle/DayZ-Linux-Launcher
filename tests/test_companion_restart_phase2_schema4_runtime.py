@@ -20,6 +20,7 @@ from dzll_launcher import companion_restart_phase2_schema4_runtime as live4
 from dzll_launcher import companion_restart_phase2_scoring as scoring
 from dzll_launcher import companion_restart_phase2_storage as storage
 from dzll_launcher import window as window_module
+from dzll_launcher import companion_learning_transfer as transfer
 from dzll_launcher.window import DZLLWindow
 
 
@@ -210,6 +211,65 @@ def test_unchanged_load_flush_is_no_write(tmp_path):
     assert not result.wrote and path.read_bytes() == raw
     assert path.stat().st_mtime_ns == stat.st_mtime_ns
     value.close(flush=False)
+
+
+def test_export_snapshot_is_locked_canonical_and_includes_dirty_memory(tmp_path):
+    value, path, raw = _open(tmp_path)
+    value.replace_server_record(SERVER, _changed_record(value, "export-dirty"), reason="export")
+    before = path.read_bytes()
+    snapshot = value.export_snapshot()
+    assert snapshot.schema_version == 4
+    assert snapshot.server_count == 1
+    assert snapshot.sha256 == hashlib.sha256(snapshot.canonical_bytes).hexdigest()
+    assert b"export-dirty" in snapshot.canonical_bytes
+    assert path.read_bytes() == before == raw
+    assert value.snapshot().dirty_server_keys == (SERVER,)
+    value.close(flush=False)
+
+
+def test_phase2_export_proxy_does_not_interrupt_monitoring(tmp_path):
+    path = tmp_path / "export-phase2.json"
+    _write(path)
+    value = _cutover_runtime(path)
+    session, _created = value.ensure_monitoring_session(
+        SERVER, wall_at=BASE, monotonic_at=0, poll_generation=7
+    )
+    snapshot = value.export_authoritative_schema4_snapshot()
+    assert snapshot.server_count == 1
+    assert value.active_monitoring_session_id(SERVER) == session
+    value.shutdown(wall_at=BASE + 1, monotonic_at=1)
+
+
+def test_startup_import_then_runtime_write_advances_imported_generation(tmp_path):
+    live = tmp_path / "companion_restart_learning_phase2.json"
+    old_state = _state()
+    old_state["runtime_write_generation"] = 3
+    live.write_bytes(schema4.serialize_schema4_state(old_state))
+    imported_state = _state()
+    imported_state["runtime_write_generation"] = 40
+    imported_state["reason_codes"] = sorted(
+        set(imported_state["reason_codes"]) | {"imported-generation"}
+    )
+    imported = schema4.serialize_schema4_state(imported_state)
+    validated = transfer.validate_external_learning_bytes(
+        imported, source_filename="imported.json"
+    )
+    transfer.stage_pending_import(validated, config_dir=tmp_path)
+    applied = transfer.apply_pending_import_at_startup(
+        config_dir=tmp_path, live_path=live
+    )
+    assert applied.status == "applied"
+
+    value = _cutover_runtime(live)
+    backend = value._authoritative_schema4_backend
+    assert backend.snapshot().generation == 40
+    backend.replace_server_record(
+        SERVER, _changed_record(backend, "post-import-write"), reason="post-import"
+    )
+    result = backend.flush()
+    assert result.wrote and result.generation == 41
+    assert b"post-import-write" in live.read_bytes()
+    value.shutdown(wall_at=BASE + 1, monotonic_at=1)
 
 
 def _cutover_runtime(path: Path) -> runtime.Phase2RestartRuntime:

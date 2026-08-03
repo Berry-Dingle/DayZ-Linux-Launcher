@@ -5,6 +5,9 @@
 # (Updated per requested ordering + new launch toggle + tooltips + dimming autodetected fields.)
 
 import os
+import threading
+import time
+from enum import IntEnum
 import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Pango, GLib, Gio
@@ -14,29 +17,122 @@ from .settings import save_settings, reset_settings, autodetect_steamcmd_path, a
 from .storage import save_last_played
 from .ui_row import hr, attach_pointer_cursor
 from .mods_ui import ModsManagerOverlay
+from .mod_manager_recovery import (
+    launch_native_steam,
+    request_graceful_flatpak_steam_shutdown,
+    wait_for_flatpak_steam_exit,
+    wait_for_native_mod_manager_ready,
+)
+from .steam_native import (
+    SteamClientState,
+    native_steam_ready_for_mod_manager,
+    resolve_steam_runtime_state,
+)
+from .steam_ugc_backend import close_active_ugc_sessions
+
+RECOVERY_DIALOG_WIDTH = 520
+RECOVERY_INVENTORY_ATTEMPTS = 3
+RECOVERY_INVENTORY_RETRY_DELAY_MS = 1500
+
+
+class ModManagerRecoveryPhase(IntEnum):
+    IDLE = 0
+    CLOSING_STEAM = 10
+    RESETTING = 20
+    STARTING_NATIVE = 30
+    WAITING_FOR_NATIVE = 40
+    PREPARING_INVENTORY = 50
+    OPENING_MOD_MANAGER = 60
+    COMPLETE = 70
+    FAILED = 80
 
 class SettingsUI:
     def __init__(self, window):
         self._win = window
+        self._mods_manager_entry_check_running = False
+        self._mods_manager_flatpak_warning = None
+        self._mods_manager_recovery_running = False
+        self._mods_manager_recovery_generation = 0
+        self._mods_manager_recovery_cancel_event = None
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.IDLE
+        self._mods_manager_recovery_retry_source_id = 0
+        self._mods_manager_recovery_launch_generation = 0
+        self._mods_manager_recovery_launched_pid = 0
+        self._mods_manager_recovery_launched_executable = ""
+        self._mods_manager_gate_mode = ""
+        self._mods_manager_recheck_running = False
+        self._mods_manager_recheck_generation = 0
+        self._mods_manager_recheck_cancel_event = None
+        try:
+            self._mods_manager_recovery_close_handler_id = int(
+                window.connect("close-request", self._on_recovery_host_close) or 0
+            )
+        except Exception:
+            self._mods_manager_recovery_close_handler_id = 0
 
     def open_mods_manager(self):
+        self._start_mod_manager_entry_check()
+
+    def _start_mod_manager_entry_check(self) -> bool:
+        if bool(getattr(self, "_mods_manager_entry_check_running", False)):
+            return False
+        self._mods_manager_entry_check_running = True
+
+        def worker():
+            try:
+                runtime = resolve_steam_runtime_state()
+            except Exception:
+                runtime = None
+            GLib.idle_add(
+                self._complete_mod_manager_entry_check,
+                runtime,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _complete_mod_manager_entry_check(self, runtime):
+        self._mods_manager_entry_check_running = False
+        if bool(getattr(runtime, "flatpak_process_running", False)):
+            if self._runtime_has_native_processes(runtime):
+                self._show_mixed_steam_mod_manager_gate()
+            else:
+                self._show_flatpak_mod_manager_recovery()
+            return False
+        self._hide_flatpak_mod_manager_recovery()
+        self._open_mods_manager_after_gate(
+            verified_native=bool(
+                runtime is not None
+                and native_steam_ready_for_mod_manager(runtime)
+            ),
+        )
+        return False
+
+    @staticmethod
+    def _runtime_has_native_processes(runtime) -> bool:
+        return bool(
+            runtime is not None
+            and (
+                getattr(runtime, "native_client_running", False)
+                or getattr(runtime, "native_helper_running", False)
+            )
+        )
+
+    def _open_mods_manager_after_gate(self, *, verified_native: bool = False):
         try:
-            ov = getattr(self, "_main_overlay", None)
-            if ov is None:
-                ov = getattr(self._win, "_main_overlay", None)
-            if ov is None:
-                print("[MODS UI] No main overlay found on settings host.")
+            manager = self._ensure_mods_manager_overlay()
+            if manager is None:
                 return
-            if not hasattr(self, "_mods_mgr_overlay") or self._mods_mgr_overlay is None:
-                self._mods_mgr_overlay = ModsManagerOverlay(self, ov)
+            if verified_native:
+                manager.accept_recovered_native_authority()
 
             def _ui_open():
                 try:
-                    self._mods_mgr_overlay.refresh()
+                    manager.refresh()
                 except Exception:
                     pass
                 try:
-                    self._mods_mgr_overlay.show()
+                    manager.show()
                 except Exception:
                     pass
                 return False
@@ -45,6 +141,804 @@ class SettingsUI:
 
         except Exception as e:
             print(f"[MODS UI] Failed to open mods manager: {e}")
+
+    def _ensure_mods_manager_overlay(self):
+        existing = getattr(self, "_mods_mgr_overlay", None)
+        if existing is not None:
+            return existing
+        ov = getattr(self, "_main_overlay", None)
+        if ov is None:
+            ov = getattr(self._win, "_main_overlay", None)
+        if ov is None:
+            print("[MODS UI] No main overlay found on settings host.")
+            return None
+        self._mods_mgr_overlay = ModsManagerOverlay(self, ov)
+        return self._mods_mgr_overlay
+
+    def _ensure_flatpak_mod_manager_warning(self):
+        existing = getattr(self, "_mods_manager_flatpak_warning", None)
+        if existing is not None:
+            return existing
+        overlay = getattr(self, "_main_overlay", None)
+        if overlay is None:
+            overlay = getattr(self._win, "_main_overlay", None)
+        if overlay is None:
+            return None
+
+        scrim = Gtk.Box()
+        scrim.set_hexpand(True)
+        scrim.set_vexpand(True)
+        scrim.set_visible(False)
+        scrim.set_can_target(True)
+        scrim.add_css_class("settings-scrim")
+        overlay.add_overlay(scrim)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        card.set_halign(Gtk.Align.CENTER)
+        card.set_valign(Gtk.Align.CENTER)
+        card.set_visible(False)
+        card.set_can_target(True)
+        card.set_size_request(RECOVERY_DIALOG_WIDTH, -1)
+        card.add_css_class("warning-card")
+        overlay.add_overlay(card)
+
+        title = Gtk.Label(label="Flatpak Steam detected")
+        title.set_xalign(0.0)
+        title.set_wrap(True)
+        title.add_css_class("steamcmd-heading")
+        title.add_css_class("confirmation-title")
+        card.append(title)
+
+        message = Gtk.Label(
+            label=self._flatpak_recovery_intro_text()
+        )
+        message.set_xalign(0.0)
+        message.set_wrap(True)
+        message.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        message.set_max_width_chars(60)
+        message.add_css_class("confirmation-body")
+        card.append(message)
+
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        buttons.set_halign(Gtk.Align.CENTER)
+        buttons.set_margin_top(12)
+        cancel_button = Gtk.Button(label="Cancel")
+        cancel_button.add_css_class("warning-btn")
+        attach_pointer_cursor(cancel_button)
+        buttons.append(cancel_button)
+        continue_button = Gtk.Button(label="Continue")
+        continue_button.add_css_class("suggested-action")
+        continue_button.add_css_class("warning-btn")
+        attach_pointer_cursor(continue_button)
+        buttons.append(continue_button)
+        card.append(buttons)
+
+        warning = {
+            "scrim": scrim,
+            "card": card,
+            "title": title,
+            "message": message,
+            "cancel_button": cancel_button,
+            "continue_button": continue_button,
+        }
+        self._mods_manager_flatpak_warning = warning
+        cancel_button.connect(
+            "clicked", lambda *_: self._cancel_flatpak_mod_manager_recovery(),
+        )
+        continue_button.connect(
+            "clicked", lambda *_: self._activate_mod_manager_gate_primary(),
+        )
+        return warning
+
+    @staticmethod
+    def _flatpak_recovery_intro_text() -> str:
+        return "DZLL will close Flatpak Steam and start native Steam."
+
+    @staticmethod
+    def _mixed_steam_gate_text() -> str:
+        return (
+            "DZLL cannot safely manage Workshop mods while both Steam clients "
+            "are running.\n\n"
+            "Close both Steam clients, start native Steam only, then click Recheck."
+        )
+
+    def _show_flatpak_mod_manager_recovery(
+        self,
+        *,
+        message: str | None = None,
+        retry: bool = False,
+    ):
+        if message is None and (
+            bool(getattr(self, "_mods_manager_recovery_running", False))
+            or getattr(self, "_mods_manager_recovery_phase", None)
+            is ModManagerRecoveryPhase.FAILED
+        ):
+            return False
+        warning = self._ensure_flatpak_mod_manager_warning()
+        if warning is None:
+            return False
+        self._mods_manager_gate_mode = "flatpak"
+        warning["title"].set_text("Flatpak Steam detected")
+        warning["message"].set_text(
+            str(message) if message else self._flatpak_recovery_intro_text()
+        )
+        warning["continue_button"].set_label("Retry" if retry else "Continue")
+        warning["continue_button"].set_sensitive(
+            not bool(getattr(self, "_mods_manager_recovery_running", False))
+        )
+        warning["cancel_button"].set_sensitive(True)
+        warning["scrim"].set_visible(True)
+        warning["card"].set_visible(True)
+        return False
+
+    def _show_mixed_steam_mod_manager_gate(self, *, message: str | None = None):
+        warning = self._ensure_flatpak_mod_manager_warning()
+        if warning is None:
+            return False
+        self._mods_manager_gate_mode = "mixed"
+        warning["title"].set_text("Both Steam clients detected")
+        warning["message"].set_text(
+            str(message) if message else self._mixed_steam_gate_text()
+        )
+        warning["continue_button"].set_label("Recheck")
+        warning["continue_button"].set_sensitive(
+            not bool(getattr(self, "_mods_manager_recheck_running", False))
+        )
+        warning["cancel_button"].set_sensitive(True)
+        warning["scrim"].set_visible(True)
+        warning["card"].set_visible(True)
+        return False
+
+    def _activate_mod_manager_gate_primary(self):
+        if getattr(self, "_mods_manager_gate_mode", "") == "mixed":
+            return self._start_mixed_mod_manager_recheck()
+        return self._start_flatpak_mod_manager_recovery()
+
+    def _set_flatpak_recovery_progress(self, message: str):
+        warning = getattr(self, "_mods_manager_flatpak_warning", None)
+        if warning is None:
+            return False
+        warning["message"].set_text(str(message or ""))
+        warning["continue_button"].set_label("Continue")
+        warning["continue_button"].set_sensitive(False)
+        warning["cancel_button"].set_sensitive(True)
+        return False
+
+    def _hide_flatpak_mod_manager_recovery(self):
+        warning = getattr(self, "_mods_manager_flatpak_warning", None)
+        if warning is None:
+            return False
+        warning["scrim"].set_visible(False)
+        warning["card"].set_visible(False)
+        self._mods_manager_gate_mode = ""
+        warning["continue_button"].set_label("Continue")
+        warning["continue_button"].set_sensitive(True)
+        warning["cancel_button"].set_sensitive(True)
+        return False
+
+    def _recovery_callback_is_current(self, generation: int, cancel_event) -> bool:
+        return bool(
+            int(generation) == int(
+                getattr(self, "_mods_manager_recovery_generation", 0) or 0
+            )
+            and cancel_event is getattr(
+                self, "_mods_manager_recovery_cancel_event", None
+            )
+            and not cancel_event.is_set()
+        )
+
+    def _advance_flatpak_recovery_phase(
+        self,
+        generation: int,
+        cancel_event,
+        phase: ModManagerRecoveryPhase,
+        message: str | None = None,
+    ) -> bool:
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        next_phase = ModManagerRecoveryPhase(phase)
+        current = ModManagerRecoveryPhase(
+            getattr(
+                self, "_mods_manager_recovery_phase",
+                ModManagerRecoveryPhase.IDLE,
+            )
+        )
+        if next_phase < current:
+            return False
+        self._mods_manager_recovery_phase = next_phase
+        if message is not None:
+            self._set_flatpak_recovery_progress(message)
+        return True
+
+    def _clear_flatpak_recovery_retry_timer(self) -> None:
+        source_id = int(
+            getattr(self, "_mods_manager_recovery_retry_source_id", 0) or 0
+        )
+        self._mods_manager_recovery_retry_source_id = 0
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+
+    def _start_mixed_mod_manager_recheck(self) -> bool:
+        """Reset DZLL state and re-detect; never control either Steam client."""
+        if bool(getattr(self, "_mods_manager_recheck_running", False)):
+            return False
+        if bool(getattr(self, "_mods_manager_recovery_running", False)):
+            return False
+        self._mods_manager_recheck_generation = int(
+            getattr(self, "_mods_manager_recheck_generation", 0) or 0
+        ) + 1
+        generation = self._mods_manager_recheck_generation
+        cancel_event = threading.Event()
+        self._mods_manager_recheck_cancel_event = cancel_event
+        self._mods_manager_recheck_running = True
+        warning = self._ensure_flatpak_mod_manager_warning()
+        if warning is not None:
+            warning["continue_button"].set_sensitive(False)
+
+        manager = getattr(self, "_mods_mgr_overlay", None)
+        inventory_idle = None
+        if manager is not None:
+            try:
+                inventory_idle = manager.reset_for_steam_recovery()
+            except Exception:
+                inventory_idle = None
+
+        def worker():
+            if inventory_idle is not None:
+                deadline = time.monotonic() + 20.0
+                while not inventory_idle.wait(0.1):
+                    if cancel_event.is_set():
+                        return
+                    if time.monotonic() >= deadline:
+                        GLib.idle_add(
+                            self._complete_mixed_mod_manager_recheck,
+                            generation,
+                            cancel_event,
+                            None,
+                        )
+                        return
+            if cancel_event.is_set():
+                return
+            try:
+                runtime = resolve_steam_runtime_state()
+            except Exception:
+                runtime = None
+            GLib.idle_add(
+                self._complete_mixed_mod_manager_recheck,
+                generation,
+                cancel_event,
+                runtime,
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _complete_mixed_mod_manager_recheck(
+        self, generation: int, cancel_event, runtime,
+    ):
+        if (
+            int(generation) != int(
+                getattr(self, "_mods_manager_recheck_generation", 0) or 0
+            )
+            or cancel_event is not getattr(
+                self, "_mods_manager_recheck_cancel_event", None
+            )
+            or cancel_event.is_set()
+        ):
+            return False
+        if runtime is None:
+            self._finish_mixed_mod_manager_recheck(cancel_event)
+            return self._show_mixed_steam_mod_manager_gate()
+        if bool(getattr(runtime, "flatpak_process_running", False)):
+            self._finish_mixed_mod_manager_recheck(cancel_event)
+            if self._runtime_has_native_processes(runtime):
+                return self._show_mixed_steam_mod_manager_gate()
+            return self._show_mixed_steam_mod_manager_gate(
+                message=(
+                    "Flatpak Steam is still running.\n\n"
+                    "Close Flatpak Steam, start native Steam only, then click "
+                    "Recheck."
+                ),
+            )
+        self._finish_mixed_mod_manager_recheck(cancel_event)
+        self._hide_flatpak_mod_manager_recovery()
+        self._open_mods_manager_after_gate(
+            verified_native=bool(
+                runtime is not None
+                and native_steam_ready_for_mod_manager(runtime)
+            ),
+        )
+        return False
+
+    def _finish_mixed_mod_manager_recheck(self, cancel_event) -> None:
+        cancel_event.set()
+        self._mods_manager_recheck_generation = int(
+            getattr(self, "_mods_manager_recheck_generation", 0) or 0
+        ) + 1
+        self._mods_manager_recheck_running = False
+        self._mods_manager_recheck_cancel_event = None
+
+    def _start_flatpak_mod_manager_recovery(self) -> bool:
+        if bool(getattr(self, "_mods_manager_recovery_running", False)):
+            return False
+        self._mods_manager_recovery_generation = int(
+            getattr(self, "_mods_manager_recovery_generation", 0) or 0
+        ) + 1
+        generation = self._mods_manager_recovery_generation
+        cancel_event = threading.Event()
+        self._mods_manager_recovery_cancel_event = cancel_event
+        self._mods_manager_recovery_running = True
+        self._clear_flatpak_recovery_retry_timer()
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.CLOSING_STEAM
+        self._set_flatpak_recovery_progress("Closing Steam…")
+
+        def status(
+            phase: ModManagerRecoveryPhase, message: str | None = None,
+        ) -> None:
+            GLib.idle_add(
+                self._apply_flatpak_recovery_status,
+                generation,
+                cancel_event,
+                phase,
+                message,
+            )
+
+        def worker() -> None:
+            try:
+                try:
+                    initial_runtime = resolve_steam_runtime_state()
+                except Exception:
+                    initial_runtime = None
+                if initial_runtime is None:
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_failure,
+                        generation,
+                        cancel_event,
+                        "DZLL could not check Steam. Retry.",
+                    )
+                    return
+                if (
+                    initial_runtime.flatpak_process_running
+                    and self._runtime_has_native_processes(initial_runtime)
+                ):
+                    GLib.idle_add(
+                        self._switch_flatpak_recovery_to_mixed_gate,
+                        generation,
+                        cancel_event,
+                    )
+                    return
+                if (
+                    not initial_runtime.flatpak_process_running
+                    and self._runtime_has_native_processes(initial_runtime)
+                ):
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_to_normal_entry,
+                        generation,
+                        cancel_event,
+                        initial_runtime,
+                    )
+                    return
+                if initial_runtime.flatpak_process_running:
+                    shutdown_errors = request_graceful_flatpak_steam_shutdown(
+                        initial_runtime
+                    )
+                    if cancel_event.is_set():
+                        return
+                    exited, exit_error = wait_for_flatpak_steam_exit(cancel_event)
+                    if not exited:
+                        if exit_error != "cancelled":
+                            detail = exit_error or (
+                                "Flatpak Steam is still running. Close it, then Retry."
+                            )
+                            if shutdown_errors:
+                                print(
+                                    "[MOD MANAGER] Steam shutdown diagnostic: "
+                                    f"{shutdown_errors[0]}",
+                                    flush=True,
+                                )
+                            GLib.idle_add(
+                                self._finish_flatpak_recovery_failure,
+                                generation,
+                                cancel_event,
+                                detail,
+                            )
+                        return
+                    if cancel_event.is_set():
+                        return
+
+                status(ModManagerRecoveryPhase.RESETTING)
+                reset_done = threading.Event()
+                inventory_idle = []
+                GLib.idle_add(
+                    self._apply_flatpak_recovery_reset,
+                    generation,
+                    cancel_event,
+                    reset_done,
+                    inventory_idle,
+                )
+                while not reset_done.wait(0.1):
+                    if cancel_event.is_set():
+                        return
+                if cancel_event.is_set():
+                    return
+                helper_errors = close_active_ugc_sessions()
+                if helper_errors:
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_failure,
+                        generation,
+                        cancel_event,
+                        "DZLL could not reset Steam. Retry.",
+                    )
+                    return
+                idle_event = inventory_idle[0] if inventory_idle else None
+                idle_deadline = time.monotonic() + 20.0
+                while idle_event is not None and not idle_event.wait(0.1):
+                    if cancel_event.is_set():
+                        return
+                    if time.monotonic() >= idle_deadline:
+                        GLib.idle_add(
+                            self._finish_flatpak_recovery_failure,
+                            generation,
+                            cancel_event,
+                            "DZLL could not stop its Steam check. Retry.",
+                        )
+                        return
+
+                if cancel_event.is_set():
+                    return
+                try:
+                    prelaunch_runtime = resolve_steam_runtime_state()
+                except Exception:
+                    prelaunch_runtime = None
+                if (
+                    prelaunch_runtime is None
+                    or prelaunch_runtime.state is not SteamClientState.OFFLINE
+                    or prelaunch_runtime.native_client_running
+                    or prelaunch_runtime.native_helper_running
+                    or prelaunch_runtime.flatpak_process_running
+                ):
+                    message = (
+                        "Native Steam could not be started.\n"
+                        "Flatpak Steam opened instead."
+                        if prelaunch_runtime is not None
+                        and prelaunch_runtime.flatpak_process_running
+                        else "Steam started again before recovery completed. Retry."
+                    )
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_failure,
+                        generation,
+                        cancel_event,
+                        message,
+                    )
+                    return
+                status(
+                    ModManagerRecoveryPhase.STARTING_NATIVE,
+                    "Starting native Steam…",
+                )
+                if int(getattr(
+                    self, "_mods_manager_recovery_launch_generation", 0,
+                ) or 0) == int(generation):
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_failure,
+                        generation,
+                        cancel_event,
+                        "Native Steam could not be started. Retry.",
+                    )
+                    return
+                self._mods_manager_recovery_launch_generation = int(generation)
+                launch_result = launch_native_steam()
+                launched = bool(getattr(launch_result, "ok", False))
+                launch_error = str(getattr(launch_result, "error", "") or "")
+                launched_pid = int(getattr(launch_result, "pid", 0) or 0)
+                launched_executable = str(
+                    getattr(launch_result, "executable", "") or ""
+                )
+                # Compatibility for deterministic doubles retained by older
+                # tests and third-party integrations.
+                if isinstance(launch_result, tuple):
+                    launched = bool(launch_result[0]) if launch_result else False
+                    launch_error = (
+                        str(launch_result[1] or "")
+                        if len(launch_result) > 1 else ""
+                    )
+                    launched_pid = 0
+                    launched_executable = ""
+                if not launched:
+                    if launch_error:
+                        print(
+                            "[MOD MANAGER] Native Steam launch diagnostic: "
+                            f"{launch_error}",
+                            flush=True,
+                        )
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_failure,
+                        generation,
+                        cancel_event,
+                        "Native Steam could not start. Check it is installed, then Retry.",
+                    )
+                    return
+                self._mods_manager_recovery_launched_pid = launched_pid
+                self._mods_manager_recovery_launched_executable = launched_executable
+                status(
+                    ModManagerRecoveryPhase.WAITING_FOR_NATIVE,
+                    "Waiting for Steam login…",
+                )
+                ready, ready_error = wait_for_native_mod_manager_ready(
+                    cancel_event, launched_pid=launched_pid,
+                )
+                if not ready:
+                    if ready_error != "cancelled":
+                        GLib.idle_add(
+                            self._finish_flatpak_recovery_failure,
+                            generation,
+                            cancel_event,
+                            ready_error,
+                        )
+                    return
+                status(ModManagerRecoveryPhase.PREPARING_INVENTORY)
+                GLib.idle_add(
+                    self._begin_flatpak_recovery_inventory_handoff,
+                    generation,
+                    cancel_event,
+                    1,
+                )
+            except Exception:
+                if not cancel_event.is_set():
+                    GLib.idle_add(
+                        self._finish_flatpak_recovery_failure,
+                        generation,
+                        cancel_event,
+                        "Steam recovery failed. Close Steam, then Retry.",
+                    )
+            finally:
+                GLib.idle_add(
+                    self._flatpak_recovery_worker_exited,
+                    cancel_event,
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _apply_flatpak_recovery_status(
+        self,
+        generation: int,
+        cancel_event,
+        phase: ModManagerRecoveryPhase,
+        message: str | None,
+    ):
+        self._advance_flatpak_recovery_phase(
+            generation, cancel_event, phase, message,
+        )
+        return False
+
+    def _apply_flatpak_recovery_reset(
+        self, generation: int, cancel_event, reset_done, inventory_idle,
+    ):
+        try:
+            if self._recovery_callback_is_current(generation, cancel_event):
+                win = getattr(self, "_win", None)
+                if win is not None:
+                    old_cancel = getattr(win, "_steamcmd_cancel_event", None)
+                    if old_cancel is not None:
+                        try:
+                            old_cancel.set()
+                        except Exception:
+                            pass
+                    try:
+                        win._steamcmd_cancel_event = threading.Event()
+                    except Exception:
+                        pass
+                    controller = getattr(
+                        win, "_background_prepare_controller", None
+                    )
+                    if controller is not None:
+                        try:
+                            controller.cancel()
+                        except Exception:
+                            pass
+                    try:
+                        win._background_prepare_ui_generation = int(
+                            getattr(win, "_background_prepare_ui_generation", 0)
+                            or 0
+                        ) + 1
+                    except Exception:
+                        pass
+                manager = getattr(self, "_mods_mgr_overlay", None)
+                if manager is not None:
+                    inventory_idle.append(manager.reset_for_steam_recovery())
+        finally:
+            reset_done.set()
+        return False
+
+    def _finish_flatpak_recovery_failure(
+        self, generation: int, cancel_event, message: str,
+    ):
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        self._clear_flatpak_recovery_retry_timer()
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.FAILED
+        self._mods_manager_recovery_running = False
+        self._show_flatpak_mod_manager_recovery(message=message, retry=True)
+        return False
+
+    def _switch_flatpak_recovery_to_mixed_gate(
+        self, generation: int, cancel_event,
+    ):
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        cancel_event.set()
+        self._clear_flatpak_recovery_retry_timer()
+        self._mods_manager_recovery_running = False
+        self._mods_manager_recovery_cancel_event = None
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.IDLE
+        self._show_mixed_steam_mod_manager_gate()
+        return False
+
+    def _finish_flatpak_recovery_to_normal_entry(
+        self, generation: int, cancel_event, runtime,
+    ):
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.COMPLETE
+        self._mods_manager_recovery_running = False
+        self._mods_manager_recovery_cancel_event = None
+        self._hide_flatpak_mod_manager_recovery()
+        self._open_mods_manager_after_gate(
+            verified_native=native_steam_ready_for_mod_manager(runtime),
+        )
+        return False
+
+    def _finish_flatpak_recovery_success(self, generation: int, cancel_event):
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        if (
+            getattr(self, "_mods_manager_recovery_phase", None)
+            is not ModManagerRecoveryPhase.OPENING_MOD_MANAGER
+        ):
+            return False
+        manager = getattr(self, "_mods_mgr_overlay", None)
+        if manager is None:
+            return self._finish_flatpak_recovery_failure(
+                generation, cancel_event,
+                "Mod Manager could not open. Retry.",
+            )
+        self._clear_flatpak_recovery_retry_timer()
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.COMPLETE
+        self._mods_manager_recovery_running = False
+        self._mods_manager_recovery_cancel_event = None
+        self._hide_flatpak_mod_manager_recovery()
+        manager.show_recovered_inventory()
+        return False
+
+    def _begin_flatpak_recovery_inventory_handoff(
+        self, generation: int, cancel_event, attempt: int,
+    ):
+        """Preload one authoritative inventory while the recovery UI stays up."""
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        try:
+            manager = self._ensure_mods_manager_overlay()
+            if manager is None:
+                raise RuntimeError("Mod Manager overlay is unavailable")
+            manager.accept_recovered_native_authority()
+            manager.prepare_recovered_inventory(
+                lambda success: self._complete_flatpak_recovery_inventory_handoff(
+                    generation, cancel_event, attempt, bool(success),
+                )
+            )
+        except Exception:
+            return self._finish_flatpak_recovery_failure(
+                generation, cancel_event,
+                "Mod Manager could not check Steam. Retry.",
+            )
+        return False
+
+    def _complete_flatpak_recovery_inventory_handoff(
+        self, generation: int, cancel_event, attempt: int, success: bool,
+    ):
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        if success:
+            if not self._advance_flatpak_recovery_phase(
+                generation,
+                cancel_event,
+                ModManagerRecoveryPhase.OPENING_MOD_MANAGER,
+                "Opening Mod Manager…",
+            ):
+                return False
+            self._clear_flatpak_recovery_retry_timer()
+            GLib.idle_add(
+                self._finish_flatpak_recovery_success,
+                generation,
+                cancel_event,
+            )
+            return False
+        if int(attempt) >= RECOVERY_INVENTORY_ATTEMPTS:
+            return self._finish_flatpak_recovery_failure(
+                generation,
+                cancel_event,
+                "Native Steam is not ready. Finish logging in, then Retry.",
+            )
+        self._mods_manager_recovery_retry_source_id = int(GLib.timeout_add(
+            RECOVERY_INVENTORY_RETRY_DELAY_MS,
+            self._retry_flatpak_recovery_inventory_handoff,
+            generation,
+            cancel_event,
+            int(attempt) + 1,
+        ) or 0)
+        return False
+
+    def _retry_flatpak_recovery_inventory_handoff(
+        self, generation: int, cancel_event, attempt: int,
+    ):
+        if not self._recovery_callback_is_current(generation, cancel_event):
+            return False
+        self._mods_manager_recovery_retry_source_id = 0
+        return self._begin_flatpak_recovery_inventory_handoff(
+            generation, cancel_event, attempt,
+        )
+
+    def _flatpak_recovery_worker_exited(self, cancel_event):
+        if cancel_event is getattr(
+            self, "_mods_manager_recovery_cancel_event", None
+        ) and cancel_event.is_set():
+            self._mods_manager_recovery_running = False
+            warning = getattr(self, "_mods_manager_flatpak_warning", None)
+            if warning is not None:
+                warning["continue_button"].set_sensitive(True)
+        return False
+
+    def _cancel_flatpak_mod_manager_recovery(self):
+        cancel_event = getattr(self, "_mods_manager_recovery_cancel_event", None)
+        if cancel_event is not None:
+            cancel_event.set()
+        recheck_cancel = getattr(
+            self, "_mods_manager_recheck_cancel_event", None
+        )
+        if recheck_cancel is not None:
+            recheck_cancel.set()
+        self._mods_manager_recovery_generation = int(
+            getattr(self, "_mods_manager_recovery_generation", 0) or 0
+        ) + 1
+        self._mods_manager_recheck_generation = int(
+            getattr(self, "_mods_manager_recheck_generation", 0) or 0
+        ) + 1
+        self._mods_manager_recheck_running = False
+        self._mods_manager_recheck_cancel_event = None
+        self._clear_flatpak_recovery_retry_timer()
+        self._mods_manager_recovery_phase = ModManagerRecoveryPhase.IDLE
+        manager = getattr(self, "_mods_mgr_overlay", None)
+        if manager is not None and bool(
+            getattr(manager, "_recovery_inventory_handoff_active", False)
+        ):
+            try:
+                manager.reset_for_steam_recovery()
+            except Exception:
+                pass
+        self._hide_flatpak_mod_manager_recovery()
+        return False
+
+    def _on_recovery_host_close(self, *_args):
+        self._cancel_flatpak_mod_manager_recovery()
+        return False
+
+    def _on_mod_manager_flatpak_detected(self, runtime=None):
+        manager = getattr(self, "_mods_mgr_overlay", None)
+        if manager is not None:
+            try:
+                manager.block_for_flatpak()
+            except Exception:
+                pass
+        if runtime is None:
+            self._start_mod_manager_entry_check()
+        elif self._runtime_has_native_processes(runtime):
+            self._show_mixed_steam_mod_manager_gate()
+        else:
+            self._show_flatpak_mod_manager_recovery()
+        return False
 
     def build_panel(self) -> Gtk.Widget:
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
@@ -548,11 +1442,77 @@ class SettingsUI:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         box.append(self._settings_section_header("General"))
 
-        box.append(self._settings_row_switch("Show Server Companion", "show_server_companion", default=False))
         box.append(self._settings_row_entry("Ingame Name", "ingame_name", "Required By Many Servers"))
+        box.append(self._settings_row_switch(
+            "Show Background Download Buttons",
+            "show_background_download_buttons",
+            default=False,
+        ))
         box.append(self._settings_row_switch("Hide Test Servers By Default", "hide_test_servers", default=True))
         # These controls are currently exposed in the sidebar; the underlying
         # settings are intentionally retained for persistence and future reuse.
+
+        box.append(hr())
+        box.append(self._settings_row_switch("Show Server Companion", "show_server_companion", default=False))
+
+        learning_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        learning_heading = self._settings_section_header("Server Companion Learning Data")
+        learning_heading.add_css_class("companion-learning-data-title")
+        learning_box.append(learning_heading)
+
+        learning_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        learning_actions.set_halign(Gtk.Align.START)
+        export_learning_btn = Gtk.Button(label="Export Data")
+        export_learning_btn.set_tooltip_text("Export restart-learning data.")
+        import_learning_btn = Gtk.Button(label="Import Data")
+        import_learning_btn.set_tooltip_text("Replace restart-learning data.")
+        for action in (export_learning_btn, import_learning_btn):
+            attach_pointer_cursor(action)
+            learning_actions.append(action)
+        learning_box.append(learning_actions)
+
+        pending_learning_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        pending_learning_box.set_visible(False)
+        pending_learning_line = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        pending_warning_icon = Gtk.Image.new_from_icon_name("dialog-warning-symbolic")
+        pending_warning_icon.set_pixel_size(16)
+        pending_warning_icon.add_css_class("companion-pending-import-warning")
+        pending_learning_line.append(pending_warning_icon)
+        pending_learning_text = Gtk.Label(label=" Learning database replacement pending - ")
+        pending_learning_text.add_css_class("companion-pending-import-warning")
+        pending_learning_line.append(pending_learning_text)
+        cancel_pending_btn = Gtk.Button(label="Cancel")
+        cancel_pending_btn.add_css_class("flat")
+        cancel_pending_btn.add_css_class("companion-pending-import-cancel")
+        attach_pointer_cursor(cancel_pending_btn)
+        pending_learning_line.append(cancel_pending_btn)
+        pending_learning_box.append(pending_learning_line)
+        pending_restart_note = Gtk.Label(label="Will be applied on next restart.")
+        pending_restart_note.set_xalign(0.0)
+        pending_restart_note.set_margin_start(21)
+        pending_restart_note.set_wrap(True)
+        pending_restart_note.add_css_class("dim-label")
+        pending_learning_box.append(pending_restart_note)
+        learning_box.append(pending_learning_box)
+
+        learning_status_label = Gtk.Label()
+        learning_status_label.set_xalign(0.0)
+        learning_status_label.set_wrap(True)
+        learning_status_label.add_css_class("dim-label")
+        learning_box.append(learning_status_label)
+        box.append(learning_box)
+
+        transfer = self._win.companion_learning_transfer
+        export_learning_btn.connect("clicked", transfer.choose_export)
+        import_learning_btn.connect("clicked", transfer.choose_import)
+        cancel_pending_btn.connect("clicked", transfer.cancel_pending)
+        transfer.bind_settings_widgets(
+            export_button=export_learning_btn,
+            import_button=import_learning_btn,
+            cancel_button=cancel_pending_btn,
+            pending_container=pending_learning_box,
+            status_label=learning_status_label,
+        )
 
         box.append(hr())
         box.append(self._settings_row_switch("Show Counts In Title Bar", "show_counts_in_title_bar", default=False))
@@ -1032,6 +1992,7 @@ class SettingsUI:
         self._win._apply_setting_runtime_effects("prioritise_trusted_servers")
         self._win._apply_setting_runtime_effects("pin_favorite_servers")
         self._win._apply_setting_runtime_effects("show_server_companion")
+        self._win._apply_setting_runtime_effects("show_background_download_buttons")
         self._win._apply_setting_runtime_effects("show_counts_in_title_bar")
         self._win._apply_setting_runtime_effects("show_counts_servers_loaded")
         self._win._apply_setting_runtime_effects("show_counts_global_players")
@@ -1160,6 +2121,11 @@ class SettingsUI:
 
         if key == "show_server_companion":
             self._win.set_server_companion_visible(bool(self._win.settings.get("show_server_companion", False)))
+
+        if key == "show_background_download_buttons":
+            self._win._set_background_download_column_visible(
+                bool(self._win.settings.get("show_background_download_buttons", False))
+            )
 
         if key in ("show_counts_in_title_bar", "show_counts_servers_loaded", "show_counts_global_players"):
             master = bool(self._win.settings.get("show_counts_in_title_bar", False))
