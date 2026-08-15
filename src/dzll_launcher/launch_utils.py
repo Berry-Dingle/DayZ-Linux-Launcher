@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
+import logging
 import subprocess
 import shlex
 from dataclasses import dataclass
 
 from .launcher_user_config import set_launcher_shutdown_mode
 from .maps import standardize_map
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -70,7 +74,7 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
             try:
                 cmd.extend(shlex.split(extra))
             except ValueError as e:
-                print(f"[JOIN] Failed To Parse Additional Launch Params: {e}")
+                logger.error("Failed to parse additional launch parameters: %s", e)
                 return SteamLaunchResult(False, error_kind="command_construction", error=str(e))
 
         cmd.append(f"-connect={ip_port}")
@@ -98,7 +102,7 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
         try:
             proc = popen(cmd)
         except Exception as e:
-            print(f"[JOIN] Failed To Submit Steam Launch Request: {e}")
+            logger.error("Failed to submit Steam launch request: %s", e)
             try:
                 if getattr(win, "_discord", None):
                     win._discord.set_menu()
@@ -110,7 +114,7 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
                                  sanitized_command=sanitized)
 
     except Exception as e:
-        print(f"[JOIN] Failed To Launch Steam/DayZ: {e}")
+        logger.error("Failed to launch Steam/DayZ: %s", e)
 
         # Discord: reset back to menus on failure
         try:

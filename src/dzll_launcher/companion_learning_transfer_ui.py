@@ -107,9 +107,9 @@ class CompanionLearningTransferController:
 
     def choose_import(self, *_args) -> None:
         if self._busy:
-            logger.warning("SC learning import: duplicate action blocked while busy")
+            logger.debug("SC learning import: duplicate action blocked while busy")
             return
-        logger.warning("SC learning import: opening native file chooser")
+        logger.debug("SC learning import: opening native file chooser")
         self._set_busy(True, "Choose a schema-4 JSON file…")
         try:
             dialog = Gtk.FileChooserNative.new(
@@ -131,21 +131,21 @@ class CompanionLearningTransferController:
 
     def _on_import_chooser_response(self, chooser, response) -> None:
         try:
-            logger.warning("SC learning import: chooser response=%s", int(response))
+            logger.debug("SC learning import: chooser response=%s", int(response))
             try:
                 chooser.hide()
             except Exception:
                 logger.exception("SC learning import: chooser hide failed")
             self._import_chooser = None
             if response != Gtk.ResponseType.ACCEPT:
-                logger.warning("SC learning import: chooser cancelled")
+                logger.debug("SC learning import: chooser cancelled")
                 self._set_busy(False)
                 return
             selected = chooser.get_file()
             path = selected.get_path() if selected is not None else None
             if not path:
                 raise ValueError("The selected source is not a local file.")
-            logger.warning("SC learning import: selected file=%s", Path(path).name)
+            logger.debug("SC learning import: selected file=%s", Path(path).name)
             self._begin_validation(Path(path))
         except Exception as exc:
             logger.exception("SC learning import chooser response failed")
@@ -184,7 +184,7 @@ class CompanionLearningTransferController:
         self._generation += 1
         generation = self._generation
         self._set_busy(True, "Validating selected learning database…")
-        logger.warning(
+        logger.debug(
             "SC learning import: submitting validation generation=%d file=%s",
             generation,
             path.name,
@@ -232,20 +232,20 @@ class CompanionLearningTransferController:
             )
 
     def _validation_complete(self, generation: int, validated, error: str | None) -> bool:
-        logger.warning(
+        logger.debug(
             "SC learning import: GTK completion generation=%d result=%s",
             generation,
             "error" if error or validated is None else "valid",
         )
         if generation != self._generation:
-            logger.warning(
+            logger.debug(
                 "SC learning import: stale completion ignored generation=%d current=%d",
                 generation,
                 self._generation,
             )
             return False
         if bool(getattr(self._win, "_shutdown_cleanup_done", False)):
-            logger.warning("SC learning import: completion ignored during shutdown")
+            logger.debug("SC learning import: completion ignored during shutdown")
             return False
         self._validation_future = None
         self._set_busy(False)
@@ -277,7 +277,7 @@ class CompanionLearningTransferController:
         if replacing:
             body += "\n\nThe currently staged replacement will be replaced by this selected database."
         body += "\n\nLearning data may contain server addresses and historical observations."
-        logger.warning(
+        logger.debug(
             "SC learning import: presenting confirmation file=%s schema=%d servers=%d",
             validated.source_filename,
             validated.schema_version,
@@ -308,7 +308,7 @@ class CompanionLearningTransferController:
             return
         self._busy = True
         self._set_busy(True, "Staging replacement learning database…")
-        logger.warning(
+        logger.debug(
             "SC learning import: staging approved action=%s",
             "restart-now" if restart_now else "restart-later",
         )

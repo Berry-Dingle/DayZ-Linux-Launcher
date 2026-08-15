@@ -5,6 +5,7 @@
 # Pure helper module; no UI changes here.
 
 import json
+import logging
 import os
 import requests
 import re
@@ -17,6 +18,9 @@ import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 from .settings import autodetect_workshop_dir, autodetect_steamcmd_path
+
+
+logger = logging.getLogger(__name__)
 
 DAYZ_APPID = 221100
 
@@ -412,10 +416,10 @@ def run_steamcmd_install(
     LAST_EFFECTIVE_WORKSHOP_DIR = workshop_dir
 
     try:
-        print(f"[SteamCMD][DEBUG] raw_steamcmd_path={raw_steamcmd_path!r}")
-        print(f"[SteamCMD][DEBUG] detected_steamcmd_path={detected_steamcmd_path!r}")
-        print(f"[SteamCMD][DEBUG] steamcmd_path={steamcmd_path!r}")
-        print(f"[SteamCMD][DEBUG] workshop_dir={workshop_dir!r}")
+        logger.debug("[SteamCMD][DEBUG] raw_steamcmd_path=%r", raw_steamcmd_path)
+        logger.debug("[SteamCMD][DEBUG] detected_steamcmd_path=%r", detected_steamcmd_path)
+        logger.debug("[SteamCMD][DEBUG] steamcmd_path=%r", steamcmd_path)
+        logger.debug("[SteamCMD][DEBUG] workshop_dir=%r", workshop_dir)
     except Exception:
         pass
 
@@ -867,15 +871,20 @@ def run_steamcmd_install(
         missing_now = _missing_from_batch(deduped_mod_ids)
 
         try:
-            print(f"[SteamCMD][DEBUG] missing_now={missing_now}")
-            print(f"[SteamCMD][DEBUG] access_denied={sorted(access_denied)}")
+            logger.debug("[SteamCMD][DEBUG] missing_now=%s", missing_now)
+            logger.debug("[SteamCMD][DEBUG] access_denied=%s", sorted(access_denied))
             for _mid in deduped_mod_ids:
                 try:
                     _path = workshop_mod_path(workshop_dir, int(_mid))
                     _installed = is_mod_installed(workshop_dir, int(_mid))
-                    print(f"[SteamCMD][DEBUG] mid={int(_mid)} path={_path!r} installed={_installed}")
+                    logger.debug(
+                        "[SteamCMD][DEBUG] mid=%d path=%r installed=%s",
+                        int(_mid),
+                        _path,
+                        _installed,
+                    )
                 except Exception as _e:
-                    print(f"[SteamCMD][DEBUG] mid={_mid!r} check failed: {_e}")
+                    logger.debug("[SteamCMD][DEBUG] mid=%r check failed: %s", _mid, _e)
         except Exception:
             pass
 
@@ -1204,12 +1213,12 @@ def ensure_watch_symlinks(
         target = workshop_mod_path(workshop_dir, mid_i)
         if not os.path.isdir(target):
             msg = f"missing target for mod {mid_i}: {target}"
-            print(f"[JOIN][SYMLINK] missing target: {msg}")
+            logger.error("Join symlink missing target: %s", msg)
             result["errors"].append(msg)
             continue
         if not _has_real_mod_content(target):
             msg = f"invalid/missing mod content for mod {mid_i}: {target}"
-            print(f"[JOIN][SYMLINK] missing target content: {msg}")
+            logger.error("Join symlink missing target content: %s", msg)
             result["errors"].append(msg)
             continue
         link_name = symlink_name_for_mod(name, mid_i)
@@ -1224,24 +1233,29 @@ def ensure_watch_symlinks(
                 tgt_real = _real_path(target)
                 if cur_real == tgt_real:
                     if debug_join_paths:
-                        print(f"[JOIN][SYMLINK] kept valid symlink: {link_path} -> {cur_real}")
+                        logger.debug(
+                            "Join kept valid symlink: %s -> %s", link_path, cur_real,
+                        )
                     result["kept"].append(link_path)
                 else:
-                    print(
-                        f"[JOIN][SYMLINK] replaced wrong-target symlink: "
-                        f"{link_path} old={cur_real} expected={tgt_real}"
+                    logger.debug(
+                        "Join replaced wrong-target symlink: %s old=%s expected=%s",
+                        link_path, cur_real, tgt_real,
                     )
                     os.unlink(link_path)
                     os.symlink(target, link_path)
                     result["updated"].append(link_path)
             elif os.path.exists(link_path):
                 msg = f"path exists and is not symlink: {link_path}"
-                print(f"[JOIN][SYMLINK] non-symlink collision: {msg}")
+                logger.error("Join symlink non-symlink collision: %s", msg)
                 result["errors"].append(msg)
                 continue
             else:
                 if debug_join_paths:
-                    print(f"[JOIN][SYMLINK] created symlink: {link_path} -> {_real_path(target)}")
+                    logger.debug(
+                        "Join created symlink: %s -> %s",
+                        link_path, _real_path(target),
+                    )
                 os.symlink(target, link_path)
                 result["created"].append(link_path)
 
@@ -1264,7 +1278,10 @@ def ensure_watch_symlinks(
                         target = _resolve_symlink_target(p)
                         os.unlink(p)
                         result["removed"].append(p)
-                        print(f"[JOIN][SYMLINK] removed stale DZLL symlink: {p} mid={mid} target={target}")
+                        logger.debug(
+                            "Join removed stale DZLL symlink: %s mid=%s target=%s",
+                            p, mid, target,
+                        )
                     except Exception as e:
                         result["errors"].append(f"remove stale {p}: {e}")
         except Exception as e:

@@ -1,12 +1,11 @@
 # db.py
-import json
-import os, requests
+import os
 import sqlite3
 import time
 import urllib.error
 import urllib.request
 
-from .config import APP_VERSION, DB_URL, DB_LOCAL_DIR, DB_LOCAL_PATH, BL_URL, BL_LOCAL_DIR, BL_LOCAL_PATH
+from .config import APP_VERSION, DB_URL, DB_LOCAL_DIR, DB_LOCAL_PATH
 
 DB_USER_AGENT = f"DZLL/{str(APP_VERSION or '0.2').lstrip('v')} (+https://github.com/Berry-Dingle/DayZ-Linux-Launcher)"
 DB_FETCH_ATTEMPTS = 3
@@ -118,37 +117,6 @@ def fetch_db_overwrite_local() -> bool:
     except Exception as e:
         _remove_tmp(tmp_path)
         print(f"[DB] Fetch failed: {e}")
-        return False
-
-def fetch_bl_overwrite_local(timeout=12) -> bool:
-    try:
-        os.makedirs(BL_LOCAL_DIR, exist_ok=True)
-        tmp = BL_LOCAL_PATH + ".tmp"
-
-        r = requests.get(BL_URL, timeout=timeout)
-        r.raise_for_status()
-        data = r.text or ""
-
-        parsed = json.loads(data)
-        if not isinstance(parsed, dict):
-            raise ValueError("Blocklist not JSON object")
-        if "version" in parsed and parsed["version"] != 2:
-            raise ValueError("Blocklist version is not 2")
-
-        with open(tmp, "w", encoding="utf-8") as f:
-            f.write(data)
-
-        os.replace(tmp, BL_LOCAL_PATH)
-        return True
-
-    except Exception as e:
-        print(f"[BL] Fetch failed: {e}")
-        try:
-            tmp = BL_LOCAL_PATH + ".tmp"
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except Exception:
-            pass
         return False
 
 def read_servers_from_db() -> list:

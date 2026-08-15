@@ -57,8 +57,6 @@ class SettingsUI:
         self._mods_manager_recovery_phase = ModManagerRecoveryPhase.IDLE
         self._mods_manager_recovery_retry_source_id = 0
         self._mods_manager_recovery_launch_generation = 0
-        self._mods_manager_recovery_launched_pid = 0
-        self._mods_manager_recovery_launched_executable = ""
         self._mods_manager_gate_mode = ""
         self._mods_manager_recheck_running = False
         self._mods_manager_recheck_generation = 0
@@ -660,8 +658,6 @@ class SettingsUI:
                         "Native Steam could not start. Check it is installed, then Retry.",
                     )
                     return
-                self._mods_manager_recovery_launched_pid = launched_pid
-                self._mods_manager_recovery_launched_executable = launched_executable
                 status(
                     ModManagerRecoveryPhase.WAITING_FOR_NATIVE,
                     "Waiting for Steam login…",
@@ -2296,12 +2292,3 @@ class SettingsUI:
 
     def _on_settings_clicked(self, *_args):
         self._toggle_settings_panel()
-
-    def _add_pointer_cursor(self, w: Gtk.Widget):
-        try:
-            motion = Gtk.EventControllerMotion()
-            motion.connect("enter", lambda *_: w.set_cursor_from_name("pointer"))
-            motion.connect("leave", lambda *_: w.set_cursor(None))
-            w.add_controller(motion)
-        except Exception:
-            pass

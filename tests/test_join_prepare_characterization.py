@@ -451,7 +451,7 @@ def test_existing_steam_start_consent_accept_and_decline(monkeypatch, accepted):
 
 def test_server_companion_and_joined_state_remain_post_launch_only():
     entry = WINDOW_SOURCE.split("def _join_server_for_obj", 1)[1].split(
-        "def _preflight_block_warning_ui_blocking", 1
+        "def _prune_expired_dead", 1
     )[0]
     watcher = WINDOW_SOURCE.split("# GAME STARTED -> activate Companion", 1)[1].split(
         "# GAME STARTED -> set Discord", 1

@@ -381,9 +381,6 @@ def _transition_overlay(initial_state):
     overlay._inventory_refresh_pending = False
     overlay._steam_state_probe_running = False
     overlay._steam_state_probe_refresh_on_change = False
-    overlay._passive_steam_was_ready_this_session = initial_state is SteamClientState.NATIVE
-    overlay._passive_steam_watch_check_started_at = 1.0
-    overlay._passive_steam_watch_checking_status_shown = True
     overlay._loaded_items = []
     overlay._set_steam_status_pill = lambda _state: None
     overlay._render_loaded_items = lambda: None
@@ -487,10 +484,6 @@ def test_closing_mod_manager_stops_runtime_state_watcher(monkeypatch):
     )
     overlay = ModsManagerOverlay.__new__(ModsManagerOverlay)
     overlay._passive_steam_watch_timer_id = 42
-    overlay._passive_steam_watch_probe_running = True
-    overlay._passive_steam_watch_check_started_at = 1.0
-    overlay._passive_steam_watch_checking_status_shown = True
-    overlay._passive_steam_shutdown_status_shown = True
     overlay._stop_passive_steam_watch()
     assert removed == [42]
     assert overlay._passive_steam_watch_timer_id == 0

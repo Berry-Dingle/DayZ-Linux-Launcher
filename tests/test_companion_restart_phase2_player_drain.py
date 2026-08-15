@@ -222,6 +222,8 @@ def test_gradual_drain_without_outage_expires_without_event():
     feed(engine, [sample(0, 10), sample(10, 10), sample(20, 10), sample(100, 0), sample(110, 0)])
     assert engine.provisional_drain is not None
     assert engine.ingest(sample(411, 0)) == ()
+    assert engine.provisional_drain is not None
+    assert engine.ingest(sample(701, 0)) == ()
     assert engine.provisional_drain is None
     assert engine.active_episode is None
 

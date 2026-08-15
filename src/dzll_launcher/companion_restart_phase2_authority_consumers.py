@@ -9,6 +9,7 @@ from enum import Enum
 from .companion_restart_phase2_authority import (
     AuthorityDecision,
     AuthorityGate,
+    AuthorityOrigin,
     RegimeRecord,
     RegimeState,
 )
@@ -80,6 +81,59 @@ class AuthoritySuppressionKey:
 
 
 @dataclass(frozen=True)
+class NormalPredictionEvidence:
+    """Non-persisted normal-scorer facts needed for safe schedule display."""
+
+    selected_period_seconds: int | None
+    incumbent_period_seconds: int | None
+    schedule_existence_confidence: float
+    fundamental_period_confidence: float
+    phase_confidence: float
+    candidate_established: bool
+    strict_direct_relationship_count: int
+    unresolved_competitor: bool
+    unresolved_divisor_or_harmonic: bool
+    regime_stable: bool
+    latest_aligned_phase_at: float | None
+    raw_predicted_occurrence_at: float | None
+    recent_strong_anomaly: bool
+
+    def __post_init__(self) -> None:
+        for name in ("selected_period_seconds", "incumbent_period_seconds"):
+            value = getattr(self, name)
+            if value is not None and (type(value) is not int or value <= 0):
+                raise ValueError(f"{name} must be a positive integer or None")
+        for name in (
+            "schedule_existence_confidence",
+            "fundamental_period_confidence",
+            "phase_confidence",
+        ):
+            value = getattr(self, name)
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                raise ValueError(f"{name} must be numeric")
+            if not math.isfinite(value) or not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between zero and one")
+        if (
+            type(self.strict_direct_relationship_count) is not int
+            or self.strict_direct_relationship_count < 0
+        ):
+            raise ValueError("strict_direct_relationship_count must be non-negative")
+        for name in (
+            "candidate_established",
+            "unresolved_competitor",
+            "unresolved_divisor_or_harmonic",
+            "regime_stable",
+            "recent_strong_anomaly",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be boolean")
+        for name in ("latest_aligned_phase_at", "raw_predicted_occurrence_at"):
+            value = getattr(self, name)
+            if value is not None:
+                _finite_nonnegative(name, value)
+
+
+@dataclass(frozen=True)
 class AuthorityConsumerPolicyInput:
     authority_decision: AuthorityDecision
     now: float
@@ -94,6 +148,7 @@ class AuthorityConsumerPolicyInput:
     fired_keys: frozenset[AuthoritySuppressionKey] = frozenset()
     normal_pattern_supported: bool = False
     normal_pattern_confidence: float = 0.0
+    normal_prediction_evidence: NormalPredictionEvidence | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.authority_decision, AuthorityDecision):
@@ -110,6 +165,11 @@ class AuthorityConsumerPolicyInput:
             _finite_nonnegative("observed_outage_at", self.observed_outage_at)
         if not 0 <= self.normal_pattern_confidence <= 1:
             raise ValueError("normal_pattern_confidence must be between zero and one")
+        if (
+            self.normal_prediction_evidence is not None
+            and not isinstance(self.normal_prediction_evidence, NormalPredictionEvidence)
+        ):
+            raise ValueError("normal_prediction_evidence must be NormalPredictionEvidence")
         if any(not isinstance(item, AuthoritySuppressionKey) for item in self.fired_keys):
             raise ValueError("fired_keys must contain AuthoritySuppressionKey values")
 
@@ -203,8 +263,18 @@ def evaluate_authority_consumers(
     decision = policy.authority_decision
     regime = decision.selected_shadow_regime
     candidate = _candidate_for_regime(decision, regime)
-    gate = candidate.highest_gate if candidate is not None else (
-        regime.authority_gate if regime is not None else AuthorityGate.NONE
+    gate = (
+        regime.authority_gate
+        if regime is not None and regime.origin is AuthorityOrigin.NORMAL
+        else (
+            candidate.highest_gate
+            if candidate is not None
+            else (
+                regime.authority_gate
+                if regime is not None
+                else AuthorityGate.NONE
+            )
+        )
     )
     h3 = gate in {AuthorityGate.H3, AuthorityGate.H4}
     phase_available = bool(
@@ -223,6 +293,42 @@ def evaluate_authority_consumers(
         and decision.countdown_safe
         and decision.state in {RegimeState.ESTABLISHED, RegimeState.CHANGE_SUSPECTED, RegimeState.NEW_REGIME_ESTABLISHED}
     )
+    normal = policy.normal_prediction_evidence
+    safe_established_normal_schedule = bool(
+        gate is AuthorityGate.NORMAL
+        and regime is not None
+        and regime.origin is AuthorityOrigin.NORMAL
+        and decision.state is RegimeState.ESTABLISHED
+        and decision.selected_shadow_regime is not None
+        and decision.incumbent_shadow_regime is not None
+        and decision.selected_shadow_regime.regime_id
+        == decision.incumbent_shadow_regime.regime_id
+        and decision.suspicion_level == 0
+        and decision.prediction_usable
+        and decision.countdown_safe
+        and policy.normal_pattern_supported
+        and policy.normal_pattern_confidence >= 0.95
+        and normal is not None
+        and normal.selected_period_seconds == regime.candidate_period_seconds
+        and normal.incumbent_period_seconds == regime.candidate_period_seconds
+        and normal.schedule_existence_confidence >= 0.95
+        and normal.fundamental_period_confidence >= 0.65
+        and normal.candidate_established
+        and normal.strict_direct_relationship_count >= 3
+        and not normal.unresolved_competitor
+        and not normal.unresolved_divisor_or_harmonic
+        and not (candidate and candidate.harmonic_blockers)
+        and normal.regime_stable
+        and normal.phase_confidence >= 0.85
+        and math.isfinite(regime.phase_offset)
+        and normal.latest_aligned_phase_at is not None
+        and 0 <= policy.now - normal.latest_aligned_phase_at
+        <= 3 * regime.candidate_period_seconds
+        and normal.raw_predicted_occurrence_at is not None
+        and math.isfinite(normal.raw_predicted_occurrence_at)
+        and normal.raw_predicted_occurrence_at > policy.now
+        and not normal.recent_strong_anomaly
+    )
     prediction = (
         next_phase_occurrence(
             period_seconds=regime.candidate_period_seconds,
@@ -230,15 +336,18 @@ def evaluate_authority_consumers(
             now=policy.now,
         )
         if safe_h3 and regime is not None
+        else normal.raw_predicted_occurrence_at
+        if safe_established_normal_schedule and normal is not None
         else None
     )
     countdown_visible = prediction is not None
+    safe_schedule = safe_h3 or safe_established_normal_schedule
 
     warning_key = None
     warning_at = None
     warning_window = None
     warning_model_eligible = bool(
-        safe_h3
+        safe_schedule
         and policy.restart_alert_enabled
         and policy.server_online_healthy
         and prediction is not None
@@ -288,8 +397,19 @@ def evaluate_authority_consumers(
             and generic_key not in policy.fired_keys
         )
 
+    normal_schedule_confidence_display = bool(
+        gate is AuthorityGate.NORMAL
+        and policy.normal_pattern_supported
+        and presentation
+        in {
+            AuthorityPresentationKey.LIKELY_CYCLE,
+            AuthorityPresentationKey.CONFIRMED_CYCLE,
+        }
+    )
     confidence = (
-        candidate.combined_confidence
+        policy.normal_pattern_confidence
+        if normal_schedule_confidence_display
+        else candidate.combined_confidence
         if candidate is not None and regime is not None
         else (
             policy.normal_pattern_confidence
@@ -303,8 +423,12 @@ def evaluate_authority_consumers(
         "structural_gate_controls_presentation",
         "generic_recovery_independent_of_schedule",
     }
-    if countdown_visible:
+    if normal_schedule_confidence_display:
+        reasons.add("normal_schedule_confidence_display")
+    if safe_h3 and countdown_visible:
         reasons.add("safe_h3_prediction_available")
+    if safe_established_normal_schedule and countdown_visible:
+        reasons.add("safe_established_normal_schedule_available")
     elif gate is AuthorityGate.H2:
         reasons.add("h2_countdown_withheld")
     if suspended:
@@ -335,10 +459,10 @@ def evaluate_authority_consumers(
         cycle_label=label,
         cycle_period_seconds=period,
         confidence_display_value=max(0.0, min(1.0, confidence)),
-        phase_available=phase_available,
+        phase_available=phase_available or safe_established_normal_schedule,
         next_expected_restart_at=prediction,
         countdown_visible=countdown_visible,
-        countdown_safe=safe_h3,
+        countdown_safe=safe_schedule,
         prediction_suspended=suspended,
         suspension_reason=suspension_reason,
         wording_key=presentation,
@@ -484,10 +608,21 @@ def authority_consumer_summary(
     _finite_nonnegative("now", now)
     prediction = decision.next_expected_restart_at
     remaining = max(0, int(prediction - now)) if prediction is not None else 0
+    normal_schedule_confidence = (
+        "normal_schedule_confidence_display" in decision.reason_codes
+    )
     return {
         "confidence_percent": int(round(decision.confidence_display_value * 100)),
-        "confidence_kind": "period" if decision.visible_cycle else "pattern",
-        "confidence_label": "Confidence:" if decision.visible_cycle else "Pattern Confidence:",
+        "confidence_kind": (
+            "schedule"
+            if normal_schedule_confidence
+            else ("period" if decision.visible_cycle else "pattern")
+        ),
+        "confidence_label": (
+            "Confidence:"
+            if normal_schedule_confidence or decision.visible_cycle
+            else "Pattern Confidence:"
+        ),
         "confidence_visible": decision.presentation_state is not AuthorityPresentationKey.NONE,
         "cycle_text": _presentation_text(decision),
         "next_text": "Prediction suspended" if decision.prediction_suspended else (
@@ -522,6 +657,12 @@ def _presentation(
             return AuthorityPresentationKey.PATTERN_ONLY, True, False, None
         return AuthorityPresentationKey.NONE, False, False, None
     if state is RegimeState.LIKELY and gate is AuthorityGate.H2:
+        return AuthorityPresentationKey.LIKELY_CYCLE, True, False, None
+    if (
+        state in {RegimeState.LIKELY, RegimeState.ESTABLISHED}
+        and gate is AuthorityGate.NORMAL
+        and policy.normal_pattern_supported
+    ):
         return AuthorityPresentationKey.LIKELY_CYCLE, True, False, None
     if state is RegimeState.NEW_REGIME_ESTABLISHED:
         return AuthorityPresentationKey.CONFIRMED_NEW_CYCLE, True, False, None

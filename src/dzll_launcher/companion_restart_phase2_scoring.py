@@ -103,6 +103,7 @@ class PhaseRecencyPolicy(str, Enum):
 class IntermediateWindowStatus(str, Enum):
     OBSERVED_COMPATIBLE = "observed_compatible_restart"
     ADEQUATELY_MONITORED_MISS = "adequately_monitored_miss"
+    POPULATION_TRANSITION_UNOBSERVABLE = "population_transition_unobservable"
     INSUFFICIENT_MONITORING = "insufficient_monitoring"
     QUERY_HEALTH_GAP = "query_health_gap"
     LIFECYCLE_GAP = "lifecycle_or_session_gap"
@@ -741,7 +742,14 @@ class RestartScheduleScorer:
                                 max(left_at, expected - window_tolerance),
                                 min(right_at, expected + window_tolerance),
                             )
-                            if window.fully_covered and window.query_health_adequate and not window.unresolved_episode:
+                            if (
+                                window.fully_covered
+                                and window.query_health_adequate
+                                and not window.unresolved_episode
+                                and not _query_visible_only_evidence(
+                                    (left, *skipped, right)
+                                )
+                            ):
                                 work[divisor].misses.append((expected, 1.0, f"{left.event_id}:{right.event_id}"))
                                 work[longer].resolution_windows.setdefault(divisor, []).append(
                                     (expected, interval_key)
@@ -778,6 +786,9 @@ class RestartScheduleScorer:
                 right_at,
                 events,
                 coverage,
+                population_transition_required=_query_visible_only_evidence(
+                    (left, *skipped, right)
+                ),
             )
             for index in range(1, multiplier)
         )
@@ -808,6 +819,13 @@ class RestartScheduleScorer:
         ):
             accepted = False
             reason = "covered_intermediate_miss"
+        elif any(
+            item.status
+            is IntermediateWindowStatus.POPULATION_TRANSITION_UNOBSERVABLE
+            for item in windows
+        ):
+            accepted = False
+            reason = "population_transition_unobservable"
 
         strict_endpoints = _strict_event(left) and _strict_event(right)
         for item in windows:
@@ -876,6 +894,8 @@ class RestartScheduleScorer:
         right_at: float,
         events: tuple[PhysicalRestartEvent, ...],
         coverage: CoverageTimeline,
+        *,
+        population_transition_required: bool = False,
     ) -> IntermediateWindowDiagnostic:
         tolerance = candidate_phase_tolerance(period)
         start = max(left_at, expected_at - tolerance)
@@ -896,7 +916,11 @@ class RestartScheduleScorer:
             and not assessment.unresolved_episode
             and not unresolved
         ):
-            status = IntermediateWindowStatus.ADEQUATELY_MONITORED_MISS
+            status = (
+                IntermediateWindowStatus.POPULATION_TRANSITION_UNOBSERVABLE
+                if population_transition_required
+                else IntermediateWindowStatus.ADEQUATELY_MONITORED_MISS
+            )
         elif set(assessment.blocking_kinds).intersection(
             {
                 CoverageKind.QUERY_HEALTH_GAP,
@@ -930,6 +954,30 @@ class RestartScheduleScorer:
         work: dict[int, _CandidateWork],
     ) -> None:
         hint_events = tuple(event for event in events if _hint_event_weight(event) > 0)
+        for event in hint_events:
+            if "query_visible_repopulation_timeout" not in event.reason_codes:
+                continue
+            at = _event_at(event)
+            if at is None:
+                continue
+            for period, candidate in work.items():
+                relationships = (*candidate.strict_pairs, *candidate.multiple_pairs)
+                participants = {
+                    event_id for pair in relationships for event_id in pair[:2]
+                }
+                phase = _phase_cluster(
+                    (
+                        item
+                        for item in events
+                        if item.event_id in participants
+                    ),
+                    period,
+                )
+                if phase[0] is None or abs(
+                    _signed_phase_residual(at, phase[0], period)
+                ) > candidate_phase_tolerance(period):
+                    continue
+                self._add_hint(candidate, event)
         for left, right in zip(hint_events, hint_events[1:]):
             if _event_weight(left) > 0 and _event_weight(right) > 0:
                 continue
@@ -1362,6 +1410,24 @@ def _strict_event(event: PhysicalRestartEvent) -> bool:
         EventOutcome.CONFIRMED_OFFLINE_RESTART,
         EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
     }
+
+
+def _query_visible_only_evidence(
+    events: Iterable[PhysicalRestartEvent],
+) -> bool:
+    values = tuple(events)
+    query_visible = {
+        EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+        EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART,
+    }
+    strong_outage = {
+        EventOutcome.CORROBORATED_OFFLINE_RESTART,
+        EventOutcome.CONFIRMED_OFFLINE_RESTART,
+    }
+    return (
+        any(item.outcome in query_visible for item in values)
+        and not any(item.outcome in strong_outage for item in values)
+    )
 
 
 def _unique_events(events: Iterable[PhysicalRestartEvent]) -> tuple[PhysicalRestartEvent, ...]:

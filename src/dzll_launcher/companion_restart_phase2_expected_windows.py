@@ -225,6 +225,7 @@ def classify_expected_window(
     events: Iterable[PhysicalRestartEvent] = (),
     spans: Iterable[ContinuitySpan] = (),
     episodes: Iterable[ExpectedWindowEpisodeEvidence] = (),
+    population_transition_observable: bool | None = None,
 ) -> ExpectedWindowResult:
     """Classify one completed expected window without consulting a model answer."""
 
@@ -368,6 +369,26 @@ def classify_expected_window(
         )
 
     healthy_proven = diagnostics[5]
+    if healthy_proven and population_transition_observable is False:
+        return _initial_result(
+            result_identity,
+            continuity_chain_id=diagnostics[0],
+            coverage_classification=WindowCoverageClassification.COMPLETE_HEALTHY,
+            observed_ratio=diagnostics[2],
+            largest_unexplained_gap=diagnostics[3],
+            blocker_kind=None,
+            healthy_throughout=True,
+            outage_observed=False,
+            outage_ids=(),
+            unresolved_episode=False,
+            finalized_event_id=None,
+            outcome=ExpectedWindowOutcome.UNKNOWN,
+            reasons={
+                "classification_order_population_observability_before_miss",
+                "query_visible_population_transition_unobservable",
+                *diagnostics[6],
+            },
+        )
     if healthy_proven:
         return _initial_result(
             result_identity,

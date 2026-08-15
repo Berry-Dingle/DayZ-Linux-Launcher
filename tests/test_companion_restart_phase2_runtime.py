@@ -209,9 +209,37 @@ def test_conventional_signals_route_one_correlated_physical_event(tmp_path):
     assert len(update.finalized_events) == 1
     event = update.finalized_events[0]
     assert event.outcome is detection.EventOutcome.CORROBORATED_OFFLINE_RESTART
+    assert update.query_visible_repopulation_event_id is None
     saved = json.loads(active.read_text(encoding="utf-8"))
     assert len(saved["servers"][SERVER]["events"]) == 1
     assert {item["event_id"] for item in saved["servers"][SERVER]["events"]} == {event.event_id}
+
+
+def test_qualified_query_visible_first_repopulation_is_exposed_before_finalization(
+    tmp_path,
+):
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    observations = (
+        (0, 12), (10, 12), (20, 12), (40, 11), (60, 9),
+        (80, 7), (100, 5), (120, 3), (140, 0), (150, 0),
+        (160, 0), (170, 0), (180, 0), (190, 0), (200, 0),
+    )
+    for at, players in observations:
+        update = poll(value, at, players=players)
+        assert update.query_visible_repopulation_event_id is None
+
+    first_positive = poll(value, 210, players=3)
+    episode = value._servers[SERVER].engine.active_episode
+
+    assert first_positive.finalized_events == ()
+    assert first_positive.query_visible_repopulation_event_id == episode.event_id
+    assert episode.stable_recovery_mono is None
+
+    finalized = poll(value, 220, players=6)
+    assert len(finalized.finalized_events) == 1
+    assert finalized.finalized_events[0].event_id == first_positive.query_visible_repopulation_event_id
+    assert finalized.query_visible_repopulation_event_id is None
 
 
 def test_drain_without_outage_routes_no_event(tmp_path):
@@ -673,6 +701,84 @@ def test_completed_covered_candidate_window_records_one_parallel_miss(tmp_path):
     value._evaluate_expected_windows(server, now=BASE + 15 * scoring.HOUR + tolerance + 1)
     assert tuple(server.expected_misses) == first
     assert any(item.period_seconds == 3 * scoring.HOUR for item in first)
+
+
+def test_query_visible_stable_zero_expected_window_is_evidence_neutral(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(
+            hour,
+            index + 1,
+            detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+        )
+        for index, hour in enumerate((0, 3, 6, 9, 12))
+    ]
+    tolerance = scoring.candidate_phase_tolerance(3 * scoring.HOUR)
+    expected = BASE + 15 * scoring.HOUR
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            expected + tolerance,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    ]
+    value._evaluate(server, now=expected + tolerance)
+    before = server.score.candidate(3 * scoring.HOUR)
+    server.player_observations = [
+        (at, 0)
+        for at in (
+            expected - tolerance,
+            expected,
+            expected + tolerance,
+        )
+    ]
+
+    value._evaluate_expected_windows(server, now=expected + tolerance)
+    value._evaluate(server, now=expected + tolerance)
+    after = server.score.candidate(3 * scoring.HOUR)
+
+    assert not any(
+        item.period_seconds == 3 * scoring.HOUR and item.expected_at == expected
+        for item in server.expected_misses
+    )
+    assert after.covered_miss_count == before.covered_miss_count
+    assert after.fundamental_period_confidence == before.fundamental_period_confidence
+
+
+def test_query_visible_populated_expected_window_still_records_covered_miss(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(
+            hour,
+            index + 1,
+            detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+        )
+        for index, hour in enumerate((0, 3, 6, 9, 12))
+    ]
+    tolerance = scoring.candidate_phase_tolerance(3 * scoring.HOUR)
+    expected = BASE + 15 * scoring.HOUR
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            expected + tolerance,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    ]
+    value._evaluate(server, now=expected + tolerance)
+    server.player_observations = [
+        (expected - tolerance, 8),
+        (expected, 7),
+        (expected + tolerance, 9),
+    ]
+
+    value._evaluate_expected_windows(server, now=expected + tolerance)
+
+    assert any(
+        item.period_seconds == 3 * scoring.HOUR and item.expected_at == expected
+        for item in server.expected_misses
+    )
 
 
 def test_unmonitored_candidate_window_never_records_a_miss(tmp_path):

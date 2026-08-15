@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import logging
 import os
 import sys
 import time
@@ -23,6 +24,9 @@ from .steam_ugc_backend import (
     ugc_item_ready,
     wait_for_ugc_ready,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_path(path):
@@ -65,7 +69,10 @@ def _choose_initial_workshop_dir(configured_workshop_dir, mods, backend):
     if resolved:
         effective = resolved
         if configured and os.path.realpath(configured) != os.path.realpath(resolved):
-            print(f"[JOIN] DayZ Steam library workshop path selected for {backend}: {resolved!r} (configured={configured!r})")
+            logger.debug(
+                "DayZ Steam library workshop path selected for %s: %r (configured=%r)",
+                backend, resolved, configured,
+            )
     elif autodetected and not effective:
         effective = autodetected
     elif autodetected and configured and os.path.realpath(autodetected) != os.path.realpath(configured):
@@ -73,15 +80,15 @@ def _choose_initial_workshop_dir(configured_workshop_dir, mods, backend):
             configured_missing = _missing_ids_for(configured, mods) if os.path.isdir(configured) else {int(mid) for mid, _ in (mods or [])}
             autodetected_missing = _missing_ids_for(autodetected, mods)
             if len(autodetected_missing) < len(configured_missing):
-                print(
-                    f"[JOIN] Workshop path refresh selected for {backend}: "
-                    f"configured={configured!r} autodetected={autodetected!r} "
-                    f"configured_missing={sorted(configured_missing)} "
-                    f"autodetected_missing={sorted(autodetected_missing)}"
+                logger.debug(
+                    "Workshop path refresh selected for %s: configured=%r "
+                    "autodetected=%r configured_missing=%s autodetected_missing=%s",
+                    backend, configured, autodetected,
+                    sorted(configured_missing), sorted(autodetected_missing),
                 )
                 effective = autodetected
         except Exception as e:
-            print(f"[JOIN] Workshop path comparison failed: {e}")
+            logger.debug("Workshop path comparison failed: %s", e)
 
     return effective or configured
 
@@ -93,7 +100,10 @@ def _refresh_effective_workshop_dir_after_backend(current_workshop_dir, mods, ba
         candidate = _resolve_path(getattr(steamcmd_mods, "LAST_EFFECTIVE_WORKSHOP_DIR", "") or "")
         if candidate and os.path.isdir(candidate):
             if current and os.path.realpath(candidate) != os.path.realpath(current):
-                print(f"[JOIN] SteamCMD effective workshop path propagated: {current!r} -> {candidate!r}")
+                logger.debug(
+                    "SteamCMD effective workshop path propagated: %r -> %r",
+                    current, candidate,
+                )
             return candidate
 
     autodetected = _maybe_autodetect_workshop_dir()
@@ -102,15 +112,15 @@ def _refresh_effective_workshop_dir_after_backend(current_workshop_dir, mods, ba
             current_missing = _missing_ids_for(current, mods) if os.path.isdir(current) else {int(mid) for mid, _ in (mods or [])}
             autodetected_missing = _missing_ids_for(autodetected, mods)
             if len(autodetected_missing) < len(current_missing):
-                print(
-                    f"[JOIN] {backend} effective workshop path refreshed after backend: "
-                    f"{current!r} -> {autodetected!r} "
-                    f"current_missing={sorted(current_missing)} "
-                    f"autodetected_missing={sorted(autodetected_missing)}"
+                logger.debug(
+                    "%s effective workshop path refreshed after backend: %r -> %r "
+                    "current_missing=%s autodetected_missing=%s",
+                    backend, current, autodetected,
+                    sorted(current_missing), sorted(autodetected_missing),
                 )
                 return autodetected
         except Exception as e:
-            print(f"[JOIN] Post-backend workshop path comparison failed: {e}")
+            logger.debug("Post-backend workshop path comparison failed: %s", e)
 
     return current
 
@@ -175,18 +185,24 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             win._join_log(attempt_id, "chosen backend", backend="Steam client UGC" if backend == "steam_client" else "SteamCMD")
         configured_workshop_dir = _resolve_path(workshop_dir)
         effective_workshop_dir = _choose_initial_workshop_dir(configured_workshop_dir, mods, backend)
-        print(f"[JOIN] selected backend: {backend}")
+        logger.debug("Selected Join mod backend: %s", backend)
         try:
             dayz_summary = dayz_paths_summary()
             dayz_library = str(dayz_summary.get("dayz_library") or "")
             if dayz_library:
-                print(f"[JOIN] resolved DayZ library: {dayz_library}")
+                logger.debug("Resolved DayZ library: %s", dayz_library)
             else:
-                print("[JOIN] DayZ Steam library not detected; using configured/default paths")
+                logger.debug("DayZ Steam library not detected; using configured/default paths")
         except Exception as exc:
-            print(f"[JOIN] DayZ Steam library not detected; using configured/default paths ({exc})")
-        print(f"[JOIN] configured workshop path: {configured_workshop_dir!r}")
-        print(f"[JOIN] effective workshop path used for checks/downloads: {effective_workshop_dir!r}")
+            logger.debug(
+                "DayZ Steam library not detected; using configured/default paths: %s",
+                exc,
+            )
+        logger.debug("Configured Workshop path: %r", configured_workshop_dir)
+        logger.debug(
+            "Effective Workshop path used for checks/downloads: %r",
+            effective_workshop_dir,
+        )
 
         missing = win.compute_missing_mods(effective_workshop_dir, mods)
         missing_ids = [mid for (mid, _name) in (missing or [])]
@@ -236,10 +252,11 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     ),
                 )
                 readiness_elapsed = time.monotonic() - readiness_started
-                print(
-                    "[BACKGROUND PREPARE] Steam UGC readiness "
-                    f"server={server_identity or server_name or '<unknown>'} "
-                    f"elapsed={readiness_elapsed:.3f}s success={bool(readiness_ok)}"
+                logger.debug(
+                    "Steam UGC readiness server=%s elapsed=%.3fs success=%s",
+                    server_identity or server_name or "<unknown>",
+                    readiness_elapsed,
+                    bool(readiness_ok),
                 )
                 if not readiness_ok:
                     if operation_cancel_event.is_set():
@@ -255,7 +272,10 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         )
                         if detail:
                             err_msg = f"{err_msg} {detail}"
-                    print(f"[JOIN] Steam UGC readiness failed before required mod state query: {err_msg}")
+                    logger.error(
+                        "Steam UGC readiness failed before required mod state query: %s",
+                        err_msg,
+                    )
                     if show_readiness_card:
                         def _ui_show_steam_ready_error():
                             win._steam_ugc_render_status(err_msg, error=True)
@@ -274,7 +294,10 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                 if show_readiness_card:
                     win.GLib.idle_add(win._show_join_progress_overlay, "Checking & Preparing Mods for Join...")
 
-                print(f"[JOIN] Steam UGC checking required mod readiness: {len(required_ids)} ids")
+                logger.debug(
+                    "Steam UGC checking required mod readiness: %d ids",
+                    len(required_ids),
+                )
                 initial_query_ok, ugc_state = query_ugc_state_checked(required_ids)
                 ugc_state = ugc_state if isinstance(ugc_state, dict) else {}
                 if attempt_id:
@@ -315,9 +338,11 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     needs_update = bool(state.get("needs_update", False))
                     downloading = bool(state.get("downloading", False))
                     download_pending = bool(state.get("download_pending", False))
-                    print(
-                        f"[Steam UGC] item {int(mid)} ready={ready} installed={installed} "
-                        f"needs_update={needs_update} downloading={downloading} pending={download_pending}"
+                    logger.debug(
+                        "Steam UGC item %d ready=%s installed=%s needs_update=%s "
+                        "downloading=%s pending=%s",
+                        int(mid), ready, installed, needs_update, downloading,
+                        download_pending,
                     )
                     if ready:
                         continue
@@ -351,7 +376,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                 elif steam_client_work_ids:
                     download_ids = steam_client_work_ids
                     status_msg = f"Checking {len(download_ids)} required Steam UGC mod(s)…"
-                    print(f"[Steam UGC] required update/download ids: {download_ids}")
+                    logger.debug(
+                        "Steam UGC required update/download ids: %s", download_ids,
+                    )
                     kinds = []
                     if queue_missing:
                         kinds.append("missing")
@@ -370,7 +397,10 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             needs_update=queue_needs_update,
                         )
                 else:
-                    print(f"[JOIN] Steam UGC required mods already ready: {len(required_ids)} ids")
+                    logger.debug(
+                        "Steam UGC required mods already ready: %d ids",
+                        len(required_ids),
+                    )
                     status_msg = "No mod downloads required for this join."
                     if attempt_id:
                         win._join_log(attempt_id, "UGC initial all-items-ready", count=len(required_ids))
@@ -399,7 +429,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
 
         if ok and use_steamcmd and download_ids:
             did_work = True
-            print(f"[JOIN] {backend} download ids: {download_ids}")
+            logger.debug("Join %s download ids: %s", backend, download_ids)
 
             work_set_event = PreparationProgressEvent.from_authoritative_payload({
                 "type": "presentation_work_set",
@@ -494,7 +524,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     try:
                         sizes = win.fetch_workshop_sizes_bytes(list(download_ids or []), appid=221100, timeout_s=20)
                     except Exception as e:
-                        print(f"[SIZES] fetch_workshop_sizes_bytes failed: {e}")
+                        logger.debug("Workshop size lookup failed: %s", e)
                         sizes = {}
 
                     def _ui_set_sizes():
@@ -614,15 +644,18 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
 
         else:
             if use_steamcmd:
-                print("[JOIN] Mod download not needed for this join; proceeding with local mods only")
+                logger.debug("Mod download not needed; proceeding with local mods")
             else:
-                print("[JOIN] Mod download handling disabled; proceeding with local mods only")
+                logger.debug("Mod download handling disabled; proceeding with local mods")
 
         if ok:
             if attempt_id and backend == "steam_client":
                 win._join_log(attempt_id, "post-UGC continuation beginning")
             effective_workshop_dir = _refresh_effective_workshop_dir_after_backend(effective_workshop_dir, mods, backend)
-            print(f"[JOIN] effective workshop path used for symlinks: {effective_workshop_dir!r}")
+            logger.debug(
+                "Effective Workshop path used for symlinks: %r",
+                effective_workshop_dir,
+            )
 
             if use_steamcmd and backend == "steam_client":
                 terminal_failure_message = (
@@ -637,7 +670,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         query_ok, states = query_ugc_state_checked(required_ids)
                     except Exception as exc:
                         query_ok, states = False, {}
-                        print(f"[JOIN] {phase} Steam UGC validation failed: {exc}")
+                        logger.error("%s Steam UGC validation failed: %s", phase, exc)
                     states = states if isinstance(states, dict) else {}
                     if not query_ok:
                         reasons = {mid: "query failure" for mid in required_ids}
@@ -663,10 +696,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             elif not ugc_item_ready(state):
                                 reasons[mid] = "unknown"
                     unresolved = [mid for mid in required_ids if mid in reasons]
-                    print(
-                        f"[JOIN] {phase} Steam UGC validation "
-                        f"success={bool(query_ok and not unresolved)} "
-                        f"unresolved={unresolved} reasons={reasons}"
+                    logger.debug(
+                        "%s Steam UGC validation success=%s unresolved=%s reasons=%s",
+                        phase, bool(query_ok and not unresolved), unresolved, reasons,
                     )
                     if attempt_id:
                         win._join_log(
@@ -774,9 +806,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         effective_workshop_dir = _refresh_effective_workshop_dir_after_backend(
                             effective_workshop_dir, mods, backend,
                         )
-                        print(
-                            "[JOIN] effective workshop path refreshed after terminal "
-                            f"retry: {effective_workshop_dir!r}"
+                        logger.debug(
+                            "Effective Workshop path refreshed after terminal retry: %r",
+                            effective_workshop_dir,
                         )
                         final_current, final_unresolved = validate_terminal_ugc(
                             "final terminal",
@@ -811,7 +843,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         err_msg = f"Required mods still missing after install: {[mid for mid, _ in unresolved]}"
                     else:
                         mods_for_launch = [pair for pair in mods if int(pair[0]) not in denied_ids]
-                        print(f"[JOIN] Skipping inaccessible mods: {sorted(denied_ids)}")
+                        logger.warning(
+                            "Skipping inaccessible required mods: %s", sorted(denied_ids),
+                        )
 
     except UGCHelperReapError as exc:
         helper_reap_error = exc
@@ -836,7 +870,10 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             raise
         except Exception as exc:
             secondary_error = f"Steam UGC session shutdown failed: {exc}"
-            print(f"[JOIN] Secondary cleanup diagnostic: {secondary_error}", file=sys.stderr)
+            print(
+                f"[JOIN] Secondary cleanup diagnostic: {secondary_error}",
+                file=sys.stderr,
+            )
             if attempt_id:
                 win._join_log(
                     attempt_id,
@@ -933,10 +970,11 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
             if continuation_cancelled():
                 ok = False
                 err_msg = err_msg or "Join cancelled."
-            print(
-                f"[JOIN] symlink result: created={len(link_info['created'])} "
-                f"updated={len(link_info['updated'])} kept={len(link_info['kept'])} "
-                f"removed={len(link_info['removed'])} errors={len(link_info['errors'])}"
+            logger.debug(
+                "Join symlink result: created=%d updated=%d kept=%d removed=%d errors=%d",
+                len(link_info["created"]), len(link_info["updated"]),
+                len(link_info["kept"]), len(link_info["removed"]),
+                len(link_info["errors"]),
             )
             if attempt_id:
                 win._join_log(attempt_id, "symlink preparation completed",
@@ -949,7 +987,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                     ok = False
                     err_msg = "Failed to create all watch-folder symlinks"
                 else:
-                    print(f"[JOIN] Symlink warnings: {link_info.get('errors')}")
+                    logger.warning("Join symlink warnings: %s", link_info.get("errors"))
 
             if ok and not continuation_cancelled():
                 validation_errors = steamcmd_mods.validate_selected_watch_symlinks(
@@ -958,7 +996,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                 )
                 if validation_errors:
                     for line in validation_errors:
-                        print(f"[JOIN] Invalid mod path before launch: {line}")
+                        logger.error("Invalid mod path before launch: %s", line)
                     ok = False
                     err_msg = "Invalid required mod path(s) before launch: " + "; ".join(validation_errors)
 
@@ -979,7 +1017,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                         installed_mod_linux_paths=installed_mods_for_local,
                         selected_mod_linux_paths=selected_mods_for_preset,
                     )
-                    print(f"[JOIN] launcher state written: {paths}")
+                    logger.debug("Join launcher state written")
                     if attempt_id:
                         win._join_log(
                             attempt_id,
@@ -1012,9 +1050,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                         installed_mod_linux_paths=installed_mods_for_local,
                         selected_mod_linux_paths=[],
                     )
-                    print(
-                        f"[JOIN] launcher state cleared for no-mod server: {paths}"
-                    )
+                    logger.debug("Join launcher state cleared for no-mod server")
                     if attempt_id:
                         win._join_log(
                             attempt_id,
@@ -1061,7 +1097,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, steamcmd_path, steam_u
                 win.steamcmd_cancel_btn.set_visible(True)
             except Exception:
                 pass
-            print(f"[JOIN] Aborting launch: {err_msg or 'unknown error'}")
+            logger.error("Aborting Join launch: %s", err_msg or "unknown error")
             if attempt_id:
                 win._cleanup_join_attempt(attempt_id, f"preparation failed: {err_msg or 'unknown error'}")
             win._on_filter_changed()

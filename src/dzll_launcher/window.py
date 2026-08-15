@@ -3,6 +3,7 @@
 #!/usr/bin/env python3
 import os
 import json
+import logging
 import time
 import subprocess
 import urllib.request
@@ -16,6 +17,9 @@ import traceback
 import weakref
 from pathlib import Path
 import sys
+
+
+logger = logging.getLogger(__name__)
 
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, Pango, GLib, Gdk, Graphene
@@ -66,6 +70,8 @@ from .config import (
     COMPANION_POLL_ONLINE_SECONDS,
     COMPANION_POLL_OFFLINE_SECONDS,
     COMPANION_ALERT_REARM_OFFLINE_SECONDS,
+    COMPANION_RECOVERY_CONFIRM_DELAY_MS,
+    COMPANION_RECOVERY_STABLE_ONLINE_SECONDS,
     COMPANION_RESTART_LEARNING_PATH,
     COMPANION_RESTART_LEARNING_PHASE2_PATH,
     AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED,
@@ -140,7 +146,6 @@ from .steam_client_mods import run_steam_client_install
 from .steam_ugc_backend import UGCHelperReapError
 from .steamcmd_overlay_ui import SteamCMDOverlayUI
 from .launcher_state import bootstrap_launcher_state
-from .blocklist_utils import bl_normalize_key, bl_load_local, bl_status
 from .join_prepare import join_prepare_and_launch
 from .background_prepare import (
     BackgroundConsentResult,
@@ -199,10 +204,16 @@ from .mod_suggestions import (
     suggest_mods,
 )
 from .companion_restart_phase2_consumers import AlertKeyKind, RecoveryAction
-from .companion_restart_phase2_detection import LifecycleMarker, pending_strike_is_recent
+from .companion_restart_phase2_detection import (
+    EventOutcome,
+    LifecycleMarker,
+    pending_strike_is_recent,
+)
 from .companion_restart_phase2_runtime import (
     LiveResultDisposition,
     Phase2RestartRuntime,
+    RECOVERY_ALERT_OUT_OF_WINDOW_HOLD_SECONDS,
+    RecoveryAlertWindowStatus,
     RuntimeNotice,
     live_result_disposition,
     phase2_alert_usability,
@@ -247,6 +258,7 @@ INCREMENTAL_MODELS_DISABLED = os.environ.get("DZLL_DISABLE_INCREMENTAL_MODELS") 
 INCREMENTAL_MODELS_ENABLED = not INCREMENTAL_MODELS_DISABLED
 PERF_STALL_INTERVAL_MS = 250
 PERF_STALL_LATE_MS = 250
+
 BROWSER_LIVE_SCROLL_PAUSE_SECONDS = 1.0
 SCROLLBAR_INTERACTION_WATCHDOG_MS = 15000
 SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS = 200
@@ -540,18 +552,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.settings = load_settings()
         self._ping_cutoff_ms = int(self.settings.get("high_ping_cutoff_ms", 250) or 250)
 
-        # --- Blocklist state (v2) ---
-        self._bl_ok = False
-        self.bl_ip_hard = set()
-        self.bl_allow_exact = set()
-        self.bl_soft = set()
-        self.bl_hard = set()
-
-        # Optional compatibility mirrors (not used for v2 logic, but kept)
-        self._bl_soft = set()
-        self._bl_hard = set()
-        self._clear_blocklist_runtime_state()
-
         # Steam global players state
         self._steam_global_players = None
         GLib.timeout_add_seconds(2, self._steam_global_players_startup_tick)
@@ -578,7 +578,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._mod_suggestion_dismissed = None
         self._mod_suggestion_refresh_id = 0
         self._mod_suggestion_last_rows = ()
-        self._mod_suggestion_keyboard_selected = False
         self._mod_search_mode_active = False
         self._mod_search_saved_normal_text = ""
         self._mod_search_entry_update_guard = False
@@ -725,17 +724,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._steamcmd_progress_timer_id = 0
         self._steamcmd_last_progress_bytes = 0
         self._steam_ugc_progress_timer_id = 0
-        self._steam_ugc_installed_ids = set()
         self._steam_ugc_active_event = None
-        self._steam_ugc_completed_count = 0
         self._steam_ugc_percent_label = None
-        self._steam_ugc_last_error = ""
 
         # NEW: Cancel support
         self._steamcmd_cancel_event = threading.Event()
         self._steam_client_stop_waiting_event = threading.Event()
         self._steam_client_safe_cancel_requested = False
-        self._steam_client_downloads_opened = False
         self._steam_client_open_downloads_btn = None
         self._steamcmd_install_in_progress = False
         self._mod_download_backend_active = ""
@@ -821,92 +816,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # ----------------------------
         self._steamcmd_overlay_ui = SteamCMDOverlayUI(self)
         self._steamcmd_overlay_ui.build(overlay)
-
-        # ----------------------------
-        # BLOCKED SERVER WARNING OVERLAY (scrim + card)
-        # ----------------------------
-        self.warn_scrim = Gtk.Box()
-        self.warn_scrim.set_hexpand(True)
-        self.warn_scrim.set_vexpand(True)
-        self.warn_scrim.set_visible(False)
-        self.warn_scrim.set_can_target(True)
-        self.warn_scrim.add_css_class("settings-scrim")
-        overlay.add_overlay(self.warn_scrim)
-
-        self.warn_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
-        self.warn_box.set_halign(Gtk.Align.CENTER)
-        self.warn_box.set_valign(Gtk.Align.CENTER)
-        self.warn_box.set_visible(False)
-        self.warn_box.set_can_target(True)
-        self.warn_box.add_css_class("warning-card")
-        overlay.add_overlay(self.warn_box)
-
-        # Icon + WARNING (centered)
-        self.warn_icon = Gtk.Label(label="⚠️")
-        self.warn_icon.set_halign(Gtk.Align.CENTER)
-        self.warn_icon.add_css_class("warning-icon")
-        self.warn_box.append(self.warn_icon)
-
-        self.warn_title = Gtk.Label(label="WARNING")
-        self.warn_title.set_halign(Gtk.Align.CENTER)
-        self.warn_title.add_css_class("warning-title")
-        self.warn_box.append(self.warn_title)
-
-        # Warning text
-        self.warn_text = Gtk.Label(
-            label="This server originates from an infrastructure source associated\n"
-                  "with fraudulent or unverifiable servers. Continue at your own risk."
-        )
-        self.warn_text.set_wrap(True)
-        self.warn_text.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.warn_text.set_xalign(0.0)
-        self.warn_box.append(self.warn_text)
-
-        # IP:PORT
-        self.warn_ip = Gtk.Label(label="")
-        self.warn_ip.set_xalign(0.0)
-        self.warn_ip.add_css_class("dim-label")
-        self.warn_box.append(self.warn_ip)
-
-        # Question
-        self.warn_q = Gtk.Label(label="Do you still want to join?")
-        self.warn_q.set_xalign(0.0)
-        self.warn_box.append(self.warn_q)
-
-        # Buttons row: centered, 20px gap, equal width
-        btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
-        btn_row.set_halign(Gtk.Align.CENTER)
-
-        self.warn_join_btn = Gtk.Button(label="Join")
-        self.warn_join_btn.add_css_class("warning-btn")
-        btn_row.append(self.warn_join_btn)
-
-        self.warn_cancel_btn = Gtk.Button(label="Cancel")
-        self.warn_cancel_btn.add_css_class("suggested-action")
-        self.warn_cancel_btn.add_css_class("warning-btn")
-        btn_row.append(self.warn_cancel_btn)
-
-        self.warn_box.append(btn_row)
-
-        # Internal state for blocking confirm
-        self._warn_decided = None
-        self._warn_loop = None
-
-        def _warn_finish(ok: bool):
-            self._warn_decided = bool(ok)
-            try:
-                self.warn_box.set_visible(False)
-                self.warn_scrim.set_visible(False)
-            except Exception:
-                pass
-            try:
-                if self._warn_loop:
-                    self._warn_loop.quit()
-            except Exception:
-                pass
-
-        self.warn_cancel_btn.connect("clicked", lambda *_: _warn_finish(False))
-        self.warn_join_btn.connect("clicked", lambda *_: _warn_finish(True))
 
         # ----------------------------
         # START STEAM ON JOIN CONSENT OVERLAY
@@ -1215,7 +1124,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_snapshot = None
         self._server_companion_obj = None
         self._server_companion_offline_since = None
-        self._server_companion_offline_since_wall = None
         self._server_companion_alert_armed = False
         self._server_companion_restart_warning_fired = set()
         self._server_companion_poll_interval_secs = COMPANION_POLL_ONLINE_SECONDS
@@ -1223,15 +1131,21 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_poll_paused = False
         self._server_companion_poll_inflight = False
         self._server_companion_poll_token = 0
-        self._server_companion_last_online = None
-        self._server_companion_monitor_last_saved_at = {}
         self._server_companion_consecutive_offline_polls = 0
         self._server_companion_first_offline_strike_mono = None
+        self._server_companion_recovery_confirmation_source_id = 0
+        self._server_companion_recovery_confirmation_inflight = False
+        self._server_companion_recovery_confirmation_nonce = 0
+        self._server_companion_recovery_candidate = None
+        self._server_companion_recovery_outage_sequence = 0
+        self._server_companion_recovery_alert_suppressed = False
+        self._server_companion_recovery_online_since = None
+        self._server_companion_pending_recovery_alert = None
+        self._server_companion_pending_recovery_alert_source_id = 0
         self._server_companion_visible_snapshot = None
         self._server_companion_observation_samples = deque(maxlen=5000)
         self._server_companion_phase2_first_accept_session_id = ""
         self._server_companion_phase2_logged_rejections = set()
-        self._server_companion_visible_zero_state = None
         self._pending_server_companion_obj = None
         self._server_companion_docked = True
         self._server_companion_undocked_window = None
@@ -1523,10 +1437,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _show_steam_client_download_overlay(self, status: str = ""):
         self._mod_download_backend_active = "steam_client"
         self._steam_client_safe_cancel_requested = False
-        self._steam_ugc_installed_ids = set()
         self._steam_ugc_active_event = None
-        self._steam_ugc_completed_count = 0
-        self._steam_ugc_last_error = ""
         try:
             self._steam_client_stop_waiting_event.clear()
         except Exception:
@@ -1554,7 +1465,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _join_popup_enter_checking(self, attempt_id: int) -> bool:
         if not self._join_attempt_is_active(attempt_id):
-            print(f"[join:{attempt_id}] stale popup callback rejected state='checking'", flush=True)
+            logger.debug(
+                "Join %d stale popup callback rejected state=checking", attempt_id,
+            )
             return False
         self._join_attempts.set_popup_state(attempt_id, "checking")
         self._join_log(attempt_id, "popup entered checking state")
@@ -1566,7 +1479,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         initialized, total = self._join_attempts.initialize_download_counter(attempt_id, mod_ids)
         if not initialized:
             if not self._join_attempt_is_active(attempt_id):
-                print(f"[join:{attempt_id}] stale download counter initialization rejected", flush=True)
+                logger.debug(
+                    "Join %d stale download counter initialization rejected",
+                    attempt_id,
+                )
             return False
         self._join_log(
             attempt_id,
@@ -1581,9 +1497,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                                           backend: str):
         result = self._join_attempts.note_genuine_mod_work(attempt_id, mod_id)
         if result.status == "stale":
-            print(
-                f"[join:{attempt_id}] stale download counter callback rejected mod_id={int(mod_id)}",
-                flush=True,
+            logger.debug(
+                "Join %d stale download counter callback rejected mod_id=%d",
+                attempt_id, int(mod_id),
             )
             return result
         if result.status in ("uninitialized", "not-in-work-set", "overflow"):
@@ -1634,7 +1550,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _join_popup_show_launching(self, attempt_id: int) -> bool:
         active = self._join_attempts.active
         if active is None or active.attempt_id != int(attempt_id):
-            print(f"[join:{attempt_id}] stale popup callback rejected state='launching'", flush=True)
+            logger.debug(
+                "Join %d stale popup callback rejected state=launching", attempt_id,
+            )
             return False
         if active.genuine_mod_work:
             state = "launching-downloaded"
@@ -1654,7 +1572,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _join_popup_process_detected(self, attempt_id: int, process: str) -> bool:
         active = self._join_attempts.active
         if active is None or active.attempt_id != int(attempt_id):
-            print(f"[join:{attempt_id}] stale popup callback rejected process={process!r}", flush=True)
+            logger.debug(
+                "Join %d stale popup callback rejected process=%r",
+                attempt_id, process,
+            )
             return False
         process = str(process)
         valid = process == "DayZ" or (process == "DayZ Launcher" and not active.skip_dayz_launcher)
@@ -1668,9 +1589,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _join_popup_watcher_failure(self, attempt_id: int, reason: str) -> bool:
         if not self._join_attempt_is_active(attempt_id):
-            print(f"[join:{attempt_id}] stale popup callback rejected state='watcher-error'", flush=True)
+            logger.debug(
+                "Join %d stale popup callback rejected state=watcher-error",
+                attempt_id,
+            )
             return False
         detail = str(reason or "DZLL did not detect DayZ starting.")
+        logger.error("DayZ watcher failed: %s", detail)
         self._join_attempts.set_popup_state(attempt_id, "error")
         self._join_log(attempt_id, "watcher terminal failure", reason=detail)
         self._steam_ugc_render_status(detail, error=True)
@@ -1822,12 +1747,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             self._steam_ugc_stop_progress_timer()
             self._steam_ugc_set_layout_active(False)
-            self._steam_ugc_installed_ids = set()
             self._steam_ugc_active_event = None
-            self._steam_ugc_completed_count = 0
-            self._steam_ugc_last_error = ""
             self._steam_client_safe_cancel_requested = False
-            self._steam_client_downloads_opened = False
             try:
                 self._steam_client_stop_waiting_event.clear()
             except Exception:
@@ -1856,9 +1777,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if attempt_id is not None and (
             active is None or int(active.attempt_id) != int(attempt_id)
         ):
-            print(
-                f"[join:{int(attempt_id)}] stale Cancel callback rejected",
-                flush=True,
+            logger.debug(
+                "Join %d stale Cancel callback rejected", int(attempt_id),
             )
             return None
         if bool(getattr(self, "_steam_client_safe_cancel_requested", False)):
@@ -2041,7 +1961,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not text:
             return False
         if error:
-            self._steam_ugc_last_error = text
             try:
                 attempt_id = self._join_popup_attempt_id()
                 if attempt_id:
@@ -2166,9 +2085,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             origin_attempt_id = 0
         if origin_attempt_id > 0 and not self._join_attempt_is_active(origin_attempt_id):
-            print(
-                f"[join:{origin_attempt_id}] stale download counter callback rejected",
-                flush=True,
+            logger.debug(
+                "Join %d stale download counter callback rejected",
+                origin_attempt_id,
             )
             return False
         reducer = getattr(self, "_join_preparation_reducer", None)
@@ -3168,11 +3087,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         self.set_server_companion_enabled(True)
 
-    def toggle_server_companion(self):
-        self.set_server_companion_enabled(
-            not bool(self.server_companion_revealer.get_reveal_child())
-        )
-
     def set_server_companion_enabled(self, enabled: bool):
         enabled = bool(enabled)
         self.settings["show_server_companion"] = enabled
@@ -3717,11 +3631,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 f"error={exc!r}"
             )
 
-    def _record_server_companion_monitor_heartbeat(self, key: str | None = None) -> None:
-        # Phase 2 persists dense coverage from actual poll results.  A coarse
-        # Phase 1 heartbeat would overstate monitoring and is intentionally gone.
-        return
-
     def _record_server_companion_monitor_ended(
         self,
         reason: str,
@@ -3863,76 +3772,564 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 panel.set_restart_alert_usability(self._server_companion_restart_alert_usability_summary())
             self._update_server_companion_undocked_size()
 
-    def _record_server_companion_restart_learning_outage(
-        self,
-        *,
-        offline_at: int,
-        online_at: int,
-        duration_seconds: int,
-        snapshot: dict,
-    ) -> int | None:
-        # The unified Phase 2 episode receives the same outage through the live
-        # poll mapper.  Keeping this compatibility hook as a no-op prevents a
-        # second physical event and retires all Phase 1 writes.
-        return None
-
-    def _reset_server_companion_visible_zero_state(self) -> None:
-        self._server_companion_visible_zero_state = None
-
-    def _feed_server_companion_visible_restart_detector(self, players: int, snapshot: dict) -> bool:
-        # Retained as a private compatibility hook for older tests/callers. Live
-        # data is now fed exactly once to the unified Phase 2 episode engine.
-        return False
-
-    def _append_server_companion_observation_sample(self, key: str | None, online: bool) -> None:
-        return
-
-    def _maybe_record_server_companion_expected_window_miss(self) -> None:
-        # Stage 3 evaluates all candidate windows from dense Phase 2 coverage
-        # whenever a poll/event closes an inspectable interval.
-        return
-
-    def _server_companion_expected_miss_exists(
-        self,
-        server: dict,
-        expected_at: int,
-        cycle_seconds: int,
-        generation: int,
-    ) -> bool:
-        for miss in server.get("expected_window_misses") or []:
-            if not isinstance(miss, dict):
-                continue
-            if (
-                self._safe_positive_int(miss.get("expected_at")) == int(expected_at)
-                and self._safe_positive_int(miss.get("cycle_seconds")) == int(cycle_seconds)
-                and self._safe_positive_int(miss.get("model_generation")) == int(generation)
-            ):
-                return True
-        return False
-
-    def _server_companion_restart_event_overlaps(self, server: dict, window_start: int, window_end: int) -> bool:
-        for event in server.get("restart_events") or []:
-            if not isinstance(event, dict):
-                continue
-            offline_at = self._safe_positive_int(event.get("offline_at"))
-            online_at = self._safe_positive_int(event.get("online_at"))
-            if offline_at <= 0 or online_at <= 0:
-                continue
-            if offline_at <= window_end and online_at >= window_start:
-                return True
-        return False
-
     def _safe_positive_int(self, value) -> int:
         try:
             return max(0, int(value))
         except Exception:
             return 0
 
-    def _safe_float_value(self, value) -> float:
+    def _cancel_server_companion_recovery_confirmation(self) -> None:
+        source_id = int(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_source_id",
+                0,
+            )
+            or 0
+        )
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+        if bool(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_inflight",
+                False,
+            )
+        ):
+            self._server_companion_poll_inflight = False
+        self._server_companion_recovery_confirmation_source_id = 0
+        self._server_companion_recovery_confirmation_inflight = False
+        self._server_companion_recovery_candidate = None
+        self._server_companion_recovery_confirmation_nonce = int(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_nonce",
+                0,
+            )
+            or 0
+        ) + 1
+
+    def _server_companion_recovery_session_id(self, key: str | None) -> str:
+        if not key:
+            return ""
         try:
-            return float(value)
+            return str(
+                self._companion_restart_phase2.active_monitoring_session_id(key)
+                or ""
+            )
         except Exception:
-            return 0.0
+            return ""
+
+    def _server_companion_recovery_confirmation_is_current(
+        self, candidate: dict | None
+    ) -> bool:
+        if not isinstance(candidate, dict):
+            return False
+        if candidate is not getattr(
+            self, "_server_companion_recovery_candidate", None
+        ):
+            return False
+        if int(candidate.get("nonce", -1)) != int(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_nonce",
+                0,
+            )
+            or 0
+        ):
+            return False
+        if int(candidate.get("poll_generation", -1)) != int(
+            getattr(self, "_server_companion_poll_token", 0) or 0
+        ):
+            return False
+        if int(candidate.get("outage_sequence", -1)) != int(
+            getattr(self, "_server_companion_recovery_outage_sequence", 0) or 0
+        ):
+            return False
+        key = self._server_companion_restart_learning_key()
+        if str(candidate.get("server_key") or "") != str(key or ""):
+            return False
+        if str(candidate.get("monitoring_session_id") or "") != (
+            self._server_companion_recovery_session_id(key)
+        ):
+            return False
+        snapshot = getattr(self, "_server_companion_snapshot", None) or {}
+        if bool(snapshot.get("online", False)):
+            return False
+        if int(
+            getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0
+        ) < 2:
+            return False
+        if str(candidate.get("ip") or "") != str(snapshot.get("ip") or ""):
+            return False
+        if int(candidate.get("qport") or 0) != int(snapshot.get("qport") or 0):
+            return False
+        return bool(self._server_companion_should_poll())
+
+    def _schedule_server_companion_recovery_confirmation(self) -> bool:
+        if getattr(self, "_server_companion_recovery_candidate", None) is not None:
+            return False
+        if bool(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_inflight",
+                False,
+            )
+        ):
+            return False
+        snapshot = getattr(self, "_server_companion_snapshot", None) or {}
+        if bool(snapshot.get("online", False)) or int(
+            getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0
+        ) < 2:
+            return False
+        key = self._server_companion_restart_learning_key()
+        nonce = int(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_nonce",
+                0,
+            )
+            or 0
+        ) + 1
+        self._server_companion_recovery_confirmation_nonce = nonce
+        candidate = {
+            "nonce": nonce,
+            "poll_generation": int(
+                getattr(self, "_server_companion_poll_token", 0) or 0
+            ),
+            "monitoring_session_id": (
+                self._server_companion_recovery_session_id(key)
+            ),
+            "server_key": str(key or ""),
+            "outage_sequence": int(
+                getattr(self, "_server_companion_recovery_outage_sequence", 0)
+                or 0
+            ),
+            "ip": str(snapshot.get("ip") or ""),
+            "qport": int(snapshot.get("qport") or 0),
+        }
+        if not candidate["ip"] or int(candidate["qport"]) <= 0:
+            return False
+        self._server_companion_recovery_candidate = candidate
+        self._server_companion_recovery_confirmation_source_id = GLib.timeout_add(
+            COMPANION_RECOVERY_CONFIRM_DELAY_MS,
+            self._begin_server_companion_recovery_confirmation,
+            candidate,
+        )
+        self._debug_server_companion_alert(
+            "recovery candidate scheduled: "
+            f"server={candidate['server_key']!r} "
+            f"generation={candidate['poll_generation']} "
+            f"session={candidate['monitoring_session_id']!r} "
+            f"outage={candidate['outage_sequence']} nonce={nonce} "
+            f"delay_ms={COMPANION_RECOVERY_CONFIRM_DELAY_MS}"
+        )
+        return True
+
+    def _begin_server_companion_recovery_confirmation(
+        self, candidate: dict
+    ) -> bool:
+        self._server_companion_recovery_confirmation_source_id = 0
+        if not self._server_companion_recovery_confirmation_is_current(candidate):
+            if candidate is getattr(
+                self, "_server_companion_recovery_candidate", None
+            ):
+                self._cancel_server_companion_recovery_confirmation()
+            return False
+        if bool(getattr(self, "_server_companion_poll_inflight", False)):
+            self._cancel_server_companion_recovery_confirmation()
+            return False
+
+        self._server_companion_recovery_confirmation_inflight = True
+        self._server_companion_poll_inflight = True
+
+        def worker():
+            try:
+                info = query_server_live(
+                    str(candidate["ip"]),
+                    int(candidate["qport"]),
+                    cycle_id=(
+                        "companion-recovery-confirm:"
+                        f"{candidate['poll_generation']}:"
+                        f"{candidate['outage_sequence']}:"
+                        f"{candidate['nonce']}"
+                    ),
+                    generation=candidate["poll_generation"],
+                )
+            except Exception as exc:
+                info = {
+                    "ok": False,
+                    "err": str(exc),
+                    "a2s_classification": "socket-error",
+                }
+            GLib.idle_add(
+                self._apply_server_companion_recovery_confirmation_result,
+                candidate,
+                info,
+            )
+
+        try:
+            self._hi_executor.submit(worker)
+        except Exception as exc:
+            self._server_companion_recovery_confirmation_inflight = False
+            self._server_companion_poll_inflight = False
+            self._debug_server_companion_alert(
+                f"recovery confirmation submit failed: {exc!r}"
+            )
+            self._cancel_server_companion_recovery_confirmation()
+        return False
+
+    def _apply_server_companion_recovery_confirmation_result(
+        self, candidate: dict, info: dict
+    ) -> bool:
+        if not self._server_companion_recovery_confirmation_is_current(candidate):
+            if candidate is getattr(
+                self, "_server_companion_recovery_candidate", None
+            ):
+                self._cancel_server_companion_recovery_confirmation()
+            return False
+        self._server_companion_recovery_confirmation_inflight = False
+        self._server_companion_poll_inflight = False
+        disposition = live_result_disposition(info)
+        self._server_companion_recovery_candidate = None
+        self._server_companion_recovery_confirmation_nonce = int(
+            getattr(
+                self,
+                "_server_companion_recovery_confirmation_nonce",
+                0,
+            )
+            or 0
+        ) + 1
+        if disposition is LiveResultDisposition.HEALTHY:
+            self._debug_server_companion_alert(
+                "recovery confirmation succeeded: "
+                f"server={candidate['server_key']!r} "
+                f"generation={candidate['poll_generation']} "
+                f"session={candidate['monitoring_session_id']!r} "
+                f"outage={candidate['outage_sequence']}"
+            )
+            self._server_companion_poll_inflight = True
+            return self._apply_server_companion_live_result(
+                int(candidate["poll_generation"]),
+                info,
+                confirmed_recovery=candidate,
+            )
+        self._debug_server_companion_alert(
+            "recovery confirmation failed; remaining offline: "
+            f"disposition={disposition.value} "
+            f"server={candidate['server_key']!r} "
+            f"outage={candidate['outage_sequence']}"
+        )
+        self._server_companion_poll_inflight = True
+        return self._apply_server_companion_live_result(
+            int(candidate["poll_generation"]), info
+        )
+
+    def _update_server_companion_recovery_alert_rearm(
+        self,
+        now: float,
+        *,
+        healthy: bool = False,
+        qualifying_failure: bool = False,
+    ) -> None:
+        if not bool(
+            getattr(self, "_server_companion_recovery_alert_suppressed", False)
+        ):
+            return
+        online_since = getattr(
+            self, "_server_companion_recovery_online_since", None
+        )
+        snapshot = getattr(self, "_server_companion_snapshot", None) or {}
+        if online_since is not None and bool(snapshot.get("online", False)):
+            if (
+                now - float(online_since)
+                >= COMPANION_RECOVERY_STABLE_ONLINE_SECONDS
+            ):
+                self._server_companion_recovery_alert_suppressed = False
+                self._server_companion_recovery_online_since = None
+                self._debug_server_companion_alert(
+                    "recovery alert re-armed after credible online operation: "
+                    f"seconds={now - float(online_since):.1f}"
+                )
+                return
+        if qualifying_failure:
+            self._server_companion_recovery_online_since = None
+        elif healthy and online_since is None:
+            self._server_companion_recovery_online_since = now
+
+    def _cancel_server_companion_pending_recovery_alert(self) -> None:
+        source_id = int(
+            getattr(
+                self,
+                "_server_companion_pending_recovery_alert_source_id",
+                0,
+            )
+            or 0
+        )
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+        self._server_companion_pending_recovery_alert_source_id = 0
+        self._server_companion_pending_recovery_alert = None
+
+    def _server_companion_pending_recovery_alert_is_current(
+        self, pending: dict | None, *, require_online: bool = True
+    ) -> bool:
+        if not isinstance(pending, dict):
+            return False
+        if pending is not getattr(
+            self, "_server_companion_pending_recovery_alert", None
+        ):
+            return False
+        key = self._server_companion_restart_learning_key()
+        if str(pending.get("server_key") or "") != str(key or ""):
+            return False
+        if int(pending.get("poll_generation", -1)) != int(
+            getattr(self, "_server_companion_poll_token", 0) or 0
+        ):
+            return False
+        if int(pending.get("outage_sequence", -1)) != int(
+            getattr(self, "_server_companion_recovery_outage_sequence", 0) or 0
+        ):
+            return False
+        if str(pending.get("monitoring_session_id") or "") != (
+            self._server_companion_recovery_session_id(key)
+        ):
+            return False
+        if require_online and not bool(
+            (getattr(self, "_server_companion_snapshot", None) or {}).get(
+                "online", False
+            )
+        ):
+            return False
+        return True
+
+    def _maybe_hold_server_companion_confirmed_recovery_alert(
+        self,
+        snapshot: dict,
+        *,
+        now: float,
+        now_wall: float,
+        confirmed_recovery: dict,
+    ) -> bool:
+        if not bool(
+            getattr(self, "_server_companion_restart_alert_enabled", False)
+        ) or bool(
+            getattr(self, "_server_companion_recovery_alert_suppressed", False)
+        ):
+            return False
+        key = self._server_companion_restart_learning_key()
+        if not key:
+            return False
+        try:
+            expected = self._companion_restart_phase2.recovery_alert_expected_window(
+                key
+            )
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                "confirmed recovery expected-window policy unavailable; "
+                f"using immediate alert: {exc!r}"
+            )
+            return False
+        if expected.status is not RecoveryAlertWindowStatus.OUTSIDE_WINDOW:
+            return False
+        event_id = str(expected.event_id or "")
+        if not event_id:
+            return False
+        existing = getattr(
+            self, "_server_companion_pending_recovery_alert", None
+        )
+        if isinstance(existing, dict):
+            if str(existing.get("event_id") or "") == event_id:
+                return True
+            self._cancel_server_companion_pending_recovery_alert()
+        pending = {
+            "server_key": str(key),
+            "monitoring_session_id": str(
+                confirmed_recovery.get("monitoring_session_id") or ""
+            ),
+            "poll_generation": int(
+                confirmed_recovery.get("poll_generation", -1)
+            ),
+            "outage_sequence": int(
+                confirmed_recovery.get("outage_sequence", -1)
+            ),
+            "event_id": event_id,
+            "recovery_mono": float(now),
+            "recovery_wall": float(now_wall),
+            "snapshot": dict(snapshot),
+        }
+        self._server_companion_pending_recovery_alert = pending
+        try:
+            source_id = GLib.timeout_add(
+                int(RECOVERY_ALERT_OUT_OF_WINDOW_HOLD_SECONDS * 1000),
+                self._release_server_companion_pending_recovery_alert,
+                pending,
+            )
+        except Exception as exc:
+            self._server_companion_pending_recovery_alert = None
+            self._server_companion_pending_recovery_alert_source_id = 0
+            self._debug_server_companion_alert(
+                "confirmed recovery hold scheduling failed; using immediate "
+                f"alert: {exc!r}"
+            )
+            return False
+        if not source_id:
+            self._server_companion_pending_recovery_alert = None
+            self._server_companion_pending_recovery_alert_source_id = 0
+            return False
+        self._server_companion_pending_recovery_alert_source_id = source_id
+        self._debug_server_companion_alert(
+            "confirmed recovery alert held outside expected restart window: "
+            f"server={key!r} event={event_id!r} "
+            f"residual_seconds={getattr(expected, 'residual_seconds', None)!r}"
+        )
+        return True
+
+    def _release_server_companion_pending_recovery_alert(
+        self, pending: dict
+    ) -> bool:
+        if not self._server_companion_pending_recovery_alert_is_current(pending):
+            if pending is getattr(
+                self, "_server_companion_pending_recovery_alert", None
+            ):
+                self._cancel_server_companion_pending_recovery_alert()
+            return False
+        self._server_companion_pending_recovery_alert = None
+        self._server_companion_pending_recovery_alert_source_id = 0
+        self._debug_server_companion_alert(
+            "held confirmed recovery alert released after bounded hold: "
+            f"server={pending['server_key']!r} event={pending['event_id']!r}"
+        )
+        self._emit_server_companion_confirmed_recovery_alert(
+            dict(pending.get("snapshot") or {}),
+            now=time.monotonic(),
+            now_wall=time.time(),
+            event_id=str(pending.get("event_id") or ""),
+            recovery_online_since=float(pending.get("recovery_mono", 0.0)),
+        )
+        return False
+
+    def _resolve_server_companion_pending_recovery_alert(
+        self, event, snapshot: dict
+    ) -> bool:
+        pending = getattr(
+            self, "_server_companion_pending_recovery_alert", None
+        )
+        if not isinstance(pending, dict) or str(
+            pending.get("event_id") or ""
+        ) != str(getattr(event, "event_id", "") or ""):
+            return False
+        if (
+            str(pending.get("monitoring_session_id") or "")
+            != str(getattr(event, "monitoring_session_id", "") or "")
+            or int(pending.get("poll_generation", -1))
+            != int(getattr(event, "poll_generation", -2))
+            or not self._server_companion_pending_recovery_alert_is_current(
+                pending
+            )
+        ):
+            self._cancel_server_companion_pending_recovery_alert()
+            return True
+        outcome = getattr(event, "outcome", None)
+        if outcome is EventOutcome.SERVICE_INTERRUPTION:
+            self._debug_server_companion_alert(
+                "held confirmed recovery alert suppressed after non-restart "
+                f"classification: server={pending['server_key']!r} "
+                f"event={pending['event_id']!r}"
+            )
+            self._cancel_server_companion_pending_recovery_alert()
+            return True
+        if outcome not in {
+            EventOutcome.CONFIRMED_OFFLINE_RESTART,
+            EventOutcome.CORROBORATED_OFFLINE_RESTART,
+        }:
+            return False
+        recovery_online_since = float(pending.get("recovery_mono", 0.0))
+        event_id = str(pending.get("event_id") or "")
+        self._cancel_server_companion_pending_recovery_alert()
+        self._debug_server_companion_alert(
+            "held confirmed recovery alert released by restart classification: "
+            f"server={pending['server_key']!r} event={event_id!r} "
+            f"outcome={outcome.value!r}"
+        )
+        self._emit_server_companion_confirmed_recovery_alert(
+            snapshot,
+            now=time.monotonic(),
+            now_wall=time.time(),
+            event_id=event_id,
+            recovery_online_since=recovery_online_since,
+        )
+        return True
+
+    def _emit_server_companion_confirmed_recovery_alert(
+        self,
+        snapshot: dict,
+        *,
+        now: float,
+        now_wall: float,
+        event_id: str | None = None,
+        recovery_online_since: float | None = None,
+    ) -> bool:
+        if not bool(
+            getattr(self, "_server_companion_restart_alert_enabled", False)
+        ):
+            return False
+        if bool(
+            getattr(self, "_server_companion_recovery_alert_suppressed", False)
+        ):
+            self._debug_server_companion_alert(
+                "confirmed recovery alert suppressed during stable-online window"
+            )
+            return False
+
+        key = self._server_companion_restart_learning_key()
+        try:
+            if key and not event_id:
+                event_id = self._companion_restart_phase2.provisional_event_id(key)
+            if key:
+                if event_id:
+                    suppression = self._companion_restart_phase2.event_suppression_key(
+                        key,
+                        kind=AlertKeyKind.GENERIC_RECOVERY,
+                        event_id=event_id,
+                    )
+                    if not self._companion_restart_phase2.mark_fired(
+                        key, suppression, now=now_wall
+                    ):
+                        self._server_companion_recovery_alert_suppressed = True
+                        self._server_companion_recovery_online_since = (
+                            now
+                            if recovery_online_since is None
+                            else recovery_online_since
+                        )
+                        self._debug_server_companion_alert(
+                            "confirmed recovery alert already reserved: "
+                            f"event={event_id!r}"
+                        )
+                        return False
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                "confirmed recovery persistent suppression unavailable; "
+                f"using session one-shot: {exc!r}"
+            )
+
+        # Reserve the operational one-shot before invoking audio/notification.
+        self._server_companion_recovery_alert_suppressed = True
+        self._server_companion_recovery_online_since = (
+            now if recovery_online_since is None else recovery_online_since
+        )
+        self._debug_server_companion_alert(
+            "confirmed recovery alert emitted immediately: "
+            f"server={str(key or '')!r} event={str(event_id or '')!r}"
+        )
+        self._server_companion_alert_back_online(snapshot, alert_type="back online")
+        return True
 
     def set_server_companion_server(self, obj: ServerObject, persist: bool = True):
         old_key = self._server_companion_restart_learning_key()
@@ -3940,20 +4337,23 @@ class DZLLWindow(Gtk.ApplicationWindow):
         ip = str(getattr(obj, "ip", "") or "").strip()
         gport = self._safe_positive_int(getattr(obj, "gport", 0))
         new_key = f"{ip}:{gport}" if ip and gport > 0 else None
+        self._cancel_server_companion_recovery_confirmation()
+        self._cancel_server_companion_pending_recovery_alert()
         if old_key and old_key != new_key:
             self._record_server_companion_monitor_ended(
                 "server_switch", old_key, source="server_selection_changed"
             )
+        if old_key != new_key:
+            self._server_companion_recovery_alert_suppressed = False
+            self._server_companion_recovery_online_since = None
+            self._server_companion_recovery_outage_sequence = 0
         self._server_companion_poll_token += 1
         self._server_companion_poll_paused = False
-        self._server_companion_last_online = None
         self._server_companion_consecutive_offline_polls = 0
         self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = dict(snapshot)
         self._server_companion_observation_samples.clear()
-        self._reset_server_companion_visible_zero_state()
         self._server_companion_offline_since = None
-        self._server_companion_offline_since_wall = None
         self._server_companion_alert_armed = False
         self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
         self._server_companion_obj = obj
@@ -3975,6 +4375,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._start_server_companion_polling()
 
     def clear_server_companion(self):
+        self._cancel_server_companion_recovery_confirmation()
+        self._cancel_server_companion_pending_recovery_alert()
         self._record_server_companion_monitor_ended(
             "clear", source="companion_server_cleared"
         )
@@ -3982,15 +4384,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_snapshot = None
         self._server_companion_obj = None
         self._last_server_companion_saved = {}
-        self._server_companion_last_online = None
         self._server_companion_consecutive_offline_polls = 0
         self._server_companion_first_offline_strike_mono = None
         self._server_companion_visible_snapshot = None
         self._server_companion_observation_samples.clear()
-        self._reset_server_companion_visible_zero_state()
         self._server_companion_offline_since = None
-        self._server_companion_offline_since_wall = None
         self._server_companion_alert_armed = False
+        self._server_companion_recovery_alert_suppressed = False
+        self._server_companion_recovery_online_since = None
+        self._server_companion_recovery_outage_sequence = 0
         self._server_companion_restart_warning_fired.clear()
         self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
         self._stop_server_companion_polling()
@@ -4075,12 +4477,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
 
     def _stop_server_companion_polling(self):
+        self._cancel_server_companion_recovery_confirmation()
+        self._cancel_server_companion_pending_recovery_alert()
         self._server_companion_poll_token = int(
             getattr(self, "_server_companion_poll_token", 0) or 0
         ) + 1
         self._server_companion_poll_inflight = False
         self._server_companion_consecutive_offline_polls = 0
         self._server_companion_first_offline_strike_mono = None
+        if bool(
+            getattr(self, "_server_companion_recovery_alert_suppressed", False)
+        ):
+            self._server_companion_recovery_online_since = None
         self._server_companion_visible_snapshot = None
         timer_id = int(getattr(self, "_server_companion_poll_timer_id", 0) or 0)
         if timer_id:
@@ -4098,7 +4506,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return True
 
     def _submit_server_companion_poll(self):
-        if self._server_companion_poll_inflight or not self._server_companion_should_poll():
+        if (
+            self._server_companion_poll_inflight
+            or getattr(self, "_server_companion_recovery_candidate", None) is not None
+            or bool(
+                getattr(
+                    self,
+                    "_server_companion_recovery_confirmation_inflight",
+                    False,
+                )
+            )
+            or not self._server_companion_should_poll()
+        ):
             return
         snapshot = dict(self._server_companion_snapshot or {})
         ip = str(snapshot.get("ip") or "")
@@ -4118,7 +4537,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             self._server_companion_poll_inflight = False
 
-    def _apply_server_companion_live_result(self, token: int, info: dict):
+    def _apply_server_companion_live_result(
+        self,
+        token: int,
+        info: dict,
+        *,
+        confirmed_recovery: dict | None = None,
+    ):
         if token != int(getattr(self, "_server_companion_poll_token", 0)):
             return False
         self._server_companion_poll_inflight = False
@@ -4129,6 +4554,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
         now = time.monotonic()
         now_wall = time.time()
         key = self._server_companion_restart_learning_key()
+        disposition = live_result_disposition(info)
+        confirmed_offline = (
+            not bool(snapshot.get("online", False))
+            and int(
+                getattr(
+                    self,
+                    "_server_companion_consecutive_offline_polls",
+                    0,
+                )
+                or 0
+            )
+            >= 2
+        )
+        if (
+            disposition is LiveResultDisposition.HEALTHY
+            and confirmed_offline
+            and confirmed_recovery is None
+        ):
+            self._schedule_server_companion_recovery_confirmation()
+            return False
         phase2_update = None
         if key:
             try:
@@ -4141,7 +4586,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
             except Exception as exc:
                 self._debug_server_companion_alert(f"Phase 2 poll mapping failed safely: {exc!r}")
-        disposition = live_result_disposition(info)
         if disposition in {
             LiveResultDisposition.NEUTRAL,
             LiveResultDisposition.PROTOCOL_FAILURE,
@@ -4205,7 +4649,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 or scheduled_restart_long_enough
             ) and bool(
                 getattr(self, "_server_companion_restart_alert_enabled", False)
-            ) and not SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
+            ) and not SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED and confirmed_recovery is None:
                 self._debug_server_companion_alert(
                     "back-online alert emitted: "
                     f"armed={bool(getattr(self, '_server_companion_alert_armed', False))} "
@@ -4233,11 +4677,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
             self._server_companion_alert_armed = False
             self._server_companion_offline_since = None
-            self._server_companion_offline_since_wall = None
             self._server_companion_consecutive_offline_polls = 0
             self._server_companion_first_offline_strike_mono = None
             self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
+            if confirmed_recovery is not None and confirmed_offline:
+                held = self._maybe_hold_server_companion_confirmed_recovery_alert(
+                    snapshot,
+                    now=now,
+                    now_wall=now_wall,
+                    confirmed_recovery=confirmed_recovery,
+                )
+                if not held:
+                    self._emit_server_companion_confirmed_recovery_alert(
+                        snapshot, now=now, now_wall=now_wall
+                    )
         else:
+            self._update_server_companion_recovery_alert_rearm(
+                now, qualifying_failure=True
+            )
             prior_failures = int(
                 getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0
             )
@@ -4268,7 +4725,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if offline_since is None:
                     offline_since = now
                     self._server_companion_offline_since = offline_since
-                    self._server_companion_offline_since_wall = time.time()
+                    self._server_companion_recovery_outage_sequence = int(
+                        getattr(
+                            self,
+                            "_server_companion_recovery_outage_sequence",
+                            0,
+                        )
+                        or 0
+                    ) + 1
                 self._set_server_companion_poll_interval(COMPANION_POLL_OFFLINE_SECONDS)
                 if now - float(offline_since) >= COMPANION_ALERT_REARM_OFFLINE_SECONDS:
                     self._server_companion_alert_armed = True
@@ -4279,8 +4743,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
 
         new_online = bool(snapshot.get("online", False))
-        self._server_companion_last_online = new_online
         self._server_companion_snapshot = snapshot
+        if disposition is LiveResultDisposition.HEALTHY:
+            self._update_server_companion_recovery_alert_rearm(now, healthy=True)
         if phase2_update is not None:
             session_id = self._companion_restart_phase2.active_monitoring_session_id(
                 key
@@ -4321,6 +4786,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         f"server={key!r} generation={token} "
                         f"session={session_id!r} reason={reason!r}"
                     )
+            DZLLWindow._handle_phase2_query_visible_repopulation_alert(
+                self,
+                phase2_update,
+                snapshot,
+            )
             self._handle_phase2_finalized_events(phase2_update, snapshot)
         self._maybe_play_server_companion_restart_warning(snapshot)
         panel = getattr(self, "server_companion_panel", None)
@@ -4337,11 +4807,106 @@ class DZLLWindow(Gtk.ApplicationWindow):
             panel.set_polling_paused(False)
         return False
 
+    def _handle_phase2_query_visible_repopulation_alert(
+        self,
+        update,
+        snapshot: dict,
+    ) -> None:
+        event_id = str(
+            getattr(update, "query_visible_repopulation_event_id", None) or ""
+        )
+        if not event_id:
+            return
+        key = self._server_companion_restart_learning_key()
+        if not key:
+            return
+        online = bool((snapshot or {}).get("online", False))
+        players = int((snapshot or {}).get("players", 0) or 0)
+        alert_enabled = bool(
+            getattr(
+                self,
+                "_server_companion_restart_alert_enabled",
+                False,
+            )
+        )
+        if not (online and players > 0 and alert_enabled):
+            return
+        try:
+            suppression = self._companion_restart_phase2.event_suppression_key(
+                key,
+                kind=AlertKeyKind.GENERIC_RECOVERY,
+                event_id=event_id,
+            )
+            reserved = self._companion_restart_phase2.mark_fired(
+                key,
+                suppression,
+                now=time.time(),
+            )
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                "query-visible first-repopulation alert reservation failed safely: "
+                f"server={key!r} event={event_id!r} error={exc!r}"
+            )
+            return
+        if reserved:
+            self._debug_server_companion_alert(
+                "query-visible recovery alert emitted on first repopulation: "
+                f"server={key!r} event={event_id!r}"
+            )
+            self._server_companion_alert_back_online(
+                snapshot,
+                alert_type="query-visible rejoin",
+            )
+
     def _handle_phase2_finalized_events(self, update, snapshot: dict) -> None:
         key = self._server_companion_restart_learning_key()
         if not key:
             return
         for event in tuple(getattr(update, "finalized_events", ()) or ()):
+            if DZLLWindow._resolve_server_companion_pending_recovery_alert(
+                self, event, snapshot
+            ):
+                continue
+            if self._server_companion_is_validated_query_visible_recovery(event):
+                alert_enabled = bool(
+                    getattr(
+                        self,
+                        "_server_companion_restart_alert_enabled",
+                        False,
+                    )
+                )
+                if alert_enabled:
+                    try:
+                        suppression = (
+                            self._companion_restart_phase2.event_suppression_key(
+                                key,
+                                kind=AlertKeyKind.GENERIC_RECOVERY,
+                                event_id=event.event_id,
+                            )
+                        )
+                        reserved = self._companion_restart_phase2.mark_fired(
+                            key,
+                            suppression,
+                            now=time.time(),
+                        )
+                    except Exception as exc:
+                        reserved = False
+                        self._debug_server_companion_alert(
+                            "query-visible recovery alert reservation failed safely: "
+                            f"server={key!r} event={event.event_id!r} error={exc!r}"
+                        )
+                    if reserved:
+                        self._debug_server_companion_alert(
+                            "query-visible recovery alert emitted immediately: "
+                            f"server={key!r} event={event.event_id!r}"
+                        )
+                        self._server_companion_alert_back_online(
+                            snapshot,
+                            alert_type="query-visible rejoin",
+                        )
+                # This physical event is query-visible-only. Never offer it to
+                # the generic offline-recovery consumer later in this handler.
+                continue
             outage_start = event.outage.first_failure_at
             outage_end = event.outage.info_return_at
             generic_duration_ok = bool(
@@ -4390,6 +4955,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._server_companion_alert_back_online(snapshot, alert_type=alert_type)
                 self._companion_restart_phase2.mark_fired(key, key_to_record, now=time.time())
         self._refresh_server_companion_restart_learning_summary()
+
+    @staticmethod
+    def _server_companion_is_validated_query_visible_recovery(event) -> bool:
+        return bool(
+            getattr(event, "outcome", None)
+            is EventOutcome.STRONG_QUERY_VISIBLE_RESTART
+            and bool(getattr(event, "coverage_complete", False))
+            and bool(getattr(getattr(event, "query_health", None), "continuous", False))
+            and getattr(getattr(event, "outage", None), "first_failure_at", None)
+            is None
+            and getattr(
+                getattr(event, "outage", None),
+                "confirmed_offline_at",
+                None,
+            )
+            is None
+            and getattr(
+                getattr(event, "recovery", None),
+                "stable_recovery_at",
+                None,
+            )
+            is not None
+        )
 
     def _maybe_play_server_companion_restart_warning(self, snapshot: dict | None):
         key = self._server_companion_restart_learning_key()
@@ -4580,8 +5168,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         widgets = (
             getattr(self, "settings_scrim", None),
             getattr(self, "settings_revealer", None),
-            getattr(self, "warn_scrim", None),
-            getattr(self, "warn_box", None),
             getattr(self, "start_steam_join_scrim", None),
             getattr(self, "start_steam_join_box", None),
             getattr(getattr(self, "_steamcmd_overlay_ui", None), "scrim", None),
@@ -4609,8 +5195,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         widgets = (
             getattr(self, "settings_scrim", None),
             getattr(self, "settings_revealer", None),
-            getattr(self, "warn_scrim", None),
-            getattr(self, "warn_box", None),
             getattr(self, "start_steam_join_scrim", None),
             getattr(self, "start_steam_join_box", None),
             getattr(getattr(self, "_steamcmd_overlay_ui", None), "scrim", None),
@@ -4765,8 +5349,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
                 rows = read_servers_from_db()
 
-                self._clear_blocklist_runtime_state()
-
                 GLib.idle_add(finish_startup, rows, ok, None)
             except Exception as e:
                 GLib.idle_add(finish_startup, [], False, e)
@@ -4826,8 +5408,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     return
 
                 rows = read_servers_from_db()
-
-                self._clear_blocklist_runtime_state()
 
                 GLib.idle_add(finish, rows, ok, None)
             except Exception as e:
@@ -7528,7 +8108,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._mod_suggestion_refresh_id = GLib.timeout_add(35, run_refresh)
 
     def _clear_mod_suggestion_rows(self):
-        self._mod_suggestion_keyboard_selected = False
         suggestion_list = getattr(self, "mod_suggestion_list", None)
         if not suggestion_list:
             return
@@ -7549,7 +8128,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             panel.set_visible(False)
         self._clear_mod_suggestion_rows()
         self._mod_suggestion_last_rows = ()
-        self._mod_suggestion_keyboard_selected = False
         if visible_before or reason not in ("ineligible_token", "no_operator", "empty_token"):
             self._log_mod_suggest(f"hide reason={reason} visible_before={visible_before}")
         return False
@@ -7642,7 +8220,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         row = suggestion_list.get_row_at_index(index)
         if row is not None:
             suggestion_list.select_row(row)
-            self._mod_suggestion_keyboard_selected = True
             self._scroll_mod_suggestion_row_into_view(row)
             GLib.idle_add(self._scroll_mod_suggestion_row_into_view, row)
 
@@ -7762,7 +8339,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     first_row = suggestion_list.get_row_at_index(0)
                     if first_row is not None:
                         suggestion_list.select_row(first_row)
-                self._mod_suggestion_keyboard_selected = bool(getattr(self, "_mod_search_mode_active", False))
                 panel.set_visible(True)
                 self._log_mod_suggest(
                     f"show token={token!r} count={len(row_names)} first={first_names!r} rows=unchanged visible_before={visible_before} visible_after={panel.get_visible()} "
@@ -7795,7 +8371,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         first_row = suggestion_list.get_row_at_index(0)
         if first_row is not None:
             suggestion_list.select_row(first_row)
-        self._mod_suggestion_keyboard_selected = bool(getattr(self, "_mod_search_mode_active", False))
         self._mod_suggestion_last_rows = row_names
         panel.set_visible(True)
         self._log_mod_suggest(
@@ -8774,7 +9349,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         steam_cmd = resolve_native_steam_cmd()
         if not steam_cmd:
             raise RuntimeError("Native Steam executable was not found.")
-        print(f"[JOIN] Using Steam command: {steam_cmd}")
+        logger.debug("Using native Steam command for Join: %s", steam_cmd)
         return [steam_cmd, "-applaunch", "221100", "--"]
 
     def _get_dayz_proton_prefix(self) -> str:
@@ -8799,17 +9374,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             summary = dayz_paths_summary()
         except Exception as exc:
-            print(f"[JOIN] DayZ Steam library not detected; using configured/default paths ({exc})")
-            print(f"[JOIN] resolved workshop path: {workshop_dir!r}")
-            print(f"[JOIN] resolved Proton prefix: {proton_prefix!r}")
+            logger.debug(
+                "DayZ Steam library not detected; using configured/default paths: %s",
+                exc,
+            )
             return
         dayz_library = str(summary.get("dayz_library") or "")
         if not dayz_library:
-            print("[JOIN] DayZ Steam library not detected; using configured/default paths")
+            logger.debug("DayZ Steam library not detected; using configured/default paths")
         else:
-            print(f"[JOIN] resolved DayZ library: {dayz_library}")
-        print(f"[JOIN] resolved workshop path: {workshop_dir!r}")
-        print(f"[JOIN] resolved Proton prefix: {proton_prefix!r}")
+            logger.debug("Resolved DayZ library: %s", dayz_library)
+        logger.debug("Resolved Workshop path: %r", workshop_dir)
+        logger.debug("Resolved Proton prefix: %r", proton_prefix)
 
     def _free_bytes_for_path(self, path: str) -> int:
         try:
@@ -8864,6 +9440,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _show_join_launch_error(self, attempt_id: int, reason: str) -> None:
         message = "DZLL could not submit the launch request to Steam."
         detail = str(reason or "Unknown launch-command error.").strip()
+        logger.error("%s %s", message, detail)
         self._join_log(attempt_id, "launch-command exception", reason=detail)
         try:
             self._show_join_progress_overlay(message)
@@ -8876,6 +9453,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _show_join_preparation_error(self, attempt_id: int, reason: str) -> None:
         detail = str(reason or "Join preparation failed.").strip()
+        logger.error("Join preparation failed: %s", detail)
         self._join_log(attempt_id, "preparation exception", reason=detail)
         try:
             self._show_join_progress_overlay(detail)
@@ -9017,7 +9595,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             ok, error = submit_native_start()
             if not ok:
                 self._join_steam_start_allowed = False
-                print(f"[JOIN] Could not start Steam: {error}")
+                logger.error("Could not start Steam for Join: %s", error)
                 self._set_updating(False, "Steam could not be started.")
                 return finish(BackgroundConsentResult(
                     BackgroundConsentStatus.ERROR,
@@ -9038,7 +9616,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 "Server mod download cancelled."
                 if str(caller) == "background" else "Join cancelled."
             )
-            print(f"[JOIN] {cancelled_text}")
+            logger.debug("%s", cancelled_text)
             self._set_updating(False, cancelled_text)
             return finish(BackgroundConsentResult(
                 BackgroundConsentStatus.DECLINED,
@@ -9058,7 +9636,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         ok, error = submit_native_start()
         if not ok:
             self._join_steam_start_allowed = False
-            print(f"[JOIN] Could not start Steam: {error}")
+            logger.error("Could not start Steam for Join: %s", error)
             self._set_updating(False, "Steam could not be started.")
             return finish(BackgroundConsentResult(
                 BackgroundConsentStatus.ERROR,
@@ -9146,13 +9724,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             threading.Thread(target=self._watch_dayz_session_until_exit, args=(attempt_id,), daemon=True).start()
         except Exception:
             if attempt_id:
+                logger.exception("Could not start the DayZ launch process watcher")
                 self._join_popup_watcher_failure(
                     attempt_id,
                     "DZLL could not start the DayZ launch process watcher.",
                 )
-
-    def _discord_watch_dayz_until_exit(self) -> None:
-        self._watch_dayz_session_until_exit()
 
     def _watch_dayz_session_until_exit(self, attempt_id: int = 0) -> None:
         """
@@ -9227,6 +9803,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     except Exception:
                         pass
                     if attempt_id:
+                        logger.warning(
+                            "DayZ watcher stopped after the launcher exited before DayZ started"
+                        )
                         self._join_log(attempt_id, "watcher terminal condition", reason="launcher exited before DayZ")
                         self._cleanup_join_attempt(attempt_id, "launcher exited before DayZ")
                     return
@@ -9286,7 +9865,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     try:
                         mark_mods_used(mod_ids, names_by_id=names_by_id)
                     except Exception as exc:
-                        print(f"[MOD METADATA] Failed to mark joined mods used: {exc}")
+                        logger.warning("Failed to mark joined mods used: %s", exc)
                 if matching_attempt:
                     self._pending_join_mod_ids = []
                     self._pending_join_mod_names_by_id = {}
@@ -9730,13 +10309,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         details = " ".join(
             f"{key}={value!r}" for key, value in fields.items()
         )
-        print(
-            "[BACKGROUND PREPARE] "
-            f"request={request.request_id} batch={request.batch_id} "
-            f"epoch={request.epoch} identity={request.identity} "
-            f"server={request.display_name!r} stage={stage}"
-            + (f" {details}" if details else ""),
-            flush=True,
+        logger.debug(
+            "Background preparation request=%s batch=%s epoch=%s identity=%s "
+            "server=%r stage=%s%s",
+            request.request_id, request.batch_id, request.epoch, request.identity,
+            request.display_name, stage, f" {details}" if details else "",
         )
 
     def _background_prepare_for_obj(self, obj: ServerObject) -> None:
@@ -10178,12 +10755,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 error=value.error,
             )
         else:
-            print(
-                "[BACKGROUND PREPARE] Steam consent returned "
-                f"server={server_label!r} elapsed={elapsed:.3f}s "
-                f"result={value.status.value} "
-                f"startup_state={value.startup_state}",
-                flush=True,
+            logger.debug(
+                "Background preparation Steam consent returned server=%r "
+                "elapsed=%.3fs result=%s startup_state=%s",
+                server_label, elapsed, value.status.value, value.startup_state,
             )
         return value
 
@@ -10368,11 +10943,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _resolve_join_mods(self, obj: ServerObject):
         raw_mods_json = getattr(obj, "mods_json", "") or ""
         server_mods = parse_mods_from_db(raw_mods_json)
-        print(f"[JOIN] server mods parsed: {len(server_mods)}")
+        logger.debug("Join server mods parsed: %d", len(server_mods))
 
         extra_ids = parse_additional_mod_ids(str(self.settings.get("additional_mod_ids") or ""))
         mods = merge_mod_lists_with_additional(server_mods, extra_ids)
-        print(f"[JOIN] total mods after extras: {len(mods)}")
+        logger.debug("Join total mods after extras: %d", len(mods))
         return mods
 
     def _resolve_join_runtime(self, mods):
@@ -10383,8 +10958,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         steamcmd_path = str(self.settings.get("steamcmd_path") or "").strip()
         if not steamcmd_path:
             steamcmd_path = autodetect_steamcmd_path() or ""
-            print(f"[JOIN][DEBUG] workshop_dir={workshop_dir!r}")
-            print(f"[JOIN][DEBUG] steamcmd_path={steamcmd_path!r}")
+            logger.debug("Join Workshop path: %r", workshop_dir)
+            logger.debug("Join SteamCMD path: %r", steamcmd_path)
 
         steam_user = str(self.settings.get("steamcmd_username") or "").strip()
         validate = bool(self.settings.get("verify_mod_files", False))
@@ -10450,15 +11025,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         attempt_id = attempt.attempt_id
         self._join_popup_enter_checking(attempt_id)
 
-        # --- Preflight hard-block warning (MUST run before SteamCMD/mods) ---
-        # Run on GTK main thread and block until the user decides.
-        if not self._preflight_block_warning_ui_blocking(obj):
-            self._join_steam_start_allowed = False
-            self._hide_steamcmd_auth_overlay()
-            self._cleanup_join_attempt(attempt_id, "preflight declined")
-            self._on_filter_changed(reason="join")
-            return
-
         if not self._ensure_join_steam_start_consent(attempt_id):
             self._hide_steamcmd_auth_overlay()
             self._cleanup_join_attempt(attempt_id, "Steam start declined or failed")
@@ -10477,11 +11043,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             raw_mods_json = getattr(obj, "mods_json", "") or ""
             server_mods = parse_mods_from_db(raw_mods_json)
-            print(f"[JOIN] server mods parsed: {len(server_mods)}")
+            logger.debug("Join server mods parsed: %d", len(server_mods))
 
             extra_ids = parse_additional_mod_ids(str(self.settings.get("additional_mod_ids") or ""))
             mods = merge_mod_lists_with_additional(server_mods, extra_ids)
-            print(f"[JOIN] total mods after extras: {len(mods)}")
+            logger.debug("Join total mods after extras: %d", len(mods))
             self._join_log(attempt_id, "required mods resolved", count=len(mods))
         except Exception as exc:
             self._show_join_preparation_error(attempt_id, f"Could not prepare required mod list: {exc}")
@@ -10555,66 +11121,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._cleanup_join_attempt(attempt_id, "worker submission failure")
 
     # ----------------------------
-    # Preflight Hard Block Warning Queue Jump (kept; not used currently)
-    # ----------------------------
-    def _preflight_block_warning_ui_blocking(self, obj) -> bool:
-        return True
-
-    # ----------------------------
-    # Preflight Hard Block Warning
-    # ----------------------------
-    def _preflight_block_warning(self, obj) -> bool:
-        return True
-
-    # ----------------------------
-    # Hard Block Warning
-    # ----------------------------
-    def _confirm_blocked_server(self, ip_port: str) -> bool:
-        """
-        Returns True if user confirms Join, False otherwise.
-        Uses the custom warning overlay card (scrim + centered card).
-        Blocks via nested GLib.MainLoop, but UI remains responsive.
-        fail-open preserved.
-        """
-        try:
-            # Populate
-            try:
-                self.warn_ip.set_text(ip_port)
-            except Exception:
-                pass
-
-            # Show
-            self._warn_decided = None
-            self._warn_loop = GLib.MainLoop()
-
-            try:
-                self.warn_scrim.set_visible(True)
-                self.warn_box.set_visible(True)
-            except Exception:
-                pass
-
-            # Focus default action
-            try:
-                self.warn_join_btn.grab_focus()
-            except Exception:
-                pass
-
-            # Block until user clicks
-            self._warn_loop.run()
-
-            decided = self._warn_decided
-            self._warn_loop = None
-
-            # If somehow undecided, treat as cancel (safer)
-            if decided is None:
-                return False
-            return bool(decided)
-
-        except Exception:
-            # fail-open
-            return True
-
-    # ----------------------------
     # Dead cache prune / clamp
     # ----------------------------
     def _prune_expired_dead(self):
@@ -10670,37 +11176,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     def _set_widget_sensitive(self, *a, **kw):
         return self._settings_ui._set_widget_sensitive(*a, **kw)
-
-    def _bl_normalize_key(self, ip: str, port) -> str:
-        return bl_normalize_key(ip, port)
-
-    def _clear_blocklist_runtime_state(self) -> None:
-        self._bl_ok = False
-        self.bl_ip_hard = set()
-        self.bl_allow_exact = set()
-        self.bl_soft = set()
-        self.bl_hard = set()
-        self._bl_soft = set()
-        self._bl_hard = set()
-
-    def _bl_load_local(self) -> None:
-        data = bl_load_local()
-        self.bl_ip_hard = data["bl_ip_hard"]
-        self.bl_allow_exact = data["bl_allow_exact"]
-        self.bl_soft = data["bl_soft"]
-        self.bl_hard = data["bl_hard"]
-        self._bl_ok = data["_bl_ok"]
-        self._bl_soft = data["_bl_soft"]
-        self._bl_hard = data["_bl_hard"]
-
-    def _bl_status(self, key_lc: str) -> str:
-        return bl_status(
-            key_lc,
-            getattr(self, "bl_allow_exact", set()),
-            getattr(self, "bl_ip_hard", set()),
-            getattr(self, "bl_hard", set()),
-            getattr(self, "bl_soft", set()),
-        )
 
     def _apply_setting_runtime_effects(self, *a, **kw):
         return self._settings_ui._apply_setting_runtime_effects(*a, **kw)

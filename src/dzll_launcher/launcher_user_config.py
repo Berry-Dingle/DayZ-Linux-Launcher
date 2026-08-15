@@ -1,6 +1,10 @@
+import logging
 import os
 import re
 from pathlib import Path
+
+
+logger = logging.getLogger(__name__)
 
 PFX_DRIVE_C = Path.home() / ".local/share/Steam/steamapps/compatdata/221100/pfx/drive_c"
 BI_BASE = PFX_DRIVE_C / "users/steamuser/AppData/Local/Bohemia_Interactive_a.s"
@@ -30,7 +34,7 @@ def set_launcher_shutdown_mode(minimize: bool) -> bool:
     """
     cfg = _find_dayzlauncher_user_config()
     if not cfg:
-        print("[DZLL] DayZ Launcher user.config not found (fail-open)")
+        logger.debug("DayZ Launcher user.config not found (fail-open)")
         return False
 
     wanted = _MODE_ON if minimize else _MODE_OFF
@@ -44,7 +48,7 @@ def set_launcher_shutdown_mode(minimize: bool) -> bool:
         )
         m = re.search(pat, text, flags=re.DOTALL)
         if not m:
-            print("[DZLL] LauncherShutdownMode not found in user.config (fail-open)")
+            logger.debug("LauncherShutdownMode not found in user.config (fail-open)")
             return False
 
         current = (m.group(2) or "").strip()
@@ -57,11 +61,11 @@ def set_launcher_shutdown_mode(minimize: bool) -> bool:
         tmp.write_text(out, encoding="utf-8")
         os.replace(tmp, cfg)
 
-        print(f"[DZLL] LauncherShutdownMode: {current!r} -> {wanted!r}")
+        logger.debug("LauncherShutdownMode: %r -> %r", current, wanted)
         return True
 
     except Exception as e:
-        print(f"[DZLL] Failed to set LauncherShutdownMode (fail-open): {e}")
+        logger.warning("Failed to set LauncherShutdownMode (fail-open): %s", e)
         try:
             tmp = cfg.with_suffix(cfg.suffix + ".tmp")
             if tmp.exists():

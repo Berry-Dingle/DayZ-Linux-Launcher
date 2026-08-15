@@ -69,10 +69,7 @@ class RendererHarness:
         )
         self._join_attempts.initialize_download_counter(attempt_id, range(1, 16))
         self._steam_client_safe_cancel_requested = False
-        self._steam_ugc_installed_ids = set()
         self._steam_ugc_active_event = None
-        self._steam_ugc_completed_count = 0
-        self._steam_ugc_last_error = ""
         self._mod_download_backend_active = "steam_client"
         self._steamcmd_install_in_progress = True
         self.steamcmd_task_heading = FakeWidget("heading", self.writes)

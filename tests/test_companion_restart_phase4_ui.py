@@ -138,6 +138,41 @@ def test_low_pattern_confidence_near_display_threshold_is_never_green():
     assert presentation["confidence_style_class"] not in {"ping-greeny", "ping-good"}
 
 
+def test_live_normal_four_hour_schedule_confidence_reaches_final_widget_as_95_percent():
+    summary = {
+        "authority_consumer": True,
+        "confidence_percent": 95,
+        "confidence_kind": "schedule",
+        "confidence_label": "Confidence:",
+        "confidence_visible": True,
+        "cycle_text": "Confirmed: Every 4 hours",
+        "next_text": "Prediction suspended",
+        "next_restart_at": None,
+        "next_visible": False,
+        "countdown_text": "--",
+        "countdown_visible": False,
+        "countdown_safe": False,
+        "prediction_usable": False,
+        "presentation_key": "confirmed_cycle",
+        "reason_codes": ("normal_schedule_confidence_display",),
+    }
+
+    presentation = restart_learning_presentation(summary)
+    panel = apply_to_fake_panel(summary)
+
+    assert presentation["confidence_percent"] == 95
+    assert panel.restart_cycle_value_label.text == "Every 4 Hours"
+    assert panel.restart_confidence_label.text == "Confidence:"
+    assert panel.restart_confidence_value_label.text == "95%"
+    assert (
+        f"{panel.restart_confidence_label.text} "
+        f"{panel.restart_confidence_value_label.text}"
+        == "Confidence: 95%"
+    )
+    assert not panel.restart_next_row.visible
+    assert not panel.restart_countdown_row.visible
+
+
 def test_selected_three_hour_period_uses_period_confidence_and_prediction():
     summary = phase2_learning_summary(
         decision(
@@ -184,6 +219,25 @@ def test_confirmed_whole_hour_cycle_formatting_is_generic(source, expected):
     assert "Confirmed:" not in format_restart_cycle_text(source)
 
 
+def test_likely_cycle_prefix_is_not_shown_in_companion_row():
+    summary = {
+        "confidence_percent": 95,
+        "confidence_visible": True,
+        "cycle_text": "Likely: Every 4 hours",
+        "next_text": "Prediction suspended",
+        "next_visible": False,
+        "countdown_visible": False,
+        "prediction_usable": False,
+    }
+
+    panel = apply_to_fake_panel(summary)
+
+    assert (
+        f"{panel.restart_cycle_label.text} {panel.restart_cycle_value_label.text}"
+        == "Restart Cycle: Every 4 Hours"
+    )
+
+
 def test_confirmed_schema4_three_hour_panel_text_is_exact_and_non_mutating(
     utc_timezone,
 ):
@@ -213,11 +267,50 @@ def test_confirmed_schema4_three_hour_panel_text_is_exact_and_non_mutating(
         "Restart Cycle: Every 3 Hours"
     )
     assert panel.restart_next_value_label.text == "13:01"
-    assert panel.restart_confidence_value_label.text == "97%"
+    assert panel.restart_confidence_value_label.text == "95%"
     assert "Confirmed:" not in panel.restart_cycle_value_label.text
     assert "46860" not in panel.restart_next_value_label.text
     assert summary == before
     assert summary["cycle_period_seconds"] == 10800
+
+
+@pytest.mark.parametrize(
+    ("internal_percent", "visible_percent"),
+    ((72, 72), (94, 94), (95, 95), (97, 95)),
+)
+def test_user_visible_confidence_caps_at_95_without_changing_policy_fields(
+    internal_percent, visible_percent
+):
+    summary = {
+        "authority_consumer": True,
+        "confidence_percent": internal_percent,
+        "confidence_kind": "period",
+        "confidence_label": "Confidence:",
+        "confidence_visible": True,
+        "cycle_text": "Confirmed: Every 3 hours",
+        "next_text": "1900010800",
+        "next_restart_at": 1900010800.0,
+        "countdown_text": "01:23",
+        "next_visible": True,
+        "countdown_visible": True,
+        "countdown_safe": True,
+        "prediction_usable": True,
+        "presentation_key": "confirmed_cycle",
+        "reason_codes": ("safe_h3_prediction_available",),
+    }
+    before = copy.deepcopy(summary)
+
+    presentation = restart_learning_presentation(summary)
+    panel = apply_to_fake_panel(summary)
+
+    assert presentation["confidence_percent"] == visible_percent
+    assert panel.restart_confidence_value_label.text == f"{visible_percent}%"
+    assert presentation["prediction_usable"]
+    assert presentation["countdown_visible"]
+    assert panel.restart_countdown_row.visible
+    assert panel.restart_countdown_hh_label.text == "01"
+    assert panel.restart_countdown_mm_label.text == "23"
+    assert summary == before
 
 
 def test_non_hour_cycle_is_preserved_safely_after_confirmed_prefix_removal():
@@ -352,7 +445,6 @@ def test_invalid_usable_occurrence_hides_next_row_without_changing_countdown():
 
 def fake_alert_status_panel():
     return SimpleNamespace(
-        _restart_alert_usable=False,
         sound_row=FakeWidget(),
         volume_row=FakeWidget(),
         restart_alert_info_label=FakeWidget(),

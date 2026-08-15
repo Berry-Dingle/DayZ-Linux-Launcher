@@ -17,8 +17,6 @@ DEFAULTS: Dict[str, Any] = {
     "hide_test_servers": True,
     "prioritise_trusted_servers": False,
     "pin_favorite_servers": False,
-    "enable_blocklist_filter": False,
-
     # Title bar counts
     "show_counts_in_title_bar": False,
     "show_counts_servers_loaded": True,

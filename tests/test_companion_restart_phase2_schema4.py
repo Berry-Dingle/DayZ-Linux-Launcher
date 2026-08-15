@@ -121,6 +121,55 @@ def _schema3_state(*, provenance: bool = True) -> dict:
     return state
 
 
+def test_restart_start_normalization_rebuilds_derived_state_from_physical_events():
+    source = schema4.migrate_schema3_state(
+        _schema3_state(), source_bytes=b"restart-start-source", source_mtime_ns=0
+    )
+    old_record = source["servers"][SERVER]
+    old_events = schema4.persisted_physical_events(old_record)
+
+    normalized, summaries = schema4.normalize_restart_start_phases(
+        source, updated_at=BASE + 11 * scoring.HOUR
+    )
+    record = normalized["servers"][SERVER]
+    events = schema4.persisted_physical_events(record)
+
+    assert len(events) == len(old_events) == 4
+    assert old_events[0].canonical_phase_at == BASE
+    assert events[0].canonical_phase_at == BASE - 70
+    assert events[0].canonical_phase_at == events[0].outage.first_failure_at
+    assert events[0].outage.info_return_at == BASE
+    assert all(
+        event.canonical_phase_at == event.outage.first_failure_at
+        for event in events
+    )
+    assert len(record["interval_relationships"]) > 0
+    assert record["authority_decision"]["state"] == "established"
+    assert summaries[SERVER]["physical_event_count"] == 4
+    assert len(summaries[SERVER]["changed_event_ids"]) == 4
+    assert summaries[SERVER]["neutralized_event_ids"] == ()
+    assert schema4.validate_schema4_state(normalized).valid
+
+
+def test_restart_start_normalization_neutralizes_missing_start_landmark():
+    source = schema4.migrate_schema3_state(
+        _schema3_state(), source_bytes=b"missing-start-source", source_mtime_ns=0
+    )
+    record = source["servers"][SERVER]
+    raw_event = record["physical_events"][0]
+    raw_event["outage"]["first_failure_at"] = None
+    record["legacy_schema3_record"]["events"][0]["outage"]["first_failure_at"] = None
+
+    normalized, summaries = schema4.normalize_restart_start_phases(
+        source, updated_at=BASE + 11 * scoring.HOUR
+    )
+    events = schema4.persisted_physical_events(normalized["servers"][SERVER])
+
+    assert events[0].canonical_phase_at is None
+    assert "restart_start_phase_unavailable" in events[0].reason_codes
+    assert summaries[SERVER]["neutralized_event_ids"] == (events[0].event_id,)
+
+
 def _schema3_state_with_retractions(
     count: int = 1,
     *,

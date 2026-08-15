@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import queue
 import re
@@ -23,6 +24,9 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
+
+
+logger = logging.getLogger(__name__)
 
 
 DAYZ_APPID = 221100
@@ -234,7 +238,10 @@ def _log_event(progress_cb, message: str, **extra) -> None:
         f"{message} {json.dumps(extra, sort_keys=True, default=str)}"
         if extra else message
     )
-    eprint(diagnostic)
+    if "failure-to-reap" in message.casefold():
+        eprint(diagnostic)
+    else:
+        logger.debug("%s", diagnostic)
     event = {"type": "log", "message": message}
     event.update(extra)
     _progress(progress_cb, event)
@@ -417,7 +424,6 @@ class CooperativeUGCSession:
         self._read_pipes_closed = False
         self._fatal = False
         self._active_request_id = ""
-        self._active_command = ""
         self._abandoned_request_ids: set[str] = set()
 
     @property
@@ -440,7 +446,6 @@ class CooperativeUGCSession:
                     "Steam UGC helper already has an active command"
                 )
             self._active_request_id = str(request_id)
-            self._active_command = str(command)
 
     def _finish_active_command(
         self,
@@ -454,7 +459,6 @@ class CooperativeUGCSession:
             if abandoned:
                 self._abandoned_request_ids.add(str(request_id))
             self._active_request_id = ""
-            self._active_command = ""
             return True
 
     def _protocol_failure(self, message: str, *, raw=None) -> UGCSessionError:

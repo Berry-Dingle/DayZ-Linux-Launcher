@@ -4,6 +4,7 @@ import hashlib
 import tempfile
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +15,10 @@ from dzll_launcher import companion_restart_phase2_detection as detection
 from dzll_launcher import companion_restart_phase2_schema4 as schema4
 from dzll_launcher import companion_restart_phase2_scoring as scoring
 from dzll_launcher import companion_restart_phase2_consumers as consumers3
-from dzll_launcher.companion_restart_phase2_runtime import Phase2RestartRuntime
+from dzll_launcher.companion_restart_phase2_runtime import (
+    Phase2RestartRuntime,
+    RecoveryAlertWindowStatus,
+)
 from dzll_launcher.server_companion_ui import restart_learning_presentation
 
 
@@ -148,6 +152,92 @@ def _transition(h3, challenger, *, state):
     )
 
 
+def _normal_established(period=4 * HOUR):
+    source = _authority(2, period)
+    source_candidate = next(
+        item
+        for item in source.candidates
+        if item.candidate_period_seconds == period and item.high_relationship_ids
+    )
+    candidate = replace(
+        source_candidate,
+        high_authority=0.0,
+        high_phase_authority=0.0,
+        combined_confidence=0.05,
+        h1_gate=False,
+        h2_gate=False,
+        h3_gate=False,
+        h4_gate=False,
+        high_relationship_ids=(),
+        maximal_streak_ids=(),
+    )
+    regime = authority._regime_from_candidate(
+        candidate,
+        status=authority.RegimeRecordStatus.ESTABLISHED,
+        origin=authority.AuthorityOrigin.NORMAL,
+    )
+    return replace(
+        source,
+        decision_id=f"normal-established-{source.decision_id}",
+        state=authority.RegimeState.ESTABLISHED,
+        selected_shadow_regime=regime,
+        incumbent_shadow_regime=regime,
+        regimes=(regime,),
+        candidates=(candidate,),
+        cycle_visible=True,
+        prediction_usable=True,
+        countdown_safe=True,
+    )
+
+
+def _normal_prediction_evidence(
+    decision,
+    *,
+    now=BASE + 100,
+    schedule=0.95,
+    fundamental=0.650058,
+    phase=0.95,
+    established=True,
+    direct=3,
+    competitor=False,
+    harmonic=False,
+    stable=True,
+    latest_phase_at=None,
+    predicted_at=None,
+    anomaly=False,
+    selected_period=None,
+    incumbent_period=None,
+):
+    regime = decision.selected_shadow_regime
+    assert regime is not None
+    period = regime.candidate_period_seconds
+    return consumers4.NormalPredictionEvidence(
+        selected_period_seconds=(period if selected_period is None else selected_period),
+        incumbent_period_seconds=(period if incumbent_period is None else incumbent_period),
+        schedule_existence_confidence=schedule,
+        fundamental_period_confidence=fundamental,
+        phase_confidence=phase,
+        candidate_established=established,
+        strict_direct_relationship_count=direct,
+        unresolved_competitor=competitor,
+        unresolved_divisor_or_harmonic=harmonic,
+        regime_stable=stable,
+        latest_aligned_phase_at=(
+            now - 60 if latest_phase_at is None else latest_phase_at
+        ),
+        raw_predicted_occurrence_at=(
+            consumers4.next_phase_occurrence(
+                period_seconds=period,
+                phase_offset=regime.phase_offset,
+                now=now,
+            )
+            if predicted_at is None
+            else predicted_at
+        ),
+        recent_strong_anomaly=anomaly,
+    )
+
+
 def _new_regime(h3, challenger):
     selected = challenger.selected_shadow_regime
     assert selected
@@ -166,6 +256,9 @@ def test_frozen_consumer_objects():
     value = consumers4.evaluate_authority_consumers(_policy(_authority(4)))
     with pytest.raises(FrozenInstanceError):
         value.visible_cycle = False
+    evidence = _normal_prediction_evidence(_normal_established())
+    with pytest.raises(FrozenInstanceError):
+        evidence.phase_confidence = 0.0
 
 
 def test_unknown_has_no_schedule_consumers():
@@ -182,6 +275,304 @@ def test_normal_learning_can_preserve_pattern_only_without_cycle():
     assert value.presentation_state is consumers4.AuthorityPresentationKey.PATTERN_ONLY
     assert value.confidence_display_value == 0.78
     assert value.cycle_period_seconds is None and not value.countdown_visible
+
+
+def test_normal_established_cycle_confidence_alone_does_not_enable_prediction():
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            _normal_established(),
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+        )
+    )
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
+    presentation = restart_learning_presentation(summary)
+
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.LIKELY_CYCLE
+    assert value.cycle_period_seconds == 4 * HOUR
+    assert value.confidence_display_value == 0.95
+    assert "normal_schedule_confidence_display" in value.reason_codes
+    assert not value.countdown_visible
+    assert not value.countdown_safe
+    assert value.next_expected_restart_at is None
+    assert summary["confidence_percent"] == 95
+    assert summary["confidence_kind"] == "schedule"
+    assert summary["confidence_label"] == "Confidence:"
+    assert not summary["prediction_usable"]
+    assert not summary["countdown_visible"]
+    assert summary["cycle_text"] == "Likely: Every 4 hours"
+    assert presentation["confidence_percent"] == 95
+    assert presentation["confidence_percent"] != 5
+
+
+def test_crowbar_established_normal_schedule_exposes_prediction_and_warning():
+    decision = _normal_established()
+    regime = decision.selected_shadow_regime
+    now = BASE + 100
+    evidence = _normal_prediction_evidence(decision, now=now)
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            restart_alert_enabled=True,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=evidence,
+        )
+    )
+
+    assert regime is not None
+    assert value.next_expected_restart_at == evidence.raw_predicted_occurrence_at
+    assert value.countdown_visible and value.countdown_safe
+    assert value.scheduled_warning_eligible
+    assert value.scheduled_warning_at == value.next_expected_restart_at - 300
+    assert "safe_established_normal_schedule_available" in value.reason_codes
+    assert not any(item.h1_gate or item.h2_gate or item.h3_gate or item.h4_gate for item in decision.candidates)
+    assert not value.outage_relaxation_eligible
+
+
+def test_established_normal_prediction_uses_learned_phase_not_wall_clock_rounding():
+    decision = _normal_established()
+    regime = decision.selected_shadow_regime
+    assert regime is not None
+    regime = replace(regime, phase_offset=(regime.phase_offset + 137.25) % (4 * HOUR))
+    decision = replace(
+        decision,
+        selected_shadow_regime=regime,
+        incumbent_shadow_regime=regime,
+        regimes=(regime,),
+    )
+    now = BASE + 123
+    learned = consumers4.next_phase_occurrence(
+        period_seconds=4 * HOUR,
+        phase_offset=regime.phase_offset,
+        now=now,
+    )
+    evidence = _normal_prediction_evidence(
+        decision, now=now, predicted_at=learned
+    )
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=evidence,
+        )
+    )
+
+    assert value.next_expected_restart_at == learned
+    assert (learned - regime.phase_offset) % (4 * HOUR) == 0
+    assert learned % 300 != 0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"established": False},
+        {"phase": 0.849999},
+        {"direct": 2},
+        {"competitor": True},
+        {"harmonic": True},
+        {"stable": False},
+        {"fundamental": 0.649999},
+    ],
+)
+def test_normal_schedule_safeguards_each_block_countdown_and_warning(override):
+    decision = _normal_established()
+    now = BASE + 100
+    evidence = _normal_prediction_evidence(decision, now=now, **override)
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=evidence,
+        )
+    )
+
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+def test_normal_schedule_confidence_below_maximum_does_not_enter_new_path():
+    decision = _normal_established()
+    now = BASE + 100
+    evidence = _normal_prediction_evidence(decision, now=now, schedule=0.949999)
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.949999,
+            normal_prediction_evidence=evidence,
+        )
+    )
+
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+@pytest.mark.parametrize(
+    "state,suspicion",
+    [
+        (authority.RegimeState.CHANGE_SUSPECTED, 0),
+        (authority.RegimeState.CHALLENGER_ACCUMULATING, 0),
+        (authority.RegimeState.NEW_REGIME_PROVISIONAL, 0),
+        (authority.RegimeState.TRANSITION_CONFIRMED, 0),
+        (authority.RegimeState.ESTABLISHED, 1),
+    ],
+)
+def test_normal_schedule_authority_state_invalidations_suppress_prediction(
+    state, suspicion
+):
+    decision = replace(
+        _normal_established(),
+        state=state,
+        suspicion_level=suspicion,
+    )
+    now = BASE + 100
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=_normal_prediction_evidence(
+                decision, now=now
+            ),
+        )
+    )
+
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+@pytest.mark.parametrize(
+    "evidence_override",
+    [
+        {"latest_phase_at": BASE + 100 - 3 * 4 * HOUR - 1},
+        {"anomaly": True},
+        {"selected_period": 3 * HOUR},
+        {"incumbent_period": 3 * HOUR},
+        {"predicted_at": BASE + 100},
+    ],
+)
+def test_normal_schedule_runtime_evidence_invalidations_suppress_prediction(
+    evidence_override
+):
+    decision = _normal_established()
+    now = BASE + 100
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=_normal_prediction_evidence(
+                decision, now=now, **evidence_override
+            ),
+        )
+    )
+
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+def test_normal_schedule_selected_and_incumbent_regimes_must_match():
+    decision = _normal_established()
+    distinct_incumbent = replace(
+        decision.incumbent_shadow_regime,
+        regime_id="distinct-normal-incumbent",
+    )
+    decision = replace(decision, incumbent_shadow_regime=distinct_incumbent)
+    now = BASE + 100
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=_normal_prediction_evidence(
+                decision, now=now
+            ),
+        )
+    )
+
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+@pytest.mark.parametrize(
+    "authority_override",
+    [
+        {"prediction_usable": False},
+        {"countdown_safe": False},
+    ],
+)
+def test_normal_schedule_respects_authority_prediction_safety_flags(
+    authority_override
+):
+    decision = replace(_normal_established(), **authority_override)
+    now = BASE + 100
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=_normal_prediction_evidence(
+                decision, now=now
+            ),
+        )
+    )
+
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+def test_normal_change_suspected_cycle_uses_schedule_confidence_not_combined_authority():
+    live_shape = replace(
+        _normal_established(),
+        decision_id="crowbar-live-change-suspected",
+        state=authority.RegimeState.CHANGE_SUSPECTED,
+        combined_confidence=0.045009,
+        prediction_usable=False,
+        countdown_safe=False,
+    )
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            live_shape,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+        )
+    )
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
+    presentation = restart_learning_presentation(summary)
+
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert value.confidence_display_value == 0.95
+    assert "normal_schedule_confidence_display" in value.reason_codes
+    assert not value.countdown_visible
+    assert not value.countdown_safe
+    assert value.next_expected_restart_at is None
+    assert summary["confidence_kind"] == "schedule"
+    assert summary["confidence_label"] == "Confidence:"
+    assert summary["confidence_percent"] == 95
+    assert presentation["confidence_percent"] == 95
+    assert presentation["confidence_label"] == "Confidence:"
+
+
+def test_unknown_authority_summary_still_renders_no_cycle_or_confidence():
+    value = consumers4.evaluate_authority_consumers(_policy(_authority(0)))
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
+    presentation = restart_learning_presentation(summary)
+
+    assert summary["cycle_text"] == "--"
+    assert not summary["confidence_visible"]
+    assert presentation["cycle_text"] == "--"
+    assert not presentation["confidence_visible"]
 
 
 def test_h1_does_not_show_likely_even_at_fifty_percent():
@@ -428,6 +819,80 @@ def test_safe_h3_warning_due_and_one_shot_suppression():
     assert not again.scheduled_pre_restart_alert_eligible
 
 
+def test_safe_normal_warning_due_uses_existing_deduplication():
+    decision = _normal_established()
+    regime = decision.selected_shadow_regime
+    assert regime is not None
+    occurrence = consumers4.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE + 100,
+    )
+    due = occurrence - 300
+    evidence = _normal_prediction_evidence(
+        decision,
+        now=due,
+        latest_phase_at=occurrence - regime.candidate_period_seconds,
+        predicted_at=occurrence,
+    )
+    first = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=due,
+            restart_alert_enabled=True,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=evidence,
+        )
+    )
+    again = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=due,
+            restart_alert_enabled=True,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=evidence,
+            fired_keys=frozenset({first.scheduled_warning_suppression_key}),
+        )
+    )
+
+    assert first.next_expected_restart_at == occurrence
+    assert first.scheduled_pre_restart_alert_eligible
+    assert not again.scheduled_pre_restart_alert_eligible
+    assert again.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
+
+
+def test_safe_normal_schedule_never_enables_outage_relaxation_or_high_gates():
+    decision = _normal_established()
+    regime = decision.selected_shadow_regime
+    assert regime is not None
+    now = BASE + 100
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            observed_outage_at=regime.phase_offset,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=_normal_prediction_evidence(
+                decision, now=now
+            ),
+        )
+    )
+
+    assert value.countdown_visible and value.scheduled_warning_eligible
+    assert not value.outage_relaxation_eligible
+    assert value.restart_classification_policy is consumers4.AuthorityRestartClassification.UNSCHEDULED_RESTART
+    assert all(
+        not candidate.h1_gate
+        and not candidate.h2_gate
+        and not candidate.h3_gate
+        and not candidate.h4_gate
+        for candidate in decision.candidates
+    )
+
+
 def test_warning_key_rotates_with_regime_and_old_key_does_not_block_new():
     old = _authority(4)
     old_value = consumers4.evaluate_authority_consumers(_policy(old, now=BASE + 3 * HOUR - 300))
@@ -548,6 +1013,74 @@ def test_transitionally_unsafe_schema4_never_falls_back_to_schema3_countdown():
         schema4_server_valid=True,
     )
     assert value.selected_output is schema4_value and not schema4_value.countdown_visible
+
+
+def _runtime_recovery_window(authority_decision, consumer_decision, restart_started_at):
+    schema3 = _schema3_decision()
+    resolution = consumers4.resolve_authority_consumer_cutover(
+        schema3_decision=schema3,
+        schema4_decision=consumer_decision,
+        production_cutover_enabled=True,
+        authoritative_schema4_runtime_enabled=True,
+        schema4_server_valid=True,
+    )
+    value = object.__new__(Phase2RestartRuntime)
+    value._servers = {
+        SERVER: SimpleNamespace(
+            engine=SimpleNamespace(
+                active_episode=SimpleNamespace(
+                    event_id="physical-event",
+                    first_failure_wall=restart_started_at,
+                )
+            )
+        )
+    }
+    value._authority_consumer_resolutions = {SERVER: resolution}
+    value._authoritative_schema4_backend = SimpleNamespace(
+        authority_decision=lambda _key: authority_decision
+    )
+    return value.recovery_alert_expected_window(SERVER)
+
+
+def test_runtime_recovery_window_uses_safe_schema4_restart_phase():
+    decision = _authority(4)
+    consumer = consumers4.evaluate_authority_consumers(_policy(decision))
+    expected = consumer.next_expected_restart_at
+    assert expected is not None
+
+    inside = _runtime_recovery_window(decision, consumer, expected - 600)
+    outside = _runtime_recovery_window(decision, consumer, expected - 600.001)
+
+    assert inside.status is RecoveryAlertWindowStatus.INSIDE_WINDOW
+    assert inside.residual_seconds == 600
+    assert outside.status is RecoveryAlertWindowStatus.OUTSIDE_WINDOW
+    assert outside.residual_seconds == pytest.approx(600.001)
+
+
+@pytest.mark.parametrize(
+    "state",
+    (
+        authority.RegimeState.CHANGE_SUSPECTED,
+        authority.RegimeState.TRANSITION_CONFIRMED,
+    ),
+)
+def test_runtime_recovery_window_fails_open_for_change_or_transition_state(state):
+    incumbent = _authority(4)
+    changed = _transition(
+        incumbent,
+        _authority(3, 4 * HOUR, start=BASE + 1234),
+        state=state,
+    )
+    consumer = consumers4.evaluate_authority_consumers(_policy(changed))
+    restart_started_at = (
+        consumer.next_expected_restart_at - 900
+        if consumer.next_expected_restart_at is not None
+        else BASE + 900
+    )
+
+    value = _runtime_recovery_window(changed, consumer, restart_started_at)
+
+    assert value.status is RecoveryAlertWindowStatus.NO_SAFE_EXPECTATION
 
 
 def test_authority_summary_reuses_current_ui_presentation_shape():

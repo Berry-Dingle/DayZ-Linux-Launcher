@@ -550,44 +550,9 @@ def current_comma_token(text: Any, cursor_pos: Any) -> tuple[str, int, int]:
     return value[token_start:token_end], token_start, token_end
 
 
-def current_mod_operator_token(text: Any, cursor_pos: Any) -> tuple[str, int, int] | None:
-    value = str(text or "")
-    try:
-        cursor = int(cursor_pos)
-    except Exception:
-        cursor = len(value)
-    cursor = max(0, min(cursor, len(value)))
-
-    match = _MOD_OPERATOR_RE.search(value)
-    if not match or cursor < match.end():
-        return None
-
-    suffix = value[match.end():]
-    suffix_cursor = cursor - match.end()
-    token, start, end = current_comma_token(suffix, suffix_cursor)
-    return token, match.end() + start, match.end() + end
-
-
 def replace_comma_token(text: Any, cursor_pos: Any, replacement: Any) -> tuple[str, int]:
     value = str(text or "")
     replacement_text = str(replacement or "").strip()
     _, start, end = current_comma_token(value, cursor_pos)
     updated = f"{value[:start]}{replacement_text}{value[end:]}"
     return updated, start + len(replacement_text)
-
-
-def replace_mod_operator_token(text: Any, cursor_pos: Any, replacement: Any) -> tuple[str, int]:
-    value = str(text or "")
-    try:
-        cursor = int(cursor_pos)
-    except Exception:
-        cursor = len(value)
-    cursor = max(0, min(cursor, len(value)))
-
-    match = _MOD_OPERATOR_RE.search(value)
-    if not match or cursor < match.end():
-        return value, cursor
-
-    suffix = value[match.end():]
-    new_suffix, suffix_cursor = replace_comma_token(suffix, cursor - match.end(), replacement)
-    return f"{value[:match.end()]}{new_suffix}", match.end() + suffix_cursor

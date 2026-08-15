@@ -318,7 +318,9 @@ def test_conventional_sequence_clusters_all_signals_into_one_event():
     assert event.outcome is detection.EventOutcome.CORROBORATED_OFFLINE_RESTART
     assert 0.95 <= event.authenticity <= 1.0
     assert event.outage.confirmed_offline_at == BASE_WALL + 96
-    assert event.canonical_phase_at == BASE_WALL + 120
+    assert event.canonical_phase_at == BASE_WALL + 90
+    assert event.canonical_phase_at == event.outage.first_failure_at
+    assert event.outage.info_return_at == BASE_WALL + 120
     assert event.coverage_complete
     assert event.sources >= {
         detection.SignalSource.PLAYER_DRAIN,
@@ -326,6 +328,29 @@ def test_conventional_sequence_clusters_all_signals_into_one_event():
         detection.SignalSource.INFO_RETURN,
         detection.SignalSource.QUEUE_RECOVERY,
     }
+
+
+def test_variable_outage_recovery_duration_does_not_move_restart_start_phase():
+    def completed(recovery_at):
+        engine = detection.PhysicalEpisodeEngine()
+        populated(engine)
+        feed(
+            engine,
+            [
+                sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+                sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+                sample(recovery_at, MISSING),
+            ],
+        )
+        return engine.tick(recovery_at + 30, BASE_WALL + recovery_at + 30)[0]
+
+    quick = completed(60)
+    slow = completed(180)
+
+    assert quick.outage.info_return_at == BASE_WALL + 60
+    assert slow.outage.info_return_at == BASE_WALL + 180
+    assert quick.canonical_phase_at == slow.canonical_phase_at == BASE_WALL + 30
+    assert quick.phase_uncertainty == slow.phase_uncertainty == 10
 
 
 def test_clean_offline_without_player_or_queue_evidence_remains_valid():

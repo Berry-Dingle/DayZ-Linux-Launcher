@@ -3,9 +3,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import logging
 import threading
 import time
 from typing import Callable
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -57,10 +61,10 @@ class JoinDownloadOrdinal:
 class JoinAttemptTracker:
     """Process-local Join diagnostics and stale-callback guard."""
 
-    def __init__(self, *, log_sink: Callable[[str], None] = print,
+    def __init__(self, *, log_sink: Callable[[str], None] | None = None,
                  wall_clock: Callable[[], float] = time.time,
                  monotonic_clock: Callable[[], float] = time.monotonic):
-        self._log_sink = log_sink
+        self._log_sink = log_sink or logger.debug
         self._wall_clock = wall_clock
         self._monotonic_clock = monotonic_clock
         self._lock = threading.Lock()

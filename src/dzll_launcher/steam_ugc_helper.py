@@ -247,7 +247,6 @@ def ensure_ld_library_path(paths: SteamPaths) -> None:
     env = dict(os.environ)
     env["LD_LIBRARY_PATH"] = ":".join(merged)
     env["DZLL_STEAM_UGC_HELPER_REEXEC"] = "1"
-    eprint(f"[steam-ugc-helper] re-exec with LD_LIBRARY_PATH={env['LD_LIBRARY_PATH']}")
     os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
 
 

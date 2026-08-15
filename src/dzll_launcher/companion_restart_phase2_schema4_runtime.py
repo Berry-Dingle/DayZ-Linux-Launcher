@@ -50,9 +50,6 @@ from .companion_restart_phase2_schema4 import (
 
 AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED_DEFAULT = False
 SCHEMA4_RUNTIME_WRITE_SEMANTICS_VERSION = 1
-SCHEMA4_DECISION_HISTORY_LIMIT = 64
-
-
 class Schema4RuntimeError(Schema4Error):
     """Authoritative schema-4 runtime operation failed safely."""
 

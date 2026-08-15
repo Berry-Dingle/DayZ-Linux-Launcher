@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Native Steam UGC Workshop downloader for DayZ mods."""
 
+import logging
 from typing import Callable, List
 
 from .steamcmd_mods import DAYZ_APPID
@@ -11,6 +12,7 @@ from .steam_ugc_backend import (
 )
 
 STEAM_CLIENT_STALL_TIMEOUT_S = 60 * 60
+logger = logging.getLogger(__name__)
 
 
 def run_steam_client_install(
@@ -33,7 +35,7 @@ def run_steam_client_install(
         if callable(log_fn):
             log_fn(message)
         else:
-            print(message)
+            logger.debug("%s", message)
 
     ids = []
     seen = set()
@@ -161,5 +163,10 @@ def run_steam_client_install(
     if cancel_event is not None and cancel_event.is_set():
         log("[Steam UGC] Cancelled")
     else:
-        log(f"[Steam UGC] Failed: {last_ugc_error}" if last_ugc_error else "[Steam UGC] Failed")
+        failure = (
+            f"[Steam UGC] Failed: {last_ugc_error}"
+            if last_ugc_error else "[Steam UGC] Failed"
+        )
+        log(failure)
+        logger.error("%s", failure)
     return False

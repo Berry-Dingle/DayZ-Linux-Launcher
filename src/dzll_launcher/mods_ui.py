@@ -46,13 +46,11 @@ MOD_ROW_CONTENT_INSET = 2
 MOD_REPAIR_COLUMN_WIDTH = 48
 MOD_MANAGER_CARD_WIDTH = 960 + MOD_REPAIR_COLUMN_WIDTH
 BATCH_UNSUBSCRIBE_ITEM_TIMEOUT_S = 45
-BATCH_UNSUBSCRIBE_VERIFY_TIMEOUT_S = 12
 BATCH_UNSUBSCRIBE_REQUEST_TIMEOUT_S = 12
 BATCH_UNSUBSCRIBE_POLL_INTERVAL_S = 1.0
 BATCH_UNSUBSCRIBE_POLL_QUERY_TIMEOUT_S = 4
 BATCH_UNSUBSCRIBE_SETTLE_TIMEOUT_S = 4.0
 PASSIVE_STEAM_WATCH_INTERVAL_S = 4
-PASSIVE_STEAM_WATCH_READY_TIMEOUT_S = 90
 PASSIVE_STEAM_WATCH_SAMPLE_SIZE = 3
 INVENTORY_NATIVE_QUERY_ATTEMPTS = 3
 INVENTORY_NATIVE_QUERY_TIMEOUT_S = 12
@@ -105,15 +103,6 @@ def _wait_for_native_steam_stopped(timeout_s: float = 45.0) -> bool:
             return True
         time.sleep(0.5)
     return not _supported_native_steam_running()
-
-
-def _wait_for_native_steam_running(timeout_s: float = 45.0) -> bool:
-    deadline = time.monotonic() + float(timeout_s)
-    while time.monotonic() < deadline:
-        if _supported_native_steam_running():
-            return True
-        time.sleep(0.5)
-    return _supported_native_steam_running()
 
 
 def _launch_native_steam_silent() -> tuple[bool, str]:
@@ -553,14 +542,8 @@ class ModsManagerOverlay:
         self._subscription_snapshot = None
         self._host_close_request_handler_id = 0
         self._passive_steam_watch_timer_id = 0
-        self._passive_steam_watch_probe_running = False
-        self._passive_steam_watch_check_started_at = 0.0
-        self._passive_steam_watch_checking_status_shown = False
-        self._passive_steam_was_ready_this_session = False
-        self._passive_steam_shutdown_status_shown = False
         self._suppress_start_steam_manage_prompt_for_operation = False
         self._recovery_inventory_handoff_active = False
-        self._steam_status_pill_state = "checking"
         self.sort_key = "name"
         self.sort_ascending = True
         self._sort_header_labels = {}
@@ -761,9 +744,6 @@ class ModsManagerOverlay:
         self._native_session_handoff_valid = False
         self._inventory_validity = InventoryValidity.STALE
         self._subscription_snapshot = None
-        self._passive_steam_was_ready_this_session = False
-        self._passive_steam_watch_check_started_at = 0.0
-        self._passive_steam_watch_checking_status_shown = False
         self._set_steam_status_pill(
             "checking" if current is SteamClientState.NATIVE else "offline"
         )
@@ -862,10 +842,6 @@ class ModsManagerOverlay:
         self._inventory_validity = InventoryValidity.STALE
         self._loaded_items = []
         self._selected_mod_ids = set()
-        self._passive_steam_was_ready_this_session = False
-        self._passive_steam_watch_check_started_at = 0.0
-        self._passive_steam_watch_checking_status_shown = False
-        self._passive_steam_shutdown_status_shown = False
         self._recovery_inventory_handoff_active = False
         self._suppress_start_steam_manage_prompt_for_operation = False
         try:
@@ -1002,16 +978,6 @@ class ModsManagerOverlay:
             show_cancel=False,
         )
 
-    def _has_steam_offline_rows(self) -> bool:
-        for item in list(getattr(self, "_loaded_items", []) or []):
-            try:
-                state = self._selection_state_for_item(item)
-            except Exception:
-                state = {}
-            if str(state.get("category") or "") == "steam_offline":
-                return True
-        return False
-
     def _has_steam_checked_rows(self) -> bool:
         for item in list(getattr(self, "_loaded_items", []) or []):
             try:
@@ -1125,7 +1091,6 @@ class ModsManagerOverlay:
             "issue": "DZLL could not check mods with Steam.",
         }
 
-        self._steam_status_pill_state = status_key
         try:
             self.steam_status_text.set_text(label_by_status[status_key])
         except Exception:
@@ -1141,34 +1106,6 @@ class ModsManagerOverlay:
         except Exception:
             pass
 
-    def _passive_steam_watch_sample_ids(self) -> list[int]:
-        items = list(getattr(self, "_loaded_items", []) or [])
-        sample = []
-        seen = set()
-
-        def add_item_id(item) -> None:
-            if len(sample) >= PASSIVE_STEAM_WATCH_SAMPLE_SIZE:
-                return
-            try:
-                mid = int(item[1])
-            except Exception:
-                return
-            if mid <= 0 or mid in seen:
-                return
-            seen.add(mid)
-            sample.append(mid)
-
-        for item in items:
-            try:
-                state = self._selection_state_for_item(item)
-            except Exception:
-                state = {}
-            if str(state.get("category") or "") == "steam_offline":
-                add_item_id(item)
-        for item in items:
-            add_item_id(item)
-        return sample
-
     def _maybe_start_passive_steam_watch(self) -> None:
         should_watch = self._mod_manager_is_visible()
         if not should_watch:
@@ -1176,10 +1113,6 @@ class ModsManagerOverlay:
             return
         if int(getattr(self, "_passive_steam_watch_timer_id", 0) or 0):
             return
-        self._passive_steam_watch_probe_running = False
-        self._passive_steam_watch_check_started_at = 0.0
-        self._passive_steam_watch_checking_status_shown = False
-        self._passive_steam_shutdown_status_shown = False
         try:
             self._passive_steam_watch_timer_id = int(
                 GLib.timeout_add_seconds(
@@ -1190,19 +1123,6 @@ class ModsManagerOverlay:
             )
         except Exception:
             self._passive_steam_watch_timer_id = 0
-
-    def _operation_status_is_protected(self) -> bool:
-        if (
-            bool(getattr(self, "_mod_operation_pending", False))
-            or bool(getattr(self, "_mod_operation_running", False))
-            or bool(getattr(self, "_batch_unsubscribe_running", False))
-        ):
-            return True
-        try:
-            current_status = str(self.operation_status_label.get_text() or "")
-        except Exception:
-            current_status = ""
-        return self._is_one_shot_action_status(current_status)
 
     def _set_mod_operation_pending(self, pending: bool) -> None:
         self._mod_operation_pending = bool(pending)
@@ -1219,10 +1139,6 @@ class ModsManagerOverlay:
             except Exception:
                 pass
         self._passive_steam_watch_timer_id = 0
-        self._passive_steam_watch_probe_running = False
-        self._passive_steam_watch_check_started_at = 0.0
-        self._passive_steam_watch_checking_status_shown = False
-        self._passive_steam_shutdown_status_shown = False
 
     def _passive_steam_watch_tick(self):
         if not self._mod_manager_is_visible():
@@ -1636,10 +1552,6 @@ class ModsManagerOverlay:
         cancel_event=None,
     ):
         workshop_roots = _candidate_workshop_roots(workshop_dir=workshop_dir)
-        try:
-            print(f"[MOD MANAGER] workshop roots: {[str(root) for root in workshop_roots]}", flush=True)
-        except Exception:
-            pass
         ids = sorted(set(_read_installed_mod_ids_from_roots(workshop_roots)))
         name_map = _name_map_from_symlinks(proton_prefix=proton_prefix)
         try:
@@ -1954,8 +1866,6 @@ class ModsManagerOverlay:
         self._subscription_snapshot = getattr(items, "subscription_snapshot", None)
         self._loaded_items = list(items or [])
         self._prune_selected_mod_ids(self._loaded_items)
-        if self._has_steam_checked_rows():
-            self._passive_steam_was_ready_this_session = True
         self._set_steam_status_pill(self._steam_status_from_loaded_items())
         self._steam_management_verified = self._compute_steam_management_verified()
         self._native_session_handoff_valid = self._steam_management_verified

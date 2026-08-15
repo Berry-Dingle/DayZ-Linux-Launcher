@@ -877,7 +877,9 @@ def test_confirmed_offline_counter_polls_coalesce_and_finalize_once(tmp_path):
     assert event.outcome is detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
     assert event.outage.failure_count == 52
     assert event.authenticity == 0.85
-    assert event.canonical_phase_at == start + 180
+    assert event.canonical_phase_at == start + 10
+    assert event.canonical_phase_at == event.outage.first_failure_at
+    assert event.outage.info_return_at == start + 180
     assert sum(item.event_id == event_id for item in value._servers[SERVER].events) == 1
     assert schema4.validate_schema4_state(
         schema4.deserialize_schema4_bytes(active.read_bytes()).state

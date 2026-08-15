@@ -109,14 +109,6 @@ _BOUNDARY_KINDS = {
     ContinuitySpanKind.UNRESOLVED_EPISODE,
 }
 
-_OBSERVED_KINDS = {
-    ContinuitySpanKind.ONLINE_HEALTHY,
-    ContinuitySpanKind.OFFLINE_OBSERVED,
-    ContinuitySpanKind.HEALTHY_TO_FAILURE,
-    ContinuitySpanKind.FAILURE_TO_HEALTHY,
-}
-
-
 @dataclass(frozen=True)
 class ContinuitySpan:
     provenance_version: int
@@ -591,12 +583,16 @@ def extract_interval_relationships(
     span_values = tuple(spans)
     relationships: dict[str, IntervalRelationship] = {}
     for left_index, left in enumerate(unique):
+        if _schedule_neutral_attribution_anomaly(left):
+            continue
         left_at = _event_at(left)
         if left_at is None:
             continue
         upper = min(len(unique), left_index + MAX_INTERVENING_EVENTS + 2)
         for right_index in range(left_index + 1, upper):
             right = unique[right_index]
+            if _schedule_neutral_attribution_anomaly(right):
+                continue
             right_at = _event_at(right)
             if right_at is None or right_at <= left_at:
                 continue
@@ -1261,6 +1257,14 @@ def _authentic_physical_event(event: PhysicalRestartEvent) -> bool:
         EventOutcome.EXPIRED,
         EventOutcome.SERVICE_INTERRUPTION,
     }
+
+
+def _schedule_neutral_attribution_anomaly(event: PhysicalRestartEvent) -> bool:
+    return bool(
+        event.outcome is EventOutcome.INCOMPLETE
+        and "query_visible_close_collapse_attribution_anomaly"
+        in event.reason_codes
+    )
 
 
 def _event_transition_span(

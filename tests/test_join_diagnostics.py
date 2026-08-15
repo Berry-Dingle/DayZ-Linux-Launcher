@@ -5,7 +5,7 @@ import threading
 import pytest
 
 from dzll_launcher.join_attempt import JoinAttemptTracker
-from dzll_launcher import join_prepare, launch_utils
+from dzll_launcher import join_prepare, launch_utils, steam_client_mods, steam_ugc_backend
 
 
 class Clock:
@@ -38,6 +38,44 @@ def test_unique_attempt_id_allocated_on_join_click():
     assert value.cleanup(first.attempt_id, "done")
     second = begin(value)
     assert (first.attempt_id, second.attempt_id) == (1, 2)
+
+
+def test_default_join_attempt_diagnostics_are_quiet(capsys):
+    value = JoinAttemptTracker()
+    attempt = begin(value)
+    value.log(attempt.attempt_id, "synthetic success", ready=True)
+    assert value.active.transitions[-1][0] == "synthetic success"
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_ugc_lifecycle_events_reach_callback_without_terminal_chatter(capsys):
+    events = []
+    steam_ugc_backend._log_event(
+        events.append,
+        "[Steam UGC] Cooperative helper session exited",
+        helper_pid=4321,
+    )
+    assert events == [{
+        "type": "log",
+        "message": "[Steam UGC] Cooperative helper session exited",
+        "helper_pid": 4321,
+    }]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_successful_steam_client_install_is_quiet_by_default(monkeypatch, capsys):
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", lambda *_a, **_k: True)
+    assert steam_client_mods.run_steam_client_install(
+        workshop_dir="/unused",
+        mod_ids=[101],
+    )
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
 
 def test_immutable_server_key_survives_replacement():
@@ -362,4 +400,4 @@ def test_no_automatic_retry_delay_or_second_handoff_added():
     assert "retry" not in launch_source.lower()
     join_section = window_source.split("def _join_server_for_obj", 1)[1]
     assert "Join already in progress" in join_section
-    assert "time.sleep" not in join_section.split("def _preflight_block_warning", 1)[0]
+    assert "time.sleep" not in join_section.split("def _prune_expired_dead", 1)[0]

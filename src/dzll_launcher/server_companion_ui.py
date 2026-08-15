@@ -29,6 +29,7 @@ RESTART_CONFIDENCE_STYLE_CLASSES = {
     "improving": "ping-greeny",
     "strong": "ping-good",
 }
+MAX_USER_VISIBLE_RESTART_CONFIDENCE_PERCENT = 95
 RESTART_PRESENTATION_TOOLTIPS = {
     "pattern_only": "Recurring timing is visible, but its duration is not established yet.",
     "likely_cycle": "A repeated cycle is likely; exact restart prediction remains withheld.",
@@ -48,9 +49,10 @@ def format_restart_cycle_text(value: object) -> str:
     """Format an already-resolved cycle label without selecting a model."""
 
     text = str(value or "").strip()
-    confirmed_prefix = "Confirmed:"
-    if text.startswith(confirmed_prefix):
-        text = text[len(confirmed_prefix):].strip()
+    for prefix in ("Confirmed:", "Likely:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].strip()
+            break
     match = _WHOLE_HOUR_CYCLE_RE.fullmatch(text)
     if match is None:
         return text or "--"
@@ -90,7 +92,10 @@ def restart_learning_presentation(summary: dict | None) -> dict | None:
     try:
         confidence_percent = max(
             0,
-            min(100, int(summary.get("confidence_percent", 0) or 0)),
+            min(
+                MAX_USER_VISIBLE_RESTART_CONFIDENCE_PERCENT,
+                int(summary.get("confidence_percent", 0) or 0),
+            ),
         )
     except Exception:
         confidence_percent = 0
@@ -162,7 +167,6 @@ class ServerCompanionPanel(Gtk.Box):
         self._on_power_off = None
         self._join_sensitivity_resolver = None
         self._alert_sound_value = "female"
-        self._restart_alert_usable = False
         self._empty_breathe_timer_id = 0
         self._empty_clock_timer_id = 0
         self._restart_countdown_colon_timer_id = 0
@@ -540,7 +544,6 @@ class ServerCompanionPanel(Gtk.Box):
     def set_restart_alert_usability(self, summary: dict | None):
         summary = summary if isinstance(summary, dict) else {}
         usable = bool(summary.get("usable", False))
-        self._restart_alert_usable = usable
         self.sound_row.set_visible(True)
         self.volume_row.set_visible(True)
         ServerCompanionPanel._suppress_restart_alert_status(self)
@@ -571,12 +574,6 @@ class ServerCompanionPanel(Gtk.Box):
             return max(0, min(100, int(round(self.alert_volume_scale.get_value()))))
         except Exception:
             return 80
-
-    def alert_sound(self) -> str:
-        value = self._alert_sound_value
-        if value in {v for v, _label in ALERT_SOUND_OPTIONS}:
-            return value
-        return "female"
 
     def set_alert_sound(self, value: str):
         if value not in {v for v, _label in ALERT_SOUND_OPTIONS}:

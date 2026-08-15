@@ -48,13 +48,26 @@ from .companion_restart_phase2_continuity import (
     observed_transition_spans_from_events,
     reconstruct_historical_event_provenance,
 )
-from .companion_restart_phase2_detection import DetectionConfig, PhysicalRestartEvent
+from .companion_restart_phase2_detection import (
+    DetectionConfig,
+    PhysicalRestartEvent,
+    normalize_event_restart_start_phase,
+)
 from .companion_restart_phase2_consumer_state import (
+    alert_record,
+    append_alert,
     compact_consumer_ledger,
     empty_consumer_state,
     ledger_from_mapping as consumer_ledger_from_mapping,
     ledger_to_mapping as consumer_ledger_to_mapping,
+    latest_alert_records,
     validate_consumer_state,
+    with_decision,
+)
+from .companion_restart_phase2_authority_consumers import (
+    AuthorityConsumerPolicyInput,
+    AuthoritySuppressionKind,
+    evaluate_authority_consumers,
 )
 from .companion_restart_phase2_expected_windows import (
     EXPECTED_WINDOW_SCHEMA_VERSION,
@@ -1292,6 +1305,189 @@ def persisted_physical_events(
     return tuple(
         _deserialize_event(item) for item in record.get("physical_events", ())
     )
+
+
+def normalize_restart_start_phases(
+    state: Mapping[str, object],
+    *,
+    updated_at: float,
+) -> tuple[dict, dict[str, dict[str, object]]]:
+    """Explicitly rebuild schema-4 state with restart-start canonical phases.
+
+    Retained physical events are the source of truth.  Existing relationship,
+    scoring, window, regime, and authority projections are intentionally not
+    unioned back: `_migrate_server` regenerates them through the normal detached
+    learner paths.  Alert suppression state is operational history rather than
+    phase-learning evidence and is preserved unchanged.
+    """
+
+    loaded = deserialize_schema4_state(
+        state, quarantine_invalid_servers=False
+    )
+    if not loaded.report.valid:
+        raise Schema4ValidationError(
+            "restart-start normalization requires valid schema-4 state"
+        )
+    from .companion_restart_phase2_runtime import _serialize_event
+
+    normalized = copy.deepcopy(loaded.state)
+    summaries: dict[str, dict[str, object]] = {}
+    schema3_snapshot = normalized.get("schema3_snapshot")
+    snapshot_servers = (
+        schema3_snapshot.get("servers")
+        if isinstance(schema3_snapshot, dict)
+        and isinstance(schema3_snapshot.get("servers"), dict)
+        else None
+    )
+    for server_key, existing in tuple(normalized.get("servers", {}).items()):
+        if not isinstance(existing, Mapping):
+            continue
+        legacy = existing.get("legacy_schema3_record")
+        if not isinstance(legacy, Mapping):
+            raise Schema4ValidationError(
+                f"schema-4 server {server_key!r} has no rebuildable schema-3 projection"
+            )
+        source_events = persisted_physical_events(existing)
+        migrated_events = tuple(
+            normalize_event_restart_start_phase(item) for item in source_events
+        )
+        changed = tuple(
+            item.event_id
+            for item, migrated in zip(source_events, migrated_events)
+            if (
+                item.canonical_phase_at != migrated.canonical_phase_at
+                or item.phase_uncertainty != migrated.phase_uncertainty
+            )
+        )
+        neutralized = tuple(
+            item.event_id
+            for item in migrated_events
+            if item.canonical_phase_at is None
+            and "restart_start_phase_unavailable" in item.reason_codes
+        )
+        raw = copy.deepcopy(dict(legacy))
+        raw["events"] = [
+            _serialize_event(item, include_samples=True)
+            for item in migrated_events
+        ]
+        raw["event_seq"] = max(
+            (item.sequence for item in migrated_events), default=0
+        )
+        raw["folded_through_event_seq"] = 0
+        raw["aggregate"] = {}
+        raw["prior_regimes"] = []
+        raw["expected_window_misses"] = []
+        raw.pop("candidate_diagnostics", None)
+        source = {
+            "schema_version": 3,
+            "scoring_algorithm_version": 1,
+            "created_at": normalized.get("created_at", 0),
+            "updated_at": float(updated_at),
+            "servers": {server_key: raw},
+        }
+        fresh, audit = _migrate_server(
+            server_key,
+            raw,
+            state=source,
+            source_bytes=canonical_json_bytes(source),
+        )
+        fresh["authority_status"] = str(
+            existing.get("authority_status") or "valid_authoritative_runtime"
+        )
+        authority_decision = persisted_authority_decision(fresh)
+        consumer_decision = evaluate_authority_consumers(
+            AuthorityConsumerPolicyInput(
+                authority_decision=authority_decision,
+                now=float(updated_at),
+                server_online_healthy=False,
+                restart_alert_enabled=False,
+            )
+        )
+        rebuilt_consumer = consumer_ledger_from_mapping(
+            empty_consumer_state(server_key), server_key=server_key
+        )
+        rebuilt_consumer = with_decision(rebuilt_consumer, consumer_decision)
+        existing_consumer = existing.get("consumer_state")
+        if isinstance(existing_consumer, Mapping):
+            old_consumer = consumer_ledger_from_mapping(
+                existing_consumer, server_key=server_key
+            )
+            physical_ids = {item.event_id for item in migrated_events}
+            for item in latest_alert_records(old_consumer):
+                # Recovery suppression is tied to an immutable physical event
+                # and remains valid.  Scheduled-warning keys are tied to the
+                # replaced recovery phase/regime and must be regenerated from
+                # the next restart-start consumer decision.
+                if (
+                    item.namespace is not AuthoritySuppressionKind.GENERIC_RECOVERY
+                    or item.physical_event_id not in physical_ids
+                ):
+                    continue
+                rebuilt_consumer = append_alert(
+                    rebuilt_consumer,
+                    alert_record(
+                        key=item.suppression_key(),
+                        authority_consumer_decision_id=consumer_decision.decision_id,
+                        created_at=item.created_at,
+                        lifecycle=item.lifecycle,
+                        action_outcome=item.action_outcome,
+                        compacted=item.compacted,
+                        reason_codes=tuple(
+                            sorted(
+                                set(item.reason_codes)
+                                | {"preserved_across_restart_start_phase_normalization"}
+                            )
+                        ),
+                    ),
+                )
+        fresh["consumer_state"] = consumer_ledger_to_mapping(rebuilt_consumer)
+        fresh["reason_codes"] = sorted(
+            set(fresh.get("reason_codes", ()))
+            | {"restart_start_phase_normalized"}
+        )
+        fresh_audit = copy.deepcopy(fresh.get("migration_audit", {}))
+        fresh_audit.update(
+            {
+                "restart_start_phase_normalized_at": float(updated_at),
+                "restart_start_events_changed": len(changed),
+                "restart_start_events_neutralized": len(neutralized),
+            }
+        )
+        fresh["migration_audit"] = fresh_audit
+        normalized["servers"][server_key] = fresh
+        if snapshot_servers is not None:
+            snapshot_servers[server_key] = copy.deepcopy(raw)
+        summaries[server_key] = {
+            "physical_event_count": len(migrated_events),
+            "changed_event_ids": changed,
+            "neutralized_event_ids": neutralized,
+            "relationship_count": len(fresh.get("interval_relationships", ())),
+            "selected_shadow_period_seconds": audit.get(
+                "selected_shadow_period_seconds"
+            ),
+        }
+    normalized["updated_at"] = max(
+        float(updated_at), float(normalized.get("created_at", 0) or 0)
+    )
+    if isinstance(schema3_snapshot, dict):
+        schema3_snapshot["updated_at"] = normalized["updated_at"]
+    normalized["reason_codes"] = sorted(
+        set(normalized.get("reason_codes", ()))
+        | {"restart_start_phase_normalization_completed"}
+    )
+    final = deserialize_schema4_state(
+        normalized, quarantine_invalid_servers=False
+    )
+    if not final.report.valid:
+        detail = "; ".join(
+            f"{item.server_key or 'root'}:{item.code}:{item.detail}"
+            for item in final.report.issues
+        )
+        raise Schema4ValidationError(
+            "restart-start normalized state failed schema-4 validation"
+            + (f": {detail}" if detail else "")
+        )
+    return final.state, summaries
 
 
 def persisted_continuity_chains(

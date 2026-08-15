@@ -13,6 +13,7 @@ from typing import Callable, Iterable, Mapping
 from . import companion_restart_phase2_detection as detection_module
 from .companion_restart_phase2_authority import (
     AuthorityDecision,
+    RegimeState,
     evaluate_authority,
 )
 from .companion_restart_phase2_consumers import (
@@ -80,6 +81,7 @@ from .companion_restart_phase2_scoring import (
     CoverageKind,
     CoverageSegment,
     CoverageTimeline,
+    GATES,
     LongTermAggregate,
     RegimeSummary,
     RegimeStatus,
@@ -107,9 +109,12 @@ MAX_FIRED_KEYS = 200
 MAX_ROUTED_FINGERPRINTS = 160
 MAX_INCOMPLETE_EPISODES = 30
 MAX_MONITORING_SESSIONS = 120
+PLAYER_OBSERVATION_RETENTION_SECONDS = 40 * 60.0
 PERSIST_HEARTBEAT_SECONDS = 60.0
 COVERAGE_MAX_AGE_SECONDS = 60 * 24 * 3600
 PERSISTED_FUTURE_SKEW_SECONDS = 5 * 60
+RECOVERY_ALERT_EXPECTED_WINDOW_SECONDS = 10 * 60.0
+RECOVERY_ALERT_OUT_OF_WINDOW_HOLD_SECONDS = 45.0
 MAX_FULL_DETAIL_SERVERS = 32
 MAX_COMPACT_DETAIL_SERVERS = 250
 COMPACT_EVENT_LIMIT = 12
@@ -138,10 +143,75 @@ class LiveResultDisposition(str, Enum):
     PROTOCOL_FAILURE = "protocol_failure"
 
 
+class RecoveryAlertWindowStatus(str, Enum):
+    NO_SAFE_EXPECTATION = "no_safe_expectation"
+    INSIDE_WINDOW = "inside_window"
+    OUTSIDE_WINDOW = "outside_window"
+
+
+@dataclass(frozen=True)
+class RecoveryAlertExpectedWindow:
+    status: RecoveryAlertWindowStatus
+    event_id: str | None = None
+    restart_started_at: float | None = None
+    candidate_period_seconds: int | None = None
+    nearest_expected_restart_at: float | None = None
+    residual_seconds: float | None = None
+
+
+def classify_recovery_alert_expected_window(
+    *,
+    event_id: str | None,
+    restart_started_at: float | None,
+    safe_prediction: bool,
+    candidate_period_seconds: int | None,
+    predicted_occurrence_at: float | None,
+) -> RecoveryAlertExpectedWindow:
+    """Classify one provisional restart start against a safe phase lattice."""
+
+    base = RecoveryAlertExpectedWindow(
+        status=RecoveryAlertWindowStatus.NO_SAFE_EXPECTATION,
+        event_id=str(event_id) if event_id else None,
+        restart_started_at=restart_started_at,
+    )
+    if not safe_prediction or not event_id:
+        return base
+    if (
+        restart_started_at is None
+        or not math.isfinite(restart_started_at)
+        or restart_started_at < 0
+        or type(candidate_period_seconds) is not int
+        or candidate_period_seconds <= 0
+        or predicted_occurrence_at is None
+        or not math.isfinite(predicted_occurrence_at)
+        or predicted_occurrence_at < 0
+    ):
+        return base
+    period = candidate_period_seconds
+    cycle = math.floor((restart_started_at - predicted_occurrence_at) / period)
+    before = predicted_occurrence_at + cycle * period
+    after = before + period
+    nearest = min((before, after), key=lambda value: abs(restart_started_at - value))
+    residual = abs(restart_started_at - nearest)
+    return RecoveryAlertExpectedWindow(
+        status=(
+            RecoveryAlertWindowStatus.INSIDE_WINDOW
+            if residual <= RECOVERY_ALERT_EXPECTED_WINDOW_SECONDS
+            else RecoveryAlertWindowStatus.OUTSIDE_WINDOW
+        ),
+        event_id=str(event_id),
+        restart_started_at=float(restart_started_at),
+        candidate_period_seconds=period,
+        nearest_expected_restart_at=float(nearest),
+        residual_seconds=float(residual),
+    )
+
+
 @dataclass(frozen=True)
 class RuntimeUpdate:
     accepted: bool
     finalized_events: tuple[PhysicalRestartEvent, ...] = ()
+    query_visible_repopulation_event_id: str | None = None
     decision: ConsumerDecision | None = None
     compatibility: CompatibilitySummary | None = None
     state_changed: bool = False
@@ -195,6 +265,9 @@ class _ServerRuntime:
     extra_fields: dict = field(default_factory=dict)
     expected_misses: list[CoveredExpectedMiss] = field(default_factory=list)
     monitoring_sessions: list[dict] = field(default_factory=list)
+    # Deliberately session-local: schema-4 persists physical evidence, while raw
+    # occupancy samples only decide whether a live query-visible miss was observable.
+    player_observations: list[tuple[float, int]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.incomplete_episodes is None:
@@ -451,6 +524,7 @@ class Phase2RestartRuntime:
             wall_at,
         )
         server.previous_sample = None
+        server.player_observations.clear()
         server.monitoring_sessions.append({
             "session_id": server.monitoring_session_id,
             "app_session_id": server.app_session_id,
@@ -569,6 +643,7 @@ class Phase2RestartRuntime:
         server.monitoring_session_id = ""
         server.continuity_chain_id = ""
         server.previous_sample = None
+        server.player_observations.clear()
         server.dirty = True
         persisted = self._persist_server(server, force=True, now=wall_at)
         return replace(update, persisted=update.persisted or persisted)
@@ -699,6 +774,75 @@ class Phase2RestartRuntime:
         server = self._servers.get(str(server_key))
         episode = server.engine.active_episode if server is not None else None
         return str(episode.event_id) if episode is not None else None
+
+    def recovery_alert_expected_window(
+        self, server_key: str
+    ) -> RecoveryAlertExpectedWindow:
+        """Return transient alert-window policy for the active physical episode."""
+
+        server = self._servers.get(str(server_key))
+        episode = server.engine.active_episode if server is not None else None
+        event_id = str(episode.event_id) if episode is not None else None
+        restart_started_at = (
+            float(episode.first_failure_wall)
+            if episode is not None and episode.first_failure_wall is not None
+            else None
+        )
+        resolution = self._authority_consumer_resolutions.get(str(server_key))
+        if resolution is None:
+            return classify_recovery_alert_expected_window(
+                event_id=event_id,
+                restart_started_at=restart_started_at,
+                safe_prediction=False,
+                candidate_period_seconds=None,
+                predicted_occurrence_at=None,
+            )
+
+        from .companion_restart_phase2_authority_consumers import (
+            AuthorityConsumerDecision,
+            CutoverSource,
+        )
+
+        selected = resolution.selected_output
+        safe = False
+        period = None
+        prediction = None
+        if resolution.source is CutoverSource.SCHEMA4 and isinstance(
+            selected, AuthorityConsumerDecision
+        ):
+            backend = self._authoritative_schema4_backend
+            authority = (
+                backend.authority_decision(str(server_key))
+                if backend is not None
+                else None
+            )
+            safe = bool(
+                authority is not None
+                and authority.state
+                in {RegimeState.ESTABLISHED, RegimeState.NEW_REGIME_ESTABLISHED}
+                and selected.countdown_visible
+                and selected.countdown_safe
+                and not selected.prediction_suspended
+            )
+            period = selected.cycle_period_seconds
+            prediction = selected.next_expected_restart_at
+        elif isinstance(selected, ConsumerDecision):
+            safe = bool(
+                selected.prediction_usable
+                and selected.countdown_usable
+                and selected.regime_status is RegimeStatus.STABLE
+                and selected.model_status is ConsumerModelStatus.CONFIRMED_PERIOD
+            )
+            period = selected.selected_period_seconds
+            prediction = selected.prediction_at
+
+        return classify_recovery_alert_expected_window(
+            event_id=event_id,
+            restart_started_at=restart_started_at,
+            safe_prediction=safe,
+            candidate_period_seconds=period,
+            predicted_occurrence_at=prediction,
+        )
 
     def scheduled_outage_relaxation_usable(
         self, server_key: str, *, observed_at: float
@@ -994,11 +1138,28 @@ class Phase2RestartRuntime:
                     )
                 server.dirty = True
         previous_state = server.engine.state
+        previous_active_episode = server.engine.active_episode
         previous_episode = _active_episode_persistence_signature(
             server.engine.active_episode,
             config=self.detection_config,
         )
         events = server.engine.ingest(sample)
+        active_episode = server.engine.active_episode
+        query_visible_repopulation_event_id = None
+        if (
+            previous_active_episode is None
+            and active_episode is not None
+            and sample.info_status is InfoStatus.HEALTHY
+            and sample.player_status is FieldStatus.PRESENT
+            and sample.players is not None
+            and sample.players > 0
+            and "standalone_query_visible_drain_promoted"
+            in active_episode.reason_codes
+            and active_episode.first_failure_mono is None
+            and active_episode.confirmed_offline_mono is None
+        ):
+            query_visible_repopulation_event_id = active_episode.event_id
+        self._record_player_observation(server, sample)
         self._extend_coverage(
             server,
             sample,
@@ -1048,6 +1209,9 @@ class Phase2RestartRuntime:
         return RuntimeUpdate(
             accepted=True,
             finalized_events=events,
+            query_visible_repopulation_event_id=(
+                query_visible_repopulation_event_id
+            ),
             decision=decision,
             compatibility=compatibility_summary(decision),
             state_changed=state_changed or misses_changed,
@@ -1416,6 +1580,7 @@ class Phase2RestartRuntime:
     ) -> None:
         from .companion_restart_phase2_authority_consumers import (
             AuthorityConsumerPolicyInput,
+            NormalPredictionEvidence,
             compare_authority_consumers,
             evaluate_authority_consumers,
             resolve_authority_consumer_cutover,
@@ -1443,6 +1608,59 @@ class Phase2RestartRuntime:
                 and valid
                 else frozenset()
             )
+            selected = None
+            if server.score is not None and server.score.selected_period_seconds is not None:
+                selected = server.score.candidate(server.score.selected_period_seconds)
+            unresolved_required_divisor = bool(
+                selected is not None
+                and GATES[selected.period_seconds].require_divisors
+                and (
+                    not selected.divisor_resolution
+                    or not all(
+                        item.established_resolved
+                        for item in selected.divisor_resolution
+                    )
+                )
+            )
+            normal_prediction_evidence = (
+                NormalPredictionEvidence(
+                    selected_period_seconds=server.score.selected_period_seconds,
+                    incumbent_period_seconds=server.score.incumbent_period_seconds,
+                    schedule_existence_confidence=(
+                        server.score.schedule_existence_confidence
+                    ),
+                    fundamental_period_confidence=(
+                        selected.fundamental_period_confidence
+                    ),
+                    phase_confidence=selected.phase_confidence,
+                    candidate_established=selected.establishment_gates_passed,
+                    strict_direct_relationship_count=(
+                        selected.strict_direct_interval_count
+                    ),
+                    unresolved_competitor=bool(
+                        server.score.unresolved_competitors
+                    ),
+                    unresolved_divisor_or_harmonic=(
+                        unresolved_required_divisor
+                    ),
+                    regime_stable=(
+                        server.score.regime_status is RegimeStatus.STABLE
+                    ),
+                    latest_aligned_phase_at=(
+                        selected.recent_phase_observation_at
+                    ),
+                    raw_predicted_occurrence_at=_next_prediction(
+                        server.score, now
+                    ),
+                    recent_strong_anomaly=bool(
+                        selected.strong_covered_contradiction
+                        or BlockReason.RECENT_STRONG_ANOMALY
+                        in schema3_decision.prediction_reasons
+                    ),
+                )
+                if server.score is not None and selected is not None
+                else None
+            )
             consumer = evaluate_authority_consumers(
                 AuthorityConsumerPolicyInput(
                     authority_decision=authority_decision,
@@ -1458,6 +1676,7 @@ class Phase2RestartRuntime:
                     normal_pattern_confidence=(
                         schema3_decision.schedule_existence_confidence
                     ),
+                    normal_prediction_evidence=normal_prediction_evidence,
                 )
             )
             self._authority_consumer_shadow_decisions[server.key] = consumer
@@ -1609,6 +1828,23 @@ class Phase2RestartRuntime:
             ",".join(comparison.reason_codes),
         )
 
+    @staticmethod
+    def _record_player_observation(
+        server: _ServerRuntime, sample: ObservationSample
+    ) -> None:
+        if (
+            sample.lifecycle is not LifecycleMarker.NORMAL
+            or sample.info_status is not InfoStatus.HEALTHY
+            or sample.player_status is not FieldStatus.PRESENT
+            or sample.players is None
+        ):
+            return
+        cutoff = sample.wall_at - PLAYER_OBSERVATION_RETENTION_SECONDS
+        server.player_observations[:] = [
+            item for item in server.player_observations if item[0] >= cutoff
+        ]
+        server.player_observations.append((sample.wall_at, sample.players))
+
     def _evaluate_expected_windows(self, server: _ServerRuntime, *, now: float) -> None:
         score = server.score
         if score is None or not server.coverage:
@@ -1668,12 +1904,21 @@ class Phase2RestartRuntime:
                         and item.authenticity >= 0.50
                         for item in events_inside
                     )
+                    population_observable = (
+                        _query_visible_population_transition_observable(
+                            server,
+                            candidate,
+                            window_start=window_start,
+                            window_end=window_end,
+                        )
+                    )
                     if (
                         assessment.fully_covered
                         and assessment.query_health_adequate
                         and not assessment.unresolved_episode
                         and not blocked
                         and not observed
+                        and population_observable is not False
                     ):
                         server.expected_misses.append(
                             CoveredExpectedMiss(period, expected, key)
@@ -1749,6 +1994,14 @@ class Phase2RestartRuntime:
                     events=server.events,
                     spans=spans,
                     episodes=episodes,
+                    population_transition_observable=(
+                        _query_visible_population_transition_observable(
+                            server,
+                            candidate,
+                            window_start=max(0.0, expected - tolerance),
+                            window_end=expected + tolerance,
+                        )
+                    ),
                 )
                 window_key = (server.key, period, int(round(expected)))
                 existing_for_window = [
@@ -3132,6 +3385,58 @@ def _field_from_payload(payload: dict, name: str, *, healthy: bool) -> tuple[Fie
 
 def _event_at(event: PhysicalRestartEvent) -> float | None:
     return event.canonical_phase_at
+
+
+def _query_visible_population_transition_observable(
+    server: _ServerRuntime,
+    candidate: CandidateScore,
+    *,
+    window_start: float,
+    window_end: float,
+) -> bool | None:
+    """Return False only when a query-visible window lacks usable population evidence."""
+
+    if candidate.phase_offset is None:
+        return None
+    query_visible = {
+        EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+        EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART,
+    }
+    strong_outage = {
+        EventOutcome.CORROBORATED_OFFLINE_RESTART,
+        EventOutcome.CONFIRMED_OFFLINE_RESTART,
+    }
+    aligned_query_visible = False
+    for event in server.events:
+        at = _event_at(event)
+        if at is None:
+            continue
+        residual = abs(
+            (
+                (at - candidate.phase_offset + candidate.period_seconds / 2)
+                % candidate.period_seconds
+            )
+            - candidate.period_seconds / 2
+        )
+        tolerance = candidate_phase_tolerance(candidate.period_seconds) + max(
+            0.0, event.phase_uncertainty
+        )
+        if residual > tolerance:
+            continue
+        if event.outcome in strong_outage:
+            return None
+        if event.outcome in query_visible:
+            aligned_query_visible = True
+    if not aligned_query_visible:
+        return None
+
+    # A populated sample inside the completed window means a drain would have
+    # been observable.  No retained samples, or only zero/near-zero samples,
+    # cannot support a miss for a query-visible schedule.
+    return any(
+        window_start <= observed_at <= window_end and players > 1
+        for observed_at, players in server.player_observations
+    )
 
 
 def _required_string(value: object) -> str:

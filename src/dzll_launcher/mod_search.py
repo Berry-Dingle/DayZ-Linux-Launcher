@@ -83,13 +83,6 @@ def _parse_mod_terms(raw_terms: Any) -> tuple[tuple[str, str, str, bool, tuple[s
     return tuple(parsed)
 
 
-def parse_mod_query(raw_query: Any) -> tuple[tuple[str, str, str, bool, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...]:
-    raw = str(raw_query or "")
-    if "," not in raw:
-        return ()
-    return _parse_mod_terms(raw)
-
-
 def parse_required_mod_query(raw_terms: Any) -> tuple[tuple[str, str, str, bool, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...]:
     return _parse_mod_terms(raw_terms)
 

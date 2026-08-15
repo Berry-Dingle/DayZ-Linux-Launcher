@@ -6,7 +6,7 @@ APP_ID = "com.bdingle.dzll"
 # ----------------------------
 # VERSION / UPDATES
 # ----------------------------
-APP_VERSION = "v0.3.1-beta"
+APP_VERSION = "v0.4.0-beta"
 RELEASES_URL = "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
 GITHUB_LATEST_API = "https://api.github.com/repos/Berry-Dingle/DayZ-Linux-Launcher/releases/latest"
 
@@ -86,14 +86,15 @@ GLOBAL_PLAYERS_POLL_SECS = 60
 COMPANION_POLL_ONLINE_SECONDS = 10
 COMPANION_POLL_OFFLINE_SECONDS = 3
 COMPANION_ALERT_REARM_OFFLINE_SECONDS = 60
+COMPANION_RECOVERY_CONFIRM_DELAY_MS = 2000
+COMPANION_RECOVERY_STABLE_ONLINE_SECONDS = 120
 
 # Offline behavior:
 # - offline recheck runs every 5 minutes
 # - repeated failures keep a server marked OFFLINE; Online Only is the user-visible hide control
 DEAD_MAX_FAILS = 6
-DEAD_HIDE_DAYS = 0  # not used in current logic
 
-# DB & BL Github Paths
+# DB Github Paths
 DATA_BRANCH = "data"
 REPO_RAW_BASE = "https://raw.githubusercontent.com/Berry-Dingle/DayZ-Linux-Launcher"
 
@@ -102,19 +103,12 @@ DB_URL = f"{REPO_RAW_BASE}/{DATA_BRANCH}/data/dzll-servers.db"
 DB_LOCAL_DIR = os.path.expanduser("~/.local/share/dzll")
 DB_LOCAL_PATH = os.path.join(DB_LOCAL_DIR, "dzll-servers.db")
 
-# Blocklist fetch
-BL_URL = f"{REPO_RAW_BASE}/{DATA_BRANCH}/data/blocklist.json"
-BL_LOCAL_DIR = os.path.join(os.path.expanduser("~/.local/share"), "dzll")
-BL_LOCAL_PATH = os.path.join(BL_LOCAL_DIR, "blocklist.json")
-
 # Live refresh rules
-PING_CUTOFF_MS = 250
 STARTUP_PING_FIRST_N = 50
 STARTUP_LIVE_REST_WORKERS = 32
 STARTUP_LIVE_REST_TIMEOUT_SECS = 0.9
 STARTUP_LIVE_FLUSH_MAX = 75
 STARTUP_LIVE_FLUSH_MS = 150
-BATCH_SIZE = 100
 MAX_WORKERS = 20
 # High-priority executor for manual refresh
 HI_WORKERS = 4

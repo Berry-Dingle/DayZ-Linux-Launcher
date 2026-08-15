@@ -43,10 +43,6 @@ def get_launcher_local_dir(proton_prefix: str = "") -> str:
     )
 
 
-def get_launcher_presets_dir(proton_prefix: str = "") -> str:
-    return os.path.join(get_launcher_local_dir(proton_prefix), "Presets")
-
-
 def ensure_launcher_dirs(proton_prefix: str = "") -> Dict[str, str]:
     local_dir = get_launcher_local_dir(proton_prefix)
     presets_dir = os.path.join(local_dir, "Presets")

@@ -284,7 +284,7 @@ def test_background_caller_contains_no_scheduler_poller_selector_or_join_continu
 
 def test_normal_join_entry_rejects_background_gate_before_starting_attempt():
     entry = WINDOW_SOURCE.split("def _join_server_for_obj", 1)[1].split(
-        "def _preflight_block_warning_ui_blocking", 1
+        "def _prune_expired_dead", 1
     )[0]
     assert entry.index("shared_join_preparation_busy(self)") < entry.index(
         "self._join_attempts.begin("
