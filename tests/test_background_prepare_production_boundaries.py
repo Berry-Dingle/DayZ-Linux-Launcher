@@ -672,6 +672,10 @@ def test_background_ugc_readiness_receives_cancel_event_and_visible_progress(mon
         "downloading": False, "download_pending": False,
     }}
     monkeypatch.setattr(
+        join_prepare, "refresh_subscribed_ugc_state_checked",
+        lambda _ids, **_kwargs: (True, state, {}),
+    )
+    monkeypatch.setattr(
         join_prepare, "query_ugc_state_checked",
         lambda _ids: (True, state),
     )

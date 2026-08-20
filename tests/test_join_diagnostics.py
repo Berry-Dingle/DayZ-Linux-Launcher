@@ -233,6 +233,10 @@ def run_join_route(monkeypatch, states):
     }
     state_results = iter(((True, states), (True, terminal_states)))
     monkeypatch.setattr(
+        join_prepare, "refresh_subscribed_ugc_state_checked",
+        lambda *_args, **_kwargs: (*next(state_results), {}),
+    )
+    monkeypatch.setattr(
         join_prepare, "query_ugc_state_checked",
         lambda *_args, **_kwargs: next(state_results),
     )

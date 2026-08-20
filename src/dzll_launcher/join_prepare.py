@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+import threading
 import time
 import traceback
 
@@ -19,8 +20,10 @@ from .steam_ugc_backend import (
     CooperativeUGCSession,
     UGCHelperReapError,
     activate_ugc_session,
+    cleanup_cancelled_ugc_subscriptions,
     deactivate_ugc_session,
     query_ugc_state_checked,
+    refresh_subscribed_ugc_state_checked,
     ugc_item_ready,
     wait_for_ugc_ready,
 )
@@ -153,6 +156,23 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
     did_work = False
     ugc_session = None
     helper_reap_error = None
+    cancel_cleanup_ids = set()
+    cancel_cleanup_lock = threading.Lock()
+
+    def collect_cancel_cleanup_handoff(handoff):
+        if not isinstance(handoff, dict):
+            return
+        collected = set()
+        for raw in handoff.get("cleanup_candidates") or []:
+            try:
+                mid = int(raw)
+            except Exception:
+                continue
+            if mid > 0:
+                collected.add(mid)
+        if collected:
+            with cancel_cleanup_lock:
+                cancel_cleanup_ids.update(collected)
 
     if not mods:
         outcome = PreparationOutcome(
@@ -298,14 +318,41 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     "Steam UGC checking required mod readiness: %d ids",
                     len(required_ids),
                 )
-                initial_query_ok, ugc_state = query_ugc_state_checked(required_ids)
+                initial_query_ok, ugc_state, refresh_result = (
+                    refresh_subscribed_ugc_state_checked(
+                        required_ids,
+                        cancel_event=operation_cancel_event,
+                    )
+                )
                 ugc_state = ugc_state if isinstance(ugc_state, dict) else {}
+                refresh_result = (
+                    refresh_result if isinstance(refresh_result, dict) else {}
+                )
                 if attempt_id:
                     win._join_log(
                         attempt_id,
-                        "UGC state helper shutdown completed",
+                        "UGC subscribed metadata refresh completed",
                         success=bool(initial_query_ok),
                         count=len(ugc_state),
+                        refreshed=list(refresh_result.get("refreshed") or []),
+                        failed=list(refresh_result.get("failed") or []),
+                        timed_out=list(refresh_result.get("timed_out") or []),
+                    )
+                refresh_problem_ids = sorted(set(
+                    list(refresh_result.get("failed") or [])
+                    + list(refresh_result.get("timed_out") or [])
+                ))
+                if refresh_problem_ids:
+                    logger.warning(
+                        "Steam UGC subscribed metadata refresh was incomplete "
+                        "for ids=%s; using available final state",
+                        refresh_problem_ids,
+                    )
+                if not initial_query_ok:
+                    if operation_cancel_event.is_set():
+                        raise RuntimeError("Steam UGC state check cancelled.")
+                    raise RuntimeError(
+                        "Could not obtain Steam UGC state for required mod(s)."
                     )
                 blocked_missing = []
                 blocked_unknown = []
@@ -404,8 +451,6 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     status_msg = "No mod downloads required for this join."
                     if attempt_id:
                         win._join_log(attempt_id, "UGC initial all-items-ready", count=len(required_ids))
-                        win._join_log(attempt_id, "UGC helper shutdown completed", success=True,
-                                      path="initial all-items-ready")
             elif backend == "steamcmd" and validate:
                 download_ids = required_ids
                 status_msg = f"Validating {len(download_ids)} required mod(s)…"
@@ -610,7 +655,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                                 cancel_event=operation_cancel_event,
                                 state_cb=_steam_client_state,
                                 progress_cb=_steam_ugc_progress,
-                                handoff_cb=None,
+                                handoff_cb=collect_cancel_cleanup_handoff,
                                 allow_start_steam=bool(allow_backend_steam_start),
                                 launch_policy=(
                                     "backend_allowed"
@@ -621,7 +666,6 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             )
                             if attempt_id:
                                 win._join_log(attempt_id, "UGC helper returned", success=bool(ok))
-                                win._join_log(attempt_id, "UGC helper shutdown completed", success=bool(ok))
                     finally:
                         win._steamcmd_install_in_progress = False
                         win._mod_download_backend_active = ""
@@ -770,7 +814,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             cancel_event=operation_cancel_event,
                             state_cb=_retry_state,
                             progress_cb=_retry_progress,
-                            handoff_cb=None,
+                            handoff_cb=collect_cancel_cleanup_handoff,
                             allow_start_steam=bool(
                                 allow_backend_steam_start
                             ),
@@ -862,10 +906,19 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
         ok = False
         err_msg = str(e)
 
+    ugc_shutdown_confirmed = False
     if ugc_session is not None:
         deactivate_ugc_session(ugc_session)
         try:
             ugc_session.close()
+            ugc_shutdown_confirmed = True
+            if attempt_id:
+                win._join_log(
+                    attempt_id,
+                    "UGC helper shutdown completed",
+                    success=True,
+                    cancelled=bool(operation_cancel_event.is_set()),
+                )
         except UGCHelperReapError:
             raise
         except Exception as exc:
@@ -884,6 +937,50 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             # The helper has already been reaped here.  Preserve a substantive
             # operation failure, and do not turn confirmed preparation success
             # into a false failure solely because teardown diagnostics failed.
+    if operation_cancel_event.is_set():
+        with cancel_cleanup_lock:
+            deferred_cleanup_ids = sorted(cancel_cleanup_ids)
+        if deferred_cleanup_ids and ugc_shutdown_confirmed:
+            try:
+                cleanup_result = cleanup_cancelled_ugc_subscriptions(
+                    deferred_cleanup_ids,
+                )
+                logger.debug(
+                    "Fresh-context Steam UGC cancel cleanup result: %s",
+                    cleanup_result,
+                )
+                if attempt_id:
+                    win._join_log(
+                        attempt_id,
+                        "fresh-context Steam UGC cancel cleanup completed",
+                        **cleanup_result,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Fresh-context Steam UGC cancel cleanup failed for ids=%s: %s",
+                    deferred_cleanup_ids,
+                    exc,
+                )
+                if attempt_id:
+                    win._join_log(
+                        attempt_id,
+                        "fresh-context Steam UGC cancel cleanup failed",
+                        ids=deferred_cleanup_ids,
+                        error=str(exc),
+                    )
+        elif deferred_cleanup_ids:
+            logger.warning(
+                "Skipping fresh-context Steam UGC cancel cleanup because the "
+                "downloader context did not confirm clean shutdown; ids=%s",
+                deferred_cleanup_ids,
+            )
+            if attempt_id:
+                win._join_log(
+                    attempt_id,
+                    "fresh-context Steam UGC cancel cleanup skipped",
+                    ids=deferred_cleanup_ids,
+                    reason="cooperative_shutdown_unconfirmed",
+                )
     if helper_reap_error is not None:
         raise helper_reap_error
 

@@ -247,6 +247,10 @@ def run_characterized(monkeypatch, *, backend="steam_client", backend_ok=True,
     }
     state_results = iter(((True, state), (True, terminal_state)))
     monkeypatch.setattr(
+        join_prepare, "refresh_subscribed_ugc_state_checked",
+        lambda *_args, **_kwargs: (*next(state_results), {}),
+    )
+    monkeypatch.setattr(
         join_prepare, "query_ugc_state_checked",
         lambda *_args, **_kwargs: next(state_results),
     )
@@ -303,6 +307,10 @@ def prepare_characterized(monkeypatch, *, mods=None, backend="steam_client",
     }
     state_results = iter(((True, state), (True, terminal_state)))
     monkeypatch.setattr(
+        join_prepare, "refresh_subscribed_ugc_state_checked",
+        lambda *_args, **_kwargs: (*next(state_results), {}),
+    )
+    monkeypatch.setattr(
         join_prepare, "query_ugc_state_checked",
         lambda *_args, **_kwargs: next(state_results),
     )
@@ -358,6 +366,79 @@ def test_backend_failure_or_cancel_never_reaches_symlinks_or_launch(
     assert win.launches == 0
     expected = "Mod download cancelled" if cancelled else "Mod download failed"
     assert any(expected in error for error in win.errors)
+
+
+def test_cancel_closes_cooperative_context_before_fresh_cleanup(monkeypatch):
+    order = []
+
+    class FakeSession:
+        def close(self):
+            order.extend(("steamapi_shutdown", "helper_exited"))
+
+    monkeypatch.setattr(
+        join_prepare, "CooperativeUGCSession", lambda **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        join_prepare, "cleanup_cancelled_ugc_subscriptions",
+        lambda ids: order.append(("fresh_cleanup", list(ids))) or {
+            "candidates": list(ids), "attempted": list(ids),
+            "confirmed_unsubscribed": list(ids), "retained_installed": [],
+            "already_unsubscribed": [], "failed": [], "timed_out": [],
+        },
+    )
+
+    def cancelled_install(self, **kwargs):
+        order.append("cooperative_cancel_result")
+        kwargs["handoff_cb"]({"cleanup_candidates": [101]})
+        self._steamcmd_cancel_event.set()
+        return False
+
+    monkeypatch.setattr(
+        CharacterizationHarness, "run_steam_client_install", cancelled_install,
+    )
+    _win, outcome = prepare_characterized(
+        monkeypatch, backend_ok=False, cancelled=True,
+    )
+    assert outcome.status is PreparationStatus.CANCELLED
+    assert order == [
+        "cooperative_cancel_result",
+        "steamapi_shutdown",
+        "helper_exited",
+        ("fresh_cleanup", [101]),
+    ]
+
+
+def test_cancel_skips_fresh_cleanup_without_confirmed_shutdown(monkeypatch):
+    class FailedSession:
+        def close(self):
+            raise RuntimeError("shutdown not confirmed")
+
+    monkeypatch.setattr(
+        join_prepare, "CooperativeUGCSession", lambda **_kwargs: FailedSession(),
+    )
+    monkeypatch.setattr(
+        join_prepare, "cleanup_cancelled_ugc_subscriptions",
+        lambda _ids: pytest.fail("fresh context must not overlap failed shutdown"),
+    )
+
+    def cancelled_install(self, **kwargs):
+        kwargs["handoff_cb"]({"cleanup_candidates": [101]})
+        self._steamcmd_cancel_event.set()
+        return False
+
+    monkeypatch.setattr(
+        CharacterizationHarness, "run_steam_client_install", cancelled_install,
+    )
+    _win, outcome = prepare_characterized(
+        monkeypatch, backend_ok=False, cancelled=True,
+    )
+    assert outcome.status is PreparationStatus.CANCELLED
+
+
+def test_initial_and_terminal_retry_calls_both_collect_cancel_handoff():
+    assert JOIN_SOURCE.count(
+        "handoff_cb=collect_cancel_cleanup_handoff"
+    ) == 2
 
 
 def test_late_ready_result_after_join_cancel_cannot_continue(monkeypatch):
@@ -579,7 +660,8 @@ def ugc_state(*, installed=True, needs_update=False, downloading=False, pending=
 
 def run_terminal_validation_route(
         monkeypatch, *, mods, initial_states, terminal_results,
-        backend_results=(), final_missing=None, background=False):
+        backend_results=(), final_missing=None, background=False,
+        refresh_details=None, initial_ok=True):
     win = CharacterizationHarness(
         initial_missing=[],
         final_missing=list(final_missing or []),
@@ -587,7 +669,7 @@ def run_terminal_validation_route(
     obj = SimpleNamespace(name="Terminal Validation", ip="127.0.0.1", gport=2302)
     trace = []
     backend_results = list(backend_results)
-    checked_results = [(True, dict(initial_states)), *list(terminal_results)]
+    checked_results = [(bool(initial_ok), dict(initial_states)), *list(terminal_results)]
     checked_call_count = 0
 
     monkeypatch.setattr(join_prepare, "_choose_initial_workshop_dir", lambda *_args: "/workshop")
@@ -598,13 +680,17 @@ def run_terminal_validation_route(
     monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
     monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", lambda *_args, **_kwargs: True)
 
-    def checked_query(ids):
+    def checked_query(ids, **_kwargs):
         nonlocal checked_call_count
         phase = "initial_query" if checked_call_count == 0 else "terminal_query"
         checked_call_count += 1
         trace.append((phase, tuple(ids)))
         assert checked_results
         return checked_results.pop(0)
+
+    def refreshed_query(ids, **kwargs):
+        ok, states = checked_query(ids, **kwargs)
+        return ok, states, dict(refresh_details or {})
 
     def install(**kwargs):
         trace.append(("backend", tuple(kwargs["mod_ids"])))
@@ -615,6 +701,9 @@ def run_terminal_validation_route(
             return False
         return bool(result)
 
+    monkeypatch.setattr(
+        join_prepare, "refresh_subscribed_ugc_state_checked", refreshed_query,
+    )
     monkeypatch.setattr(join_prepare, "query_ugc_state_checked", checked_query)
     monkeypatch.setattr(
         join_prepare.steamcmd_mods, "validate_selected_watch_symlinks",
@@ -799,6 +888,72 @@ def test_initially_ready_mods_are_revalidated_before_ready(monkeypatch):
         ("validate_symlinks",),
         ("preset",),
         ("launch",),
+    ]
+    assert win.launches == 1
+
+
+@pytest.mark.parametrize("detail_key", ["failed", "timed_out"])
+def test_partial_subscribed_refresh_failure_is_non_blocking_and_does_not_download(
+        monkeypatch, detail_key):
+    details = {
+        "failed": [],
+        "timed_out": [],
+        "failures": [],
+    }
+    details[detail_key] = [101]
+    if detail_key == "failed":
+        details["failures"] = [{"id": 101, "reason": "api_call_failed"}]
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Current")],
+        initial_states={101: ugc_state()},
+        terminal_results=[(True, {101: ugc_state()})],
+        refresh_details=details,
+    )
+    assert not [item for item in trace if item[0] == "backend"]
+    assert trace[-1] == ("launch",)
+    assert win.launches == 1
+
+
+def test_initial_ugc_protocol_failure_cannot_be_classified_as_missing(
+        monkeypatch):
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Unknown")],
+        initial_states={},
+        terminal_results=[],
+        initial_ok=False,
+    )
+    assert trace == [("initial_query", (101,))]
+    assert not [item for item in trace if item[0] == "backend"]
+    assert win.launches == 0
+
+
+def test_refreshed_mixed_states_preserve_existing_work_classification(
+        monkeypatch):
+    states = {
+        1: ugc_state(),
+        2: ugc_state(needs_update=True),
+        3: {
+            **ugc_state(installed=False),
+            "subscribed": True,
+        },
+        4: {
+            **ugc_state(installed=False),
+            "subscribed": False,
+        },
+    }
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(mid, f"Mod {mid}") for mid in range(1, 5)],
+        initial_states=states,
+        backend_results=[True],
+        terminal_results=[
+            (True, {mid: ugc_state() for mid in range(1, 5)}),
+        ],
+    )
+    assert [item for item in trace if item[0] == "backend"] == [
+        ("backend", (2, 3, 4)),
     ]
     assert win.launches == 1
 

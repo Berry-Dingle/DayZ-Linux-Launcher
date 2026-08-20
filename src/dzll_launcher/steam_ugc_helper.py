@@ -33,6 +33,10 @@ EXIT_UNEXPECTED = 5
 
 DAYZ_APPID = 221100
 SESSION_INIT_RETRY_S = 0.25
+SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S = 2.0
+CANCEL_CLEANUP_BATCH_TIMEOUT_S = 2.0
+REMOTE_STORAGE_SUBSCRIBE_RESULT_CALLBACK_ID = 1313
+ERESULT_OK = 1
 
 
 _protocol_stdout = None
@@ -97,7 +101,6 @@ class ItemSnapshot:
             and not bool(self.downloading)
             and not bool(self.download_pending)
         )
-
     def event(self) -> dict:
         return {
             "type": "item",
@@ -125,6 +128,21 @@ class ItemSnapshot:
             self.size_on_disk,
             self.install_folder,
         )
+
+
+class RemoteStorageSubscribePublishedFileResult(ctypes.Structure):
+    _fields_ = (
+        ("result", ctypes.c_int32),
+        ("published_file_id", ctypes.c_uint64),
+    )
+
+
+if (
+    ctypes.sizeof(RemoteStorageSubscribePublishedFileResult) != 16
+    or RemoteStorageSubscribePublishedFileResult.result.offset != 0
+    or RemoteStorageSubscribePublishedFileResult.published_file_id.offset != 8
+):
+    raise RuntimeError("unexpected Steam subscribe-result ABI layout")
 
 
 def eprint(message: str) -> None:
@@ -195,6 +213,10 @@ def dedupe_sorted_item_ids(item_ids: Iterable[int]) -> list[int]:
     if not out:
         raise CliError("at least one valid Workshop item id is required")
     return out
+
+
+def _dedupe_optional_item_ids(item_ids: Iterable[int]) -> list[int]:
+    return sorted({int(item_id) for item_id in item_ids if int(item_id) > 0})
 
 
 def likely_steam_roots() -> list[Path]:
@@ -323,15 +345,40 @@ def find_steam_user_accessor(lib, lib_path: Path) -> str | None:
     return max(candidates)[1] if candidates else None
 
 
+def find_steam_utils_accessor(lib, lib_path: Path) -> str:
+    symbols = nm_symbols(lib_path)
+    candidates = []
+    for name in symbols:
+        match = re.fullmatch(r"SteamAPI_SteamUtils_v(\d+)", name)
+        if match:
+            candidates.append((int(match.group(1)), name))
+    if not candidates:
+        for version in range(99, 0, -1):
+            name = f"SteamAPI_SteamUtils_v{version:03d}"
+            try:
+                getattr(lib, name)
+                candidates.append((version, name))
+                break
+            except AttributeError:
+                continue
+    if not candidates:
+        raise MissingSymbolsError("missing SteamAPI_SteamUtils_vXXX accessor")
+    return max(candidates)[1]
+
+
 class SteamUGC:
     def __init__(self, paths: SteamPaths):
         self.paths = paths
         self.lib = ctypes.CDLL(str(paths.libsteam_api))
         self.ugc_accessor_name = find_ugc_accessor(self.lib, paths.libsteam_api)
+        self.utils_accessor_name = find_steam_utils_accessor(
+            self.lib, paths.libsteam_api,
+        )
         self.steam_user_accessor_name = find_steam_user_accessor(
             self.lib, paths.libsteam_api,
         )
         self.ugc = None
+        self.utils = None
         self.steam_user = None
         self.init_ok = False
         self._bind_required()
@@ -366,6 +413,10 @@ class SteamUGC:
         self.SteamUGC.argtypes = []
         self.SteamUGC.restype = ctypes.c_void_p
 
+        self.SteamUtils = self._required(self.utils_accessor_name)
+        self.SteamUtils.argtypes = []
+        self.SteamUtils.restype = ctypes.c_void_p
+
         self.GetItemState = self._required("SteamAPI_ISteamUGC_GetItemState")
         self.GetItemState.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
         self.GetItemState.restype = ctypes.c_uint32
@@ -381,6 +432,29 @@ class SteamUGC:
         self.DownloadItem = self._required("SteamAPI_ISteamUGC_DownloadItem")
         self.DownloadItem.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_bool]
         self.DownloadItem.restype = ctypes.c_bool
+
+        self.IsAPICallCompleted = self._required(
+            "SteamAPI_ISteamUtils_IsAPICallCompleted"
+        )
+        self.IsAPICallCompleted.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_bool),
+        ]
+        self.IsAPICallCompleted.restype = ctypes.c_bool
+
+        self.GetAPICallResult = self._required(
+            "SteamAPI_ISteamUtils_GetAPICallResult"
+        )
+        self.GetAPICallResult.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(ctypes.c_bool),
+        ]
+        self.GetAPICallResult.restype = ctypes.c_bool
 
     def _bind_optional(self) -> None:
         self.GetNumSubscribedItems = self._optional(
@@ -445,6 +519,9 @@ class SteamUGC:
         self.ugc = self.SteamUGC()
         if not self.ugc:
             raise MissingSymbolsError(f"{self.ugc_accessor_name} returned null")
+        self.utils = self.SteamUtils()
+        if not self.utils:
+            raise MissingSymbolsError(f"{self.utils_accessor_name} returned null")
         if self.SteamUser is not None:
             self.steam_user = self.SteamUser()
 
@@ -463,6 +540,37 @@ class SteamUGC:
 
     def subscribe(self, item_id: int) -> int:
         return int(self.SubscribeItem(self.ugc, ctypes.c_uint64(int(item_id))))
+
+    def api_call_completed(self, call_handle: int) -> tuple[bool, bool]:
+        failed = ctypes.c_bool(False)
+        completed = bool(
+            self.IsAPICallCompleted(
+                self.utils,
+                ctypes.c_uint64(int(call_handle)),
+                ctypes.byref(failed),
+            )
+        )
+        return completed, bool(failed.value)
+
+    def subscribe_call_result(self, call_handle: int) -> tuple[bool, bool, int, int]:
+        result = RemoteStorageSubscribePublishedFileResult()
+        failed = ctypes.c_bool(False)
+        retrieved = bool(
+            self.GetAPICallResult(
+                self.utils,
+                ctypes.c_uint64(int(call_handle)),
+                ctypes.byref(result),
+                ctypes.c_int(ctypes.sizeof(result)),
+                ctypes.c_int(REMOTE_STORAGE_SUBSCRIBE_RESULT_CALLBACK_ID),
+                ctypes.byref(failed),
+            )
+        )
+        return (
+            retrieved,
+            bool(failed.value),
+            int(result.result),
+            int(result.published_file_id),
+        )
 
     def unsubscribe(self, item_id: int) -> int:
         return int(self.UnsubscribeItem(self.ugc, ctypes.c_uint64(int(item_id))))
@@ -688,10 +796,18 @@ def _capture_native_readiness(steam: SteamUGC) -> tuple[bool, bool, int]:
 
 
 class _SessionCancelled(Exception):
-    def __init__(self, reason: str, *, control_request_id=None):
+    def __init__(
+        self,
+        reason: str,
+        *,
+        control_request_id=None,
+        cleanup_item_ids=None,
+    ):
         super().__init__(reason)
         self.reason = str(reason)
         self.control_request_id = control_request_id
+        self.cleanup_item_ids = _dedupe_optional_item_ids(cleanup_item_ids or [])
+        self.cancel_handoff = None
 
 
 def _session_check_control(
@@ -716,7 +832,10 @@ def _session_check_control(
             target = message.get("target_request_id")
             if target in (None, active_request_id):
                 _session_emit(request_id, "cancellation_ack", target_request_id=active_request_id)
-                raise _SessionCancelled("cancelled")
+                raise _SessionCancelled(
+                    "cancelled",
+                    cleanup_item_ids=message.get("cleanup_item_ids") or [],
+                )
             _session_emit(request_id, "recoverable_error", error="cancel target is not active")
         elif command == "shutdown":
             _session_emit(request_id, "command_accepted", command="shutdown")
@@ -733,6 +852,217 @@ def _session_query_state(steam: SteamUGC, request_id, item_ids: list[int]) -> No
     _session_emit(request_id, "command_result", ok=True, command="query_state", items=item_ids)
 
 
+def _refresh_subscribed_batch(
+    steam: SteamUGC,
+    item_ids: list[int],
+    timeout: float,
+    *,
+    control_check=None,
+    monotonic_fn=None,
+    sleep_fn=None,
+) -> tuple[list[ItemSnapshot], dict]:
+    """Refresh subscribed items concurrently and return final states and outcomes."""
+    monotonic_fn = monotonic_fn or time.monotonic
+    sleep_fn = sleep_fn or time.sleep
+    initial = [steam.snapshot(item_id) for item_id in item_ids]
+    subscribed = [snap.item_id for snap in initial if snap.subscribed]
+    pending: dict[int, int] = {}
+    refreshed: list[int] = []
+    failures: list[dict] = []
+
+    # Queue every asynchronous request before examining completion of any one.
+    for item_id in subscribed:
+        call_handle = int(steam.subscribe(item_id))
+        if call_handle <= 0:
+            failures.append({"id": item_id, "reason": "invalid_call_handle"})
+        else:
+            pending[item_id] = call_handle
+
+    deadline = monotonic_fn() + max(0.0, float(timeout))
+    while pending:
+        if callable(control_check):
+            control_check()
+        steam.run_callbacks()
+        for item_id, call_handle in list(pending.items()):
+            try:
+                completed, api_failed = steam.api_call_completed(call_handle)
+            except Exception as exc:
+                failures.append({
+                    "id": item_id,
+                    "reason": "completion_check_failed",
+                    "error": str(exc),
+                })
+                pending.pop(item_id, None)
+                continue
+            if not completed:
+                continue
+            if api_failed:
+                failures.append({"id": item_id, "reason": "api_call_failed"})
+                pending.pop(item_id, None)
+                continue
+            try:
+                retrieved, result_failed, result_code, result_item_id = (
+                    steam.subscribe_call_result(call_handle)
+                )
+            except Exception as exc:
+                failures.append({
+                    "id": item_id,
+                    "reason": "result_retrieval_failed",
+                    "error": str(exc),
+                })
+                pending.pop(item_id, None)
+                continue
+            if not retrieved:
+                reason = "result_callback_mismatch"
+            elif result_failed:
+                reason = "result_io_failure"
+            elif result_item_id != item_id:
+                reason = "result_item_mismatch"
+            elif result_code != ERESULT_OK:
+                reason = "subscribe_result_failed"
+            else:
+                reason = ""
+            if reason:
+                failure = {"id": item_id, "reason": reason}
+                if result_code:
+                    failure["result"] = result_code
+                if result_item_id:
+                    failure["result_item_id"] = result_item_id
+                failures.append(failure)
+            else:
+                refreshed.append(item_id)
+            pending.pop(item_id, None)
+
+        if not pending:
+            break
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            break
+        sleep_fn(min(0.01, remaining))
+
+    timed_out = sorted(pending)
+    final_snapshots = [steam.snapshot(item_id) for item_id in item_ids]
+    return final_snapshots, {
+        "subscribed": sorted(subscribed),
+        "refreshed": sorted(refreshed),
+        "failed": sorted(int(value["id"]) for value in failures),
+        "timed_out": timed_out,
+        "failures": failures,
+    }
+
+
+def _session_refresh_subscribed_state(
+    steam: SteamUGC,
+    commands: queue.Queue,
+    request_id,
+    item_ids: list[int],
+    timeout: float,
+) -> None:
+    snapshots, result = _refresh_subscribed_batch(
+        steam,
+        item_ids,
+        timeout,
+        control_check=lambda: _session_check_control(
+            commands, active_request_id=request_id,
+        ),
+    )
+    for snap in snapshots:
+        _session_item_event(request_id, snap)
+    _session_emit(
+        request_id,
+        "command_result",
+        ok=True,
+        command="refresh_subscribed_state",
+        **result,
+    )
+
+
+def _cancel_cleanup_unsubscribe_batch(
+    steam: SteamUGC,
+    item_ids: list[int],
+    timeout: float,
+    *,
+    monotonic_fn=None,
+    sleep_fn=None,
+) -> dict:
+    """Fresh-context, provenance-approved unsubscribe under one deadline."""
+    monotonic_fn = monotonic_fn or time.monotonic
+    sleep_fn = sleep_fn or time.sleep
+    candidates = dedupe_sorted_item_ids(item_ids)
+    retained_installed: list[int] = []
+    already_unsubscribed: list[int] = []
+    attempted: list[int] = []
+    confirmed_unsubscribed: list[int] = []
+    failures: list[dict] = []
+    pending: set[int] = set()
+    deadline = monotonic_fn() + max(0.0, float(timeout))
+
+    # Decide eligibility in this fresh context. All mutations are batched before
+    # callback pumping so the deadline applies to the batch, never per item.
+    for item_id in candidates:
+        try:
+            snap = steam.snapshot(item_id)
+        except Exception as exc:
+            failures.append({
+                "id": item_id, "reason": "state_query_failed", "error": str(exc),
+            })
+            continue
+        if snap.installed:
+            retained_installed.append(item_id)
+        elif not snap.subscribed:
+            already_unsubscribed.append(item_id)
+        else:
+            attempted.append(item_id)
+            try:
+                call_handle = int(steam.unsubscribe(item_id) or 0)
+            except Exception as exc:
+                failures.append({
+                    "id": item_id, "reason": "unsubscribe_call_failed",
+                    "error": str(exc),
+                })
+                continue
+            if call_handle <= 0:
+                failures.append({
+                    "id": item_id, "reason": "invalid_unsubscribe_call",
+                })
+                continue
+            pending.add(item_id)
+
+    while pending:
+        steam.run_callbacks()
+        for item_id in list(pending):
+            try:
+                snap = steam.snapshot(item_id)
+            except Exception as exc:
+                failures.append({
+                    "id": item_id, "reason": "state_query_failed",
+                    "error": str(exc),
+                })
+                pending.discard(item_id)
+                continue
+            if not snap.subscribed:
+                confirmed_unsubscribed.append(item_id)
+                pending.discard(item_id)
+        if not pending:
+            break
+        remaining = deadline - monotonic_fn()
+        if remaining <= 0:
+            break
+        sleep_fn(min(0.01, remaining))
+
+    failed_ids = sorted({int(failure["id"]) for failure in failures})
+    return {
+        "candidates": candidates,
+        "attempted": sorted(attempted),
+        "confirmed_unsubscribed": sorted(confirmed_unsubscribed),
+        "retained_installed": sorted(retained_installed),
+        "already_unsubscribed": sorted(already_unsubscribed),
+        "failed": failed_ids,
+        "timed_out": sorted(pending),
+        "failures": failures,
+    }
+
+
 def _session_subscribe_download(
     steam: SteamUGC,
     commands: queue.Queue,
@@ -741,55 +1071,72 @@ def _session_subscribe_download(
     timeout: float,
 ) -> None:
     last_seen: dict[int, tuple] = {}
-    for item_id in item_ids:
-        snap = steam.snapshot(item_id)
-        subscribe_call_result = None
-        if not snap.subscribed:
-            subscribe_call_result = steam.subscribe(item_id)
-        download_requested = steam.download(item_id, True)
-        event = snap.event()
-        event.update(
-            {
-                "type": "request",
-                "request_id": request_id,
-                "subscribe_call_result": subscribe_call_result,
-                "download_requested": bool(download_requested),
-                "high_priority": True,
-            }
-        )
-        emit(event)
-
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    while True:
-        _session_check_control(commands, active_request_id=request_id)
-        steam.run_callbacks()
-        ready = []
-        installed = []
+    subscribe_calls: dict[int, int] = {}
+    try:
         for item_id in item_ids:
+            _session_check_control(commands, active_request_id=request_id)
             snap = steam.snapshot(item_id)
-            key = snap.progress_key()
-            if last_seen.get(item_id) != key:
-                last_seen[item_id] = key
-                _session_item_event(request_id, snap)
-            if snap.installed:
-                installed.append(item_id)
-            if snap.ready:
-                ready.append(item_id)
-        failed = [item_id for item_id in item_ids if item_id not in ready]
-        if not failed:
-            _session_emit(
-                request_id, "command_result", ok=True,
-                command="subscribe_download", installed=installed, ready=ready, failed=[],
+            subscribe_call_result = None
+            if not snap.subscribed:
+                subscribe_call_result = steam.subscribe(item_id)
+                subscribe_calls[item_id] = int(subscribe_call_result or 0)
+            _session_check_control(commands, active_request_id=request_id)
+            download_requested = steam.download(item_id, True)
+            event = snap.event()
+            event.update(
+                {
+                    "type": "request",
+                    "request_id": request_id,
+                    "subscribe_call_result": subscribe_call_result,
+                    "download_requested": bool(download_requested),
+                    "high_priority": True,
+                }
             )
-            return
-        if time.monotonic() >= deadline:
-            _session_emit(
-                request_id, "command_result", ok=False,
-                command="subscribe_download", installed=installed, ready=ready,
-                failed=failed, reason="timeout",
-            )
-            return
-        time.sleep(0.1)
+            emit(event)
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            _session_check_control(commands, active_request_id=request_id)
+            steam.run_callbacks()
+            ready = []
+            installed = []
+            for item_id in item_ids:
+                snap = steam.snapshot(item_id)
+                key = snap.progress_key()
+                if last_seen.get(item_id) != key:
+                    last_seen[item_id] = key
+                    _session_item_event(request_id, snap)
+                if snap.installed:
+                    installed.append(item_id)
+                if snap.ready:
+                    ready.append(item_id)
+            failed = [item_id for item_id in item_ids if item_id not in ready]
+            if not failed:
+                _session_emit(
+                    request_id, "command_result", ok=True,
+                    command="subscribe_download", installed=installed, ready=ready, failed=[],
+                )
+                return
+            if time.monotonic() >= deadline:
+                _session_emit(
+                    request_id, "command_result", ok=False,
+                    command="subscribe_download", installed=installed, ready=ready,
+                    failed=failed, reason="timeout",
+                )
+                return
+            time.sleep(0.1)
+    except _SessionCancelled as exc:
+        if exc.reason == "cancelled":
+            parent_allowlisted = set(exc.cleanup_item_ids)
+            helper_subscribe_attempted = set(subscribe_calls)
+            exc.cancel_handoff = {
+                "parent_allowlisted": sorted(parent_allowlisted),
+                "helper_subscribe_attempted": sorted(helper_subscribe_attempted),
+                "cleanup_candidates": sorted(
+                    parent_allowlisted & helper_subscribe_attempted
+                ),
+            }
+        raise
 
 
 def _session_unsubscribe(
@@ -941,7 +1288,10 @@ def command_session(args) -> int:
             if command == "cancel":
                 _session_emit(request_id, "cancellation_ack", reason="no_active_command")
                 continue
-            if command not in {"query_state", "subscribe_download", "unsubscribe"}:
+            if command not in {
+                "query_state", "refresh_subscribed_state",
+                "subscribe_download", "unsubscribe",
+            }:
                 _session_emit(request_id, "recoverable_error", error=f"unknown command: {command}")
                 continue
             try:
@@ -956,6 +1306,10 @@ def command_session(args) -> int:
             try:
                 if command == "query_state":
                     _session_query_state(steam, request_id, item_ids)
+                elif command == "refresh_subscribed_state":
+                    _session_refresh_subscribed_state(
+                        steam, commands, request_id, item_ids, timeout,
+                    )
                 elif command == "subscribe_download":
                     _session_subscribe_download(
                         steam, commands, request_id, item_ids, timeout,
@@ -967,9 +1321,12 @@ def command_session(args) -> int:
                     shutdown_reason = exc.reason
                     shutdown_request_id = exc.control_request_id
                     break
+                result_fields = {}
+                if isinstance(exc.cancel_handoff, dict):
+                    result_fields["cancel_handoff"] = exc.cancel_handoff
                 _session_emit(
                     request_id, "command_result", ok=False, cancelled=True,
-                    command=command, reason=exc.reason,
+                    command=command, reason=exc.reason, **result_fields,
                 )
             except Exception as exc:
                 _session_emit(
@@ -1163,6 +1520,33 @@ def command_subscribe_download(args) -> int:
             tmp.cleanup()
 
 
+def command_refresh_subscribed_state(args) -> int:
+    steam = None
+    tmp = None
+    original_cwd = os.getcwd()
+    try:
+        item_ids = dedupe_sorted_item_ids(args.item_ids)
+        steam, _paths, tmp = init_steam(args.appid)
+        snapshots, result = _refresh_subscribed_batch(
+            steam, item_ids, float(args.timeout),
+        )
+        for snap in snapshots:
+            emit(snap.event())
+        emit({
+            "type": "done",
+            "ok": True,
+            "command": "refresh_subscribed_state",
+            **result,
+        })
+        return EXIT_OK
+    finally:
+        if steam is not None:
+            steam.shutdown()
+        os.chdir(original_cwd)
+        if tmp is not None:
+            tmp.cleanup()
+
+
 def command_unsubscribe(args) -> int:
     steam = None
     tmp = None
@@ -1197,6 +1581,40 @@ def command_unsubscribe(args) -> int:
                 emit({"type": "done", "ok": False, "unsubscribed": unsubscribed, "failed": failed})
                 return EXIT_TIMEOUT
             time.sleep(1.0)
+    finally:
+        if steam is not None:
+            steam.shutdown()
+        if tmp is not None:
+            tmp.cleanup()
+
+
+def command_cancel_cleanup_unsubscribe(args) -> int:
+    """Clean provenance-approved unfinished items in a fresh SteamAPI context."""
+    steam = None
+    tmp = None
+    try:
+        item_ids = dedupe_sorted_item_ids(args.item_ids)
+        steam, _paths, tmp = init_steam(args.appid)
+        result = _cancel_cleanup_unsubscribe_batch(
+            steam,
+            item_ids,
+            min(
+                CANCEL_CLEANUP_BATCH_TIMEOUT_S,
+                max(0.0, float(args.timeout)),
+            ),
+        )
+        for item_id in item_ids:
+            try:
+                emit(steam.snapshot(item_id).event())
+            except Exception:
+                pass
+        emit({
+            "type": "done",
+            "ok": not bool(result["failed"] or result["timed_out"]),
+            "command": "cancel_cleanup_unsubscribe",
+            **result,
+        })
+        return EXIT_OK
     finally:
         if steam is not None:
             steam.shutdown()
@@ -1277,11 +1695,37 @@ def build_parser() -> argparse.ArgumentParser:
     subscribe_download.add_argument("item_ids", nargs="+", type=parse_item_id)
     subscribe_download.set_defaults(func=command_subscribe_download)
 
+    refresh_subscribed = sub.add_parser(
+        "refresh-subscribed-state",
+        help="refresh metadata for subscribed items and print final state",
+    )
+    refresh_subscribed.add_argument("--appid", type=int, default=DAYZ_APPID)
+    refresh_subscribed.add_argument(
+        "--timeout", type=float, default=SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S,
+    )
+    refresh_subscribed.add_argument("item_ids", nargs="+", type=parse_item_id)
+    refresh_subscribed.set_defaults(func=command_refresh_subscribed_state)
+
     unsubscribe = sub.add_parser("unsubscribe", help="unsubscribe and wait until no longer subscribed")
     unsubscribe.add_argument("--appid", type=int, default=DAYZ_APPID)
     unsubscribe.add_argument("--timeout", type=float, default=120.0)
     unsubscribe.add_argument("item_ids", nargs="+", type=parse_item_id)
     unsubscribe.set_defaults(func=command_unsubscribe)
+
+    cancel_cleanup_unsubscribe = sub.add_parser(
+        "cancel-cleanup-unsubscribe",
+        help="fresh-context cleanup for provenance-approved cancelled downloads",
+    )
+    cancel_cleanup_unsubscribe.add_argument("--appid", type=int, default=DAYZ_APPID)
+    cancel_cleanup_unsubscribe.add_argument(
+        "--timeout", type=float, default=CANCEL_CLEANUP_BATCH_TIMEOUT_S,
+    )
+    cancel_cleanup_unsubscribe.add_argument(
+        "item_ids", nargs="+", type=parse_item_id,
+    )
+    cancel_cleanup_unsubscribe.set_defaults(
+        func=command_cancel_cleanup_unsubscribe,
+    )
 
     unsubscribe_request = sub.add_parser("unsubscribe-request", help="send unsubscribe request without waiting for final state")
     unsubscribe_request.add_argument("--appid", type=int, default=DAYZ_APPID)

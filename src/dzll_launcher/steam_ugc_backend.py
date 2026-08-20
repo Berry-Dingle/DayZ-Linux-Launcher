@@ -33,6 +33,8 @@ DAYZ_APPID = 221100
 UGC_PREFLIGHT_TIMEOUT_S = 60.0
 UGC_PREFLIGHT_RETRY_S = 3.0
 UGC_PREFLIGHT_PROBE_TIMEOUT_S = 8.0
+UGC_SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S = 2.0
+UGC_CANCEL_CLEANUP_BATCH_TIMEOUT_S = 2.0
 
 
 class SteamLaunchPolicy(Enum):
@@ -227,7 +229,10 @@ def _helper_cmd(command: str, *, appid: int, timeout: float | None, mod_ids: lis
         "--appid",
         str(int(appid)),
     ]
-    if timeout is not None and command in ("subscribe-download", "unsubscribe"):
+    if timeout is not None and command in (
+        "refresh-subscribed-state", "subscribe-download", "unsubscribe",
+        "cancel-cleanup-unsubscribe",
+    ):
         cmd.extend(["--timeout", str(int(max(0, timeout)))])
     cmd.extend(str(int(mid)) for mid in mod_ids)
     return cmd
@@ -642,16 +647,29 @@ class CooperativeUGCSession:
         timeout: float | None,
         mod_ids: list[int],
         cancel_event=None,
+        cancel_cleanup_ids=None,
         on_event=None,
         progress_cb=None,
     ) -> tuple[bool, int | None]:
         command_name = {
             "state": "query_state",
+            "refresh-subscribed-state": "refresh_subscribed_state",
             "subscribe-download": "subscribe_download",
             "unsubscribe": "unsubscribe",
         }.get(str(command))
         if command_name is None:
             raise UGCSessionError(f"unsupported cooperative command: {command}")
+        command_item_ids = _dedupe_sorted_ids(mod_ids)
+        command_item_id_set = set(command_item_ids)
+        approved_cancel_cleanup_ids = (
+            [
+                item_id for item_id in _dedupe_sorted_ids(
+                    cancel_cleanup_ids or [],
+                )
+                if item_id in command_item_id_set
+            ]
+            if command_name == "subscribe_download" else []
+        )
         with self._request_lock:
             if self._closed or self._close_requested.is_set():
                 raise UGCSessionError("Steam UGC helper session is closed")
@@ -673,12 +691,14 @@ class CooperativeUGCSession:
                     {
                         "command": command_name,
                         "request_id": request_id,
-                        "item_ids": list(mod_ids),
+                        "item_ids": command_item_ids,
                         "timeout": float(timeout if timeout is not None else 120.0),
                     }
                 )
                 deadline = (
-                    time.monotonic() + float(timeout)
+                    time.monotonic() + float(timeout) + (
+                        1.0 if command_name == "refresh_subscribed_state" else 0.0
+                    )
                     if timeout is not None else None
                 )
                 accepted = False
@@ -700,13 +720,16 @@ class CooperativeUGCSession:
                     )
                     if cancellation_requested and not cancel_sent:
                         cancel_id = self._next_id("cancel")
-                        self._send(
-                            {
-                                "command": "cancel",
-                                "request_id": cancel_id,
-                                "target_request_id": request_id,
-                            }
-                        )
+                        cancel_message = {
+                            "command": "cancel",
+                            "request_id": cancel_id,
+                            "target_request_id": request_id,
+                        }
+                        if approved_cancel_cleanup_ids:
+                            cancel_message["cleanup_item_ids"] = (
+                                approved_cancel_cleanup_ids
+                            )
+                        self._send(cancel_message)
                         cancel_sent = True
                         cancel_reason = (
                             "shutdown" if self._close_requested.is_set() else "user"
@@ -714,13 +737,16 @@ class CooperativeUGCSession:
                         deadline = time.monotonic() + 5.0
                     if deadline is not None and time.monotonic() >= deadline and not cancel_sent:
                         cancel_id = self._next_id("timeout-cancel")
-                        self._send(
-                            {
-                                "command": "cancel",
-                                "request_id": cancel_id,
-                                "target_request_id": request_id,
-                            }
-                        )
+                        cancel_message = {
+                            "command": "cancel",
+                            "request_id": cancel_id,
+                            "target_request_id": request_id,
+                        }
+                        if approved_cancel_cleanup_ids:
+                            cancel_message["cleanup_item_ids"] = (
+                                approved_cancel_cleanup_ids
+                            )
+                        self._send(cancel_message)
                         cancel_sent = True
                         cancel_reason = "timeout"
                         deadline = time.monotonic() + 5.0
@@ -1042,6 +1068,7 @@ def _run_helper_json_lines(
     timeout: float | None,
     mod_ids: list[int],
     cancel_event=None,
+    cancel_cleanup_ids=None,
     on_event: Callable[[dict], None] | None = None,
     progress_cb=None,
     strict_native_environment: bool = False,
@@ -1053,6 +1080,7 @@ def _run_helper_json_lines(
             timeout=timeout,
             mod_ids=mod_ids,
             cancel_event=cancel_event,
+            cancel_cleanup_ids=cancel_cleanup_ids,
             on_event=on_event,
             progress_cb=progress_cb,
         )
@@ -1103,7 +1131,14 @@ def _run_helper_json_lines(
     stdout_t.start()
     stderr_t.start()
 
-    deadline = time.monotonic() + float(timeout) if timeout is not None else None
+    deadline = (
+        time.monotonic() + float(timeout) + (
+            1.0 if command in (
+                "refresh-subscribed-state", "cancel-cleanup-unsubscribe",
+            ) else 0.0
+        )
+        if timeout is not None else None
+    )
     ok = False
     done_seen = False
 
@@ -1371,14 +1406,24 @@ def _cache_ugc_state(state_by_id: dict[int, dict], *, names_by_id=None) -> None:
         eprint(f"[Steam UGC] Metadata cache update failed: {exc}")
 
 
-def _cleanup_subscriptions(sessions: dict[int, UGCModSession], *, appid: int, progress_cb=None) -> None:
+def _cleanup_subscriptions(
+    sessions: dict[int, UGCModSession],
+    *,
+    appid: int,
+    progress_cb=None,
+    only_ids=None,
+) -> None:
     cleanup_started = time.monotonic()
+    allowed_ids = (
+        set(_dedupe_sorted_ids(only_ids)) if only_ids is not None else None
+    )
     cleanup_ids = sorted(
         mid
         for mid, session in sessions.items()
         if session.subscribed_by_dzll_this_join
         and not session.was_subscribed_before
         and not session.installed_now
+        and (allowed_ids is None or mid in allowed_ids)
     )
     _log_event(progress_cb, f"[Steam UGC] Cleanup unsubscribe ids: {cleanup_ids}", cleanup_ids=cleanup_ids)
     if not cleanup_ids:
@@ -1468,6 +1513,67 @@ def query_ugc_state_checked(mod_ids, *, appid=DAYZ_APPID, timeout=60) -> tuple[b
     )
     _cache_ugc_state(snapshots)
     return bool(ok), snapshots
+
+
+def refresh_subscribed_ugc_state_checked(
+    mod_ids,
+    *,
+    appid=DAYZ_APPID,
+    timeout=UGC_SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S,
+    cancel_event=None,
+) -> tuple[bool, dict[int, dict], dict]:
+    """Best-effort metadata refresh with authoritative final item snapshots."""
+    ids = _dedupe_sorted_ids(mod_ids)
+    snapshots: dict[int, dict] = {}
+    result = {
+        "subscribed": [],
+        "refreshed": [],
+        "failed": [],
+        "timed_out": [],
+        "failures": [],
+    }
+    if not ids:
+        return True, snapshots, result
+
+    def on_event(event: dict) -> None:
+        if event.get("type") == "item":
+            normalized = _normalize_ugc_snapshot(event)
+            try:
+                mid = int(normalized.get("id") or 0)
+            except Exception:
+                mid = 0
+            if mid > 0:
+                snapshots[mid] = dict(normalized)
+            return
+        if event.get("type") not in ("command_result", "done"):
+            return
+        for key in ("subscribed", "refreshed", "failed", "timed_out"):
+            values = []
+            for raw in event.get(key) or []:
+                try:
+                    value = int(raw)
+                except Exception:
+                    continue
+                if value > 0:
+                    values.append(value)
+            result[key] = sorted(set(values))
+        result["failures"] = [
+            dict(value) for value in event.get("failures") or []
+            if isinstance(value, dict)
+        ]
+
+    ok, _rc = _run_helper_json_lines(
+        "refresh-subscribed-state",
+        appid=int(appid),
+        timeout=float(timeout),
+        mod_ids=ids,
+        cancel_event=cancel_event,
+        on_event=on_event,
+        progress_cb=None,
+    )
+    complete_state = bool(ok and all(mid in snapshots for mid in ids))
+    _cache_ugc_state(snapshots)
+    return complete_state, snapshots, result
 
 
 def query_ugc_inventory_checked(
@@ -1746,6 +1852,79 @@ def unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=120) -> dict[int
     )
     _cache_ugc_state(snapshots)
     return snapshots
+
+
+def cleanup_cancelled_ugc_subscriptions(
+    mod_ids,
+    *,
+    appid=DAYZ_APPID,
+    timeout=UGC_CANCEL_CLEANUP_BATCH_TIMEOUT_S,
+    progress_cb=None,
+) -> dict:
+    """Best-effort cleanup in a fresh, short-lived SteamAPI context."""
+    ids = _dedupe_sorted_ids(mod_ids)
+    result = {
+        "candidates": ids,
+        "attempted": [],
+        "confirmed_unsubscribed": [],
+        "retained_installed": [],
+        "already_unsubscribed": [],
+        "failed": [],
+        "timed_out": [],
+        "failures": [],
+    }
+    if not ids:
+        return result
+    native_ok, _state = _supported_native_steam_mutation_state()
+    if not native_ok:
+        result["failed"] = list(ids)
+        result["failures"] = [
+            {"id": mid, "reason": "native_steam_unavailable"} for mid in ids
+        ]
+        return result
+
+    def on_event(event: dict) -> None:
+        if event.get("type") != "done":
+            return
+        for key in (
+            "candidates", "attempted", "confirmed_unsubscribed",
+            "retained_installed", "already_unsubscribed", "failed",
+            "timed_out",
+        ):
+            result[key] = _dedupe_sorted_ids(event.get(key) or [])
+        result["failures"] = list(event.get("failures") or [])
+
+    ok, _rc = _run_helper_json_lines(
+        "cancel-cleanup-unsubscribe",
+        appid=int(appid),
+        timeout=min(
+            UGC_CANCEL_CLEANUP_BATCH_TIMEOUT_S,
+            max(0.0, float(timeout)),
+        ),
+        mod_ids=ids,
+        cancel_event=None,
+        on_event=on_event,
+        progress_cb=progress_cb,
+        strict_native_environment=True,
+    )
+    accounted = set(
+        result["confirmed_unsubscribed"]
+        + result["retained_installed"]
+        + result["already_unsubscribed"]
+        + result["failed"]
+        + result["timed_out"]
+    )
+    if not ok and not accounted:
+        result["failed"] = list(ids)
+        result["failures"] = [
+            {"id": mid, "reason": "fresh_cleanup_helper_failed"} for mid in ids
+        ]
+    _log_event(
+        progress_cb,
+        "[Steam UGC] Fresh-context cancel cleanup completed",
+        **result,
+    )
+    return result
 
 
 def request_unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=12) -> tuple[bool, dict[int, dict]]:
@@ -2781,6 +2960,7 @@ def run_ugc_install(
     appid: int = DAYZ_APPID,
     cancel_event=None,
     progress_cb=None,
+    handoff_cb=None,
     names_by_id=None,
     allow_start_steam: bool = True,
     launch_policy=None,
@@ -2867,10 +3047,19 @@ def run_ugc_install(
             session = sessions[mid]
             if not session.was_subscribed_before:
                 session.subscribed_by_dzll_this_join = True
+        cancel_cleanup_allowlist = sorted(
+            mid
+            for mid in not_ready
+            if sessions[mid].subscribed_by_dzll_this_join
+            and not sessions[mid].was_subscribed_before
+        )
 
         _progress(progress_cb, {"backend": "steam_ugc", "type": "status", "message": "Checking/Updating Required Mods"})
 
+        cancel_handoff: dict = {}
+
         def on_install_event(event: dict) -> None:
+            nonlocal cancel_handoff
             event_type = event.get("type")
             if event_type in ("item", "request"):
                 event = _normalize_ugc_snapshot(event)
@@ -2902,6 +3091,29 @@ def run_ugc_install(
                         session.download_pending = False
                 _progress(progress_cb, {"type": "helper_event", "event": event})
                 return
+            if event_type == "command_result" and isinstance(
+                event.get("cancel_handoff"), dict,
+            ):
+                helper_handoff = dict(event["cancel_handoff"])
+                helper_attempted = set(_dedupe_sorted_ids(
+                    helper_handoff.get("helper_subscribe_attempted") or [],
+                ))
+                parent_allowed = set(cancel_cleanup_allowlist)
+                cleanup_candidates = sorted(parent_allowed & helper_attempted)
+                cancel_handoff = {
+                    "parent_allowlisted": sorted(parent_allowed),
+                    "helper_subscribe_attempted": sorted(helper_attempted),
+                    "cleanup_candidates": cleanup_candidates,
+                }
+                if callable(handoff_cb):
+                    try:
+                        handoff_cb(dict(cancel_handoff))
+                    except Exception as exc:
+                        _log_event(
+                            progress_cb,
+                            "[Steam UGC] Cancellation handoff callback failed",
+                            error=str(exc), cleanup_candidates=cleanup_candidates,
+                        )
             _progress(progress_cb, {"type": "helper_event", "event": event})
 
         ok, _rc = _run_helper_json_lines(
@@ -2910,13 +3122,18 @@ def run_ugc_install(
             timeout=float(timeout),
             mod_ids=not_ready,
             cancel_event=cancel_event,
+            cancel_cleanup_ids=cancel_cleanup_allowlist,
             on_event=on_install_event,
             progress_cb=progress_cb,
         )
 
         if cancel_event is not None and cancel_event.is_set():
-            _refresh_current_state(sessions, appid=appid, progress_cb=progress_cb, names_by_id=names_by_id)
-            _cleanup_subscriptions(sessions, appid=appid, progress_cb=progress_cb)
+            if cancel_handoff:
+                _log_event(
+                    progress_cb,
+                    "[Steam UGC] Deferred cancel cleanup handoff captured",
+                    **cancel_handoff,
+                )
             installed = sorted(mid for mid, session in sessions.items() if session.installed_now)
             ready = sorted(mid for mid, session in sessions.items() if ugc_item_ready(session))
             failed = sorted(mid for mid in ids if mid not in ready)

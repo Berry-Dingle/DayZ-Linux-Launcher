@@ -182,6 +182,10 @@ def test_parent_reuses_one_helper_for_multiple_commands_and_cleans_temp(monkeypa
             on_event=events.append,
         )[0]
         assert steam_ugc_backend._run_helper_json_lines(
+            "refresh-subscribed-state", appid=221100, timeout=2, mod_ids=[2],
+            on_event=events.append,
+        )[0]
+        assert steam_ugc_backend._run_helper_json_lines(
             "subscribe-download", appid=221100, timeout=2, mod_ids=[2],
             on_event=events.append,
         )[0]
@@ -195,14 +199,15 @@ def test_parent_reuses_one_helper_for_multiple_commands_and_cleans_temp(monkeypa
 
     assert len(processes) == 1
     assert [message["command"] for message in processes[0].commands] == [
-        "query_state", "query_state", "subscribe_download", "unsubscribe", "shutdown",
+        "query_state", "query_state", "refresh_subscribed_state",
+        "subscribe_download", "unsubscribe", "shutdown",
     ]
     request_ids = [message["request_id"] for message in processes[0].commands]
     assert len(request_ids) == len(set(request_ids))
     assert not appid_dir.exists()
     assert processes[0].signals == []
     assert processes[0].stdin_closed
-    assert [event["id"] for event in events if event.get("type") == "item"] == [1, 2, 2, 2]
+    assert [event["id"] for event in events if event.get("type") == "item"] == [1, 2, 2, 2, 2]
 
 
 def test_helper_session_initializes_and_shuts_down_steamapi_once(monkeypatch):
@@ -328,6 +333,316 @@ def test_cooperative_unsubscribe_uses_canonical_snapshot_item_id(monkeypatch):
     assert not any(event.get("type") == "fatal_session_error" for event in events)
 
 
+def _cancel_cleanup_snapshot(
+    item_id, *, subscribed=True, installed=False, downloading=True,
+    download_pending=False,
+):
+    state_names = []
+    if subscribed:
+        state_names.append("Subscribed")
+    if installed:
+        state_names.append("Installed")
+    if downloading:
+        state_names.append("Downloading")
+    if download_pending:
+        state_names.append("DownloadPending")
+    return steam_ugc_helper.ItemSnapshot(
+        item_id=int(item_id),
+        state=0,
+        state_names=state_names,
+        subscribed=bool(subscribed),
+        installed=bool(installed),
+        needs_update=False,
+        downloading=bool(downloading),
+        download_pending=bool(download_pending),
+        download_bytes=1,
+        total_bytes=10,
+        size_on_disk=1 if installed else 0,
+        install_folder=f"/workshop/{item_id}" if installed else None,
+    )
+
+
+def test_fresh_cancel_cleanup_batches_downloading_and_pending_before_wait():
+    state = {
+        1: _cancel_cleanup_snapshot(1, downloading=True),
+        2: _cancel_cleanup_snapshot(
+            2, downloading=False, download_pending=True,
+        ),
+    }
+    operations = []
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return state[int(item_id)]
+
+        def unsubscribe(self, item_id):
+            item_id = int(item_id)
+            operations.append(("unsubscribe", item_id))
+            old = state[item_id]
+            state[item_id] = _cancel_cleanup_snapshot(
+                item_id, subscribed=False, installed=old.installed,
+                downloading=False, download_pending=False,
+            )
+            return 100 + item_id
+
+        def run_callbacks(self):
+            operations.append(("callbacks", None))
+
+    result = steam_ugc_helper._cancel_cleanup_unsubscribe_batch(
+        FakeSteam(), [1, 2], timeout=2,
+    )
+    assert result["attempted"] == [1, 2]
+    assert result["confirmed_unsubscribed"] == [1, 2]
+    assert result["failed"] == []
+    assert result["timed_out"] == []
+    first_callbacks = operations.index(("callbacks", None))
+    assert operations[:first_callbacks] == [
+        ("unsubscribe", 1), ("unsubscribe", 2),
+    ]
+
+
+def test_fresh_cancel_cleanup_retains_installed_and_accepts_already_clean():
+    state = {
+        1: _cancel_cleanup_snapshot(
+            1, subscribed=True, installed=True, downloading=False,
+        ),
+        2: _cancel_cleanup_snapshot(2, subscribed=True),
+        3: _cancel_cleanup_snapshot(3, subscribed=False),
+    }
+    unsubscribed = []
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return state[int(item_id)]
+
+        def unsubscribe(self, item_id):
+            unsubscribed.append(int(item_id))
+            return 1
+
+        def run_callbacks(self):
+            return None
+
+    result = steam_ugc_helper._cancel_cleanup_unsubscribe_batch(
+        FakeSteam(), [1, 2, 3], timeout=0,
+    )
+    assert result["retained_installed"] == [1]
+    assert result["already_unsubscribed"] == [3]
+    assert result["attempted"] == [2]
+    assert result["timed_out"] == [2]
+    assert unsubscribed == [2]
+
+
+def test_fresh_cancel_cleanup_uses_one_deadline_for_large_batch():
+    item_ids = list(range(1, 81))
+    state = {
+        item_id: _cancel_cleanup_snapshot(item_id, subscribed=True)
+        for item_id in item_ids
+    }
+    monotonic_values = iter((10.0, 12.0))
+    operations = []
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return state[int(item_id)]
+
+        def run_callbacks(self):
+            operations.append(("callbacks", None))
+
+        def unsubscribe(self, item_id):
+            operations.append(("unsubscribe", int(item_id)))
+            return 1000 + int(item_id)
+
+    result = steam_ugc_helper._cancel_cleanup_unsubscribe_batch(
+        FakeSteam(), item_ids, timeout=2,
+        monotonic_fn=lambda: next(monotonic_values),
+        sleep_fn=lambda _duration: pytest.fail("expired batch must not sleep"),
+    )
+    first_callbacks = operations.index(("callbacks", None))
+    assert operations[:first_callbacks] == [
+        ("unsubscribe", item_id) for item_id in item_ids
+    ]
+    assert result["timed_out"] == item_ids
+    assert result["attempted"] == item_ids
+
+
+def test_fresh_cancel_cleanup_records_unsubscribe_failure_without_guessing():
+    state = {7: _cancel_cleanup_snapshot(7, subscribed=True)}
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return state[int(item_id)]
+
+        def run_callbacks(self):
+            return None
+
+        def unsubscribe(self, _item_id):
+            raise RuntimeError("request failed")
+
+    result = steam_ugc_helper._cancel_cleanup_unsubscribe_batch(
+        FakeSteam(), [7], timeout=2,
+    )
+    assert result["failed"] == [7]
+    assert result["attempted"] == [7]
+    assert result["confirmed_unsubscribed"] == []
+
+
+def test_fresh_cancel_cleanup_backend_forces_one_shot_context(monkeypatch):
+    observed = {}
+    monkeypatch.setattr(
+        steam_ugc_backend, "_supported_native_steam_mutation_state",
+        lambda: (True, "native"),
+    )
+
+    def fake_helper(command, **kwargs):
+        observed["command"] = command
+        observed.update(kwargs)
+        kwargs["on_event"]({
+            "type": "done", "ok": True,
+            "candidates": [7], "attempted": [7],
+            "confirmed_unsubscribed": [7], "retained_installed": [],
+            "already_unsubscribed": [], "failed": [], "timed_out": [],
+            "failures": [],
+        })
+        return True, 0
+
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines", fake_helper,
+    )
+    result = steam_ugc_backend.cleanup_cancelled_ugc_subscriptions([7])
+    assert observed["command"] == "cancel-cleanup-unsubscribe"
+    assert observed["strict_native_environment"] is True
+    assert observed["timeout"] == 2.0
+    assert result["confirmed_unsubscribed"] == [7]
+
+
+def test_fresh_cancel_cleanup_command_shuts_down_once(monkeypatch):
+    shutdowns = []
+    emitted = []
+    state = {
+        1: _cancel_cleanup_snapshot(1, subscribed=True, installed=True),
+        2: _cancel_cleanup_snapshot(2, subscribed=False),
+    }
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return state[int(item_id)]
+
+        def unsubscribe(self, _item_id):
+            pytest.fail("installed and already-clean items must be retained")
+
+        def run_callbacks(self):
+            return None
+
+        def shutdown(self):
+            shutdowns.append(True)
+
+    class FakeTemp:
+        def cleanup(self):
+            return None
+
+    monkeypatch.setattr(
+        steam_ugc_helper, "init_steam",
+        lambda _appid: (FakeSteam(), SimpleNamespace(), FakeTemp()),
+    )
+    monkeypatch.setattr(steam_ugc_helper, "emit", emitted.append)
+    args = SimpleNamespace(appid=221100, timeout=2.0, item_ids=[1, 2])
+    assert steam_ugc_helper.command_cancel_cleanup_unsubscribe(args) == 0
+    done = next(event for event in emitted if event.get("type") == "done")
+    assert done["retained_installed"] == [1]
+    assert done["already_unsubscribed"] == [2]
+    assert shutdowns == [True]
+
+
+def test_cancel_during_submission_stops_later_requests_and_hands_off_attempted(monkeypatch):
+    commands = queue.Queue()
+    state = {
+        item_id: _cancel_cleanup_snapshot(item_id, subscribed=False)
+        for item_id in (1, 2, 3)
+    }
+    subscribe_calls = []
+    download_calls = []
+    unsubscribe_calls = []
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return state[int(item_id)]
+
+        def subscribe(self, item_id):
+            item_id = int(item_id)
+            subscribe_calls.append(item_id)
+            state[item_id] = _cancel_cleanup_snapshot(item_id, subscribed=True)
+            return 100 + item_id
+
+        def download(self, item_id, _high_priority):
+            item_id = int(item_id)
+            download_calls.append(item_id)
+            commands.put({
+                "command": "cancel",
+                "request_id": "c-1",
+                "target_request_id": "d-1",
+                "cleanup_item_ids": [1, 2, 3],
+            })
+            return True
+
+        def unsubscribe(self, item_id):
+            item_id = int(item_id)
+            unsubscribe_calls.append(item_id)
+            state[item_id] = _cancel_cleanup_snapshot(
+                item_id, subscribed=False, downloading=False,
+            )
+            return 200 + item_id
+
+        def run_callbacks(self):
+            return None
+
+    monkeypatch.setattr(steam_ugc_helper, "emit", lambda _event: None)
+    monkeypatch.setattr(steam_ugc_helper, "_session_emit", lambda *_a, **_k: None)
+    with pytest.raises(steam_ugc_helper._SessionCancelled) as caught:
+        steam_ugc_helper._session_subscribe_download(
+            FakeSteam(), commands, "d-1", [1, 2, 3], 30,
+        )
+    assert subscribe_calls == [1]
+    assert download_calls == [1]
+    assert unsubscribe_calls == []
+    assert caught.value.cancel_handoff == {
+        "parent_allowlisted": [1, 2, 3],
+        "helper_subscribe_attempted": [1],
+        "cleanup_candidates": [1],
+    }
+
+
+def test_cancel_between_subscribe_and_download_hands_off_subscription(monkeypatch):
+    commands = queue.Queue()
+    subscribed = []
+    downloads = []
+
+    class FakeSteam:
+        def snapshot(self, item_id):
+            return _cancel_cleanup_snapshot(item_id, subscribed=False)
+
+        def subscribe(self, item_id):
+            subscribed.append(int(item_id))
+            commands.put({
+                "command": "cancel", "request_id": "c-1",
+                "target_request_id": "d-1", "cleanup_item_ids": [7, 8],
+            })
+            return 70
+
+        def download(self, item_id, _high_priority):
+            downloads.append(int(item_id))
+            return True
+
+    monkeypatch.setattr(steam_ugc_helper, "emit", lambda _event: None)
+    monkeypatch.setattr(steam_ugc_helper, "_session_emit", lambda *_a, **_k: None)
+    with pytest.raises(steam_ugc_helper._SessionCancelled) as caught:
+        steam_ugc_helper._session_subscribe_download(
+            FakeSteam(), commands, "d-1", [7, 8], 30,
+        )
+    assert subscribed == [7]
+    assert downloads == []
+    assert caught.value.cancel_handoff["cleanup_candidates"] == [7]
+
+
 def test_protocol_request_id_mismatch_fails_closed(monkeypatch):
     appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_bad_protocol_"))
 
@@ -379,9 +694,16 @@ def test_active_session_routes_commands_without_one_shot_process(monkeypatch):
         assert steam_ugc_backend._run_helper_json_lines(
             "subscribe-download", appid=221100, timeout=2, mod_ids=[3],
         )[0]
+        assert steam_ugc_backend._run_helper_json_lines(
+            "refresh-subscribed-state", appid=221100, timeout=2, mod_ids=[3],
+        )[0]
     finally:
         steam_ugc_backend.deactivate_ugc_session(session)
-    assert calls == [("state", (3,)), ("subscribe-download", (3,))]
+    assert calls == [
+        ("state", (3,)),
+        ("subscribe-download", (3,)),
+        ("refresh-subscribed-state", (3,)),
+    ]
 
 
 def test_steam_client_boundary_activates_shared_session_on_worker(monkeypatch):
@@ -701,6 +1023,91 @@ def test_helper_cooperative_cancel_still_shuts_down_once_and_removes_appid(monke
         and event.get("cancelled")
         for event in events
     )
+
+
+def test_cancel_ack_and_result_do_not_unsubscribe_before_session_shutdown(monkeypatch):
+    download_started = threading.Event()
+    events = []
+    operations = []
+    subscribed = {7: False}
+
+    class ControlledInput:
+        def __iter__(self):
+            yield (
+                '{"command":"subscribe_download","request_id":"d-1",'
+                '"item_ids":[7],"timeout":30}\n'
+            )
+            assert download_started.wait(timeout=2.0)
+            yield (
+                '{"command":"cancel","request_id":"c-2",'
+                '"target_request_id":"d-1","cleanup_item_ids":[7]}\n'
+            )
+            yield '{"command":"shutdown","request_id":"s-3"}\n'
+
+    class FakeSteam:
+        ugc_accessor_name = "fake"
+
+        def __init__(self, _paths):
+            pass
+
+        def init(self):
+            return None
+
+        def shutdown(self):
+            operations.append("steam_shutdown")
+
+        def snapshot(self, item_id):
+            return _cancel_cleanup_snapshot(
+                item_id, subscribed=subscribed[int(item_id)],
+                downloading=subscribed[int(item_id)],
+            )
+
+        def subscribe(self, item_id):
+            subscribed[int(item_id)] = True
+            return 70
+
+        def download(self, _item_id, _high_priority):
+            download_started.set()
+            return True
+
+        def unsubscribe(self, item_id):
+            operations.append("unsubscribe")
+            subscribed[int(item_id)] = False
+            return 71
+
+        def run_callbacks(self):
+            operations.append("callbacks")
+
+    def collect(event):
+        events.append(event)
+        if event.get("type") in {"cancellation_ack", "command_result"}:
+            operations.append(event["type"])
+
+    monkeypatch.setattr(steam_ugc_helper.sys, "stdin", ControlledInput())
+    monkeypatch.setattr(
+        steam_ugc_helper, "detect_steam_paths", lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        steam_ugc_helper, "ensure_ld_library_path", lambda _paths: None,
+    )
+    monkeypatch.setattr(steam_ugc_helper, "SteamUGC", FakeSteam)
+    monkeypatch.setattr(steam_ugc_helper, "emit", collect)
+
+    assert steam_ugc_helper.command_session(SimpleNamespace(appid=221100)) == 0
+    assert "unsubscribe" not in operations
+    assert operations.index("cancellation_ack") < operations.index("command_result")
+    assert operations.index("command_result") < operations.index("steam_shutdown")
+    cancelled = next(
+        event for event in events
+        if event.get("type") == "command_result"
+        and event.get("request_id") == "d-1"
+    )
+    assert cancelled["cancel_handoff"] == {
+        "parent_allowlisted": [7],
+        "helper_subscribe_attempted": [7],
+        "cleanup_candidates": [7],
+    }
+    assert operations.count("steam_shutdown") == 1
 
 
 def test_helper_fatal_command_error_fails_closed_and_removes_appid(monkeypatch):
@@ -1197,6 +1604,77 @@ def test_shutdown_waits_for_active_command_cancellation_and_reaps_once(monkeypat
     ]
     assert session._active_request_id == ""
     assert process.signals == []
+    assert not appid_dir.exists()
+
+
+def test_close_waits_for_active_cancel_handoff_result_before_shutdown(monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_cancel_cleanup_close_"))
+    cancel = threading.Event()
+    cancel_received = threading.Event()
+
+    class CleanupUntilReleasedProcess(ProtocolProcess):
+        def write(self, raw):
+            message = json.loads(raw)
+            if message["command"] == "subscribe_download":
+                self.commands.append(message)
+                self.stdout.push({
+                    "type": "command_accepted",
+                    "request_id": message["request_id"],
+                    "command": message["command"],
+                })
+                cancel.set()
+                return len(raw)
+            if message["command"] == "cancel":
+                self.commands.append(message)
+                self.stdout.push({
+                    "type": "cancellation_ack",
+                    "request_id": message["request_id"],
+                    "target_request_id": message["target_request_id"],
+                })
+                cancel_received.set()
+                return len(raw)
+            return super().write(raw)
+
+    process = CleanupUntilReleasedProcess(appid_dir)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession(cancel_event=cancel)
+    command_result = []
+    worker = threading.Thread(target=lambda: command_result.append(
+        session.run_command(
+            "subscribe-download", timeout=30, mod_ids=[7],
+            cancel_cleanup_ids=[7],
+        )
+    ))
+    worker.start()
+    assert cancel_received.wait(timeout=2.0)
+
+    close_done = threading.Event()
+    closer = threading.Thread(target=lambda: (session.close(), close_done.set()))
+    closer.start()
+    assert not close_done.wait(timeout=0.05)
+    process.stdout.push({
+        "type": "command_result",
+        "request_id": process.commands[0]["request_id"],
+        "ok": False,
+        "cancelled": True,
+        "cancel_handoff": {
+            "parent_allowlisted": [7],
+            "helper_subscribe_attempted": [7],
+            "cleanup_candidates": [7],
+        },
+    })
+    worker.join(timeout=2.0)
+    closer.join(timeout=2.0)
+    assert not worker.is_alive()
+    assert not closer.is_alive()
+    assert command_result == [(False, None)]
+    assert [message["command"] for message in process.commands] == [
+        "subscribe_download", "cancel", "shutdown",
+    ]
+    cancel_message = process.commands[1]
+    assert cancel_message["cleanup_item_ids"] == [7]
     assert not appid_dir.exists()
 
 
