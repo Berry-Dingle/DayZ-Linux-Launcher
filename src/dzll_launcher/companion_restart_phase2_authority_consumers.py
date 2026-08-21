@@ -291,7 +291,12 @@ def evaluate_authority_consumers(
         and phase_available
         and decision.prediction_usable
         and decision.countdown_safe
-        and decision.state in {RegimeState.ESTABLISHED, RegimeState.CHANGE_SUSPECTED, RegimeState.NEW_REGIME_ESTABLISHED}
+        and decision.state in {
+            RegimeState.ESTABLISHED,
+            RegimeState.CHANGE_SUSPECTED,
+            RegimeState.CHALLENGER_ACCUMULATING,
+            RegimeState.NEW_REGIME_ESTABLISHED,
+        }
     )
     normal = policy.normal_prediction_evidence
     safe_established_normal_schedule = bool(

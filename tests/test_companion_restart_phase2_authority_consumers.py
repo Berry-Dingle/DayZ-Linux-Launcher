@@ -751,15 +751,28 @@ def test_unsafe_challenger_suspends_countdown_and_warning():
         countdown_safe=False,
     )
     value = consumers4.evaluate_authority_consumers(_policy(suspect))
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
     assert value.presentation_state is consumers4.AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
     assert value.prediction_suspended and not value.countdown_visible
+    assert not value.countdown_safe
+    assert value.next_expected_restart_at is None
     assert not value.scheduled_warning_eligible
+    assert summary["next_restart_at"] is None
+    assert not summary["countdown_visible"]
 
 
 def test_weak_challenger_cannot_show_new_cycle():
     suspect = replace(_authority(4), state=authority.RegimeState.CHALLENGER_ACCUMULATING, suspicion_level=1)
     value = consumers4.evaluate_authority_consumers(_policy(suspect))
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
     assert value.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert value.selected_regime_id == suspect.incumbent_shadow_regime.regime_id
+    assert suspect.prediction_usable and suspect.countdown_safe
+    assert value.next_expected_restart_at is not None
+    assert value.countdown_safe and value.countdown_visible
+    assert summary["prediction_usable"]
+    assert summary["next_visible"]
+    assert summary["countdown_visible"]
 
 
 @pytest.mark.parametrize("state", [authority.RegimeState.TRANSITION_CONFIRMED, authority.RegimeState.NEW_REGIME_PROVISIONAL])
