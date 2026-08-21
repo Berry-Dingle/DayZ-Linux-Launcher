@@ -9470,6 +9470,60 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             self._set_updating(False, detail)
 
+    def _join_worker_future_done(self, attempt_id: int, future) -> None:
+        """Observe only exceptions which escaped the foreground Join worker."""
+        try:
+            if future.cancelled():
+                return
+            error = future.exception()
+        except Exception:
+            logger.exception(
+                "Join %d worker Future could not be inspected", int(attempt_id),
+            )
+            return
+        if error is None:
+            return
+
+        logger.error(
+            "Join %d worker failed with an uncaught exception",
+            int(attempt_id),
+            exc_info=(type(error), error, error.__traceback__),
+        )
+        if isinstance(error, UGCHelperReapError):
+            message = (
+                "Steam preparation could not shut down cleanly. Join was aborted."
+            )
+        else:
+            message = "Join preparation failed unexpectedly. Please try again."
+        try:
+            self.GLib.idle_add(
+                self._handle_join_worker_exception,
+                int(attempt_id),
+                message,
+            )
+        except Exception:
+            logger.exception(
+                "Join %d worker failure could not be queued on the GTK thread",
+                int(attempt_id),
+            )
+
+    def _handle_join_worker_exception(
+            self, attempt_id: int, message: str) -> bool:
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        if not self._join_attempt_is_active(attempt_id):
+            return False
+        try:
+            if getattr(self, "_discord", None):
+                self._discord.set_menu()
+        except Exception:
+            pass
+        self._show_join_preparation_error(attempt_id, message)
+        self._cleanup_join_attempt(attempt_id, "uncaught Join worker exception")
+        self._set_updating(False)
+        self._on_filter_changed(reason="join")
+        return False
+
     def _launch_direct_steam_url(self, obj: ServerObject, mod_win_paths=None, *, attempt_id: int = 0):
         active = self._join_attempts.active
         captured_skip_launcher = (
@@ -11107,7 +11161,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._show_join_progress_overlay("Checking & Preparing Mods for Join...")
         try:
-            self._hi_executor.submit(do_prepare_and_launch)
+            future = self._hi_executor.submit(do_prepare_and_launch)
+            future.add_done_callback(
+                lambda completed, owner=attempt_id: self._join_worker_future_done(
+                    owner, completed,
+                )
+            )
             self._join_log(attempt_id, "worker submitted")
         except Exception as exc:
             self._show_join_preparation_error(attempt_id, f"Could not start Join preparation: {exc}")

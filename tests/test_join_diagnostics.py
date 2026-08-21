@@ -1,11 +1,13 @@
 from pathlib import Path
 from types import SimpleNamespace
+from concurrent.futures import Future
 import threading
 
 import pytest
 
 from dzll_launcher.join_attempt import JoinAttemptTracker
 from dzll_launcher import join_prepare, launch_utils, steam_client_mods, steam_ugc_backend
+from dzll_launcher.window import DZLLWindow
 
 
 class Clock:
@@ -405,3 +407,131 @@ def test_no_automatic_retry_delay_or_second_handoff_added():
     join_section = window_source.split("def _join_server_for_obj", 1)[1]
     assert "Join already in progress" in join_section
     assert "time.sleep" not in join_section.split("def _prune_expired_dead", 1)[0]
+
+
+class QueuedGLib:
+    def __init__(self):
+        self.calls = []
+
+    def idle_add(self, callback, *args):
+        self.calls.append((callback, args))
+        return len(self.calls)
+
+
+def worker_exception_host(*, active_attempt=1, shutting_down=False):
+    scheduled = QueuedGLib()
+    events = []
+    host = SimpleNamespace(
+        GLib=scheduled,
+        _shutdown_cleanup_done=shutting_down,
+        _discord=SimpleNamespace(set_menu=lambda: events.append(("discord", "menu"))),
+        _join_attempt_is_active=lambda attempt_id: int(attempt_id) == int(active_attempt),
+        _show_join_preparation_error=(
+            lambda attempt_id, message: events.append(("error", attempt_id, message))
+        ),
+        _cleanup_join_attempt=(
+            lambda attempt_id, reason: events.append(("cleanup", attempt_id, reason))
+        ),
+        _set_updating=lambda value: events.append(("updating", value)),
+        _on_filter_changed=lambda **kwargs: events.append(("filter", kwargs)),
+    )
+    host._handle_join_worker_exception = (
+        lambda attempt_id, message: DZLLWindow._handle_join_worker_exception(
+            host, attempt_id, message,
+        )
+    )
+    return host, scheduled, events
+
+
+def failed_future(error):
+    future = Future()
+    future.set_exception(error)
+    return future
+
+
+def test_normal_join_worker_completion_schedules_no_exception_handling():
+    host, scheduled, events = worker_exception_host()
+    future = Future()
+    future.set_result(None)
+
+    DZLLWindow._join_worker_future_done(host, 1, future)
+
+    assert scheduled.calls == []
+    assert events == []
+
+
+@pytest.mark.parametrize(
+    ("error", "expected_message"),
+    [
+        (
+            steam_ugc_backend.UGCHelperReapError("helper remained alive"),
+            "Steam preparation could not shut down cleanly. Join was aborted.",
+        ),
+        (
+            RuntimeError("unexpected synthetic failure"),
+            "Join preparation failed unexpectedly. Please try again.",
+        ),
+    ],
+)
+def test_uncaught_join_worker_exception_is_marshaled_and_fails_current_attempt(
+        error, expected_message):
+    host, scheduled, events = worker_exception_host()
+
+    DZLLWindow._join_worker_future_done(host, 1, failed_future(error))
+
+    assert events == []
+    assert len(scheduled.calls) == 1
+    callback, args = scheduled.calls[0]
+    assert args == (1, expected_message)
+    assert callback(*args) is False
+    assert events == [
+        ("discord", "menu"),
+        ("error", 1, expected_message),
+        ("cleanup", 1, "uncaught Join worker exception"),
+        ("updating", False),
+        ("filter", {"reason": "join"}),
+    ]
+
+
+def test_stale_join_worker_exception_cannot_touch_newer_attempt():
+    host, scheduled, events = worker_exception_host(active_attempt=2)
+
+    DZLLWindow._join_worker_future_done(
+        host, 1, failed_future(RuntimeError("late old failure")),
+    )
+    callback, args = scheduled.calls[0]
+    assert callback(*args) is False
+    assert events == []
+
+
+def test_join_worker_exception_during_shutdown_is_not_presented():
+    host, scheduled, events = worker_exception_host(shutting_down=True)
+
+    DZLLWindow._join_worker_future_done(
+        host, 1, failed_future(RuntimeError("shutdown race")),
+    )
+    callback, args = scheduled.calls[0]
+    assert callback(*args) is False
+    assert events == []
+
+
+def test_cancelled_join_worker_future_is_not_an_exception_error():
+    host, scheduled, events = worker_exception_host()
+    future = Future()
+    assert future.cancel()
+
+    DZLLWindow._join_worker_future_done(host, 1, future)
+
+    assert scheduled.calls == []
+    assert events == []
+
+
+def test_join_submission_attaches_identity_captured_future_observer():
+    source = Path("src/dzll_launcher/window.py").read_text(encoding="utf-8")
+    submission = source.split("def _join_server_for_obj", 1)[1].split(
+        "def _prune_expired_dead", 1,
+    )[0]
+    assert "future = self._hi_executor.submit(do_prepare_and_launch)" in submission
+    assert "future.add_done_callback(" in submission
+    assert "owner=attempt_id" in submission
+    assert "self._join_worker_future_done(" in submission
