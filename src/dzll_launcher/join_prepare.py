@@ -338,17 +338,43 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                         failed=list(refresh_result.get("failed") or []),
                         timed_out=list(refresh_result.get("timed_out") or []),
                     )
-                refresh_problem_ids = sorted(set(
-                    list(refresh_result.get("failed") or [])
-                    + list(refresh_result.get("timed_out") or [])
-                ))
-                if refresh_problem_ids:
-                    logger.warning(
-                        "Steam UGC subscribed metadata refresh was incomplete "
-                        "for ids=%s; using available final state",
-                        refresh_problem_ids,
+                refreshed_ids = list(refresh_result.get("refreshed") or [])
+                failed_ids = list(refresh_result.get("failed") or [])
+                timed_out_ids = list(refresh_result.get("timed_out") or [])
+                if initial_query_ok and (failed_ids or timed_out_ids):
+                    failure_reason_counts = {}
+                    for failure in refresh_result.get("failures") or []:
+                        if not isinstance(failure, dict):
+                            continue
+                        reason = str(failure.get("reason") or "").strip()
+                        if reason:
+                            failure_reason_counts[reason] = (
+                                failure_reason_counts.get(reason, 0) + 1
+                            )
+                    reason_summary = ""
+                    if failure_reason_counts:
+                        reason_summary = "; failure_reasons={%s}" % ", ".join(
+                            f"{reason}: {count}"
+                            for reason, count in sorted(
+                                failure_reason_counts.items()
+                            )
+                        )
+                    logger.debug(
+                        "Steam UGC metadata refresh partial: refreshed=%d/%d, "
+                        "failed=%d, timed_out=%d; using complete final state%s",
+                        len(refreshed_ids),
+                        len(list(refresh_result.get("subscribed") or [])),
+                        len(failed_ids),
+                        len(timed_out_ids),
+                        reason_summary,
                     )
                 if not initial_query_ok:
+                    logger.warning(
+                        "Steam UGC authoritative final state incomplete: "
+                        "received=%d/%d; preparation will fail closed",
+                        len(ugc_state),
+                        len(required_ids),
+                    )
                     if operation_cancel_event.is_set():
                         raise RuntimeError("Steam UGC state check cancelled.")
                     raise RuntimeError(

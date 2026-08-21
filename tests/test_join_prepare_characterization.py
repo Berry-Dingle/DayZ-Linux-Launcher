@@ -1,5 +1,6 @@
 from pathlib import Path
 from types import SimpleNamespace
+import logging
 import threading
 
 import pytest
@@ -894,8 +895,10 @@ def test_initially_ready_mods_are_revalidated_before_ready(monkeypatch):
 
 @pytest.mark.parametrize("detail_key", ["failed", "timed_out"])
 def test_partial_subscribed_refresh_failure_is_non_blocking_and_does_not_download(
-        monkeypatch, detail_key):
+        monkeypatch, caplog, detail_key):
     details = {
+        "subscribed": [101],
+        "refreshed": [],
         "failed": [],
         "timed_out": [],
         "failures": [],
@@ -903,30 +906,56 @@ def test_partial_subscribed_refresh_failure_is_non_blocking_and_does_not_downloa
     details[detail_key] = [101]
     if detail_key == "failed":
         details["failures"] = [{"id": 101, "reason": "api_call_failed"}]
-    win, trace, _outcome = run_terminal_validation_route(
-        monkeypatch,
-        mods=[(101, "Current")],
-        initial_states={101: ugc_state()},
-        terminal_results=[(True, {101: ugc_state()})],
-        refresh_details=details,
-    )
+    with caplog.at_level(logging.DEBUG, logger=join_prepare.__name__):
+        win, trace, _outcome = run_terminal_validation_route(
+            monkeypatch,
+            mods=[(101, "Current")],
+            initial_states={101: ugc_state()},
+            terminal_results=[(True, {101: ugc_state()})],
+            refresh_details=details,
+        )
     assert not [item for item in trace if item[0] == "backend"]
     assert trace[-1] == ("launch",)
     assert win.launches == 1
+    assert not any(
+        "subscribed metadata refresh was incomplete" in record.getMessage()
+        for record in caplog.records
+    )
+    assert any(
+        (
+            "Steam UGC metadata refresh partial: refreshed=0/1, "
+            f"failed={int(detail_key == 'failed')}, "
+            f"timed_out={int(detail_key == 'timed_out')}; "
+            "using complete final state"
+        ) in record.getMessage()
+        for record in caplog.records
+    )
+    reason_text = "failure_reasons={api_call_failed: 1}"
+    assert any(reason_text in record.getMessage() for record in caplog.records) is (
+        detail_key == "failed"
+    )
 
 
 def test_initial_ugc_protocol_failure_cannot_be_classified_as_missing(
-        monkeypatch):
-    win, trace, _outcome = run_terminal_validation_route(
-        monkeypatch,
-        mods=[(101, "Unknown")],
-        initial_states={},
-        terminal_results=[],
-        initial_ok=False,
-    )
+        monkeypatch, caplog):
+    with caplog.at_level(logging.WARNING, logger=join_prepare.__name__):
+        win, trace, _outcome = run_terminal_validation_route(
+            monkeypatch,
+            mods=[(101, "Unknown")],
+            initial_states={},
+            terminal_results=[],
+            initial_ok=False,
+        )
     assert trace == [("initial_query", (101,))]
     assert not [item for item in trace if item[0] == "backend"]
     assert win.launches == 0
+    assert any(
+        (
+            "Steam UGC authoritative final state incomplete: received=0/1; "
+            "preparation will fail closed"
+        ) in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_refreshed_mixed_states_preserve_existing_work_classification(
