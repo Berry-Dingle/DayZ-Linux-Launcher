@@ -30,6 +30,7 @@ RESTART_CONFIDENCE_STYLE_CLASSES = {
     "strong": "ping-good",
 }
 MAX_USER_VISIBLE_RESTART_CONFIDENCE_PERCENT = 95
+JOIN_STATUS_TRANSIENT_SECONDS = 20
 RESTART_PRESENTATION_TOOLTIPS = {
     "pattern_only": "Recurring timing is visible, but its duration is not established yet.",
     "likely_cycle": "A repeated cycle is likely; exact restart prediction remains withheld.",
@@ -172,6 +173,8 @@ class ServerCompanionPanel(Gtk.Box):
         self._restart_countdown_colon_timer_id = 0
         self._join_status_flash_timer_id = 0
         self._join_status_flash_step = 0
+        self._join_status_clear_timer_id = 0
+        self._join_status_generation = 0
         self._empty_clock_colon_visible = True
         self._restart_countdown_colon_visible = True
         self._empty_breathe_phase = 0.0
@@ -590,8 +593,19 @@ class ServerCompanionPanel(Gtk.Box):
     def set_alert_audio_status(self, message: str | None):
         ServerCompanionPanel._suppress_restart_alert_status(self)
 
-    def set_join_status(self, message: str | None, flash: bool = False):
+    def set_join_status(
+        self,
+        message: str | None,
+        flash: bool = False,
+        *,
+        transient: bool = True,
+    ):
         message = str(message or "").strip()
+        self._join_status_generation += 1
+        generation = self._join_status_generation
+        if self._join_status_clear_timer_id:
+            GLib.source_remove(self._join_status_clear_timer_id)
+            self._join_status_clear_timer_id = 0
         if self._join_status_flash_timer_id:
             GLib.source_remove(self._join_status_flash_timer_id)
             self._join_status_flash_timer_id = 0
@@ -601,6 +615,20 @@ class ServerCompanionPanel(Gtk.Box):
         self.join_status_label.set_visible(bool(message))
         if message and flash:
             self._join_status_flash_timer_id = GLib.timeout_add(180, self._join_status_flash_tick)
+        if message and transient:
+            self._join_status_clear_timer_id = GLib.timeout_add_seconds(
+                JOIN_STATUS_TRANSIENT_SECONDS,
+                self._clear_join_status_if_current,
+                generation,
+            )
+
+    def _clear_join_status_if_current(self, generation: int):
+        if int(generation) != self._join_status_generation:
+            return False
+        self._join_status_clear_timer_id = 0
+        self.join_status_label.set_text("")
+        self.join_status_label.set_visible(False)
+        return False
 
     def _join_status_flash_tick(self):
         self._join_status_flash_step += 1

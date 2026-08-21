@@ -634,8 +634,8 @@ def get_app_css(
         }}
 
         .dzll-app-root .dzll-background-prepare-status {{
-          background: transparent;
-          background-color: transparent;
+          background: @dzll_surface_control;
+          background-color: @dzll_surface_control;
           border: 1px solid @dzll_border;
           border-radius: 8px;
         }}
@@ -658,14 +658,8 @@ def get_app_css(
         }}
 
         .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-right-status {{
-          color: @dzll_text_muted;
-          font-weight: 600;
-        }}
-
-        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-progress trough,
-        .dzll-app-root .dzll-background-prepare-status .dzll-background-prepare-progress progress {{
-          min-height: 5px;
-          border-radius: 4px;
+          color: @dzll_text_primary;
+          font-weight: normal;
         }}
 
         .dzll-app-root .status-refresh-progress {{
@@ -2335,5 +2329,23 @@ def get_app_css(
         """
         )
     css += "\n".join(repair_progress_rules).encode("utf-8")
+
+    background_prepare_progress_rules = []
+    for percent in range(101):
+        background_prepare_progress_rules.append(
+            f"""
+        .dzll-app-root .dzll-background-prepare-status.dzll-background-prepare-progress-{percent} {{
+          background-color: @dzll_surface_control;
+          background-image: linear-gradient(
+            to right,
+            @dzll_accent 0%,
+            @dzll_accent {percent}%,
+            @dzll_surface_control {percent}%,
+            @dzll_surface_control 100%
+          );
+        }}
+        """
+        )
+    css += "\n".join(background_prepare_progress_rules).encode("utf-8")
 
     return css

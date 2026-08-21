@@ -1408,10 +1408,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _steamcmd_install_line_from_worker(self, line: str):
         return self._steamcmd_overlay_ui._steamcmd_install_line_from_worker(line)
 
-    def _set_server_companion_join_status(self, message: str | None, flash: bool = False):
+    def _set_server_companion_join_status(
+        self,
+        message: str | None,
+        flash: bool = False,
+        *,
+        transient: bool = True,
+    ):
         panel = getattr(self, "server_companion_panel", None)
         if panel is not None and hasattr(panel, "set_join_status"):
-            panel.set_join_status(message, flash=flash)
+            panel.set_join_status(message, flash=flash, transient=transient)
 
     def _server_companion_join_sensitive(self, otherwise_joinable: bool) -> bool:
         return bool(
@@ -1431,6 +1437,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._set_server_companion_join_status(
             "SteamCMD Login Required",
             flash=True,
+            transient=False,
         )
         return self._steamcmd_overlay_ui._show_steamcmd_auth_overlay(username_prefill=username_prefill, status=status)
 
@@ -9958,9 +9965,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         grid = Gtk.Grid()
         grid.set_hexpand(True)
         grid.set_vexpand(False)
-        grid.set_row_spacing(2)
-        grid.set_margin_top(4)
-        grid.set_margin_bottom(4)
+        grid.set_margin_top(3)
+        grid.set_margin_bottom(3)
         grid.set_margin_start(8)
         grid.set_margin_end(8)
         self.background_prepare_grid = grid
@@ -10055,15 +10061,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         right.append(self.background_prepare_count_label)
 
-        self.background_prepare_action_btn = Gtk.Button(label="Cancel")
-        self.background_prepare_action_btn.add_css_class("flat")
-        self.background_prepare_action_btn.set_hexpand(True)
-        self.background_prepare_action_btn.set_halign(Gtk.Align.END)
-        self.background_prepare_action_btn.connect(
-            "clicked", self._background_prepare_action_clicked,
+        self.background_prepare_percent_label = Gtk.Label(label="", xalign=1.0)
+        self.background_prepare_percent_label.set_size_request(44, -1)
+        self.background_prepare_percent_label.set_width_chars(4)
+        self.background_prepare_percent_label.set_max_width_chars(4)
+        self.background_prepare_percent_label.set_halign(Gtk.Align.FILL)
+        self.background_prepare_percent_label.set_valign(Gtk.Align.CENTER)
+        self.background_prepare_percent_label.set_single_line_mode(True)
+        self.background_prepare_percent_label.add_css_class(
+            "dzll-background-prepare-percent"
         )
-        attach_pointer_cursor(self.background_prepare_action_btn)
-        right.append(self.background_prepare_action_btn)
+        right.append(self.background_prepare_percent_label)
 
         self.background_prepare_right_status_label = Gtk.Label(xalign=1.0)
         self.background_prepare_right_status_label.set_wrap(False)
@@ -10078,37 +10086,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         right.append(self.background_prepare_right_status_label)
 
-        progress_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        self.background_prepare_progress_row = progress_row
-        progress_row.set_hexpand(True)
-        progress_row.set_halign(Gtk.Align.FILL)
-        progress_row.set_vexpand(False)
-        progress_row.set_valign(Gtk.Align.CENTER)
-        progress_row.set_opacity(0.0)
-        progress_row.set_sensitive(False)
-        grid.attach(progress_row, 0, 1, 2, 1)
-
-        self.background_prepare_progress = Gtk.ProgressBar()
-        self.background_prepare_progress.set_show_text(False)
-        self.background_prepare_progress.set_hexpand(True)
-        self.background_prepare_progress.set_valign(Gtk.Align.CENTER)
-        self.background_prepare_progress.set_margin_end(20)
-        self.background_prepare_progress.add_css_class(
-            "dzll-background-prepare-progress"
+        self.background_prepare_action_btn = Gtk.Button(label="Cancel")
+        self.background_prepare_action_btn.add_css_class("flat")
+        self.background_prepare_action_btn.set_hexpand(True)
+        self.background_prepare_action_btn.set_halign(Gtk.Align.END)
+        self.background_prepare_action_btn.connect(
+            "clicked", self._background_prepare_action_clicked,
         )
-        progress_row.append(self.background_prepare_progress)
-
-        self.background_prepare_percent_label = Gtk.Label(label="", xalign=1.0)
-        self.background_prepare_percent_label.set_size_request(44, -1)
-        self.background_prepare_percent_label.set_width_chars(4)
-        self.background_prepare_percent_label.set_max_width_chars(4)
-        self.background_prepare_percent_label.set_halign(Gtk.Align.FILL)
-        self.background_prepare_percent_label.set_valign(Gtk.Align.CENTER)
-        self.background_prepare_percent_label.set_single_line_mode(True)
-        self.background_prepare_percent_label.add_css_class(
-            "dzll-background-prepare-percent"
-        )
-        progress_row.append(self.background_prepare_percent_label)
+        attach_pointer_cursor(self.background_prepare_action_btn)
+        right.append(self.background_prepare_action_btn)
         return root
 
     def _background_prepare_set_status_container(
@@ -10196,12 +10182,21 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.background_prepare_status.set_visible(True)
 
     def _background_prepare_set_progress_presentation(
-            self, active: bool) -> None:
-        row = self.background_prepare_progress_row
-        row.set_opacity(1.0 if active else 0.0)
-        row.set_sensitive(bool(active))
+            self, active: bool, fraction: float = 0.0) -> None:
+        root = self.background_prepare_status
+        old_class = str(
+            getattr(root, "_dzll_background_prepare_progress_class", "") or ""
+        )
+        if old_class:
+            root.remove_css_class(old_class)
+            root._dzll_background_prepare_progress_class = ""
         if not active:
             self.background_prepare_percent_label.set_text("")
+            return
+        percent = max(0, min(100, int(float(fraction) * 100)))
+        progress_class = f"dzll-background-prepare-progress-{percent}"
+        root.add_css_class(progress_class)
+        root._dzll_background_prepare_progress_class = progress_class
 
     def _background_prepare_download_available(self, obj=None) -> bool:
         queue = self._background_prepare_queue
@@ -10413,7 +10408,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self.background_prepare_detail_label.set_text("Preparing…")
             self.background_prepare_count_label.set_text("")
             self.background_prepare_count_label.set_visible(False)
-            self.background_prepare_progress.set_fraction(0.0)
             DZLLWindow._background_prepare_set_progress_presentation(self, False)
             self._background_prepare_apply_queue_snapshot(queue.snapshot())
             self._background_prepare_log_request(request, "worker-submit")
@@ -10596,7 +10590,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.background_prepare_detail_label.set_text("Preparing…")
         self.background_prepare_count_label.set_text("")
         self.background_prepare_count_label.set_visible(False)
-        self.background_prepare_progress.set_fraction(0.0)
         DZLLWindow._background_prepare_set_progress_presentation(self, False)
         self.background_prepare_action_btn.set_label("Cancel")
         self.background_prepare_status.set_visible(True)
@@ -10801,9 +10794,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if snapshot.progress_mode is PreparationProgressMode.INDETERMINATE:
             DZLLWindow._background_prepare_set_progress_presentation(self, False)
         elif snapshot.progress_mode is PreparationProgressMode.DETERMINATE:
-            DZLLWindow._background_prepare_set_progress_presentation(self, True)
             fraction = max(0.0, min(1.0, float(snapshot.fraction or 0.0)))
-            self.background_prepare_progress.set_fraction(fraction)
+            DZLLWindow._background_prepare_set_progress_presentation(
+                self, True, fraction,
+            )
             self.background_prepare_percent_label.set_text(
                 f"{int(fraction * 100)}%"
             )
@@ -10829,7 +10823,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.background_prepare_detail_label.set_text(" · ".join(parts))
         self.background_prepare_count_label.set_text("")
         self.background_prepare_count_label.set_visible(False)
-        self.background_prepare_progress.set_fraction(0.0)
         DZLLWindow._background_prepare_set_progress_presentation(self, False)
         failed = batch.failed_entries
         if failed:

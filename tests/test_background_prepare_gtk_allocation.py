@@ -62,9 +62,8 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
 
         outer_identity = id(status)
         info = host.background_prepare_info
-        progress_row = host.background_prepare_progress_row
         assert host.background_prepare_grid.get_child_at(0, 0) is info
-        assert host.background_prepare_grid.get_child_at(0, 1) is progress_row
+        assert host.background_prepare_grid.get_child_at(0, 1) is None
 
         allocations = {}
 
@@ -73,17 +72,15 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
             allocations[name] = (
                 status.get_allocated_height(),
                 header.get_allocation().y,
-                progress_row.get_allocated_height(),
             )
             assert id(host.background_prepare_status) == outer_identity
             assert host.background_prepare_grid.get_child_at(0, 0) is info
-            assert host.background_prepare_grid.get_child_at(0, 1) is progress_row
+            assert host.background_prepare_grid.get_child_at(0, 1) is None
 
         record("checking")
 
-        host.background_prepare_progress.set_fraction(0.5)
         host.background_prepare_percent_label.set_text("50%")
-        DZLLWindow._background_prepare_set_progress_presentation(host, True)
+        DZLLWindow._background_prepare_set_progress_presentation(host, True, 0.5)
         record("progress")
 
         DZLLWindow._background_prepare_present_cancelling(host)
@@ -102,13 +99,9 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
 
         heights = {value[0] for value in allocations.values()}
         header_positions = {value[1] for value in allocations.values()}
-        progress_heights = {value[2] for value in allocations.values()}
         assert len(heights) == 1
         assert len(header_positions) == 1
-        assert len(progress_heights) == 1
-        assert next(iter(progress_heights)) > 0
-        assert progress_row.get_visible()
-        assert progress_row.get_opacity() == 0.0
+        assert status.get_allocated_height() < 50
 
         for label in (
             host.background_prepare_server_label,

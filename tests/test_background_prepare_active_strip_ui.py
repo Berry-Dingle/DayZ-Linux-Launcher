@@ -113,8 +113,6 @@ def _host(queue=None):
         background_prepare_failed_label=Widget(),
         background_prepare_action_btn=Widget(),
         background_prepare_right_status_label=Widget(),
-        background_prepare_progress=Widget(),
-        background_prepare_progress_row=Widget(),
         background_prepare_percent_label=Widget(),
         _refresh_background_prepare_action_states=lambda: None,
         _background_prepare_is_current=lambda generation: generation == 7,
@@ -127,11 +125,7 @@ def _host(queue=None):
     host._steam_ugc_format_size = (
         lambda value: DZLLWindow._steam_ugc_format_size(host, value)
     )
-    for name in ("background_prepare_progress_row",):
-        widget = getattr(host, name)
-        widget.visible = True
-        widget.opacity = 0.0
-    for name in ("background_prepare_progress", "background_prepare_percent_label"):
+    for name in ("background_prepare_percent_label",):
         widget = getattr(host, name)
         widget.visible = True
         widget.opacity = 1.0
@@ -145,10 +139,9 @@ def test_active_strip_builder_has_fixed_flexible_optional_and_right_blocks():
     assert "grid = Gtk.Grid()" in builder
     assert "root.append(grid)" in builder
     assert "grid.attach(info, 0, 0, 2, 1)" in builder
-    assert "grid.attach(progress_row, 0, 1, 2, 1)" in builder
-    assert "grid.set_row_spacing(2)" in builder
-    assert "grid.set_margin_top(4)" in builder
-    assert "grid.set_margin_bottom(4)" in builder
+    assert "grid.attach(progress_row" not in builder
+    assert "grid.set_margin_top(3)" in builder
+    assert "grid.set_margin_bottom(3)" in builder
     assert "root.set_vexpand(False)" in builder
     assert "root.set_valign(Gtk.Align.START)" in builder
     assert "self.background_prepare_info = info" in builder
@@ -172,38 +165,34 @@ def test_active_strip_builder_has_fixed_flexible_optional_and_right_blocks():
     assert "right.set_size_request(108, -1)" in builder
     assert "right.set_halign(Gtk.Align.END)" in builder
     assert builder.index("background_prepare_count_label") < builder.index(
+        "background_prepare_percent_label"
+    ) < builder.index(
         "background_prepare_action_btn"
     )
-    assert "background_prepare_percent_label" in builder
-    assert "progress_row.set_vexpand(False)" in builder
-    assert "progress_row.set_vexpand(True)" not in builder
-    assert "progress_row.set_valign(Gtk.Align.CENTER)" in builder
-    assert "progress_row.set_opacity(0.0)" in builder
-    assert "progress_row.set_sensitive(False)" in builder
-    assert "background_prepare_progress.set_valign(Gtk.Align.CENTER)" in builder
-    assert "background_prepare_progress.set_margin_end(20)" in builder
+    assert builder.index("background_prepare_action_btn") < builder.index(
+        "return root"
+    )
+    assert 'connect(\n            "clicked", self._background_prepare_action_clicked' in builder
     assert "background_prepare_percent_label.set_size_request(44, -1)" in builder
     assert "background_prepare_percent_label.set_halign(Gtk.Align.FILL)" in builder
     assert "background_prepare_percent_label.set_valign(Gtk.Align.CENTER)" in builder
-    assert "background_prepare_progress.set_opacity" not in builder
     assert "background_prepare_percent_label.set_opacity" not in builder
     assert "failed_slot" not in builder
-    assert "progress_row.set_size_request(-1, 24)" not in builder
     assert "BACKGROUND_PREPARE_STATUS_HEIGHT" not in WINDOW_SOURCE
     assert "FixedHeightStatusBox" not in WINDOW_SOURCE
-    assert "progress_row.append(self.background_prepare_progress)" in builder
-    assert "progress_row.append(self.background_prepare_percent_label)" in builder
+    assert "Gtk.ProgressBar()" not in builder
+    assert "right.append(self.background_prepare_percent_label)" in builder
+    assert "dzll-background-prepare-progress trough" not in STYLE_SOURCE
 
 
-def test_progress_row_is_permanent_and_visibility_uses_opacity_only():
+def test_progress_fill_uses_container_class_and_clears_it_when_inactive():
     helper = WINDOW_SOURCE.split(
         "def _background_prepare_set_progress_presentation", 1,
     )[1].split("def _background_prepare_download_available", 1)[0]
-    assert "row.set_opacity(1.0 if active else 0.0)" in helper
-    assert "row.set_sensitive(bool(active))" in helper
-    assert ".set_visible(" not in helper
-    assert "background_prepare_progress.set_opacity" not in helper
-    assert "percent_label.set_opacity" not in helper
+    assert "root = self.background_prepare_status" in helper
+    assert "root.remove_css_class(old_class)" in helper
+    assert 'f"dzll-background-prepare-progress-{percent}"' in helper
+    assert "root.add_css_class(progress_class)" in helper
 
 
 def test_cancelling_keeps_action_button_allocation():
@@ -284,11 +273,7 @@ def test_active_mod_count_size_progress_and_percentage_are_presented_separately(
     )
     assert host.background_prepare_count_label.text == "1/13"
     assert host.background_prepare_count_label.visible
-    assert host.background_prepare_progress.fraction == 0.28
-    assert host.background_prepare_progress_row.visible
-    assert host.background_prepare_progress_row.opacity == 1.0
-    assert host.background_prepare_progress.visible
-    assert host.background_prepare_progress.opacity == 1.0
+    assert "dzll-background-prepare-progress-28" in host.background_prepare_status.css_classes
     assert host.background_prepare_percent_label.text == "28%"
     assert host.background_prepare_percent_label.visible
     assert host.background_prepare_percent_label.opacity == 1.0
@@ -315,8 +300,6 @@ def test_indeterminate_state_keeps_reserved_progress_row_visually_suppressed():
     assert host.background_prepare_detail_label.text == "Waiting for Steam…"
     assert not host.background_prepare_count_label.visible
     assert host.background_prepare_percent_label.text == ""
-    assert host.background_prepare_progress_row.visible
-    assert host.background_prepare_progress_row.opacity == 0.0
     assert host.background_prepare_percent_label.visible
     assert host.background_prepare_percent_label.opacity == 1.0
 
@@ -340,10 +323,6 @@ def test_finished_and_cancelling_states_clear_percentage_without_collapsing_row(
     assert host.background_prepare_detail_label.text == "1 ready · 0 failed"
     assert host.background_prepare_action_btn.text == "Close"
     assert host.background_prepare_action_btn.visible
-    assert host.background_prepare_progress.visible
-    assert host.background_prepare_progress.opacity == 1.0
-    assert host.background_prepare_progress_row.visible
-    assert host.background_prepare_progress_row.opacity == 0.0
     assert host.background_prepare_percent_label.visible
     assert host.background_prepare_percent_label.text == ""
     assert host.background_prepare_percent_label.opacity == 1.0
@@ -373,8 +352,6 @@ def test_finished_and_cancelling_states_clear_percentage_without_collapsing_row(
     assert host.background_prepare_action_btn.visible
     assert host.background_prepare_action_btn.opacity == 0.0
     assert not host.background_prepare_action_btn.sensitive
-    assert host.background_prepare_progress_row.visible
-    assert host.background_prepare_progress_row.opacity == 0.0
     assert host.background_prepare_percent_label.visible
     assert host.background_prepare_percent_label.text == ""
     assert host.background_prepare_percent_label.opacity == 1.0
@@ -402,6 +379,30 @@ def test_percentage_values_use_one_stable_right_aligned_slot():
         )
         DZLLWindow._background_prepare_render_snapshot(host, 7, snapshot)
         assert host.background_prepare_percent_label.text == expected
+        assert (
+            f"dzll-background-prepare-progress-{int(fraction * 100)}"
+            in host.background_prepare_status.css_classes
+        )
+
+
+def test_progress_fill_covers_zero_partial_and_complete_without_changing_cancel():
+    host = _host()
+    host.background_prepare_action_btn.set_label("Cancel")
+    for fraction, expected_class in (
+        (0.0, "dzll-background-prepare-progress-0"),
+        (0.42, "dzll-background-prepare-progress-42"),
+        (1.0, "dzll-background-prepare-progress-100"),
+    ):
+        DZLLWindow._background_prepare_set_progress_presentation(
+            host, True, fraction,
+        )
+        progress_classes = {
+            name for name in host.background_prepare_status.css_classes
+            if name.startswith("dzll-background-prepare-progress-")
+        }
+        assert progress_classes == {expected_class}
+        assert host.background_prepare_action_btn.text == "Cancel"
+        assert host.background_prepare_action_btn.sensitive
 
 
 def test_panel_uses_standard_border_and_large_bullet_separators():
@@ -409,11 +410,22 @@ def test_panel_uses_standard_border_and_large_bullet_separators():
     base_rule = STYLE_SOURCE.split(
         ".dzll-background-prepare-status {{", 1,
     )[1].split("}}", 1)[0]
-    assert "background-color: transparent" in base_rule
+    assert "background-color: @dzll_surface_control" in base_rule
     assert "background-color: alpha(@dzll_accent" not in base_rule
     assert "border: 1px solid @dzll_border" in base_rule
     assert "alpha(@dzll_focus" not in base_rule
     assert ".dzll-background-prepare-status .dzll-background-prepare-bullet" in STYLE_SOURCE
     assert "font-size: 1.25em" in STYLE_SOURCE
     assert ".dzll-background-prepare-active .dzll-background-prepare-divider" not in STYLE_SOURCE
-    assert ".dzll-background-prepare-status .dzll-background-prepare-progress" in STYLE_SOURCE
+    assert "@dzll_accent {percent}%" in STYLE_SOURCE
+    assert "@dzll_surface_control {percent}%" in STYLE_SOURCE
+
+
+def test_cancelling_status_text_is_neither_dimmed_nor_bold():
+    rule = STYLE_SOURCE.split(
+        ".dzll-background-prepare-status .dzll-background-prepare-right-status {{",
+        1,
+    )[1].split("}}", 1)[0]
+    assert "color: @dzll_text_primary" in rule
+    assert "font-weight: normal" in rule
+    assert "@dzll_text_muted" not in rule
