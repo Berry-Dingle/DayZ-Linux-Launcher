@@ -683,7 +683,11 @@ def test_phase_shift_preserves_period_but_suspends_then_recovers_prediction():
     old_score = scoring.RestartScheduleScorer().score(old, full_coverage(1, 29), now=BASE + 29 * HOUR)
     mixed = (*old, *events_at((34, 38, 42, 46)))
     transition = scoring.RestartScheduleScorer().score(
-        mixed, full_coverage(1, 46), now=BASE + 46 * HOUR, previous=old_score
+        mixed,
+        full_coverage(1, 46),
+        now=BASE + 46 * HOUR,
+        previous=old_score,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
     )
     assert transition.selected_period_seconds == 4 * HOUR
     assert transition.candidate(4 * HOUR).phase_confidence < 0.80
@@ -724,6 +728,36 @@ def test_one_covered_expected_miss_does_not_trigger_regime_change():
     assert result.candidate(4 * HOUR).covered_miss_count == 1
     assert result.regime_status is not scoring.RegimeStatus.CHANGE_SUSPECTED
     assert result.selected_period_seconds == 4 * HOUR
+
+
+def test_inactivity_neutral_policy_still_suppresses_after_observed_misses():
+    stable = events_at(tuple(range(0, 36, 4)))
+    timeline = full_coverage(0, 44)
+    scorer = scoring.RestartScheduleScorer()
+    initial = scorer.score(
+        stable,
+        timeline,
+        now=BASE + 32 * HOUR,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+    misses = (
+        scoring.CoveredExpectedMiss(4 * HOUR, BASE + 36 * HOUR, "4h:36"),
+        scoring.CoveredExpectedMiss(4 * HOUR, BASE + 40 * HOUR, "4h:40"),
+    )
+    contradicted = scorer.score(
+        stable,
+        timeline,
+        now=BASE + 44 * HOUR,
+        previous=initial,
+        expected_misses=misses,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+
+    assert contradicted.candidate(4 * HOUR).covered_miss_count == 2
+    assert contradicted.candidate(4 * HOUR).fundamental_period_confidence < initial.candidate(
+        4 * HOUR
+    ).fundamental_period_confidence
+    assert not contradicted.prediction_usable
 
 
 def test_old_aggregate_support_is_bounded_and_cannot_block_recent_change():

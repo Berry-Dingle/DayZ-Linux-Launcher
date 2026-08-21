@@ -16,6 +16,7 @@ from dzll_launcher.update_ui import UpdateUI
 
 BASE = 2_000_000_000.0
 SERVER = "198.51.100.10:2302"
+DAY = 24 * scoring.HOUR
 
 
 def paths(tmp_path):
@@ -664,6 +665,115 @@ def test_crowbar_query_only_covered_4h_model_reaches_active_consumer_gates(tmp_p
     assert not value.scheduled_outage_relaxation_usable(
         SERVER, observed_at=BASE + 30 * scoring.HOUR
     )
+
+
+@pytest.mark.parametrize("inactive_days", [7, 31])
+def test_runtime_scoring_retains_safe_query_visible_model_through_inactivity(
+    tmp_path, inactive_days
+):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(
+            hour,
+            index + 1,
+            detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+        )
+        for index, hour in enumerate(range(0, 36, 4))
+    ]
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 32 * scoring.HOUR,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    ]
+    recent_now = BASE + 32 * scoring.HOUR + 60
+    value.decision(SERVER, now=recent_now)
+    recent = server.score.candidate(4 * scoring.HOUR)
+
+    stale_now = recent_now + inactive_days * DAY
+    decision = value.decision(SERVER, now=stale_now)
+    stale = server.score.candidate(4 * scoring.HOUR)
+    prediction = runtime._next_prediction(server.score, stale_now)
+
+    assert stale.phase_confidence == recent.phase_confidence
+    assert stale.fundamental_period_confidence == recent.fundamental_period_confidence
+    assert stale.confidence_cap == recent.confidence_cap
+    assert stale.fundamental_period_confidence > 0.79
+    assert stale.confidence_cap > 0.79
+    assert server.score.regime_status is scoring.RegimeStatus.STABLE
+    assert decision.prediction_usable
+    assert prediction is not None and prediction > stale_now
+    assert (prediction - stale.phase_offset) % (4 * scoring.HOUR) == 0
+
+
+def test_reload_recomputes_retained_model_with_inactivity_neutral_policy(tmp_path):
+    value, active, legacy = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        scored_event(
+            hour,
+            index + 1,
+            detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
+        )
+        for index, hour in enumerate(range(0, 36, 4))
+    ]
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 32 * scoring.HOUR,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    ]
+    recent_now = BASE + 32 * scoring.HOUR + 60
+    value.decision(SERVER, now=recent_now)
+    before = server.score.candidate(4 * scoring.HOUR)
+    reload_now = recent_now + 31 * DAY
+    server.score = value.scorer.score(
+        server.events,
+        scoring.CoverageTimeline(tuple(server.coverage)),
+        now=reload_now,
+        incumbent_period_seconds=server.incumbent_period_seconds,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.LEGACY_DECAY,
+    )
+    assert server.score.regime_status is scoring.RegimeStatus.PHASE_UNCERTAIN
+    assert server.score.candidate(4 * scoring.HOUR).phase_confidence <= 0.60
+    server.dirty = True
+    assert value._persist_server(server, force=True, now=reload_now)
+
+    again = runtime.Phase2RestartRuntime.initialize(
+        active_path=active,
+        legacy_path=legacy,
+        now=reload_now,
+        app_session_id="inactivity-neutral-reload",
+    )
+    restored = again._servers[SERVER]
+    after = restored.score.candidate(4 * scoring.HOUR)
+
+    assert after.phase_confidence == before.phase_confidence
+    assert after.fundamental_period_confidence == before.fundamental_period_confidence
+    assert after.confidence_cap == before.confidence_cap
+    assert restored.score.regime_status is scoring.RegimeStatus.STABLE
+    assert restored.score.prediction_usable
+    assert runtime._next_prediction(restored.score, reload_now) > reload_now
+
+
+def test_compaction_fold_uses_inactivity_neutral_phase_policy(tmp_path, monkeypatch):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [scored_event(hour, index + 1) for index, hour in enumerate((0, 4, 8))]
+    policies = []
+    score = value.scorer.score
+
+    def recording_score(*args, **kwargs):
+        policies.append(kwargs.get("phase_recency_policy"))
+        return score(*args, **kwargs)
+
+    monkeypatch.setattr(value.scorer, "score", recording_score)
+    value._fold_old_events(server, now=BASE + 31 * DAY, target_limit=2)
+
+    assert policies == [scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL]
 
 
 def test_dawn_sparse_12h_hints_cannot_beat_covered_3h_evidence(tmp_path):

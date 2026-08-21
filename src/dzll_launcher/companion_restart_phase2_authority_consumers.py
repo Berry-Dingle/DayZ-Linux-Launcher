@@ -323,7 +323,6 @@ def evaluate_authority_consumers(
         and math.isfinite(regime.phase_offset)
         and normal.latest_aligned_phase_at is not None
         and 0 <= policy.now - normal.latest_aligned_phase_at
-        <= 3 * regime.candidate_period_seconds
         and normal.raw_predicted_occurrence_at is not None
         and math.isfinite(normal.raw_predicted_occurrence_at)
         and normal.raw_predicted_occurrence_at > policy.now

@@ -414,6 +414,34 @@ def test_normal_schedule_confidence_below_maximum_does_not_enter_new_path():
     assert not value.scheduled_warning_eligible
 
 
+@pytest.mark.parametrize("inactive_days", [7, 31])
+def test_safe_established_normal_schedule_retains_prediction_through_inactivity(
+    inactive_days,
+):
+    decision = _normal_established()
+    now = BASE + inactive_days * 24 * HOUR
+    evidence = _normal_prediction_evidence(
+        decision,
+        now=now,
+        latest_phase_at=BASE,
+    )
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            restart_alert_enabled=True,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=evidence,
+        )
+    )
+
+    assert value.next_expected_restart_at == evidence.raw_predicted_occurrence_at
+    assert value.next_expected_restart_at > now
+    assert value.countdown_visible and value.countdown_safe
+    assert value.scheduled_warning_eligible
+
+
 @pytest.mark.parametrize(
     "state,suspicion",
     [
@@ -452,7 +480,6 @@ def test_normal_schedule_authority_state_invalidations_suppress_prediction(
 @pytest.mark.parametrize(
     "evidence_override",
     [
-        {"latest_phase_at": BASE + 100 - 3 * 4 * HOUR - 1},
         {"anomaly": True},
         {"selected_period": 3 * HOUR},
         {"incumbent_period": 3 * HOUR},
@@ -476,6 +503,29 @@ def test_normal_schedule_runtime_evidence_invalidations_suppress_prediction(
         )
     )
 
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+def test_future_normal_phase_timestamp_remains_invalid():
+    decision = _normal_established()
+    now = BASE + 100
+    value = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=now,
+            restart_alert_enabled=True,
+            normal_pattern_supported=True,
+            normal_pattern_confidence=0.95,
+            normal_prediction_evidence=_normal_prediction_evidence(
+                decision,
+                now=now,
+                latest_phase_at=now + 1,
+            ),
+        )
+    )
+
+    assert value.next_expected_restart_at is None
     assert not value.countdown_visible
     assert not value.scheduled_warning_eligible
 

@@ -83,6 +83,7 @@ from .companion_restart_phase2_scoring import (
     CoverageTimeline,
     GATES,
     LongTermAggregate,
+    PhaseRecencyPolicy,
     RegimeSummary,
     RegimeStatus,
     RestartScheduleScorer,
@@ -1410,6 +1411,7 @@ class Phase2RestartRuntime:
                 pair_events,
                 CoverageTimeline(tuple(server.coverage)),
                 now=now,
+                phase_recency_policy=PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
             )
             candidates = []
             removed_at = _event_at(removed)
@@ -1496,6 +1498,7 @@ class Phase2RestartRuntime:
             server.events,
             CoverageTimeline(tuple(server.coverage)),
             now=now,
+            phase_recency_policy=PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
             previous=previous,
             incumbent_period_seconds=server.incumbent_period_seconds,
             aggregate=server.aggregate,
@@ -2257,6 +2260,7 @@ class Phase2RestartRuntime:
                     server.events,
                     CoverageTimeline(tuple(server.coverage)),
                     now=now,
+                    phase_recency_policy=PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
                     incumbent_period_seconds=server.incumbent_period_seconds,
                     aggregate=server.aggregate,
                     expected_misses=server.expected_misses,
