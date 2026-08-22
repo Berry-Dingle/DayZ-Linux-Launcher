@@ -647,11 +647,7 @@ class CooperativeUGCSession:
         self._next_request_id += 1
         return f"{prefix}-{self._next_request_id}"
 
-    def _event(self, timeout: float) -> dict:
-        try:
-            raw = self._stdout_q.get(timeout=max(0.01, float(timeout)))
-        except queue.Empty as exc:
-            raise TimeoutError("timed out waiting for Steam UGC helper protocol") from exc
+    def _decode_event(self, raw) -> dict:
         if raw is None:
             raise self._protocol_failure(
                 "Steam UGC helper closed its protocol stream"
@@ -681,6 +677,13 @@ class CooperativeUGCSession:
             self._fatal = True
             raise UGCSessionError(str(event.get("error") or "fatal Steam UGC session error"))
         return event
+
+    def _event(self, timeout: float) -> dict:
+        try:
+            raw = self._stdout_q.get(timeout=max(0.01, float(timeout)))
+        except queue.Empty as exc:
+            raise TimeoutError("timed out waiting for Steam UGC helper protocol") from exc
+        return self._decode_event(raw)
 
     def _close_stdin(self) -> None:
         if self._stdin_closed:
@@ -1005,6 +1008,72 @@ class CooperativeUGCSession:
         escalated = False
         escalation_reason = ""
         request_id = ""
+
+        def process_shutdown_event(event: dict) -> None:
+            nonlocal shutdown_acknowledged
+            event_type = str(event.get("type") or "")
+            event_request_id = event.get("request_id")
+            if str(event_request_id) in self._abandoned_request_ids:
+                _log_event(
+                    self.progress_cb,
+                    "[Steam UGC] Quarantined late command event",
+                    command="session", helper_pid=self.helper_pid,
+                    request_id=event_request_id,
+                    event_type=event_type or "<missing>",
+                )
+                return
+            if (
+                event_request_id is None
+                and event_type in {
+                    "session_starting", "session_waiting", "session_ready",
+                }
+            ):
+                return
+            if event_type == "command_accepted":
+                if event_request_id != request_id:
+                    raise UGCSessionError(
+                        "shutdown acknowledgement request_id did not match"
+                    )
+                shutdown_acknowledged = True
+                _log_event(
+                    self.progress_cb,
+                    "[Steam UGC] Cooperative shutdown acknowledged",
+                    command="session", helper_pid=self.helper_pid,
+                    request_id=request_id,
+                )
+                return
+            if event_type == "shutdown_complete":
+                if event_request_id != request_id:
+                    raise UGCSessionError(
+                        "shutdown_complete request_id did not match"
+                    )
+                if not bool(event.get("ok", False)):
+                    raise UGCSessionError(
+                        str(event.get("error") or
+                            "helper reported failed shutdown cleanup")
+                    )
+                if not bool(event.get("steamapi_shutdown", False)):
+                    raise UGCSessionError(
+                        "helper did not confirm SteamAPI shutdown"
+                    )
+                if not bool(event.get("temp_cleanup", False)):
+                    raise UGCSessionError(
+                        "helper did not confirm temporary AppID cleanup"
+                    )
+                self._shutdown_complete = True
+                _log_event(
+                    self.progress_cb,
+                    "[Steam UGC] Cooperative shutdown complete",
+                    command="session", helper_pid=self.helper_pid,
+                    request_id=request_id,
+                    steamapi_shutdown=True, temp_cleanup=True,
+                )
+                return
+            raise UGCSessionError(
+                f"unexpected event during helper shutdown: "
+                f"{event_type or '<missing>'}"
+            )
+
         if proc.poll() is None:
             request_id = self._next_id("shutdown")
             try:
@@ -1027,68 +1096,7 @@ class CooperativeUGCSession:
                         if proc.poll() is not None and self._stdout_q.empty():
                             break
                         continue
-                    event_type = str(event.get("type") or "")
-                    event_request_id = event.get("request_id")
-                    if str(event_request_id) in self._abandoned_request_ids:
-                        _log_event(
-                            self.progress_cb,
-                            "[Steam UGC] Quarantined late command event",
-                            command="session", helper_pid=self.helper_pid,
-                            request_id=event_request_id,
-                            event_type=event_type or "<missing>",
-                        )
-                        continue
-                    if (
-                        event_request_id is None
-                        and event_type in {
-                            "session_starting", "session_waiting", "session_ready",
-                        }
-                    ):
-                        continue
-                    if event_type == "command_accepted":
-                        if event_request_id != request_id:
-                            raise UGCSessionError(
-                                "shutdown acknowledgement request_id did not match"
-                            )
-                        shutdown_acknowledged = True
-                        _log_event(
-                            self.progress_cb,
-                            "[Steam UGC] Cooperative shutdown acknowledged",
-                            command="session", helper_pid=self.helper_pid,
-                            request_id=request_id,
-                        )
-                        continue
-                    if event_type == "shutdown_complete":
-                        if event_request_id != request_id:
-                            raise UGCSessionError(
-                                "shutdown_complete request_id did not match"
-                            )
-                        if not bool(event.get("ok", False)):
-                            raise UGCSessionError(
-                                str(event.get("error") or
-                                    "helper reported failed shutdown cleanup")
-                            )
-                        if not bool(event.get("steamapi_shutdown", False)):
-                            raise UGCSessionError(
-                                "helper did not confirm SteamAPI shutdown"
-                            )
-                        if not bool(event.get("temp_cleanup", False)):
-                            raise UGCSessionError(
-                                "helper did not confirm temporary AppID cleanup"
-                            )
-                        self._shutdown_complete = True
-                        _log_event(
-                            self.progress_cb,
-                            "[Steam UGC] Cooperative shutdown complete",
-                            command="session", helper_pid=self.helper_pid,
-                            request_id=request_id,
-                            steamapi_shutdown=True, temp_cleanup=True,
-                        )
-                        break
-                    raise UGCSessionError(
-                        f"unexpected event during helper shutdown: "
-                        f"{event_type or '<missing>'}"
-                    )
+                    process_shutdown_event(event)
             except Exception as exc:
                 shutdown_error = exc
         try:
@@ -1154,6 +1162,22 @@ class CooperativeUGCSession:
                     f"[Steam UGC] Cooperative {name} reader exit confirmed",
                     command="session", helper_pid=self.helper_pid,
                 )
+        if (
+            shutdown_error is None
+            and not self._shutdown_complete
+            and not escalated
+            and bool(request_id)
+            and self._stdout_thread is not None
+            and not self._stdout_thread.is_alive()
+        ):
+            try:
+                while not self._shutdown_complete:
+                    raw = self._stdout_q.get_nowait()
+                    process_shutdown_event(self._decode_event(raw))
+            except queue.Empty:
+                pass
+            except Exception as exc:
+                shutdown_error = exc
         self._close_read_pipes()
         cleanup_error = None
         try:
@@ -1278,6 +1302,22 @@ def _run_helper_json_lines(
     ok = False
     done_seen = False
 
+    def process_protocol_line(line) -> None:
+        nonlocal done_seen, ok
+        raw = str(line or "").strip()
+        if not raw:
+            return
+        try:
+            event = json.loads(raw)
+        except Exception:
+            eprint(f"[steam-ugc-backend] ignoring malformed helper output: {raw[:160]}")
+            return
+        if callable(on_event):
+            on_event(event)
+        if event.get("type") == "done":
+            done_seen = True
+            ok = bool(event.get("ok", False))
+
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
@@ -1297,31 +1337,30 @@ def _run_helper_json_lines(
                     break
                 continue
 
-            raw = str(line or "").strip()
-            if not raw:
-                continue
-            try:
-                event = json.loads(raw)
-            except Exception:
-                eprint(f"[steam-ugc-backend] ignoring malformed helper output: {raw[:160]}")
-                continue
-            if callable(on_event):
-                on_event(event)
-            if event.get("type") == "done":
-                done_seen = True
-                ok = bool(event.get("ok", False))
+            process_protocol_line(line)
 
         rc = proc.poll()
         _log_event(
             progress_cb, "[Steam UGC] Helper subprocess exited",
             command=command, helper_pid=helper_pid, returncode=rc,
         )
+        stdout_reader_finished = False
         try:
             stdout_t.join(timeout=0.5)
+            stdout_reader_finished = not stdout_t.is_alive()
+        except Exception:
+            stdout_reader_finished = False
+        try:
             stderr_t.join(timeout=0.5)
         except Exception:
             pass
-        if rc != 0 or not done_seen:
+        if stdout_reader_finished:
+            while True:
+                try:
+                    process_protocol_line(stdout_q.get_nowait())
+                except queue.Empty:
+                    break
+        if rc != 0 or not done_seen or not stdout_reader_finished:
             for line in stderr_tail:
                 eprint(f"[steam-ugc-backend][helper-stderr] {line}")
             return False, rc

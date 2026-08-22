@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -156,6 +157,116 @@ class ProtocolProcess:
         self.signals.append("kill")
         self.returncode = -9
         self.stdout.close()
+
+
+class DelayedOneShotStdout:
+    def __init__(self, lines, *, delay=0.0, release=None):
+        self._lines = list(lines)
+        self._delay = float(delay)
+        self._release = release
+
+    def __iter__(self):
+        if self._release is not None:
+            self._release.wait()
+        elif self._delay:
+            time.sleep(self._delay)
+        yield from self._lines
+
+
+class OneShotProcess:
+    next_pid = 7200
+
+    def __init__(self, lines, *, delay=0.0, release=None):
+        type(self).next_pid += 1
+        self.pid = type(self).next_pid
+        self.returncode = 0
+        self.stdout = DelayedOneShotStdout(
+            lines, delay=delay, release=release,
+        )
+        self.stderr = io.StringIO("")
+
+    def poll(self):
+        return self.returncode
+
+
+class DelayedShutdownStdout:
+    def __init__(self):
+        self._lines = queue.Queue()
+        self._closed = False
+
+    def push(self, raw, *, delay=0.0):
+        self._lines.put((float(delay), str(raw)))
+
+    def close(self):
+        if not self._closed:
+            self._closed = True
+            self._lines.put(None)
+
+    def __iter__(self):
+        while True:
+            item = self._lines.get()
+            if item is None:
+                return
+            delay, raw = item
+            if delay:
+                time.sleep(delay)
+            yield raw
+
+
+class DelayedShutdownProcess:
+    next_pid = 7300
+
+    def __init__(self, terminal_event, *, delay=0.2):
+        type(self).next_pid += 1
+        self.pid = type(self).next_pid
+        self.returncode = None
+        self.stdout = DelayedShutdownStdout()
+        self.stderr = io.StringIO("")
+        self._terminal_event = terminal_event
+        self._delay = float(delay)
+        self.stdin = SimpleNamespace(
+            write=self.write,
+            flush=lambda: None,
+            close=lambda: None,
+        )
+
+    def write(self, raw):
+        message = json.loads(raw)
+        request_id = message["request_id"]
+        assert message["command"] == "shutdown"
+        self.stdout.push(json.dumps({
+            "type": "command_accepted",
+            "request_id": request_id,
+            "command": "shutdown",
+        }) + "\n")
+        terminal = (
+            self._terminal_event(request_id)
+            if callable(self._terminal_event) else self._terminal_event
+        )
+        self.stdout.push(
+            terminal if isinstance(terminal, str) else json.dumps(terminal) + "\n",
+            delay=self._delay,
+        )
+        self.returncode = 0
+        self.stdout.close()
+        return len(raw)
+
+    def poll(self):
+        return self.returncode
+
+    def wait(self, timeout):
+        del timeout
+        return self.returncode
+
+
+def run_one_shot_process(monkeypatch, process, *, on_event=None):
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    return steam_ugc_backend._run_helper_json_lines(
+        "readiness", appid=221100, timeout=2, mod_ids=[],
+        on_event=on_event, strict_native_environment=True,
+    )
 
 
 def test_parent_reuses_one_helper_for_multiple_commands_and_cleans_temp(monkeypatch):
@@ -704,6 +815,52 @@ def test_active_session_routes_commands_without_one_shot_process(monkeypatch):
         ("subscribe-download", (3,)),
         ("refresh-subscribed-state", (3,)),
     ]
+
+
+def test_one_shot_done_consumed_before_exit_check_remains_successful(monkeypatch):
+    process = OneShotProcess([
+        json.dumps({"type": "done", "ok": True}) + "\n",
+    ])
+    assert run_one_shot_process(monkeypatch, process) == (True, 0)
+
+
+def test_one_shot_done_enqueued_during_reader_join_is_finally_drained(monkeypatch):
+    process = OneShotProcess([
+        json.dumps({"type": "done", "ok": True}) + "\n",
+    ], delay=0.3)
+    assert run_one_shot_process(monkeypatch, process) == (True, 0)
+
+
+def test_one_shot_delayed_malformed_terminal_remains_fail_closed(
+        monkeypatch, capsys):
+    process = OneShotProcess(["not-json\n"], delay=0.3)
+    assert run_one_shot_process(monkeypatch, process) == (False, 0)
+    assert "ignoring malformed helper output" in capsys.readouterr().err
+
+
+def test_one_shot_final_drain_delivers_late_events_before_done(monkeypatch):
+    events = []
+    process = OneShotProcess([
+        json.dumps({"type": "item", "id": 7, "installed": True}) + "\n",
+        json.dumps({"type": "done", "ok": True}) + "\n",
+    ], delay=0.3)
+    assert run_one_shot_process(
+        monkeypatch, process, on_event=events.append,
+    ) == (True, 0)
+    assert [event["type"] for event in events] == ["item", "done"]
+
+
+def test_one_shot_surviving_protocol_reader_fails_bounded(monkeypatch):
+    release = threading.Event()
+    process = OneShotProcess([
+        json.dumps({"type": "done", "ok": True}) + "\n",
+    ], release=release)
+    started = time.monotonic()
+    try:
+        assert run_one_shot_process(monkeypatch, process) == (False, 0)
+    finally:
+        release.set()
+    assert time.monotonic() - started < 1.5
 
 
 def test_steam_client_boundary_activates_shared_session_on_worker(monkeypatch):
@@ -1269,6 +1426,64 @@ def test_delayed_natural_exit_after_shutdown_is_clean(monkeypatch):
     assert process.stdin_closed
     assert process.signals == []
     assert not appid_dir.exists()
+
+
+def test_shutdown_complete_enqueued_during_reader_join_is_finally_drained(
+        monkeypatch):
+    process = DelayedShutdownProcess(
+        lambda request_id: {
+            "type": "shutdown_complete",
+            "request_id": request_id,
+            "ok": True,
+            "steamapi_shutdown": True,
+            "temp_cleanup": True,
+        },
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._start()
+    session.close()
+    assert session._shutdown_complete
+    assert process.returncode == 0
+
+
+def test_delayed_mismatched_shutdown_complete_remains_fail_closed(monkeypatch):
+    process = DelayedShutdownProcess({
+        "type": "shutdown_complete",
+        "request_id": "wrong-shutdown",
+        "ok": True,
+        "steamapi_shutdown": True,
+        "temp_cleanup": True,
+    })
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._start()
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="shutdown_complete request_id did not match",
+    ):
+        session.close()
+    assert not session._shutdown_complete
+
+
+def test_delayed_malformed_shutdown_terminal_remains_fail_closed(monkeypatch):
+    process = DelayedShutdownProcess("not-json\n")
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._start()
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="malformed protocol data",
+    ):
+        session.close()
+    assert session._fatal
+    assert not session._shutdown_complete
 
 
 def test_mismatched_shutdown_complete_fails_closed(monkeypatch):
