@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 from xml.etree import ElementTree as ET
 
+from .atomic_json import atomic_write_json
+
 
 DAYZ_COMPAT_APPID = "221100"
 
@@ -69,9 +71,7 @@ def _json_read(path: str) -> Optional[dict]:
 
 
 def _json_write(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, separators=(",", ":"), ensure_ascii=False)
+    atomic_write_json(path, data, separators=(",", ":"), ensure_ascii=False)
 
 
 def _ms_date_created() -> str:

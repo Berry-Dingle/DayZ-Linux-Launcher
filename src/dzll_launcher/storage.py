@@ -1,8 +1,9 @@
 # storage.py
-import os
 import json
+import os
 import time
 
+from .atomic_json import atomic_write_json
 from .config import (
     FAV_PATH,
     LAST_PLAYED_PATH,
@@ -25,9 +26,7 @@ def load_json_dict(path: str) -> dict:
     return {}
 
 def save_json_dict(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    atomic_write_json(path, data, indent=2, sort_keys=True)
 
 def load_favorites() -> dict:
     raw = load_json_dict(FAV_PATH)

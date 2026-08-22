@@ -1,8 +1,9 @@
 # settings.py
-import os
 import json
+import os
 from typing import Any, Dict
 
+from .atomic_json import atomic_write_json
 from .config import CFG_DIR
 
 SETTINGS_PATH = os.path.join(CFG_DIR, "settings.json")
@@ -85,9 +86,7 @@ def _read_json(path: str) -> Dict[str, Any]:
     return {}
 
 def _write_json(path: str, data: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2, sort_keys=True)
+    atomic_write_json(path, data, indent=2, sort_keys=True)
 
 def load_settings() -> Dict[str, Any]:
     raw = _read_json(SETTINGS_PATH)
