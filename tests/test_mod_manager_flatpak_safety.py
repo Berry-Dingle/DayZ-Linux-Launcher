@@ -573,7 +573,7 @@ def test_backend_mutation_boundaries_reject_unsupported_steam(
     repair = steam_ugc_backend.repair_ugc_item(123)
     assert repair["reason"] == "unsupported_steam"
     cleanup = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
-        123, native_session_verified=True,
+        123, steam_absence_verified=True,
     )
     assert cleanup["ok"] is False
     assert "refusing local Workshop cleanup" in cleanup["error"]
@@ -658,4 +658,6 @@ def test_programmatic_mod_manager_mutation_paths_fail_closed_for_flatpak(monkeyp
     overlay._run_batch_unsubscribe([123], 0)
     overlay._run_batch_local_cleanup([123], close_steam=True)
     assert len(statuses) == 3
-    assert all("native Steam" in text for text, _running in statuses)
+    assert "native Steam" in statuses[0][0]
+    assert "native Steam" in statuses[1][0]
+    assert "authorized cleanup transaction" in statuses[2][0]

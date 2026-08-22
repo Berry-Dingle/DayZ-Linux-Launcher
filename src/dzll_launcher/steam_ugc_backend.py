@@ -35,6 +35,7 @@ UGC_PREFLIGHT_RETRY_S = 3.0
 UGC_PREFLIGHT_PROBE_TIMEOUT_S = 8.0
 UGC_SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S = 2.0
 UGC_CANCEL_CLEANUP_BATCH_TIMEOUT_S = 2.0
+UGC_DESTRUCTIVE_CLEANUP_SNAPSHOT_MAX_AGE_S = 300.0
 
 
 class SteamLaunchPolicy(Enum):
@@ -55,6 +56,29 @@ class UGCSubscriptionSnapshot:
     steam_id: int = 0
     native_attachment_verified: bool = False
     created_monotonic: float = 0.0
+
+    def is_fresh_for_destructive_cleanup(
+        self,
+        *,
+        now_monotonic: float | None = None,
+    ) -> bool:
+        """Return whether this in-process authority is current enough to delete."""
+
+        try:
+            captured = float(self.created_monotonic)
+            now = (
+                time.monotonic()
+                if now_monotonic is None
+                else float(now_monotonic)
+            )
+        except (TypeError, ValueError):
+            return False
+        age = now - captured
+        return bool(
+            captured > 0.0
+            and age >= 0.0
+            and age <= UGC_DESTRUCTIVE_CLEANUP_SNAPSHOT_MAX_AGE_S
+        )
 
     def proves_unsubscribed(self, mod_id: int) -> bool:
         try:
@@ -2959,15 +2983,16 @@ def delete_ugc_mod_local_files_after_unsubscribe(
     *,
     appid=DAYZ_APPID,
     log_fn=None,
-    native_session_verified: bool = False,
+    steam_absence_verified: bool = False,
     subscription_snapshot: UGCSubscriptionSnapshot | None = None,
 ) -> dict:
     """
     Delete local DayZ Workshop state for an already-unsubscribed item.
 
-    Intended for Delete All after Steam has been politely stopped. This does not
-    call Steam UGC APIs; it only removes guarded native DayZ workshop paths,
-    exact ACF entries, DZLL-owned symlinks, and cached metadata.
+    This does not call Steam UGC APIs; it only removes guarded native DayZ
+    workshop paths, exact ACF entries, DZLL-owned symlinks, and cached metadata.
+    The caller must supply fresh authoritative proof that Steam is absent, and
+    this boundary independently rechecks the current Steam state.
     """
     def log(message: str) -> None:
         try:
@@ -2998,14 +3023,26 @@ def delete_ugc_mod_local_files_after_unsubscribe(
         result["error"] = f"invalid mod id: {mod_id!r}"
         return result
 
-    _native_ok, steam_state = _supported_native_steam_mutation_state()
-    if not bool(native_session_verified):
+    try:
+        cleanup_appid = int(appid)
+    except (TypeError, ValueError):
+        cleanup_appid = 0
+    if cleanup_appid != DAYZ_APPID:
         result["error"] = (
-            "refusing local Workshop cleanup without a verified native Steam session"
+            f"refusing local Workshop cleanup for unsupported app id: {appid!r}"
+        )
+        return result
+
+    _native_ok, steam_state = _supported_native_steam_mutation_state()
+    if not bool(steam_absence_verified):
+        result["error"] = (
+            "refusing local Workshop cleanup without fresh authoritative proof "
+            "that Steam is offline"
         )
         return result
     if not isinstance(subscription_snapshot, UGCSubscriptionSnapshot) or not (
-        subscription_snapshot.proves_unsubscribed(mid)
+        subscription_snapshot.is_fresh_for_destructive_cleanup()
+        and subscription_snapshot.proves_unsubscribed(mid)
     ):
         result["error"] = (
             "refusing local Workshop cleanup without a current authoritative "
@@ -3023,25 +3060,25 @@ def delete_ugc_mod_local_files_after_unsubscribe(
         deleted_any_staging = False
 
         for root in _native_steam_roots():
-            content_dir = root / "steamapps/workshop/content" / str(int(appid)) / str(mid)
-            safe_content = _safe_workshop_content_path(str(content_dir), mod_id=mid, appid=int(appid))
+            content_dir = root / "steamapps/workshop/content" / str(cleanup_appid) / str(mid)
+            safe_content = _safe_workshop_content_path(str(content_dir), mod_id=mid, appid=cleanup_appid)
             if safe_content is None:
                 result["error"] = f"refusing unsafe install folder: {content_dir}"
                 return result
             if _delete_dir_if_present(safe_content, log_fn=log):
                 deleted_any_folder = True
 
-            downloads_dir = root / "steamapps/workshop/downloads" / str(int(appid)) / str(mid)
-            safe_downloads = _safe_workshop_download_dir(downloads_dir, mod_id=mid, appid=int(appid))
+            downloads_dir = root / "steamapps/workshop/downloads" / str(cleanup_appid) / str(mid)
+            safe_downloads = _safe_workshop_download_dir(downloads_dir, mod_id=mid, appid=cleanup_appid)
             if safe_downloads is not None and _delete_dir_if_present(safe_downloads, log_fn=log):
                 deleted_any_staging = True
 
-            patch_file = root / "steamapps/workshop/downloads" / f"state_{int(appid)}_{int(appid)}_{mid}.patch"
-            safe_patch = _safe_workshop_patch_file(patch_file, mod_id=mid, appid=int(appid))
+            patch_file = root / "steamapps/workshop/downloads" / f"state_{cleanup_appid}_{cleanup_appid}_{mid}.patch"
+            safe_patch = _safe_workshop_patch_file(patch_file, mod_id=mid, appid=cleanup_appid)
             if safe_patch is not None and _delete_file_if_present(safe_patch, log_fn=log):
                 deleted_any_staging = True
-            root_patch_file = root / "steamapps/workshop" / f"state_{int(appid)}_{int(appid)}_{mid}.patch"
-            safe_root_patch = _safe_workshop_patch_file(root_patch_file, mod_id=mid, appid=int(appid))
+            root_patch_file = root / "steamapps/workshop" / f"state_{cleanup_appid}_{cleanup_appid}_{mid}.patch"
+            safe_root_patch = _safe_workshop_patch_file(root_patch_file, mod_id=mid, appid=cleanup_appid)
             if safe_root_patch is not None and _delete_file_if_present(safe_root_patch, log_fn=log):
                 deleted_any_staging = True
 
@@ -3057,7 +3094,7 @@ def delete_ugc_mod_local_files_after_unsubscribe(
             return result
 
         acf_cleanup = _remove_workshop_acf_entries_from_paths(
-            _native_appworkshop_acf_paths(int(appid)),
+            _native_appworkshop_acf_paths(cleanup_appid),
             [mid],
             log_fn=log,
         )

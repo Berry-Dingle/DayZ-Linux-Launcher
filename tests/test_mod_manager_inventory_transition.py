@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -30,7 +31,14 @@ class Widget:
         return None
 
 
-def _snapshot(ids, subscribed=(), *, valid=True, logged_on=True):
+def _snapshot(
+    ids,
+    subscribed=(),
+    *,
+    valid=True,
+    logged_on=True,
+    created_monotonic=None,
+):
     requested = frozenset(int(mid) for mid in ids)
     subscribed_ids = frozenset(int(mid) for mid in subscribed)
     states = {
@@ -50,7 +58,11 @@ def _snapshot(ids, subscribed=(), *, valid=True, logged_on=True):
         logged_on=logged_on,
         steam_id=76561198000000001 if logged_on else 0,
         native_attachment_verified=bool(valid and logged_on),
-        created_monotonic=1.0,
+        created_monotonic=(
+            time.monotonic()
+            if created_monotonic is None
+            else float(created_monotonic)
+        ),
     )
 
 
@@ -530,11 +542,585 @@ def test_backend_local_delete_requires_authoritative_target_snapshot(monkeypatch
     )
     result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
         20,
-        native_session_verified=True,
+        steam_absence_verified=True,
         subscription_snapshot=None,
     )
     assert result["ok"] is False
     assert "authoritative subscription snapshot" in result["error"]
+
+
+def _local_cleanup_overlay():
+    overlay = ModsManagerOverlay.__new__(ModsManagerOverlay)
+    overlay._require_supported_native_steam = lambda: True
+    overlay._set_mod_operation_status_calls = []
+    overlay._set_mod_operation_status = (
+        lambda text="", running=False: overlay._set_mod_operation_status_calls.append(
+            (text, running)
+        )
+    )
+    overlay._suppress_start_steam_manage_prompt_for_current_operation = lambda: None
+    overlay.refresh_calls = []
+    overlay.refresh = lambda **kwargs: overlay.refresh_calls.append(kwargs)
+    overlay._steam_management_verified = True
+    overlay._native_session_handoff_valid = True
+    overlay._authoritative_steam_state = SteamClientState.NATIVE
+    overlay._inventory_validity = InventoryValidity.VALID
+    overlay._steam_state_generation = 1
+    overlay._local_cleanup_transaction_generation = 0
+    overlay._local_cleanup_authorization_request = None
+    overlay._local_cleanup_transaction = None
+    return overlay
+
+
+def _cleanup_transaction(overlay, snapshot, ids=(20,)):
+    request = overlay._begin_local_cleanup_authorization(list(ids))
+    assert request is not None
+    transaction = overlay._mint_local_cleanup_transaction(
+        request,
+        list(ids),
+        snapshot,
+    )
+    assert transaction is not None
+    return transaction
+
+
+def _run_threads_inline(monkeypatch):
+    monkeypatch.setattr(
+        mods_ui.threading,
+        "Thread",
+        lambda target, daemon: SimpleNamespace(start=target),
+    )
+    monkeypatch.setattr(
+        mods_ui.GLib,
+        "idle_add",
+        lambda callback, *args: callback(*args),
+    )
+
+
+def test_local_cleanup_running_shutdown_uses_fresh_offline_evidence(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    snapshot = _snapshot([10, 20], subscribed=[10])
+    state = {"value": SteamClientState.NATIVE}
+    monkeypatch.setattr(mods_ui, "_mod_manager_steam_state", lambda: state["value"])
+    overlay._verify_local_cleanup_candidates = lambda ids, timeout=20: (
+        True,
+        {"safe_ids": list(ids), "subscription_snapshot": snapshot},
+        "",
+    )
+    monkeypatch.setattr(mods_ui, "resolve_native_steam_cmd", lambda: "/fake/steam")
+    monkeypatch.setattr(
+        mods_ui.subprocess,
+        "run",
+        lambda *_args, **_kwargs: state.__setitem__("value", SteamClientState.OFFLINE),
+    )
+    calls = []
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda mid, **kwargs: calls.append((mid, kwargs)) or {"ok": True},
+    )
+    transaction = _cleanup_transaction(overlay, snapshot)
+
+    overlay._run_batch_local_cleanup(
+        [20], close_steam=True, cleanup_transaction=transaction,
+    )
+
+    assert [mid for mid, _kwargs in calls] == [20]
+    assert calls[0][1]["steam_absence_verified"] is True
+    assert calls[0][1]["subscription_snapshot"] is snapshot
+    assert overlay.refresh_calls[-1]["completion_status"] == "Steam closed · Cleaned up: 1"
+
+
+def test_local_cleanup_already_stopped_with_authoritative_snapshot_is_allowed(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    snapshot = _snapshot([10, 20], subscribed=[10])
+    monkeypatch.setattr(
+        mods_ui, "_mod_manager_steam_state", lambda: SteamClientState.OFFLINE,
+    )
+    calls = []
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda mid, **kwargs: calls.append((mid, kwargs)) or {"ok": True},
+    )
+    transaction = _cleanup_transaction(overlay, snapshot)
+
+    overlay._run_batch_local_cleanup(
+        [20],
+        close_steam=False,
+        cleanup_transaction=transaction,
+    )
+
+    assert [mid for mid, _kwargs in calls] == [20]
+    assert calls[0][1]["steam_absence_verified"] is True
+    assert overlay.refresh_calls[-1]["completion_status"] == "Cleaned up: 1"
+
+
+def test_cleanup_transaction_survives_watcher_offline_authority_invalidation(
+        monkeypatch, tmp_path):
+    _run_threads_inline(monkeypatch)
+    overlay = ModsManagerOverlay.__new__(ModsManagerOverlay)
+    snapshot = _snapshot([10, 20], subscribed=[10])
+    overlay._subscription_snapshot = snapshot
+    overlay._mod_operation_running = False
+    overlay._batch_unsubscribe_running = False
+    overlay._mod_operation_pending = False
+    overlay._steam_management_verified = True
+    overlay._native_session_handoff_valid = True
+    overlay._authoritative_steam_state = SteamClientState.NATIVE
+    overlay._inventory_validity = InventoryValidity.VALID
+    overlay._last_mod_state_query_ok = True
+    overlay._steam_state_generation = 1
+    overlay._local_cleanup_transaction_generation = 0
+    overlay._local_cleanup_authorization_request = None
+    overlay._local_cleanup_transaction = None
+    overlay._selected_local_cleanup_candidate_ids = lambda: [20]
+    overlay._selected_mod_ids_snapshot = lambda: [20]
+    overlay._set_mod_operation_pending = lambda value: setattr(
+        overlay, "_mod_operation_pending", bool(value)
+    )
+    overlay._set_mod_operation_status = lambda *_args, **_kwargs: None
+    overlay._workshop_dir = lambda: str(tmp_path)
+    overlay._set_steam_status_pill = lambda _status: None
+    overlay._update_batch_action_buttons = lambda: None
+    overlay._suppress_start_steam_manage_prompt_for_current_operation = lambda: None
+    overlay.refresh_calls = []
+    overlay.refresh = lambda **kwargs: overlay.refresh_calls.append(kwargs)
+    state = {"value": SteamClientState.NATIVE}
+    monkeypatch.setattr(mods_ui, "_mod_manager_steam_state", lambda: state["value"])
+    monkeypatch.setattr(mods_ui, "query_ugc_inventory_checked", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(mods_ui, "_candidate_workshop_roots", lambda **_kwargs: [tmp_path])
+    monkeypatch.setattr(mods_ui, "_has_local_workshop_state", lambda _roots, _mid: True)
+    backend_calls = []
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda mid, **kwargs: backend_calls.append((mid, kwargs)) or {"ok": True},
+    )
+    global_authority_after_offline = []
+    original_mint = overlay._mint_local_cleanup_transaction
+
+    def mint_then_observe_offline(*args, **kwargs):
+        transaction = original_mint(*args, **kwargs)
+        state["value"] = SteamClientState.OFFLINE
+        overlay._set_authoritative_steam_state(SteamClientState.OFFLINE)
+        global_authority_after_offline.append(overlay._steam_management_is_verified())
+        return transaction
+
+    overlay._mint_local_cleanup_transaction = mint_then_observe_offline
+    overlay._confirm_show = lambda _title, _body, _ok, callback, **_kwargs: callback(True)
+
+    overlay._start_batch_local_cleanup_selected()
+
+    assert global_authority_after_offline == [False]
+    assert overlay._subscription_snapshot is None
+    assert [mid for mid, _kwargs in backend_calls] == [20]
+    assert backend_calls[0][1]["subscription_snapshot"] is snapshot
+    assert overlay._local_cleanup_transaction is None
+
+
+def test_offline_only_session_cannot_begin_cleanup_authorization(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    overlay._authoritative_steam_state = SteamClientState.OFFLINE
+    overlay._steam_management_verified = False
+    overlay._native_session_handoff_valid = False
+    overlay._inventory_validity = InventoryValidity.STALE
+    overlay._mod_operation_running = False
+    overlay._batch_unsubscribe_running = False
+    overlay._mod_operation_pending = False
+    prompts = []
+    overlay._show_start_steam_manage_prompt = lambda: prompts.append(True)
+
+    assert overlay._begin_local_cleanup_authorization([20]) is None
+    overlay._start_batch_local_cleanup_selected()
+    assert overlay._local_cleanup_authorization_request is None
+    assert overlay._local_cleanup_transaction is None
+    assert prompts == [True]
+
+
+def test_cleanup_without_transaction_fails_before_local_deletion(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda *_args, **_kwargs: pytest.fail("local deletion must not begin"),
+    )
+    overlay._run_batch_local_cleanup([20], close_steam=False)
+    assert "No current authorized cleanup transaction" in (
+        overlay._set_mod_operation_status_calls[-1][0]
+    )
+
+
+def test_local_cleanup_accepts_independent_exact_offline_exit_during_wait(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    snapshot = _snapshot([10, 20], subscribed=[10])
+    state = {"value": SteamClientState.NATIVE}
+    monkeypatch.setattr(mods_ui, "_mod_manager_steam_state", lambda: state["value"])
+    overlay._verify_local_cleanup_candidates = lambda ids, timeout=20: (
+        True,
+        {"safe_ids": list(ids), "subscription_snapshot": snapshot},
+        "",
+    )
+    monkeypatch.setattr(mods_ui, "resolve_native_steam_cmd", lambda: "/fake/steam")
+    monkeypatch.setattr(mods_ui.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mods_ui,
+        "_wait_for_native_steam_stopped",
+        lambda **_kwargs: state.__setitem__("value", SteamClientState.OFFLINE) or True,
+    )
+    calls = []
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda mid, **kwargs: calls.append((mid, kwargs)) or {"ok": True},
+    )
+    transaction = _cleanup_transaction(overlay, snapshot)
+
+    overlay._run_batch_local_cleanup(
+        [20], close_steam=True, cleanup_transaction=transaction,
+    )
+
+    assert [mid for mid, _kwargs in calls] == [20]
+    assert calls[0][1]["steam_absence_verified"] is True
+
+
+def test_local_cleanup_shutdown_timeout_preserves_files(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    snapshot = _snapshot([10, 20], subscribed=[10])
+    monkeypatch.setattr(
+        mods_ui, "_mod_manager_steam_state", lambda: SteamClientState.NATIVE,
+    )
+    overlay._verify_local_cleanup_candidates = lambda ids, timeout=20: (
+        True,
+        {"safe_ids": list(ids), "subscription_snapshot": snapshot},
+        "",
+    )
+    monkeypatch.setattr(mods_ui, "resolve_native_steam_cmd", lambda: "/fake/steam")
+    monkeypatch.setattr(mods_ui.subprocess, "run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mods_ui, "_wait_for_native_steam_stopped", lambda **_kwargs: False)
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda *_args, **_kwargs: pytest.fail("local deletion must not begin"),
+    )
+    transaction = _cleanup_transaction(overlay, snapshot)
+
+    overlay._run_batch_local_cleanup(
+        [20], close_steam=True, cleanup_transaction=transaction,
+    )
+
+    assert "Steam did not close in time" in overlay.refresh_calls[-1]["completion_status"]
+
+
+@pytest.mark.parametrize(
+    "state",
+    [SteamClientState.UNKNOWN, SteamClientState.FLATPAK],
+)
+def test_local_cleanup_ambiguous_or_flatpak_state_fails_closed(monkeypatch, state):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    monkeypatch.setattr(mods_ui, "_mod_manager_steam_state", lambda: state)
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda *_args, **_kwargs: pytest.fail("local deletion must not begin"),
+    )
+    transaction = _cleanup_transaction(
+        overlay, _snapshot([10, 20], subscribed=[10]),
+    )
+
+    overlay._run_batch_local_cleanup(
+        [20],
+        close_steam=False,
+        cleanup_transaction=transaction,
+    )
+
+    assert "Could not verify that Steam is stopped" in (
+        overlay.refresh_calls[-1]["completion_status"]
+    )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [SteamClientState.UNKNOWN, SteamClientState.FLATPAK],
+)
+def test_native_shutdown_wait_accepts_only_exact_offline(monkeypatch, state):
+    monkeypatch.setattr(mods_ui, "_mod_manager_steam_state", lambda: state)
+    assert mods_ui._wait_for_native_steam_stopped(timeout_s=0) is False
+
+
+def test_backend_local_delete_requires_explicit_absence_proof(monkeypatch):
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_supported_native_steam_mutation_state",
+        lambda: (False, SteamClientState.OFFLINE),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_native_steam_roots",
+        lambda: pytest.fail("filesystem deletion must not begin"),
+    )
+    result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
+        20,
+        subscription_snapshot=_snapshot([10, 20], subscribed=[10]),
+    )
+    assert result["ok"] is False
+    assert "authoritative proof" in result["error"]
+
+
+def test_destructive_cleanup_snapshot_freshness_contract():
+    now = time.monotonic()
+    fresh = _snapshot(
+        [10, 20],
+        subscribed=[10],
+        created_monotonic=now,
+    )
+    stale = _snapshot(
+        [10, 20],
+        subscribed=[10],
+        created_monotonic=(
+            now
+            - steam_ugc_backend.UGC_DESTRUCTIVE_CLEANUP_SNAPSHOT_MAX_AGE_S
+            - 1.0
+        ),
+    )
+    assert fresh.is_fresh_for_destructive_cleanup(now_monotonic=now)
+    assert not stale.is_fresh_for_destructive_cleanup(now_monotonic=now)
+
+
+def test_backend_stale_snapshot_preserves_guarded_tree(monkeypatch, tmp_path):
+    mod_id = 20
+    content = (
+        tmp_path
+        / "steamapps/workshop/content"
+        / str(steam_ugc_backend.DAYZ_APPID)
+        / str(mod_id)
+    )
+    content.mkdir(parents=True)
+    (content / "synthetic.pbo").write_bytes(b"preserve")
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_supported_native_steam_mutation_state",
+        lambda: (False, SteamClientState.OFFLINE),
+    )
+    monkeypatch.setattr(steam_ugc_backend, "_native_steam_roots", lambda: [tmp_path])
+    stale = _snapshot(
+        [10, mod_id],
+        subscribed=[10],
+        created_monotonic=(
+            time.monotonic()
+            - steam_ugc_backend.UGC_DESTRUCTIVE_CLEANUP_SNAPSHOT_MAX_AGE_S
+            - 1.0
+        ),
+    )
+    result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
+        mod_id,
+        steam_absence_verified=True,
+        subscription_snapshot=stale,
+    )
+    assert result["ok"] is False
+    assert "current authoritative subscription snapshot" in result["error"]
+    assert content.is_dir()
+    assert (content / "synthetic.pbo").read_bytes() == b"preserve"
+
+
+def test_cleanup_transaction_fails_closed_if_snapshot_expires_before_use(
+        monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    now = {"value": 1000.0}
+    monkeypatch.setattr(
+        steam_ugc_backend.time,
+        "monotonic",
+        lambda: now["value"],
+    )
+    snapshot = _snapshot(
+        [10, 20], subscribed=[10], created_monotonic=now["value"],
+    )
+    transaction = _cleanup_transaction(overlay, snapshot)
+    now["value"] += (
+        steam_ugc_backend.UGC_DESTRUCTIVE_CLEANUP_SNAPSHOT_MAX_AGE_S + 1.0
+    )
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda *_args, **_kwargs: pytest.fail("local deletion must not begin"),
+    )
+    overlay._run_batch_local_cleanup(
+        [20], close_steam=False, cleanup_transaction=transaction,
+    )
+    assert "authorized cleanup transaction" in (
+        overlay._set_mod_operation_status_calls[-1][0]
+    )
+
+
+def test_cleanup_transaction_is_one_shot_and_target_bound(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    snapshot = _snapshot([10, 20, 30], subscribed=[10])
+    monkeypatch.setattr(
+        mods_ui, "_mod_manager_steam_state", lambda: SteamClientState.OFFLINE,
+    )
+    calls = []
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda mid, **_kwargs: calls.append(mid) or {"ok": True},
+    )
+    transaction = _cleanup_transaction(overlay, snapshot, ids=(20,))
+    overlay._run_batch_local_cleanup(
+        [30], close_steam=False, cleanup_transaction=transaction,
+    )
+    assert calls == []
+
+    transaction = _cleanup_transaction(overlay, snapshot, ids=(20,))
+    overlay._run_batch_local_cleanup(
+        [20], close_steam=False, cleanup_transaction=transaction,
+    )
+    overlay._run_batch_local_cleanup(
+        [20], close_steam=False, cleanup_transaction=transaction,
+    )
+    assert calls == [20]
+    assert "authorized cleanup transaction" in (
+        overlay._set_mod_operation_status_calls[-1][0]
+    )
+
+
+def test_multi_target_cleanup_stops_when_steam_becomes_unsafe(monkeypatch):
+    _run_threads_inline(monkeypatch)
+    overlay = _local_cleanup_overlay()
+    snapshot = _snapshot([10, 20, 30], subscribed=[10])
+    states = iter((
+        SteamClientState.OFFLINE,
+        SteamClientState.OFFLINE,
+        SteamClientState.OFFLINE,
+        SteamClientState.NATIVE,
+    ))
+    monkeypatch.setattr(mods_ui, "_mod_manager_steam_state", lambda: next(states))
+    calls = []
+    monkeypatch.setattr(
+        mods_ui,
+        "delete_ugc_mod_local_files_after_unsubscribe",
+        lambda mid, **_kwargs: calls.append(mid) or {"ok": True},
+    )
+    transaction = _cleanup_transaction(overlay, snapshot, ids=(20, 30))
+    overlay._run_batch_local_cleanup(
+        [20, 30], close_steam=False, cleanup_transaction=transaction,
+    )
+    assert calls == [20]
+    assert overlay.refresh_calls[-1]["completion_status"] == "Cleaned up: 1 · Failed: 1"
+
+
+def test_backend_local_delete_independently_rejects_running_native_steam(monkeypatch):
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_supported_native_steam_mutation_state",
+        lambda: (True, SteamClientState.NATIVE),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_native_steam_roots",
+        lambda: pytest.fail("filesystem deletion must not begin"),
+    )
+    result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
+        20,
+        steam_absence_verified=True,
+        subscription_snapshot=_snapshot([10, 20], subscribed=[10]),
+    )
+    assert result["ok"] is False
+    assert "Steam is stopped" in result["error"]
+
+
+def test_backend_local_delete_retains_safe_path_guard(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_supported_native_steam_mutation_state",
+        lambda: (False, SteamClientState.OFFLINE),
+    )
+    monkeypatch.setattr(steam_ugc_backend, "_native_steam_roots", lambda: [tmp_path])
+    monkeypatch.setattr(steam_ugc_backend, "_safe_workshop_content_path", lambda *_args, **_kwargs: None)
+    result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
+        20,
+        steam_absence_verified=True,
+        subscription_snapshot=_snapshot([10, 20], subscribed=[10]),
+    )
+    assert result["ok"] is False
+    assert "refusing unsafe install folder" in result["error"]
+
+
+def test_backend_rejects_non_dayz_appid_without_touching_matching_tree(
+        monkeypatch, tmp_path):
+    wrong_appid = 999999
+    mod_id = 20
+    content = (
+        tmp_path
+        / "steamapps/workshop/content"
+        / str(wrong_appid)
+        / str(mod_id)
+    )
+    content.mkdir(parents=True)
+    payload = content / "synthetic.pbo"
+    payload.write_bytes(b"preserve")
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_supported_native_steam_mutation_state",
+        lambda: (False, SteamClientState.OFFLINE),
+    )
+    monkeypatch.setattr(steam_ugc_backend, "_native_steam_roots", lambda: [tmp_path])
+    result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
+        mod_id,
+        appid=wrong_appid,
+        steam_absence_verified=True,
+        subscription_snapshot=_snapshot([10, mod_id], subscribed=[10]),
+    )
+    assert result["ok"] is False
+    assert "unsupported app id" in result["error"]
+    assert content.is_dir()
+    assert payload.read_bytes() == b"preserve"
+
+
+def test_backend_exact_offline_evidence_deletes_only_guarded_fake_tree(
+        monkeypatch, tmp_path):
+    mod_id = 20
+    content = (
+        tmp_path
+        / "steamapps/workshop/content"
+        / str(steam_ugc_backend.DAYZ_APPID)
+        / str(mod_id)
+    )
+    content.mkdir(parents=True)
+    (content / "synthetic.pbo").write_bytes(b"test-only")
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_supported_native_steam_mutation_state",
+        lambda: (False, SteamClientState.OFFLINE),
+    )
+    monkeypatch.setattr(steam_ugc_backend, "_native_steam_roots", lambda: [tmp_path])
+    monkeypatch.setattr(steam_ugc_backend, "_native_appworkshop_acf_paths", lambda _appid: [])
+    monkeypatch.setattr(steam_ugc_backend, "_mark_metadata_deleted", lambda _mid: None)
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_delete_file_if_present",
+        lambda path, **_kwargs: path.unlink(missing_ok=True) or True,
+    )
+    from dzll_launcher import steamcmd_mods
+    monkeypatch.setattr(steamcmd_mods, "remove_dzll_symlinks_for_mod", lambda *_args, **_kwargs: [])
+
+    result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
+        mod_id,
+        steam_absence_verified=True,
+        subscription_snapshot=_snapshot([10, mod_id], subscribed=[10]),
+    )
+
+    assert result["ok"] is True
+    assert result["deleted_folder"] is True
+    assert not content.exists()
 
 
 def test_badge_state_can_be_native_while_inventory_stays_non_mutating():

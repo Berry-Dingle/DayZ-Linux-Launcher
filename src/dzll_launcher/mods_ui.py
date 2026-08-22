@@ -3,6 +3,7 @@ import os
 import subprocess
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timezone
 from enum import Enum
@@ -97,13 +98,29 @@ class InventoryValidity(str, Enum):
     FAILED = "failed"
 
 
+@dataclass(frozen=True)
+class _LocalCleanupAuthorizationRequest:
+    generation: int
+    steam_state_generation: int
+    appid: int
+    candidate_ids: frozenset[int]
+
+
+@dataclass(frozen=True)
+class _LocalCleanupTransaction:
+    generation: int
+    appid: int
+    mod_ids: frozenset[int]
+    subscription_snapshot: UGCSubscriptionSnapshot
+
+
 def _wait_for_native_steam_stopped(timeout_s: float = 45.0) -> bool:
     deadline = time.monotonic() + float(timeout_s)
     while time.monotonic() < deadline:
-        if not _supported_native_steam_running():
+        if _mod_manager_steam_state() is SteamClientState.OFFLINE:
             return True
         time.sleep(0.5)
-    return not _supported_native_steam_running()
+    return _mod_manager_steam_state() is SteamClientState.OFFLINE
 
 
 def _launch_native_steam_silent() -> tuple[bool, str]:
@@ -542,6 +559,9 @@ class ModsManagerOverlay:
         self._inventory_refresh_idle_event.set()
         self._inventory_validity = InventoryValidity.STALE
         self._subscription_snapshot = None
+        self._local_cleanup_transaction_generation = 0
+        self._local_cleanup_authorization_request = None
+        self._local_cleanup_transaction = None
         self._host_close_request_handler_id = 0
         self._passive_steam_watch_timer_id = 0
         self._suppress_start_steam_manage_prompt_for_operation = False
@@ -721,6 +741,7 @@ class ModsManagerOverlay:
 
     def _hide_now(self):
         self._stop_passive_steam_watch()
+        self._discard_local_cleanup_authority()
         self._repair_ui_attached = False
         self.scrim.set_visible(False)
         self.card.set_visible(False)
@@ -746,6 +767,8 @@ class ModsManagerOverlay:
         self._native_session_handoff_valid = False
         self._inventory_validity = InventoryValidity.STALE
         self._subscription_snapshot = None
+        if current is not SteamClientState.OFFLINE:
+            self._discard_local_cleanup_authority()
         self._set_steam_status_pill(
             "checking" if current is SteamClientState.NATIVE else "offline"
         )
@@ -841,6 +864,7 @@ class ModsManagerOverlay:
         self._steam_management_verified = False
         self._native_session_handoff_valid = False
         self._subscription_snapshot = None
+        self._discard_local_cleanup_authority()
         self._inventory_validity = InventoryValidity.STALE
         self._loaded_items = []
         self._selected_mod_ids = set()
@@ -1062,6 +1086,98 @@ class ModsManagerOverlay:
                 self, "_inventory_validity", InventoryValidity.STALE,
             ) is InventoryValidity.VALID
         )
+
+    def _begin_local_cleanup_authorization(
+        self,
+        mod_ids: list[int],
+    ) -> _LocalCleanupAuthorizationRequest | None:
+        ids = frozenset(int(mid) for mid in mod_ids if int(mid) > 0)
+        if not ids or not self._steam_management_is_verified():
+            return None
+        generation = int(
+            getattr(self, "_local_cleanup_transaction_generation", 0) or 0
+        ) + 1
+        self._local_cleanup_transaction_generation = generation
+        request = _LocalCleanupAuthorizationRequest(
+            generation=generation,
+            steam_state_generation=int(
+                getattr(self, "_steam_state_generation", 0) or 0
+            ),
+            appid=int(APPID),
+            candidate_ids=ids,
+        )
+        self._local_cleanup_authorization_request = request
+        self._local_cleanup_transaction = None
+        return request
+
+    def _mint_local_cleanup_transaction(
+        self,
+        request: _LocalCleanupAuthorizationRequest,
+        mod_ids: list[int],
+        snapshot: UGCSubscriptionSnapshot,
+    ) -> _LocalCleanupTransaction | None:
+        ids = frozenset(int(mid) for mid in mod_ids if int(mid) > 0)
+        if (
+            not isinstance(request, _LocalCleanupAuthorizationRequest)
+            or getattr(self, "_local_cleanup_authorization_request", None)
+            is not request
+            or request.appid != int(APPID)
+            or not ids.issubset(request.candidate_ids)
+            or not ids
+            or not isinstance(snapshot, UGCSubscriptionSnapshot)
+            or not snapshot.is_fresh_for_destructive_cleanup()
+            or not all(snapshot.proves_unsubscribed(mid) for mid in ids)
+        ):
+            if (
+                getattr(self, "_local_cleanup_authorization_request", None)
+                is request
+            ):
+                self._local_cleanup_authorization_request = None
+            return None
+        transaction = _LocalCleanupTransaction(
+            generation=request.generation,
+            appid=int(APPID),
+            mod_ids=ids,
+            subscription_snapshot=snapshot,
+        )
+        self._local_cleanup_authorization_request = None
+        self._local_cleanup_transaction = transaction
+        return transaction
+
+    def _discard_local_cleanup_authority(
+        self,
+        authority=None,
+    ) -> None:
+        request = getattr(self, "_local_cleanup_authorization_request", None)
+        transaction = getattr(self, "_local_cleanup_transaction", None)
+        if authority is None or request is authority:
+            self._local_cleanup_authorization_request = None
+        if authority is None or transaction is authority:
+            self._local_cleanup_transaction = None
+
+    def _consume_local_cleanup_transaction(
+        self,
+        transaction: _LocalCleanupTransaction | None,
+        mod_ids: list[int],
+    ) -> _LocalCleanupTransaction | None:
+        current = getattr(self, "_local_cleanup_transaction", None)
+        requested_ids = frozenset(int(mid) for mid in mod_ids if int(mid) > 0)
+        if (
+            not isinstance(transaction, _LocalCleanupTransaction)
+            or current is not transaction
+            or transaction.appid != int(APPID)
+            or transaction.mod_ids != requested_ids
+            or not transaction.subscription_snapshot.is_fresh_for_destructive_cleanup()
+            or not all(
+                transaction.subscription_snapshot.proves_unsubscribed(mid)
+                for mid in requested_ids
+            )
+        ):
+            if current is transaction:
+                self._local_cleanup_transaction = None
+            return None
+        self._local_cleanup_transaction = None
+        return transaction
 
     def _require_supported_native_steam(self) -> bool:
         if self._steam_management_is_verified():
@@ -2919,6 +3035,57 @@ class ModsManagerOverlay:
         ids.sort()
         return ids
 
+    def _local_cleanup_plan_from_snapshot(
+        self,
+        candidate_ids: list[int],
+        snapshot: UGCSubscriptionSnapshot | None,
+    ) -> tuple[bool, dict, str]:
+        result = {
+            "safe_ids": [],
+            "rejected_ids": [],
+            "subscription_snapshot": snapshot,
+        }
+        ids = []
+        seen = set()
+        for raw_mid in list(candidate_ids or []):
+            try:
+                mid = int(raw_mid)
+            except Exception:
+                continue
+            if mid <= 0 or mid in seen:
+                continue
+            seen.add(mid)
+            ids.append(mid)
+
+        if not ids:
+            return True, result, ""
+        if (
+            not isinstance(snapshot, UGCSubscriptionSnapshot)
+            or not snapshot.valid
+            or not snapshot.is_fresh_for_destructive_cleanup()
+        ):
+            return False, result, "DZLL could not check the selected mods with Steam."
+
+        states = snapshot.states
+        workshop_roots = _candidate_workshop_roots(workshop_dir=self._workshop_dir())
+        for mid in ids:
+            state = states.get(mid) or states.get(str(mid)) or {}
+            if not state:
+                result["rejected_ids"].append(int(mid))
+                continue
+            if mid in snapshot.subscribed_ids or bool(state.get("subscribed", False)):
+                result["rejected_ids"].append(int(mid))
+                continue
+            if not snapshot.proves_unsubscribed(mid):
+                result["rejected_ids"].append(int(mid))
+                continue
+            if not _has_local_workshop_state(workshop_roots, int(mid)):
+                result["rejected_ids"].append(int(mid))
+                continue
+            result["safe_ids"].append(int(mid))
+
+        return True, result, ""
+
     def _verify_local_cleanup_candidates(self, candidate_ids: list[int], *, timeout: int = 20) -> tuple[bool, dict, str]:
         result = {
             "safe_ids": [],
@@ -2948,29 +3115,7 @@ class ModsManagerOverlay:
             )
         except Exception:
             return False, result, "DZLL could not check the selected mods with Steam."
-        if not isinstance(snapshot, UGCSubscriptionSnapshot) or not snapshot.valid:
-            return False, result, "DZLL could not check the selected mods with Steam."
-        states = snapshot.states
-        result["subscription_snapshot"] = snapshot
-
-        workshop_roots = _candidate_workshop_roots(workshop_dir=self._workshop_dir())
-        for mid in ids:
-            state = states.get(mid) or states.get(str(mid)) or {}
-            if not state:
-                result["rejected_ids"].append(int(mid))
-                continue
-            if mid in snapshot.subscribed_ids or bool(state.get("subscribed", False)):
-                result["rejected_ids"].append(int(mid))
-                continue
-            if not snapshot.proves_unsubscribed(mid):
-                result["rejected_ids"].append(int(mid))
-                continue
-            if not _has_local_workshop_state(workshop_roots, int(mid)):
-                result["rejected_ids"].append(int(mid))
-                continue
-            result["safe_ids"].append(int(mid))
-
-        return True, result, ""
+        return self._local_cleanup_plan_from_snapshot(ids, snapshot)
 
     def _show_start_steam_manage_prompt(self) -> None:
         if bool(getattr(self, "_mod_operation_pending", False)):
@@ -3076,14 +3221,27 @@ class ModsManagerOverlay:
                 self._set_mod_operation_status("No local files selected for cleanup.", running=False)
             return
 
+        authorization_request = self._begin_local_cleanup_authorization(
+            cleanup_ids,
+        )
+        if authorization_request is None:
+            self._show_start_steam_manage_prompt()
+            return
+
         self._set_mod_operation_pending(True)
         self._set_mod_operation_status("Checking with Steam...", running=False)
-
         def worker():
-            ready, plan, error = self._verify_local_cleanup_candidates(cleanup_ids, timeout=20)
+            observed_state = _mod_manager_steam_state()
+            if observed_state is SteamClientState.NATIVE:
+                ready, plan, error = self._verify_local_cleanup_candidates(cleanup_ids, timeout=20)
+            else:
+                ready = False
+                plan = {"safe_ids": [], "subscription_snapshot": None}
+                error = "Supported native Steam authority is unavailable. Local files were preserved."
 
             def done():
                 if not ready:
+                    self._discard_local_cleanup_authority(authorization_request)
                     self._set_mod_operation_pending(False)
                     self._set_mod_operation_status(
                         error or "DZLL could not check the selected mods with Steam.",
@@ -3093,27 +3251,50 @@ class ModsManagerOverlay:
 
                 safe_ids = list(plan.get("safe_ids") or [])
                 if not safe_ids:
+                    self._discard_local_cleanup_authority(authorization_request)
                     self._set_mod_operation_pending(False)
                     self._set_mod_operation_status("Selected mods are no longer safe to clean up.", running=False)
                     return False
 
-                try:
-                    steam_running = _supported_native_steam_running()
-                except Exception:
-                    steam_running = False
+                transaction = self._mint_local_cleanup_transaction(
+                    authorization_request,
+                    safe_ids,
+                    plan.get("subscription_snapshot"),
+                )
+                if transaction is None:
+                    self._discard_local_cleanup_authority(
+                        authorization_request,
+                    )
+                    self._set_mod_operation_pending(False)
+                    self._set_mod_operation_status(
+                        "The authoritative Steam subscription check expired. "
+                        "Local files were preserved.",
+                        running=False,
+                    )
+                    return False
 
-                if steam_running:
+                steam_state = _mod_manager_steam_state()
+
+                if steam_state is SteamClientState.NATIVE:
                     title = "Close Steam and clean up local files?"
                     body = "DZLL will close Steam before deleting selected local-only Workshop files."
                     ok_label = "Close Steam and Clean Up"
                     close_steam = True
                     show_restart_checkbox = True
-                else:
+                elif steam_state is SteamClientState.OFFLINE:
                     title = "Clean up selected local files?"
                     body = "DZLL will delete selected local-only Workshop files."
                     ok_label = "Clean Up"
                     close_steam = False
                     show_restart_checkbox = False
+                else:
+                    self._discard_local_cleanup_authority(transaction)
+                    self._set_mod_operation_pending(False)
+                    self._set_mod_operation_status(
+                        "Could not verify that Steam is stopped. Local files were preserved.",
+                        running=False,
+                    )
+                    return False
 
                 def after(ok: bool):
                     if ok:
@@ -3130,8 +3311,10 @@ class ModsManagerOverlay:
                             safe_ids,
                             close_steam=close_steam,
                             restart_steam=restart_steam,
+                            cleanup_transaction=transaction,
                         )
                     else:
+                        self._discard_local_cleanup_authority(transaction)
                         self._set_mod_operation_pending(False)
                         self._set_mod_operation_status("Cleanup cancelled.", running=False)
 
@@ -3151,9 +3334,14 @@ class ModsManagerOverlay:
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _run_batch_local_cleanup(self, mod_ids: list[int], *, close_steam: bool, restart_steam: bool = False) -> None:
-        if not self._require_supported_native_steam():
-            return
+    def _run_batch_local_cleanup(
+        self,
+        mod_ids: list[int],
+        *,
+        close_steam: bool,
+        restart_steam: bool = False,
+        cleanup_transaction: _LocalCleanupTransaction | None = None,
+    ) -> None:
         ids = []
         seen = set()
         for raw_mid in list(mod_ids or []):
@@ -3166,7 +3354,20 @@ class ModsManagerOverlay:
             seen.add(mid)
             ids.append(mid)
         if not ids:
+            self._discard_local_cleanup_authority(cleanup_transaction)
             self._set_mod_operation_status("No local files selected for cleanup.", running=False)
+            return
+
+        transaction = self._consume_local_cleanup_transaction(
+            cleanup_transaction,
+            ids,
+        )
+        if transaction is None:
+            self._set_mod_operation_status(
+                "No current authorized cleanup transaction is available. "
+                "Local files were preserved.",
+                running=False,
+            )
             return
 
         self._set_mod_operation_status("Closing Steam..." if close_steam else "Cleaning up local files...", running=True)
@@ -3174,60 +3375,66 @@ class ModsManagerOverlay:
         def worker():
             failures = []
             cleaned_ids = []
-            steam_closed_by_cleanup = False
+            steam_shutdown_verified = False
+            steam_absence_verified = False
             cleanup_attempted = False
             restart_attempted = False
             restart_ok = False
 
-            ready, plan, error = self._verify_local_cleanup_candidates(ids, timeout=20)
-            if not ready:
-                failures.append((0, error or "DZLL could not check the selected mods with Steam."))
+            authoritative_snapshot = transaction.subscription_snapshot
+            initial_steam_state = _mod_manager_steam_state()
+            if initial_steam_state is SteamClientState.NATIVE:
+                if not close_steam:
+                    failures.append((0, "Steam is running. Local files were preserved."))
+            elif initial_steam_state is SteamClientState.OFFLINE:
+                if not authoritative_snapshot.is_fresh_for_destructive_cleanup():
+                    failures.append((
+                        0,
+                        "The authoritative Steam subscription check expired. "
+                        "Local files were preserved.",
+                    ))
             else:
-                ids[:] = list(plan.get("safe_ids") or [])
-                subscription_snapshot = plan.get("subscription_snapshot")
-                if not ids:
-                    failures.append((0, "Selected mods are no longer safe to clean up."))
-            if not ready:
-                subscription_snapshot = None
+                failures.append((
+                    0,
+                    "Could not verify that Steam is stopped. Local files were preserved.",
+                ))
 
             if not failures and close_steam:
-                if not _supported_native_steam_running():
-                    failures.append((0, "Supported native Steam is unavailable. Local files were preserved."))
-                steam_cmd = resolve_native_steam_cmd()
-                if not failures and not steam_cmd:
-                    failures.append((0, "Native Steam could not be found. Local files were preserved."))
-                elif not failures:
-                    try:
-                        subprocess.run(
-                            [steam_cmd, "-shutdown"],
-                            check=False,
-                            stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL,
-                            timeout=10,
-                        )
-                    except Exception as exc:
-                        failures.append((0, f"Steam could not be closed: {exc}"))
-                    if not failures and not _wait_for_native_steam_stopped(timeout_s=45.0):
-                        failures.append((0, "Steam did not close in time. Local files were preserved."))
-                    elif not failures:
-                        steam_closed_by_cleanup = True
+                if initial_steam_state is SteamClientState.NATIVE:
+                    steam_cmd = resolve_native_steam_cmd()
+                    if not steam_cmd:
+                        failures.append((0, "Native Steam could not be found. Local files were preserved."))
+                    else:
+                        try:
+                            subprocess.run(
+                                [steam_cmd, "-shutdown"],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=10,
+                            )
+                        except Exception as exc:
+                            failures.append((0, f"Steam could not be closed: {exc}"))
+                        if not failures and not _wait_for_native_steam_stopped(timeout_s=45.0):
+                            failures.append((0, "Steam did not close in time. Local files were preserved."))
+                        elif not failures:
+                            steam_shutdown_verified = True
 
-            try:
-                steam_running_now = _supported_native_steam_running()
-            except Exception:
-                steam_running_now = True
-            if not failures and steam_running_now:
-                failures.append((0, "Steam is running. Local files were preserved."))
+            if not failures:
+                steam_absence_verified = (
+                    _mod_manager_steam_state() is SteamClientState.OFFLINE
+                )
+                if not steam_absence_verified:
+                    failures.append((
+                        0,
+                        "Could not verify that Steam is stopped. Local files were preserved.",
+                    ))
 
             total = len(ids)
             if not failures:
                 cleanup_attempted = True
                 for index, mid in enumerate(ids, start=1):
-                    try:
-                        if _supported_native_steam_running():
-                            failures.append((mid, "Steam is running. Local files were preserved."))
-                            break
-                    except Exception:
+                    if _mod_manager_steam_state() is not SteamClientState.OFFLINE:
                         failures.append((mid, "Could not confirm Steam is closed. Local files were preserved."))
                         break
 
@@ -3237,8 +3444,8 @@ class ModsManagerOverlay:
                             int(mid),
                             appid=int(APPID),
                             log_fn=print,
-                            native_session_verified=steam_closed_by_cleanup,
-                            subscription_snapshot=subscription_snapshot,
+                            steam_absence_verified=steam_absence_verified,
+                            subscription_snapshot=authoritative_snapshot,
                         )
                     except Exception as exc:
                         result = {"ok": False, "error": str(exc)}
@@ -3247,7 +3454,7 @@ class ModsManagerOverlay:
                     else:
                         failures.append((mid, str(result.get("error") or "Delete failed.")))
 
-            if steam_closed_by_cleanup and bool(restart_steam) and cleanup_attempted:
+            if steam_shutdown_verified and bool(restart_steam) and cleanup_attempted:
                 restart_attempted = True
                 steam_cmd = resolve_native_steam_cmd()
                 if steam_cmd:
@@ -3281,12 +3488,12 @@ class ModsManagerOverlay:
                         summary = "Cleanup failed."
                 else:
                     summary = "No local files selected for cleanup."
-                if steam_closed_by_cleanup:
+                if steam_shutdown_verified:
                     self._suppress_start_steam_manage_prompt_for_current_operation()
 
                 if restart_attempted and restart_ok:
                     summary = f"Restarting Steam · {summary}"
-                elif steam_closed_by_cleanup:
+                elif steam_shutdown_verified:
                     summary = f"Steam closed · {summary}"
                     if restart_attempted and not restart_ok:
                         summary = f"{summary} · Could not restart Steam"
