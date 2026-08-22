@@ -1,10 +1,14 @@
 from pathlib import Path
 from types import SimpleNamespace
+import threading
+
+import pytest
 
 from dzll_launcher.background_prepare import preparation_operation_gate
 from dzll_launcher import mods_ui
 from dzll_launcher.mods_ui import ModsManagerOverlay
 from dzll_launcher.steam_ugc_backend import repair_ugc_item
+from dzll_launcher.steam_ugc_backend import UGCHelperReapError
 
 
 def _clock():
@@ -136,6 +140,35 @@ def test_repair_download_failure_and_terminal_unresolved():
     assert unresolved["reason"] == "terminal_unresolved"
 
 
+def test_repair_preserves_structured_helper_reap_failure():
+    class Process:
+        def poll(self):
+            return None
+
+    error = UGCHelperReapError("repair helper remained alive", process=Process())
+    monotonic, sleep = _clock()
+
+    with pytest.raises(UGCHelperReapError) as raised:
+        repair_ugc_item(
+            123,
+            request_unsubscribe_fn=lambda *_a, **_k: (True, {}),
+            query_state_fn=lambda ids, **_k: (
+                True,
+                {int(ids[0]): {
+                    "subscribed": False,
+                    "installed": False,
+                    "folder": False,
+                }},
+            ),
+            install_fn=lambda *_a, **_k: (_ for _ in ()).throw(error),
+            content_exists_fn=lambda *_a: False,
+            monotonic_fn=monotonic,
+            sleep_fn=sleep,
+        )
+    assert raised.value is error
+    assert raised.value.helper_process_may_be_alive
+
+
 def test_repair_rejects_missing_directory_after_ready():
     result, _calls = _run_repair_with_states(
         [
@@ -195,6 +228,122 @@ def test_repair_rejects_dayz_and_respects_one_global_owner():
     overlay.confirm["callback"](True)
     assert overlay.started == []
     assert preparation_operation_gate(owner).release(lease)
+
+
+def _terminal_repair_overlay(owner, lease, generation=7):
+    overlay = ModsManagerOverlay.__new__(ModsManagerOverlay)
+    overlay.host = SimpleNamespace(_win=owner)
+    overlay._repair_state_by_id = {
+        123: {"generation": generation, "phase": "spinner", "fraction": 0.0}
+    }
+    overlay._repair_ui_attached = False
+    overlay._repair_lease = lease
+    overlay._repair_lease_generation = generation
+    overlay._repair_refresh_needed = False
+    overlay.statuses = []
+    overlay._set_mod_operation_status = (
+        lambda text, running=False: overlay.statuses.append((text, running))
+    )
+    overlay._current_row_for_mod = lambda _mid: None
+    overlay._apply_repair_state_to_row = lambda *_a: None
+    overlay._mod_manager_is_visible = lambda: False
+    return overlay
+
+
+def test_unresolved_repair_reap_failure_blocks_owned_lease_until_recovery():
+    class Process:
+        alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+    owner = SimpleNamespace(recovery_scheduled=0)
+    owner._schedule_preparation_reap_recovery_poll = lambda: setattr(
+        owner, "recovery_scheduled", owner.recovery_scheduled + 1,
+    )
+    gate = preparation_operation_gate(owner)
+    lease = gate.try_acquire("mod_repair")
+    overlay = _terminal_repair_overlay(owner, lease)
+    process = Process()
+    error = UGCHelperReapError("repair helper unresolved", process=process)
+
+    overlay._finish_repair(123, 7, {
+        "ok": False,
+        "error": str(error),
+        "_ugc_helper_reap_error": error,
+    })
+
+    assert gate.blocked_reap_failure
+    assert gate.active_owner == "mod_repair"
+    assert overlay._repair_lease is None
+    assert owner.recovery_scheduled == 1
+    assert "temporarily blocked" in overlay.statuses[-1][0]
+    process.alive = False
+    assert gate.try_recover_reap_failure()
+    assert gate.active_owner == ""
+
+
+def test_reader_only_repair_failure_releases_owned_lease():
+    owner = SimpleNamespace()
+    gate = preparation_operation_gate(owner)
+    lease = gate.try_acquire("mod_repair")
+    overlay = _terminal_repair_overlay(owner, lease)
+    error = UGCHelperReapError(
+        "reader survived",
+        helper_process_confirmed_dead=True,
+        helper_process_may_be_alive=False,
+        reader_cleanup_only=True,
+    )
+
+    overlay._finish_repair(123, 7, {
+        "ok": False,
+        "error": str(error),
+        "_ugc_helper_reap_error": error,
+    })
+
+    assert not gate.blocked_reap_failure
+    assert gate.active_owner == ""
+    assert 123 not in overlay._repair_state_by_id
+
+
+def test_repair_worker_preserves_structured_reap_error_for_owned_lease(
+        monkeypatch):
+    class Process:
+        def poll(self):
+            return None
+
+    owner = SimpleNamespace(recovery_scheduled=0)
+    owner._schedule_preparation_reap_recovery_poll = lambda: setattr(
+        owner, "recovery_scheduled", owner.recovery_scheduled + 1,
+    )
+    gate = preparation_operation_gate(owner)
+    lease = gate.try_acquire("mod_repair")
+    overlay = _terminal_repair_overlay(owner, lease, generation=1)
+    overlay._repair_generation = 0
+    overlay._require_supported_native_steam = lambda: True
+    error = UGCHelperReapError(
+        "worker helper unresolved", process=Process(),
+    )
+    monkeypatch.setattr(
+        mods_ui, "repair_ugc_item",
+        lambda *_a, **_k: (_ for _ in ()).throw(error),
+    )
+    scheduled = []
+    queued = threading.Event()
+
+    def idle_add(callback, *args):
+        scheduled.append((callback, args))
+        queued.set()
+        return len(scheduled)
+
+    monkeypatch.setattr(mods_ui.GLib, "idle_add", idle_add)
+    overlay._start_repair(123)
+    assert queued.wait(timeout=2.0)
+    callback, args = scheduled[-1]
+    assert args[2]["_ugc_helper_reap_error"] is error
+    assert callback(*args) is False
+    assert gate.blocked_reap_failure
+    assert gate.active_owner == "mod_repair"
 
 
 def test_repair_progress_spinner_percentage_and_identity_guard():
@@ -290,7 +439,8 @@ def test_repair_success_and_failure_restore_row(monkeypatch):
     overlay._repair_lease = None
     overlay._repair_refresh_needed = False
     overlay._set_mod_operation_status = lambda *args, **kwargs: None
-    overlay._release_repair_lease = lambda: None
+    releases = []
+    overlay._release_repair_lease = lambda **kwargs: releases.append(kwargs)
     overlay._current_row_for_mod = lambda _mid: "row"
     applied = []
     overlay._apply_repair_state_to_row = lambda row, state: applied.append((row, state))
@@ -303,6 +453,7 @@ def test_repair_success_and_failure_restore_row(monkeypatch):
     assert overlay._repair_state_by_id[123]["phase"] == "success"
     assert overlay._repair_state_by_id[123]["fraction"] == 1.0
     assert scheduled and scheduled[0][0] == 900
+    assert releases == [{"expected_generation": 7}]
 
     overlay._repair_state_by_id = {123: {"generation": 8, "phase": "spinner", "fraction": 0.0}}
     overlay._finish_repair(
@@ -312,6 +463,10 @@ def test_repair_success_and_failure_restore_row(monkeypatch):
     )
     assert 123 not in overlay._repair_state_by_id
     assert applied[-1] == ("row", None)
+    assert releases == [
+        {"expected_generation": 7},
+        {"expected_generation": 8},
+    ]
 
 
 def test_repair_close_detaches_and_reopen_defers_refresh():

@@ -253,10 +253,14 @@ class UnreapableProcess:
 
 def test_helper_failure_to_reap_is_observable():
     events = []
-    with pytest.raises(steam_ugc_backend.UGCHelperReapError):
+    process = UnreapableProcess()
+    with pytest.raises(steam_ugc_backend.UGCHelperReapError) as raised:
         steam_ugc_backend._stop_helper_process(
-            UnreapableProcess(), command="state", progress_cb=events.append,
+            process, command="state", progress_cb=events.append,
         )
+    assert raised.value.helper_process_may_be_alive
+    assert not raised.value.helper_process_confirmed_dead
+    assert raised.value._recovery_process is process
     assert any(
         event.get("message") == "[Steam UGC] Helper failure-to-reap"
         and event.get("helper_pid") == 4242

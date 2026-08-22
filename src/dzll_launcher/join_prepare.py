@@ -934,7 +934,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
 
     ugc_shutdown_confirmed = False
     if ugc_session is not None:
-        deactivate_ugc_session(ugc_session)
+        retain_ugc_recovery = False
         try:
             ugc_session.close()
             ugc_shutdown_confirmed = True
@@ -945,7 +945,12 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     success=True,
                     cancelled=bool(operation_cancel_event.is_set()),
                 )
-        except UGCHelperReapError:
+        except UGCHelperReapError as exc:
+            retain_ugc_recovery = bool(exc.helper_process_may_be_alive)
+            deactivate_ugc_session(
+                ugc_session,
+                retain_for_recovery=retain_ugc_recovery,
+            )
             raise
         except Exception as exc:
             secondary_error = f"Steam UGC session shutdown failed: {exc}"
@@ -963,6 +968,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             # The helper has already been reaped here.  Preserve a substantive
             # operation failure, and do not turn confirmed preparation success
             # into a false failure solely because teardown diagnostics failed.
+        finally:
+            if not retain_ugc_recovery:
+                deactivate_ugc_session(ugc_session)
     if operation_cancel_event.is_set():
         with cancel_cleanup_lock:
             deferred_cleanup_ids = sorted(cancel_cleanup_ids)

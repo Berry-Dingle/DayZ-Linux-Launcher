@@ -9,7 +9,11 @@ from dzll_launcher.background_prepare import (
 from dzll_launcher.background_prepare_queue import BackgroundPreparationQueue
 from dzll_launcher.preparation_contracts import PreparationOutcome, PreparationStatus
 from dzll_launcher.server_companion_ui import ServerCompanionPanel
-from dzll_launcher.join_preparation_busy import shared_join_preparation_busy
+from dzll_launcher.join_preparation_busy import (
+    shared_join_preparation_busy,
+    shared_join_preparation_state,
+)
+from dzll_launcher.steam_ugc_backend import UGCHelperReapError
 from dzll_launcher.window import DZLLWindow
 
 
@@ -91,6 +95,33 @@ def test_opening_companion_during_background_gate_ownership_starts_disabled():
     assert gate.release(lease)
     panel.refresh_join_sensitivity()
     assert panel.join_btn.sensitive is True
+
+
+def test_foreground_join_and_mod_repair_share_one_gate_owner():
+    host = _host(join_active=SimpleNamespace(attempt_id=7))
+    gate = preparation_operation_gate(host)
+    join_lease = gate.try_acquire("foreground_join")
+    assert join_lease is not None
+    assert gate.try_acquire("mod_repair") is None
+
+    assert gate.release(join_lease)
+    host._join_attempts.active = None
+    repair_lease = gate.try_acquire("mod_repair")
+    assert repair_lease is not None
+    assert gate.try_acquire("foreground_join") is None
+    assert gate.release(repair_lease)
+
+
+def test_shared_busy_distinguishes_unresolved_reap_block_from_active_work():
+    host = _host()
+    gate = preparation_operation_gate(host)
+    assert gate.block_reap_failure(
+        "foreground_join", UGCHelperReapError("helper unresolved")
+    )
+    panel = _panel(host)
+    assert shared_join_preparation_state(host) == "blocked_reap_failure"
+    assert shared_join_preparation_busy(host)
+    assert panel.join_btn.sensitive is False
 
 
 def test_background_queue_start_cancel_cleanup_controls_same_busy_state():

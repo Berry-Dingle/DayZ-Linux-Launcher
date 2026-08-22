@@ -126,6 +126,43 @@ def test_early_terminal_observation_never_advances_before_worker_return():
     assert transition.dispatch.identity == "10.0.0.2:2302"
 
 
+def test_reap_block_terminalizes_active_without_dispatching_pending():
+    queue = BackgroundPreparationQueue()
+    a = queue.enqueue(snap("10.0.0.1:2302", name="A"), runtime())
+    queue.enqueue(snap("10.0.0.2:2302", name="B"), runtime())
+    controller = Controller()
+    assert queue.attach_controller(a.dispatch, controller)
+    blocked = queue.finish_blocked_reap_failure(a.dispatch, FAILED)
+    assert blocked.accepted and blocked.dispatch is None
+    assert blocked.snapshot.active is None
+    assert blocked.snapshot.blocked_reap_failure
+    assert [item.display_name for item in blocked.snapshot.pending] == ["B"]
+    assert queue.record_for(a.dispatch.identity).state is BackgroundServerState.FAILED
+    assert not queue.accepting
+
+    resumed = queue.clear_reap_block()
+    assert resumed.accepted
+    assert not resumed.snapshot.blocked_reap_failure
+    assert resumed.dispatch.display_name == "B"
+    assert queue.accepting
+
+
+def test_cancel_blocked_pending_never_enters_cancelling_state():
+    queue = BackgroundPreparationQueue()
+    a = queue.enqueue(snap("10.0.0.1:2302", name="A"), runtime())
+    b = queue.enqueue(snap("10.0.0.2:2302", name="B"), runtime())
+    queue.attach_controller(a.dispatch, Controller())
+    queue.finish_blocked_reap_failure(a.dispatch, FAILED)
+    cancelled = queue.cancel_blocked_pending()
+    assert cancelled.accepted
+    assert cancelled.snapshot.blocked_reap_failure
+    assert cancelled.snapshot.active is None
+    assert cancelled.snapshot.pending == ()
+    assert not cancelled.snapshot.busy
+    assert not cancelled.snapshot.cancelling
+    assert queue.record_for(b.request.identity).state is BackgroundServerState.IDLE
+
+
 def test_stale_progress_terminal_and_finish_cannot_mutate_retried_identity():
     queue = BackgroundPreparationQueue()
     first = queue.enqueue(snap("10.0.0.1:2302"), runtime())

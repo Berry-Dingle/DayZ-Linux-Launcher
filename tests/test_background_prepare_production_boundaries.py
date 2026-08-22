@@ -127,6 +127,12 @@ class ProductionStartHarness:
     _background_prepare_worker_returned = (
         window_module.DZLLWindow._background_prepare_worker_returned
     )
+    _ensure_preparation_reap_recovery_poll = (
+        window_module.DZLLWindow._ensure_preparation_reap_recovery_poll
+    )
+    _poll_preparation_reap_recovery = (
+        window_module.DZLLWindow._poll_preparation_reap_recovery
+    )
     _background_prepare_cancel_consent_ui = (
         window_module.DZLLWindow._background_prepare_cancel_consent_ui
     )
@@ -163,6 +169,7 @@ class ProductionStartHarness:
         self._shutdown_cleanup_done = False
         self._start_steam_join_loop = None
         self._background_prepare_queue = BackgroundPreparationQueue()
+        self._preparation_reap_recovery_source_id = 0
         self.list_view = None
         self.background_prepare_server_label = Widget()
         self.background_prepare_detail_label = Widget()
@@ -403,17 +410,38 @@ def test_production_batch_cancel_waits_for_cleanup_and_never_dispatches_next(
     assert host._background_prepare_queue.record_for("10.0.0.2:2302").state.value == "idle"
 
 
-def test_helper_failure_to_reap_blocks_fifo_and_global_owner(monkeypatch):
+class RecoverableProcess:
+    pid = 4242
+
+    def __init__(self):
+        self.alive = True
+
+    def poll(self):
+        return None if self.alive else 0
+
+
+def test_helper_failure_to_reap_terminalizes_and_blocks_until_recovery(monkeypatch):
     scheduler = MainThreadScheduler()
     executor = RecordingExecutor()
     host = ProductionStartHarness(executor)
-
+    process = RecoverableProcess()
+    entered = threading.Event()
+    release = threading.Event()
     cancel_events = []
 
     def engine(*_args, **kwargs):
         cancel_events.append(kwargs["cancel_event"])
-        kwargs["cancel_event"].set()
-        raise UGCHelperReapError("pid 4242 remained alive")
+        if kwargs["server_name"] == "A":
+            entered.set()
+            assert release.wait(timeout=2.0)
+            raise UGCHelperReapError(
+                "pid 4242 remained alive",
+                helper_process_may_be_alive=True,
+                process=process,
+            )
+        outcome = PreparationOutcome(PreparationStatus.READY, reason="ready")
+        kwargs["presenter"].on_terminal(outcome)
+        return outcome
 
     monkeypatch.setattr(window_module.GLib, "idle_add", scheduler.idle_add)
     monkeypatch.setattr(background_prepare, "prepare_required_mods", engine)
@@ -424,19 +452,136 @@ def test_helper_failure_to_reap_blocks_fifo_and_global_owner(monkeypatch):
         ip="10.0.0.2", gport=2302, qport=27016, name="B", mods_json="[]",
     )
     host._background_prepare_for_obj(a)
+    scheduler.drain_until(entered.is_set)
+    host._background_prepare_for_obj(b)
+    release.set()
     scheduler.drain_until(lambda: executor.futures and executor.futures[0].done())
     assert executor.futures[0].result().reason == "ugc_helper_failure_to_reap"
-    host._background_prepare_for_obj(b)
     assert len(executor.futures) == 1
     queue_snapshot = host._background_prepare_queue.snapshot()
     assert queue_snapshot.busy
-    assert queue_snapshot.active.identity == "10.0.0.1:2302"
+    assert queue_snapshot.blocked_reap_failure
+    assert queue_snapshot.active is None
     assert [request.identity for request in queue_snapshot.pending] == [
         "10.0.0.2:2302",
     ]
+    assert (
+        host._background_prepare_queue.record_for("10.0.0.1:2302").state.value
+        == "failed"
+    )
     assert background_prepare.preparation_operation_busy(host)
     assert len(cancel_events) == 1
     assert cancel_events[0].is_set() is False
+    assert host.background_prepare_server_label.text == (
+        "Steam preparation is temporarily blocked"
+    )
+    assert host.background_prepare_right_status_label.text == "Blocked"
+
+    process.alive = False
+    assert host._poll_preparation_reap_recovery() is False
+    scheduler.drain_until(
+        lambda: len(executor.futures) == 2 and executor.futures[1].done()
+    )
+    recovered = host._background_prepare_queue.snapshot()
+    assert not recovered.blocked_reap_failure
+    assert not background_prepare.preparation_operation_busy(host)
+    assert recovered.completed_batch.ready_count == 1
+    assert recovered.completed_batch.failed_count == 1
+    executor.close()
+
+
+def test_cancel_after_reap_failure_clears_pending_without_endless_cancelling(
+        monkeypatch):
+    scheduler = MainThreadScheduler()
+    executor = RecordingExecutor()
+    host = ProductionStartHarness(executor)
+    process = RecoverableProcess()
+    entered = threading.Event()
+    release = threading.Event()
+
+    def engine(*_args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=2.0)
+        raise UGCHelperReapError("alive", process=process)
+
+    monkeypatch.setattr(window_module.GLib, "idle_add", scheduler.idle_add)
+    monkeypatch.setattr(background_prepare, "prepare_required_mods", engine)
+    a = SimpleNamespace(ip="10.0.0.1", gport=2302, qport=1, name="A", mods_json="[]")
+    b = SimpleNamespace(ip="10.0.0.2", gport=2302, qport=2, name="B", mods_json="[]")
+    try:
+        host._background_prepare_for_obj(a)
+        scheduler.drain_until(entered.is_set)
+        host._background_prepare_for_obj(b)
+        release.set()
+        scheduler.drain_until(lambda: executor.futures[0].done())
+        window_module.DZLLWindow._background_prepare_action_clicked(host, None)
+        snapshot = host._background_prepare_queue.snapshot()
+        assert snapshot.blocked_reap_failure
+        assert not snapshot.cancelling
+        assert snapshot.active is None and snapshot.pending == ()
+        assert not snapshot.busy
+        assert host.background_prepare_action_btn.text == "Close"
+        assert background_prepare.preparation_operation_busy(host)
+    finally:
+        release.set()
+        executor.close()
+
+
+def test_reader_only_reap_failure_terminalizes_without_poisoning_gate(monkeypatch):
+    scheduler = MainThreadScheduler()
+    executor = RecordingExecutor()
+    host = ProductionStartHarness(executor)
+
+    def engine(*_args, **_kwargs):
+        raise UGCHelperReapError(
+            "stderr reader survived",
+            helper_process_confirmed_dead=True,
+            helper_process_may_be_alive=False,
+            reader_cleanup_only=True,
+            steamapi_shutdown_confirmed=True,
+        )
+
+    monkeypatch.setattr(window_module.GLib, "idle_add", scheduler.idle_add)
+    monkeypatch.setattr(background_prepare, "prepare_required_mods", engine)
+    row = SimpleNamespace(ip="10.0.0.3", gport=2302, qport=3, name="Reader", mods_json="[]")
+    try:
+        host._background_prepare_for_obj(row)
+        scheduler.drain_until(lambda: executor.futures[0].done())
+        snapshot = host._background_prepare_queue.snapshot()
+        assert not snapshot.blocked_reap_failure and not snapshot.busy
+        assert snapshot.completed_batch.failed_count == 1
+        assert not background_prepare.preparation_operation_busy(host)
+    finally:
+        executor.close()
+
+
+def test_shutdown_after_reap_failure_has_no_logically_active_queue_item(monkeypatch):
+    scheduler = MainThreadScheduler()
+    executor = RecordingExecutor()
+    host = ProductionStartHarness(executor)
+    process = RecoverableProcess()
+    monkeypatch.setattr(window_module.GLib, "idle_add", scheduler.idle_add)
+    monkeypatch.setattr(
+        background_prepare,
+        "prepare_required_mods",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            UGCHelperReapError("alive during shutdown", process=process)
+        ),
+    )
+    host._settle_browser_scrollbar_interaction = lambda _reason: None
+    row = SimpleNamespace(ip="10.0.0.4", gport=2302, qport=4, name="Shutdown", mods_json="[]")
+    try:
+        host._background_prepare_for_obj(row)
+        scheduler.drain_until(lambda: executor.futures[0].done())
+        window_module.DZLLWindow._shutdown_cleanup(host)
+        snapshot = host._background_prepare_queue.snapshot()
+        assert snapshot.shutdown
+        assert snapshot.active is None and snapshot.pending == ()
+        assert not snapshot.busy and not snapshot.cancelling
+        assert snapshot.blocked_reap_failure
+        assert background_prepare.preparation_operation_busy(host)
+    finally:
+        executor.close()
 
 
 def test_production_setup_exception_becomes_visible_failed_batch(monkeypatch, capsys):

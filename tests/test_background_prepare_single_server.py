@@ -181,6 +181,83 @@ def test_every_terminal_path_releases_ownership(monkeypatch, snapshot, runtime, 
     assert background_prepare.preparation_operation_gate(win).active_owner == ""
 
 
+def test_unconfirmed_reap_failure_poison_is_recoverable_from_process_handle(
+        monkeypatch, snapshot, runtime):
+    win = FakeWindow()
+
+    class Process:
+        alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+    process = Process()
+    monkeypatch.setattr(
+        background_prepare,
+        "prepare_required_mods",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            background_prepare.UGCHelperReapError(
+                "helper unresolved", process=process,
+            )
+        ),
+    )
+    controller = SingleServerBackgroundPreparation(win)
+    with pytest.raises(background_prepare.UGCHelperReapError):
+        controller.run(snapshot, runtime)
+    gate = background_prepare.preparation_operation_gate(win)
+    assert gate.blocked_reap_failure and controller.active
+    assert not gate.try_recover_reap_failure()
+    process.alive = False
+    assert gate.try_recover_reap_failure()
+    assert not gate.blocked_reap_failure and not controller.active
+
+
+def test_recovery_generation_cannot_clear_a_different_blocked_lease():
+    win = FakeWindow()
+
+    class Process:
+        def poll(self):
+            return 0
+
+    gate = background_prepare.preparation_operation_gate(win)
+    lease = gate.try_acquire("foreground_join")
+    assert gate.mark_reap_failure(
+        lease,
+        background_prepare.UGCHelperReapError(
+            "old helper exited", process=Process(),
+        ),
+    )
+    assert not gate.try_recover_reap_failure(
+        expected_generation=lease.generation + 1,
+    )
+    assert gate.blocked_reap_failure
+    assert gate.try_recover_reap_failure(
+        expected_generation=lease.generation,
+    )
+
+
+def test_process_dead_reader_failure_releases_gate_immediately(
+        monkeypatch, snapshot, runtime):
+    win = FakeWindow()
+    monkeypatch.setattr(
+        background_prepare,
+        "prepare_required_mods",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            background_prepare.UGCHelperReapError(
+                "reader survived",
+                helper_process_confirmed_dead=True,
+                helper_process_may_be_alive=False,
+                reader_cleanup_only=True,
+            )
+        ),
+    )
+    controller = SingleServerBackgroundPreparation(win)
+    with pytest.raises(background_prepare.UGCHelperReapError):
+        controller.run(snapshot, runtime)
+    gate = background_prepare.preparation_operation_gate(win)
+    assert not gate.blocked_reap_failure and not controller.active
+
+
 def test_cancel_signals_existing_event_and_releases_owner(monkeypatch, snapshot, runtime):
     win = FakeWindow()
     controller = SingleServerBackgroundPreparation(win)
@@ -287,6 +364,9 @@ def test_normal_join_entry_rejects_background_gate_before_starting_attempt():
         "def _prune_expired_dead", 1
     )[0]
     assert entry.index("shared_join_preparation_busy(self)") < entry.index(
+        'gate.try_acquire("foreground_join")'
+    )
+    assert entry.index('gate.try_acquire("foreground_join")') < entry.index(
         "self._join_attempts.begin("
     )
     assert entry.index("self._join_attempts.begin(") < entry.index(

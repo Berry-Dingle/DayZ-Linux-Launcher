@@ -5,12 +5,14 @@ from dzll_launcher import window as window_module
 from dzll_launcher.background_prepare import (
     BackgroundPreparationRuntime,
     BackgroundServerPreparationSnapshot,
+    preparation_operation_gate,
 )
 from dzll_launcher.background_prepare_queue import (
     BackgroundPreparationQueue,
     BackgroundServerState,
 )
 from dzll_launcher.preparation_contracts import PreparationOutcome, PreparationStatus
+from dzll_launcher.steam_ugc_backend import UGCHelperReapError
 from dzll_launcher.ui_row import ServerObject
 from dzll_launcher.window import DZLLWindow
 
@@ -133,6 +135,25 @@ def test_blocked_join_presentation_is_exact_and_returns_to_normal_when_idle():
     queue.finish(transition.dispatch, PreparationOutcome(PreparationStatus.READY))
     assert DZLLWindow._background_prepare_join_available(host, a)
     assert DZLLWindow._background_prepare_join_presentation(host, a) == {}
+
+
+def test_reap_block_has_distinct_join_presentation_and_disables_download():
+    queue = BackgroundPreparationQueue()
+    server = row("10.0.0.9", "Blocked")
+    host = state_host(queue)
+    gate = preparation_operation_gate(host)
+    assert gate.block_reap_failure(
+        "foreground_join", UGCHelperReapError("helper unresolved")
+    )
+    assert not DZLLWindow._background_prepare_join_available(host, server)
+    assert DZLLWindow._background_prepare_join_presentation(host, server) == {
+        "icon_name": "dialog-error-symbolic",
+        "tooltip": (
+            "Join unavailable because Steam preparation did not shut down cleanly"
+        ),
+        "css_class": "dzll-join-blocked",
+    }
+    assert not DZLLWindow._background_prepare_download_available(host, server)
 
 
 def test_download_row_presentations_derive_from_central_identity_records():

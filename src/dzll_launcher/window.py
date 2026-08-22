@@ -153,9 +153,13 @@ from .background_prepare import (
     BackgroundPreparationRuntime,
     BackgroundServerPreparationSnapshot,
     SingleServerBackgroundPreparation,
+    preparation_operation_gate,
     prepare_server_mods_without_joining,
 )
-from .join_preparation_busy import shared_join_preparation_busy
+from .join_preparation_busy import (
+    shared_join_preparation_busy,
+    shared_join_preparation_state,
+)
 from .background_prepare_queue import (
     BackgroundBatchEntry,
     BackgroundPreparationQueue,
@@ -663,6 +667,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._pending_join_mod_names_by_id = {}
         self._pending_join_attempt_id = 0
         self._join_attempts = JoinAttemptTracker()
+        self._join_preparation_leases = {}
         self._join_popup_presentation = JoinPopupPresentationController(
             schedule=lambda callback: GLib.idle_add(callback),
             commit=self._commit_join_popup_presentation,
@@ -789,6 +794,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._background_prepare_controller = None
         self._background_prepare_snapshot = None
         self._background_prepare_queue = BackgroundPreparationQueue()
+        self._preparation_reap_recovery_source_id = 0
+        self._preparation_reap_recovery_generation = 0
 
         css = get_app_css(
             DIVIDER_COLOR=DIVIDER_COLOR,
@@ -2957,6 +2964,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._background_prepare_ui_generation = int(
             getattr(self, "_background_prepare_ui_generation", 0) or 0
         ) + 1
+        reap_recovery_source = int(
+            getattr(self, "_preparation_reap_recovery_source_id", 0) or 0
+        )
+        if reap_recovery_source:
+            try:
+                GLib.source_remove(reap_recovery_source)
+            except Exception:
+                pass
+            self._preparation_reap_recovery_source_id = 0
+        self._preparation_reap_recovery_generation = 0
         queue = getattr(self, "_background_prepare_queue", None)
         transition = queue.shutdown() if queue is not None else None
         controller = (
@@ -2969,6 +2986,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 controller.cancel()
             except Exception:
                 pass
+        try:
+            gate = preparation_operation_gate(self)
+            if gate.try_recover_reap_failure() and queue is not None:
+                queue.clear_reap_block()
+        except Exception:
+            logger.exception("Steam helper reap recovery check failed during shutdown")
         self._settle_browser_scrollbar_interaction("shutdown")
         drag_light = getattr(self, "_scroll_drag_light", None)
         if drag_light is not None:
@@ -9492,6 +9515,47 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._pending_join_attempt_id = 0
         return True
 
+    def _remember_join_preparation_lease(self, attempt_id: int, lease) -> None:
+        leases = getattr(self, "_join_preparation_leases", None)
+        if leases is None:
+            leases = {}
+            self._join_preparation_leases = leases
+        leases[int(attempt_id)] = lease
+
+    def _release_join_preparation_lease(self, attempt_id: int) -> bool:
+        leases = getattr(self, "_join_preparation_leases", None)
+        lease = leases.pop(int(attempt_id), None) if leases is not None else None
+        if lease is None:
+            return False
+        released = preparation_operation_gate(self).release(lease)
+        if released and not bool(getattr(self, "_shutdown_cleanup_done", False)):
+            refresh = getattr(self, "_refresh_background_prepare_action_states", None)
+            if callable(refresh):
+                try:
+                    self.GLib.idle_add(refresh)
+                except Exception:
+                    logger.exception(
+                        "Could not refresh preparation controls after Join release"
+                    )
+        return bool(released)
+
+    def _block_join_preparation_lease(
+            self, attempt_id: int, error: UGCHelperReapError) -> bool:
+        leases = getattr(self, "_join_preparation_leases", None)
+        lease = leases.get(int(attempt_id)) if leases is not None else None
+        if lease is None:
+            return False
+        gate = preparation_operation_gate(self)
+        if not gate.mark_reap_failure(lease, error):
+            return False
+        leases.pop(int(attempt_id), None)
+        schedule_recovery = getattr(
+            self, "_schedule_preparation_reap_recovery_poll", None,
+        )
+        if callable(schedule_recovery):
+            schedule_recovery()
+        return True
+
     def _cleanup_join_attempt(self, attempt_id: int, reason: str, *, clear_pending: bool = True) -> bool:
         cleaned = self._join_attempts.cleanup(attempt_id, reason)
         if cleaned:
@@ -9546,14 +9610,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         """Observe only exceptions which escaped the foreground Join worker."""
         try:
             if future.cancelled():
+                DZLLWindow._release_join_preparation_lease(self, attempt_id)
                 return
             error = future.exception()
         except Exception:
             logger.exception(
                 "Join %d worker Future could not be inspected", int(attempt_id),
             )
+            DZLLWindow._release_join_preparation_lease(self, attempt_id)
             return
         if error is None:
+            DZLLWindow._release_join_preparation_lease(self, attempt_id)
             return
 
         logger.error(
@@ -9565,7 +9632,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
             message = (
                 "Steam preparation could not shut down cleanly. Join was aborted."
             )
+            if error.helper_process_may_be_alive:
+                if not DZLLWindow._block_join_preparation_lease(
+                    self, attempt_id, error,
+                ):
+                    logger.error(
+                        "Join %d could not register unresolved Steam helper ownership",
+                        int(attempt_id),
+                    )
+            else:
+                DZLLWindow._release_join_preparation_lease(self, attempt_id)
         else:
+            DZLLWindow._release_join_preparation_lease(self, attempt_id)
             message = "Join preparation failed unexpectedly. Please try again."
         try:
             self.GLib.idle_add(
@@ -9594,6 +9672,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._cleanup_join_attempt(attempt_id, "uncaught Join worker exception")
         self._set_updating(False)
         self._on_filter_changed(reason="join")
+        ensure_recovery = getattr(
+            self, "_ensure_preparation_reap_recovery_poll", None
+        )
+        if callable(ensure_recovery):
+            ensure_recovery()
         return False
 
     def _launch_direct_steam_url(self, obj: ServerObject, mod_win_paths=None, *, attempt_id: int = 0):
@@ -10329,6 +10412,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if (
             not queue.accepting
             or getattr(self._join_attempts, "active", None) is not None
+            or preparation_operation_gate(self).blocked_reap_failure
         ):
             return False
         if not isinstance(obj, ServerObject):
@@ -10372,6 +10456,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         }.get(state, {})
 
     def _background_prepare_join_presentation(self, _obj=None) -> dict:
+        if shared_join_preparation_state(self) == "blocked_reap_failure":
+            return {
+                "icon_name": "dialog-error-symbolic",
+                "tooltip": (
+                    "Join unavailable because Steam preparation did not shut "
+                    "down cleanly"
+                ),
+                "css_class": "dzll-join-blocked",
+            }
         if not self._background_prepare_queue.busy:
             return {}
         return {
@@ -10391,6 +10484,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         if callable(refresh_companion):
             refresh_companion()
+        manager = getattr(
+            getattr(self, "_settings_ui", None), "_mods_mgr_overlay", None,
+        )
+        refresh_manager = getattr(manager, "_update_batch_action_buttons", None)
+        if callable(refresh_manager):
+            refresh_manager()
 
     def _background_prepare_is_current(self, generation: int) -> bool:
         return bool(
@@ -10462,7 +10561,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         else:
             snapshot = current
         self._background_prepare_active = snapshot.busy
-        if snapshot.cancelling:
+        if snapshot.blocked_reap_failure:
+            DZLLWindow._background_prepare_render_reap_blocked(self, snapshot)
+        elif snapshot.cancelling:
             DZLLWindow._background_prepare_present_cancelling(self)
         elif snapshot.active is not None:
             pending_count = len(snapshot.pending)
@@ -10482,6 +10583,42 @@ class DZLLWindow(Gtk.ApplicationWindow):
             DZLLWindow._background_prepare_set_active_presentation(self, False)
             self.background_prepare_status.set_visible(False)
         self._refresh_background_prepare_action_states()
+
+    def _background_prepare_render_reap_blocked(
+            self, snapshot: BackgroundQueueSnapshot) -> None:
+        self._background_prepare_active = False
+        DZLLWindow._background_prepare_set_status_container(self, True)
+        self.background_prepare_server_label.set_text(
+            "Steam preparation is temporarily blocked"
+        )
+        self.background_prepare_detail_label.set_text(
+            "DZLL could not confirm that its Steam UGC helper exited. "
+            "No new Steam preparation will start until safe shutdown is confirmed."
+        )
+        pending_count = len(snapshot.pending)
+        self.background_prepare_queue_label.set_text(
+            f"Queued Servers: {pending_count}" if pending_count else ""
+        )
+        self.background_prepare_queue_label.set_visible(bool(pending_count))
+        self.background_prepare_queue_divider.set_visible(bool(pending_count))
+        self.background_prepare_count_label.set_text("")
+        self.background_prepare_count_label.set_visible(False)
+        DZLLWindow._background_prepare_set_progress_presentation(self, False)
+        self.background_prepare_failed_label.set_text(
+            "Steam helper shutdown was not confirmed"
+        )
+        self.background_prepare_failed_label.set_tooltip_text(
+            snapshot.blocked_error or None
+        )
+        self.background_prepare_failed_label.set_visible(True)
+        self.background_prepare_retry_btn.set_visible(False)
+        self.background_prepare_action_btn.set_label(
+            "Cancel Queue" if pending_count else "Close"
+        )
+        DZLLWindow._background_prepare_set_action_presentation(self, True)
+        self.background_prepare_right_status_label.set_text("Blocked")
+        self.background_prepare_right_status_label.set_visible(True)
+        self.background_prepare_status.set_visible(True)
 
     def _background_prepare_start_frozen_request(
             self, request: BackgroundPreparationRequest,
@@ -10564,11 +10701,27 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         backend=request.runtime.mod_download_backend,
                     )
                     presenter.on_terminal(outcome)
+                    if exc.helper_process_may_be_alive:
+                        transition = queue.finish_blocked_reap_failure(
+                            request, outcome,
+                        )
+                    else:
+                        transition = queue.finish(request, outcome)
                     self._background_prepare_log_request(
                         request,
-                        "helper-reap-failed-blocked",
+                        (
+                            "helper-reap-failed-blocked"
+                            if exc.helper_process_may_be_alive
+                            else "helper-reader-cleanup-failed-process-dead"
+                        ),
                         elapsed=f"{time.monotonic() - started:.3f}s",
                         error=str(exc),
+                    )
+                    GLib.idle_add(
+                        self._background_prepare_worker_returned,
+                        request,
+                        outcome,
+                        transition,
                     )
                     return outcome
                 except Exception as exc:
@@ -10675,11 +10828,115 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
         self._background_prepare_controller = None
         self._background_prepare_apply_queue_snapshot(transition.snapshot)
+        if transition.snapshot.blocked_reap_failure:
+            self._ensure_preparation_reap_recovery_poll()
         if transition.dispatch is not None:
             self._background_prepare_start_frozen_request(
                 transition.dispatch,
                 previous=transition.completed,
             )
+        return False
+
+    def _ensure_preparation_reap_recovery_poll(self) -> bool:
+        if getattr(self, "_shutdown_cleanup_done", False):
+            return False
+        gate = preparation_operation_gate(self)
+        if not gate.blocked_reap_failure:
+            return False
+        generation = int(gate.blocked_generation)
+        source_id = int(
+            getattr(self, "_preparation_reap_recovery_source_id", 0) or 0
+        )
+        source_generation = int(
+            getattr(self, "_preparation_reap_recovery_generation", 0) or 0
+        )
+        if source_id and source_generation == generation:
+            return True
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+            self._preparation_reap_recovery_source_id = 0
+        try:
+            self._preparation_reap_recovery_generation = generation
+            self._preparation_reap_recovery_source_id = GLib.timeout_add(
+                1000,
+                self._poll_preparation_reap_recovery,
+                generation,
+            )
+            return True
+        except Exception:
+            logger.exception("Could not schedule Steam helper reap recovery polling")
+            self._preparation_reap_recovery_source_id = 0
+            self._preparation_reap_recovery_generation = 0
+            return False
+
+    def _schedule_preparation_reap_recovery_poll(self) -> bool:
+        """Queue lifecycle recovery independently of operation presentation."""
+
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        try:
+            self.GLib.idle_add(self._start_preparation_reap_recovery_poll)
+            return True
+        except Exception:
+            logger.exception("Could not queue Steam helper reap recovery lifecycle")
+            return False
+
+    def _start_preparation_reap_recovery_poll(self) -> bool:
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        self._ensure_preparation_reap_recovery_poll()
+        self._refresh_background_prepare_action_states()
+        return False
+
+    def _poll_preparation_reap_recovery(
+            self, expected_generation: int = 0) -> bool:
+        if getattr(self, "_shutdown_cleanup_done", False):
+            self._preparation_reap_recovery_source_id = 0
+            self._preparation_reap_recovery_generation = 0
+            return False
+        gate = preparation_operation_gate(self)
+        source_generation = int(
+            getattr(self, "_preparation_reap_recovery_generation", 0) or 0
+        )
+        if (
+            int(expected_generation or 0)
+            and source_generation != int(expected_generation)
+        ):
+            return False
+        if not gate.blocked_reap_failure:
+            self._preparation_reap_recovery_source_id = 0
+            self._preparation_reap_recovery_generation = 0
+            return False
+        if (
+            int(expected_generation or 0)
+            and gate.blocked_generation != int(expected_generation)
+        ):
+            self._preparation_reap_recovery_source_id = 0
+            self._preparation_reap_recovery_generation = 0
+            self._ensure_preparation_reap_recovery_poll()
+            return False
+        if not gate.try_recover_reap_failure(
+            expected_generation=int(expected_generation or 0),
+        ):
+            return True
+        logger.info(
+            "Steam UGC helper exit was confirmed; shared preparation is available again"
+        )
+        self._preparation_reap_recovery_source_id = 0
+        self._preparation_reap_recovery_generation = 0
+        transition = self._background_prepare_queue.clear_reap_block()
+        if transition.accepted:
+            self._background_prepare_apply_queue_snapshot(transition.snapshot)
+            if transition.dispatch is not None:
+                self._background_prepare_start_frozen_request(
+                    transition.dispatch,
+                    previous=transition.completed,
+                )
+        else:
+            self._refresh_background_prepare_action_states()
         return False
 
         self._background_prepare_ui_generation += 1
@@ -10977,6 +11234,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _background_prepare_action_clicked(self, _button) -> None:
         queue = self._background_prepare_queue
+        snapshot = queue.snapshot()
+        if snapshot.blocked_reap_failure:
+            if snapshot.pending:
+                transition = queue.cancel_blocked_pending()
+                if transition.accepted:
+                    self._background_prepare_apply_queue_snapshot(
+                        transition.snapshot
+                    )
+            else:
+                self._background_prepare_close()
+            return
         if not queue.busy:
             self._background_prepare_close()
             return
@@ -10991,7 +11259,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._background_prepare_cancel_consent_ui()
 
     def _background_prepare_close(self) -> None:
-        if self._background_prepare_queue.busy:
+        snapshot = self._background_prepare_queue.snapshot()
+        if snapshot.busy:
             return
         self._background_prepare_queue.clear_completed_batch()
         self._background_prepare_ui_generation += 1
@@ -11123,8 +11392,28 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     requested_server=f"{obj.ip}:{int(obj.gport)}",
                 )
                 message = "Join already in progress…"
+            elif shared_join_preparation_state(self) == "blocked_reap_failure":
+                reason = preparation_operation_gate(self).blocked_reason
+                message = (
+                    "Steam preparation is temporarily blocked until helper "
+                    "shutdown is confirmed."
+                )
+                if reason:
+                    logger.warning("Blocked Join request: %s", reason)
             else:
                 message = "Mod preparation already in progress…"
+            self._set_server_companion_join_status(message, flash=True)
+            return
+
+        gate = preparation_operation_gate(self)
+        join_lease = gate.try_acquire("foreground_join")
+        if join_lease is None:
+            message = (
+                "Steam preparation is temporarily blocked until helper "
+                "shutdown is confirmed."
+                if gate.blocked_reap_failure
+                else "Mod preparation already in progress…"
+            )
             self._set_server_companion_join_status(message, flash=True)
             return
 
@@ -11136,7 +11425,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             skip_dayz_launcher=bool(self.settings.get("skip_dayz_launcher", True)),
         )
         if attempt is None:
+            gate.release(join_lease)
             return
+        self._remember_join_preparation_lease(attempt.attempt_id, join_lease)
         # Cancellation belongs to this Join attempt. Background preparation and
         # earlier Join attempts must never donate a set event to a new attempt.
         self._steamcmd_cancel_event = threading.Event()
@@ -11144,9 +11435,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
         attempt_id = attempt.attempt_id
         self._join_popup_enter_checking(attempt_id)
 
-        if not self._ensure_join_steam_start_consent(attempt_id):
+        try:
+            consent_ready = self._ensure_join_steam_start_consent(attempt_id)
+        except Exception as exc:
+            logger.exception("Join %d Steam consent failed", int(attempt_id))
+            self._show_join_preparation_error(
+                attempt_id, f"Could not obtain Steam start permission: {exc}",
+            )
+            self._cleanup_join_attempt(attempt_id, "Steam start consent exception")
+            self._release_join_preparation_lease(attempt_id)
+            return
+        if not consent_ready:
             self._hide_steamcmd_auth_overlay()
             self._cleanup_join_attempt(attempt_id, "Steam start declined or failed")
+            self._release_join_preparation_lease(attempt_id)
             self._on_filter_changed(reason="join")
             return
 
@@ -11171,6 +11473,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             self._show_join_preparation_error(attempt_id, f"Could not prepare required mod list: {exc}")
             self._cleanup_join_attempt(attempt_id, "required mod resolution failure")
+            self._release_join_preparation_lease(attempt_id)
             return
 
         try:
@@ -11184,32 +11487,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._pending_join_mod_ids = []
             self._pending_join_mod_names_by_id = {}
 
-        workshop_dir = self._get_dayz_workshop_root() or str(self.settings.get("workshop_dir") or "").strip()
-        if not workshop_dir:
-            workshop_dir = autodetect_workshop_dir() or ""
-
-        steamcmd_path = str(self.settings.get("steamcmd_path") or "").strip()
-        if not steamcmd_path:
-            steamcmd_path = autodetect_steamcmd_path() or ""
-
-        steam_user = str(self.settings.get("steamcmd_username") or "").strip()
-        validate = bool(self.settings.get("verify_mod_files", False))
-        dry = bool(self.settings.get("steamcmd_dry_run", False))  # kept for legacy; UI removed
-
-        proton_prefix = self._get_dayz_proton_prefix()
-        watch_folder_linux = self._get_dzll_watch_folder_linux()
-        self._log_join_resolved_dayz_paths(workshop_dir=workshop_dir, proton_prefix=proton_prefix)
-
-        use_steamcmd = bool(self.settings.get("enable_steamcmd_mod_handling", True))
-        mod_download_backend = str(self.settings.get("mod_download_backend") or "steam_client")
-
-        # New split toggles (with backwards compatibility to old combined toggle)
-        auto_install_missing = bool(self.settings.get("auto_install_missing_mods", True))
-        auto_update_required = bool(self.settings.get("auto_update_required_mods", False))
-        if ("auto_install_missing_mods" not in self.settings) and ("auto_update_required_mods" not in self.settings):
-            legacy = bool(self.settings.get("auto_install_update_mods", True))
-            auto_install_missing = legacy
-            auto_update_required = legacy
+        try:
+            runtime = self._resolve_join_runtime(mods)
+            workshop_dir = runtime["workshop_dir"]
+            steamcmd_path = runtime["steamcmd_path"]
+            steam_user = runtime["steam_user"]
+            validate = runtime["validate"]
+            dry = runtime["dry"]
+            proton_prefix = runtime["proton_prefix"]
+            watch_folder_linux = runtime["watch_folder_linux"]
+            use_steamcmd = runtime["use_steamcmd"]
+            mod_download_backend = runtime["mod_download_backend"]
+            auto_install_missing = runtime["auto_install_missing"]
+            auto_update_required = runtime["auto_update_required"]
+        except Exception as exc:
+            self._show_join_preparation_error(
+                attempt_id, f"Could not resolve Join preparation settings: {exc}",
+            )
+            self._cleanup_join_attempt(attempt_id, "Join runtime resolution failure")
+            self._release_join_preparation_lease(attempt_id)
+            return
 
         def do_prepare_and_launch():
             self._join_log(attempt_id, "worker started")
@@ -11231,8 +11528,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 attempt_id=attempt_id,
             )
 
-        self._show_join_progress_overlay("Checking & Preparing Mods for Join...")
         try:
+            self._show_join_progress_overlay("Checking & Preparing Mods for Join...")
             future = self._hi_executor.submit(do_prepare_and_launch)
             future.add_done_callback(
                 lambda completed, owner=attempt_id: self._join_worker_future_done(
@@ -11243,6 +11540,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception as exc:
             self._show_join_preparation_error(attempt_id, f"Could not start Join preparation: {exc}")
             self._cleanup_join_attempt(attempt_id, "worker submission failure")
+            self._release_join_preparation_lease(attempt_id)
 
     # ----------------------------
     # Dead cache prune / clamp

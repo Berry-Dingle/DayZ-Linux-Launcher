@@ -255,9 +255,89 @@ def _log_event(progress_cb, message: str, **extra) -> None:
 class UGCHelperReapError(RuntimeError):
     """Raised when DZLL's own UGC helper cannot be confirmed exited."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        helper_process_confirmed_dead: bool = False,
+        helper_process_may_be_alive: bool = True,
+        reader_cleanup_only: bool = False,
+        steamapi_shutdown_confirmed: bool = False,
+        process=None,
+        session=None,
+    ) -> None:
+        super().__init__(message)
+        self.helper_process_confirmed_dead = bool(helper_process_confirmed_dead)
+        self.helper_process_may_be_alive = bool(
+            helper_process_may_be_alive and not helper_process_confirmed_dead
+        )
+        self.reader_cleanup_only = bool(reader_cleanup_only)
+        self.steamapi_shutdown_confirmed = bool(steamapi_shutdown_confirmed)
+        self._recovery_process = process
+        self._recovery_session = session
+
+    def bind_session(self, session) -> "UGCHelperReapError":
+        """Retain the concrete owner needed for non-PID-based recovery."""
+
+        self._recovery_session = session
+        if self._recovery_process is None:
+            self._recovery_process = getattr(session, "_proc", None)
+        self.steamapi_shutdown_confirmed = bool(
+            self.steamapi_shutdown_confirmed
+            or getattr(session, "_shutdown_complete", False)
+        )
+        return self
+
+    def refresh_process_confirmation(self) -> bool:
+        """Poll the retained Process handle and record confirmed process death."""
+
+        if self.helper_process_confirmed_dead:
+            return True
+        proc = self._recovery_process
+        if proc is None:
+            return False
+        try:
+            confirmed = proc.poll() is not None
+        except Exception:
+            confirmed = False
+        if confirmed:
+            self.helper_process_confirmed_dead = True
+            self.helper_process_may_be_alive = False
+        return confirmed
+
+    def finalize_confirmed_recovery(self) -> bool:
+        """Release retained local resources after Process-based death confirmation."""
+
+        if not self.refresh_process_confirmation():
+            return False
+        session = self._recovery_session
+        if session is not None:
+            try:
+                session._finalize_confirmed_reap_recovery()
+            except Exception as exc:
+                logger.warning(
+                    "Steam UGC helper exited but local recovery cleanup was incomplete: %s",
+                    exc,
+                )
+            finally:
+                deactivate_ugc_session(session)
+                self._recovery_session = None
+        self._recovery_process = None
+        return True
+
 
 class UGCSessionError(RuntimeError):
     """Raised when the cooperative helper protocol fails closed."""
+
+
+def _unconfirmed_helper_reap_error(message: str, proc) -> UGCHelperReapError:
+    error = UGCHelperReapError(
+        message,
+        helper_process_may_be_alive=True,
+        process=proc,
+    )
+    error.refresh_process_confirmation()
+    return error
 
 
 _ACTIVE_UGC_SESSION = threading.local()
@@ -282,11 +362,12 @@ def activate_ugc_session(session) -> None:
         _ACTIVE_UGC_SESSIONS.add(session)
 
 
-def deactivate_ugc_session(session) -> None:
+def deactivate_ugc_session(session, *, retain_for_recovery: bool = False) -> None:
     if getattr(_ACTIVE_UGC_SESSION, "value", None) is session:
         _ACTIVE_UGC_SESSION.value = None
-    with _ACTIVE_UGC_SESSIONS_LOCK:
-        _ACTIVE_UGC_SESSIONS.discard(session)
+    if not retain_for_recovery:
+        with _ACTIVE_UGC_SESSIONS_LOCK:
+            _ACTIVE_UGC_SESSIONS.discard(session)
 
 
 def active_ugc_session():
@@ -373,8 +454,8 @@ def _stop_helper_process(proc: subprocess.Popen, *, command: str, progress_cb=No
                 command=command, helper_pid=pid, elapsed=f"{elapsed:.3f}s",
                 error=str(exc),
             )
-            raise UGCHelperReapError(
-                f"UGC helper pid {pid} for {command} could not be reaped"
+            raise _unconfirmed_helper_reap_error(
+                f"UGC helper pid {pid} for {command} could not be reaped", proc,
             ) from exc
     except Exception as exc:
         elapsed = time.monotonic() - stop_started
@@ -383,8 +464,8 @@ def _stop_helper_process(proc: subprocess.Popen, *, command: str, progress_cb=No
             command=command, helper_pid=pid, elapsed=f"{elapsed:.3f}s",
             error=str(exc),
         )
-        raise UGCHelperReapError(
-            f"UGC helper pid {pid} for {command} could not be reaped"
+        raise _unconfirmed_helper_reap_error(
+            f"UGC helper pid {pid} for {command} could not be reaped", proc,
         ) from exc
     returncode = proc.poll()
     elapsed = time.monotonic() - stop_started
@@ -393,8 +474,8 @@ def _stop_helper_process(proc: subprocess.Popen, *, command: str, progress_cb=No
             progress_cb, "[Steam UGC] Helper failure-to-reap",
             command=command, helper_pid=pid, elapsed=f"{elapsed:.3f}s",
         )
-        raise UGCHelperReapError(
-            f"UGC helper pid {pid} for {command} remained alive after stop"
+        raise _unconfirmed_helper_reap_error(
+            f"UGC helper pid {pid} for {command} remained alive after stop", proc,
         )
     _log_event(
         progress_cb, "[Steam UGC] Stopped helper subprocess",
@@ -864,7 +945,32 @@ class CooperativeUGCSession:
                 if self._closed:
                     return
                 self._closed = True
-                self._close_session()
+                try:
+                    self._close_session()
+                except UGCHelperReapError as exc:
+                    exc.bind_session(self)
+                    raise
+
+    def _finalize_confirmed_reap_recovery(self) -> None:
+        """Best-effort local cleanup after the retained Process is confirmed dead."""
+
+        errors = []
+        for cleanup in (self._close_stdin, self._close_read_pipes):
+            try:
+                cleanup()
+            except Exception as exc:
+                errors.append(exc)
+        for thread in (self._stdout_thread, self._stderr_thread):
+            if thread is not None and thread.is_alive():
+                thread.join(timeout=0.0)
+        try:
+            self._cleanup_temp_dir()
+        except Exception as exc:
+            errors.append(exc)
+        if errors:
+            raise UGCSessionError(
+                "; ".join(str(error) for error in errors)
+            )
 
     def _close_session(self) -> None:
         proc = self._proc
@@ -1046,7 +1152,13 @@ class CooperativeUGCSession:
         if surviving_readers:
             reader_names = ", ".join(surviving_readers)
             raise UGCHelperReapError(
-                f"Steam UGC helper {reader_names} reader thread survived shutdown"
+                f"Steam UGC helper {reader_names} reader thread survived shutdown",
+                helper_process_confirmed_dead=True,
+                helper_process_may_be_alive=False,
+                reader_cleanup_only=True,
+                steamapi_shutdown_confirmed=bool(self._shutdown_complete),
+                process=proc,
+                session=self,
             )
         if cleanup_error is not None:
             raise cleanup_error
@@ -2017,6 +2129,8 @@ def repair_ugc_item(
     emit_stage("unsubscribing")
     try:
         request_ok, _snapshots = request_unsubscribe_fn([mid], appid=int(appid), timeout=12)
+    except UGCHelperReapError:
+        raise
     except Exception as exc:
         return {"ok": False, "id": mid, "reason": "unsubscribe_failed", "error": f"Steam could not unsubscribe the mod: {exc}"}
     if not request_ok:
@@ -2028,6 +2142,8 @@ def repair_ugc_item(
         emit_stage("waiting_removal")
         try:
             state_ok, state = query()
+        except UGCHelperReapError:
+            raise
         except Exception:
             state_ok, state = False, {}
         if state_ok and state:
@@ -2076,6 +2192,8 @@ def repair_ugc_item(
                 timeout=float(download_timeout),
             )
         )
+    except UGCHelperReapError:
+        raise
     except Exception as exc:
         return {
             "ok": False,
@@ -2088,6 +2206,8 @@ def repair_ugc_item(
     emit_stage("verifying")
     try:
         state_ok, terminal = query()
+    except UGCHelperReapError:
+        raise
     except Exception:
         state_ok, terminal = False, {}
     if not state_ok or not terminal:

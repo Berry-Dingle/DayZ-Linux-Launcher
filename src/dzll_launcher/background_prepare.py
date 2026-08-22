@@ -116,6 +116,22 @@ class _OperationLease:
     owner: str
 
 
+class PreparationOperationState(Enum):
+    IDLE = "idle"
+    ACTIVE = "active"
+    BLOCKED_REAP_FAILURE = "blocked_reap_failure"
+
+
+@dataclass(frozen=True)
+class PreparationReapFailure:
+    lease: _OperationLease
+    error: UGCHelperReapError
+
+    @property
+    def reason(self) -> str:
+        return str(self.error or "Steam UGC helper shutdown could not be confirmed.")
+
+
 class PreparationOperationGate:
     """Small process-local serialization gate; it schedules no work."""
 
@@ -123,6 +139,32 @@ class PreparationOperationGate:
         self._lock = threading.Lock()
         self._generation = 0
         self._active: _OperationLease | None = None
+        self._reap_failure: PreparationReapFailure | None = None
+
+    @property
+    def state(self) -> PreparationOperationState:
+        with self._lock:
+            if self._reap_failure is not None:
+                return PreparationOperationState.BLOCKED_REAP_FAILURE
+            if self._active is not None:
+                return PreparationOperationState.ACTIVE
+            return PreparationOperationState.IDLE
+
+    @property
+    def blocked_reap_failure(self) -> bool:
+        return self.state is PreparationOperationState.BLOCKED_REAP_FAILURE
+
+    @property
+    def blocked_reason(self) -> str:
+        with self._lock:
+            failure = self._reap_failure
+        return failure.reason if failure is not None else ""
+
+    @property
+    def blocked_generation(self) -> int:
+        with self._lock:
+            failure = self._reap_failure
+        return int(failure.lease.generation) if failure is not None else 0
 
     @property
     def active_owner(self) -> str:
@@ -143,8 +185,58 @@ class PreparationOperationGate:
 
     def release(self, lease: _OperationLease) -> bool:
         with self._lock:
+            if self._active != lease or self._reap_failure is not None:
+                return False
+            self._active = None
+            return True
+
+    def mark_reap_failure(
+        self,
+        lease: _OperationLease,
+        error: UGCHelperReapError,
+    ) -> bool:
+        with self._lock:
             if self._active != lease:
                 return False
+            self._reap_failure = PreparationReapFailure(lease, error)
+            return True
+
+    def block_reap_failure(
+        self,
+        owner: str,
+        error: UGCHelperReapError,
+    ) -> bool:
+        """Poison an otherwise idle gate for an unresolved foreground helper."""
+
+        with self._lock:
+            if self._reap_failure is not None:
+                return True
+            if self._active is not None:
+                return False
+            self._generation += 1
+            lease = _OperationLease(self._generation, str(owner))
+            self._active = lease
+            self._reap_failure = PreparationReapFailure(lease, error)
+            return True
+
+    def try_recover_reap_failure(self, *, expected_generation: int = 0) -> bool:
+        """Clear poison only after the retained Process confirms its own exit."""
+
+        with self._lock:
+            failure = self._reap_failure
+        if failure is None:
+            return False
+        if (
+            int(expected_generation or 0)
+            and failure.lease.generation != int(expected_generation)
+        ):
+            return False
+        if not failure.error.finalize_confirmed_recovery():
+            return False
+        with self._lock:
+            if self._reap_failure != failure or self._active != failure.lease:
+                return False
+            self._reap_failure = None
             self._active = None
             return True
 
@@ -223,7 +315,7 @@ class SingleServerBackgroundPreparation:
 
         cancel_event = self._cancel_event
         cancel_event.clear()
-        helper_reap_failed = False
+        helper_reap_blocked = False
         if cancel_requested:
             cancel_event.set()
         try:
@@ -313,13 +405,15 @@ class SingleServerBackgroundPreparation:
                 ),
                 cancel_event=cancel_event,
             )
-        except UGCHelperReapError:
-            helper_reap_failed = True
+        except UGCHelperReapError as exc:
+            helper_reap_blocked = bool(exc.helper_process_may_be_alive)
+            if helper_reap_blocked:
+                self._gate.mark_reap_failure(lease, exc)
             raise
         finally:
             cancel_event.clear()
             self._win._join_steam_start_allowed = False
-            if not helper_reap_failed:
+            if not helper_reap_blocked:
                 with self._state_lock:
                     self._lease = None
                     self._presenter = None

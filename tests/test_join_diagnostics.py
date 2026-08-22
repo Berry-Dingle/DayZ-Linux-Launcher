@@ -6,7 +6,13 @@ import threading
 import pytest
 
 from dzll_launcher.join_attempt import JoinAttemptTracker
-from dzll_launcher import join_prepare, launch_utils, steam_client_mods, steam_ugc_backend
+from dzll_launcher import (
+    join_prepare, launch_utils, steam_client_mods, steam_ugc_backend,
+    window as window_module,
+)
+from dzll_launcher.background_prepare import preparation_operation_gate
+from dzll_launcher.background_prepare_queue import BackgroundPreparationQueue
+from dzll_launcher.join_preparation_busy import shared_join_preparation_busy
 from dzll_launcher.window import DZLLWindow
 
 
@@ -95,6 +101,30 @@ def test_second_click_during_active_attempt_allocates_no_worker_identity():
     first = begin(value)
     assert begin(value, name="Second") is None
     assert value.active is first
+
+
+def test_mod_repair_gate_owner_blocks_join_before_attempt_creation():
+    attempts = JoinAttemptTracker()
+    statuses = []
+    host = SimpleNamespace(
+        _join_attempts=attempts,
+        _background_prepare_queue=None,
+        _set_server_companion_join_status=(
+            lambda message, flash=False: statuses.append((message, flash))
+        ),
+        _join_log=lambda *_a, **_k: None,
+    )
+    gate = preparation_operation_gate(host)
+    lease = gate.try_acquire("mod_repair")
+
+    DZLLWindow._join_server_for_obj(
+        host,
+        SimpleNamespace(ip="192.0.2.1", gport=2302, qport=27016, name="Server"),
+    )
+
+    assert attempts.active is None
+    assert statuses == [("Mod preparation already in progress…", True)]
+    assert gate.release(lease)
 
 
 def test_duplicate_click_does_not_replace_active_state():
@@ -435,6 +465,13 @@ def worker_exception_host(*, active_attempt=1, shutting_down=False):
         _set_updating=lambda value: events.append(("updating", value)),
         _on_filter_changed=lambda **kwargs: events.append(("filter", kwargs)),
     )
+    host._join_preparation_leases = {}
+    if int(active_attempt) == 1:
+        lease = preparation_operation_gate(host).try_acquire("foreground_join")
+        host._join_preparation_leases[1] = lease
+    host._schedule_preparation_reap_recovery_poll = lambda: scheduled.idle_add(
+        lambda: events.append(("recovery",)) or False
+    )
     host._handle_join_worker_exception = (
         lambda attempt_id, message: DZLLWindow._handle_join_worker_exception(
             host, attempt_id, message,
@@ -456,6 +493,19 @@ def test_normal_join_worker_completion_schedules_no_exception_handling():
 
     DZLLWindow._join_worker_future_done(host, 1, future)
 
+    assert scheduled.calls == []
+    assert events == []
+    assert preparation_operation_gate(host).active_owner == ""
+
+
+def test_cancelled_join_worker_releases_foreground_lease():
+    host, scheduled, events = worker_exception_host()
+    future = Future()
+    assert future.cancel()
+
+    DZLLWindow._join_worker_future_done(host, 1, future)
+
+    assert preparation_operation_gate(host).active_owner == ""
     assert scheduled.calls == []
     assert events == []
 
@@ -480,8 +530,13 @@ def test_uncaught_join_worker_exception_is_marshaled_and_fails_current_attempt(
     DZLLWindow._join_worker_future_done(host, 1, failed_future(error))
 
     assert events == []
-    assert len(scheduled.calls) == 1
-    callback, args = scheduled.calls[0]
+    ui_calls = [
+        (callback, args)
+        for callback, args in scheduled.calls
+        if args == (1, expected_message)
+    ]
+    assert len(ui_calls) == 1
+    callback, args = ui_calls[0]
     assert args == (1, expected_message)
     assert callback(*args) is False
     assert events == [
@@ -491,6 +546,108 @@ def test_uncaught_join_worker_exception_is_marshaled_and_fails_current_attempt(
         ("updating", False),
         ("filter", {"reason": "join"}),
     ]
+    gate = preparation_operation_gate(host)
+    if isinstance(error, steam_ugc_backend.UGCHelperReapError):
+        assert gate.blocked_reap_failure
+    else:
+        assert gate.active_owner == ""
+
+
+def test_foreground_unconfirmed_reap_failure_blocks_later_join_until_recovery():
+    class Process:
+        alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+    process = Process()
+    host, scheduled, events = worker_exception_host()
+    error = steam_ugc_backend.UGCHelperReapError(
+        "helper remained alive", process=process,
+    )
+    DZLLWindow._join_worker_future_done(host, 1, failed_future(error))
+    gate = preparation_operation_gate(host)
+    assert gate.blocked_reap_failure
+    assert gate.active_owner == "foreground_join"
+    assert shared_join_preparation_busy(host)
+    assert len(scheduled.calls) == 2
+    recovery_callback, recovery_args = scheduled.calls[0]
+    assert recovery_callback(*recovery_args) is False
+    callback, args = scheduled.calls[1]
+    assert callback(*args) is False
+    assert any(event[0] == "cleanup" for event in events)
+    assert ("recovery",) in events
+    assert shared_join_preparation_busy(host)
+    process.alive = False
+    assert gate.try_recover_reap_failure()
+    assert not shared_join_preparation_busy(host)
+
+
+def test_foreground_reader_only_failure_does_not_poison_shared_gate():
+    host, scheduled, _events = worker_exception_host()
+    error = steam_ugc_backend.UGCHelperReapError(
+        "reader survived",
+        helper_process_confirmed_dead=True,
+        helper_process_may_be_alive=False,
+        reader_cleanup_only=True,
+    )
+    DZLLWindow._join_worker_future_done(host, 1, failed_future(error))
+    assert not preparation_operation_gate(host).blocked_reap_failure
+    assert preparation_operation_gate(host).active_owner == ""
+    callback, args = scheduled.calls[0]
+    assert callback(*args) is False
+
+
+def test_stale_foreground_reap_ui_does_not_suppress_recovery_lifecycle(
+        monkeypatch):
+    class Process:
+        def poll(self):
+            return None
+
+    host, scheduled, events = worker_exception_host()
+    host._background_prepare_queue = BackgroundPreparationQueue()
+    host._preparation_reap_recovery_source_id = 0
+    host._preparation_reap_recovery_generation = 0
+    host._refresh_background_prepare_action_states = lambda: None
+    host._schedule_preparation_reap_recovery_poll = lambda: (
+        DZLLWindow._schedule_preparation_reap_recovery_poll(host)
+    )
+    host._start_preparation_reap_recovery_poll = lambda: (
+        DZLLWindow._start_preparation_reap_recovery_poll(host)
+    )
+    host._ensure_preparation_reap_recovery_poll = lambda: (
+        DZLLWindow._ensure_preparation_reap_recovery_poll(host)
+    )
+    host._poll_preparation_reap_recovery = lambda generation=0: (
+        DZLLWindow._poll_preparation_reap_recovery(host, generation)
+    )
+    timers = []
+    monkeypatch.setattr(
+        window_module.GLib,
+        "timeout_add",
+        lambda delay, callback, *args: (
+            timers.append((delay, callback, args)) or len(timers)
+        ),
+    )
+    error = steam_ugc_backend.UGCHelperReapError(
+        "helper unresolved", process=(process := Process()),
+    )
+    DZLLWindow._join_worker_future_done(host, 1, failed_future(error))
+    assert preparation_operation_gate(host).blocked_reap_failure
+    assert len(scheduled.calls) == 2
+
+    host._join_attempt_is_active = lambda _attempt_id: False
+    recovery_callback, recovery_args = scheduled.calls[0]
+    ui_callback, ui_args = scheduled.calls[1]
+    assert ui_callback(*ui_args) is False
+    assert events == []
+    assert recovery_callback(*recovery_args) is False
+    assert len(timers) == 1
+    assert preparation_operation_gate(host).blocked_reap_failure
+    process.poll = lambda: 0
+    _delay, timer_callback, timer_args = timers[0]
+    assert timer_callback(*timer_args) is False
+    assert not preparation_operation_gate(host).blocked_reap_failure
 
 
 def test_stale_join_worker_exception_cannot_touch_newer_attempt():

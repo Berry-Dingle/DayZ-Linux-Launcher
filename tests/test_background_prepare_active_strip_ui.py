@@ -6,6 +6,7 @@ from dzll_launcher.background_prepare import (
     BackgroundServerPreparationSnapshot,
 )
 from dzll_launcher.background_prepare_queue import BackgroundPreparationQueue
+from dzll_launcher.preparation_contracts import PreparationOutcome, PreparationStatus
 from dzll_launcher.preparation_presentation import PreparationProgressMode
 from dzll_launcher.ui_row import ServerObject
 from dzll_launcher.window import DZLLWindow
@@ -228,6 +229,34 @@ def test_active_queue_snapshot_uses_separate_server_and_optional_queue_blocks():
     assert host.background_prepare_queue_divider.visible
     assert "dzll-background-prepare-active" in host.background_prepare_status.css_classes
     assert host.background_prepare_action_btn.text == "Cancel"
+
+
+def test_reap_blocked_strip_is_terminal_truthful_and_actionable():
+    queue = BackgroundPreparationQueue()
+    server = _server("10.0.0.1", "Blocked Server")
+    transition = queue.enqueue(_snapshot(server), _runtime())
+    queue.finish_blocked_reap_failure(
+        transition.dispatch,
+        PreparationOutcome(
+            PreparationStatus.FAILED,
+            reason="ugc_helper_failure_to_reap",
+            error="helper pid 4242 remained alive",
+        ),
+    )
+    host = _host(queue)
+    DZLLWindow._background_prepare_apply_queue_snapshot(host, queue.snapshot())
+    assert host._background_prepare_active is False
+    assert host.background_prepare_server_label.text == (
+        "Steam preparation is temporarily blocked"
+    )
+    assert "No new Steam preparation" in host.background_prepare_detail_label.text
+    assert host.background_prepare_failed_label.visible
+    assert host.background_prepare_failed_label.tooltip == (
+        "helper pid 4242 remained alive"
+    )
+    assert host.background_prepare_action_btn.text == "Close"
+    assert host.background_prepare_action_btn.sensitive
+    assert host.background_prepare_right_status_label.text == "Blocked"
 
 
 def test_status_container_uses_search_row_inset_and_present_only_bottom_spacing():

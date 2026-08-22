@@ -16,6 +16,7 @@ from .steam_ugc_backend import query_ugc_inventory_checked
 from .steam_ugc_backend import probe_native_mod_manager_readiness
 from .steam_ugc_backend import query_ugc_state_checked
 from .steam_ugc_backend import UGCSubscriptionSnapshot
+from .steam_ugc_backend import UGCHelperReapError
 from .steam_ugc_backend import repair_ugc_item
 from .steam_ugc_backend import request_unsubscribe_ugc_items
 from .background_prepare import preparation_operation_gate
@@ -520,6 +521,7 @@ class ModsManagerOverlay:
         self._repair_generation = 0
         self._repair_state_by_id = {}
         self._repair_lease = None
+        self._repair_lease_generation = 0
         self._repair_ui_attached = True
         self._repair_refresh_needed = False
         self._steam_management_verified = False
@@ -889,7 +891,8 @@ class ModsManagerOverlay:
         return False
 
     def _app_session_owner(self):
-        return getattr(self.host, "_win", None) or self.host
+        host = getattr(self, "host", self)
+        return getattr(host, "_win", None) or host
 
     def _settings_owner(self):
         return getattr(self.host, "_win", None) or self.host
@@ -2132,8 +2135,11 @@ class ModsManagerOverlay:
         spinner = getattr(control, "_dzll_repair_spinner", None)
         percent_label = getattr(control, "_dzll_repair_percent", None)
         if button is not None:
+            gate = preparation_operation_gate(self._app_session_owner())
             button.set_sensitive(
-                (not active) and self._steam_management_is_verified()
+                (not active)
+                and self._steam_management_is_verified()
+                and not bool(gate.active_owner)
             )
         if not active:
             row.remove_css_class("mods-repair-active")
@@ -2221,7 +2227,13 @@ class ModsManagerOverlay:
             lease = gate.try_acquire("mod_repair")
             if lease is None:
                 self._set_mod_operation_pending(False)
-                self._set_mod_operation_status("Another Steam mod operation is already running.", running=False)
+                message = (
+                    "Steam mod operations are blocked until DZLL confirms its "
+                    "previous UGC helper exited."
+                    if gate.blocked_reap_failure
+                    else "Another Steam mod operation is already running."
+                )
+                self._set_mod_operation_status(message, running=False)
                 return
             self._repair_lease = lease
             self._set_mod_operation_pending(False)
@@ -2244,6 +2256,7 @@ class ModsManagerOverlay:
             return
         self._repair_generation += 1
         generation = int(self._repair_generation)
+        self._repair_lease_generation = generation
         mid = int(mod_id)
         state = {"generation": generation, "phase": "spinner", "fraction": 0.0}
         self._repair_state_by_id = {mid: state}
@@ -2256,6 +2269,22 @@ class ModsManagerOverlay:
         def worker() -> None:
             try:
                 result = repair_ugc_item(mid, appid=int(APPID), progress_cb=progress)
+            except UGCHelperReapError as exc:
+                result = {
+                    "ok": False,
+                    "id": mid,
+                    "reason": (
+                        "ugc_helper_failure_to_reap"
+                        if exc.helper_process_may_be_alive
+                        else "ugc_helper_reader_cleanup_failed"
+                    ),
+                    "error": (
+                        "Steam preparation could not shut down cleanly. "
+                        f"Repair failed: {exc}"
+                    ),
+                    "not_installed": True,
+                    "_ugc_helper_reap_error": exc,
+                }
             except Exception as exc:
                 result = {
                     "ok": False,
@@ -2307,20 +2336,74 @@ class ModsManagerOverlay:
             self._apply_repair_state_to_row(self._current_row_for_mod(int(mod_id)), state)
         return False
 
-    def _release_repair_lease(self) -> None:
+    def _release_repair_lease(self, *, expected_generation: int = 0) -> bool:
+        lease_generation = int(
+            getattr(self, "_repair_lease_generation", 0) or 0
+        )
+        if (
+            int(expected_generation or 0)
+            and lease_generation != int(expected_generation)
+        ):
+            return False
         lease = getattr(self, "_repair_lease", None)
         self._repair_lease = None
+        self._repair_lease_generation = 0
         if lease is not None:
             try:
-                preparation_operation_gate(self._app_session_owner()).release(lease)
+                return bool(
+                    preparation_operation_gate(
+                        self._app_session_owner()
+                    ).release(lease)
+                )
             except Exception:
                 pass
+        return False
+
+    def _block_repair_lease(
+            self, generation: int, error: UGCHelperReapError) -> bool:
+        if int(getattr(self, "_repair_lease_generation", 0) or 0) != int(generation):
+            return False
+        lease = getattr(self, "_repair_lease", None)
+        if lease is None:
+            return False
+        owner = self._app_session_owner()
+        gate = preparation_operation_gate(owner)
+        if not gate.mark_reap_failure(lease, error):
+            return False
+        self._repair_lease = None
+        self._repair_lease_generation = 0
+        schedule_recovery = getattr(
+            owner, "_schedule_preparation_reap_recovery_poll", None,
+        )
+        if callable(schedule_recovery):
+            schedule_recovery()
+        return True
 
     def _finish_repair(self, mod_id: int, generation: int, result: dict) -> bool:
+        reap_error = result.get("_ugc_helper_reap_error")
+        if isinstance(reap_error, UGCHelperReapError):
+            if reap_error.helper_process_may_be_alive:
+                blocked = self._block_repair_lease(generation, reap_error)
+                if blocked:
+                    result = dict(result)
+                    result["error"] = (
+                        "Steam preparation could not shut down cleanly. Repair "
+                        "failed and further Steam preparation is temporarily "
+                        f"blocked: {reap_error}"
+                    )
+                else:
+                    result = dict(result)
+                    result["error"] = (
+                        "Steam helper ownership could not be registered safely. "
+                        "Repair failed and Steam preparation remains unavailable."
+                    )
+            else:
+                self._release_repair_lease(expected_generation=generation)
         state = self._repair_state_by_id.get(int(mod_id))
         if not state or int(state.get("generation", 0)) != int(generation):
             return False
-        self._release_repair_lease()
+        if not isinstance(reap_error, UGCHelperReapError):
+            self._release_repair_lease(expected_generation=generation)
         if bool(result.get("ok", False)):
             state["fraction"] = 1.0
             state["percent"] = 100

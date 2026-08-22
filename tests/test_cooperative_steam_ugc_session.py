@@ -1352,9 +1352,46 @@ def test_reader_thread_survival_after_clean_shutdown_fails_closed(monkeypatch):
     with pytest.raises(
         steam_ugc_backend.UGCHelperReapError,
         match="stderr reader thread survived",
-    ):
+    ) as raised:
         session.close()
     assert process.signals == []
+    assert raised.value.helper_process_confirmed_dead
+    assert not raised.value.helper_process_may_be_alive
+    assert raised.value.reader_cleanup_only
+    assert raised.value.steamapi_shutdown_confirmed
+
+
+def test_unconfirmed_session_ownership_is_retained_until_process_recovery():
+    class Process:
+        alive = True
+
+        def poll(self):
+            return None if self.alive else 0
+
+    class Session:
+        def __init__(self):
+            self._proc = Process()
+            self._shutdown_complete = False
+            self.finalized = 0
+
+        def _finalize_confirmed_reap_recovery(self):
+            self.finalized += 1
+
+    session = Session()
+    steam_ugc_backend.activate_ugc_session(session)
+    error = steam_ugc_backend.UGCHelperReapError(
+        "unconfirmed", process=session._proc,
+    ).bind_session(session)
+    steam_ugc_backend.deactivate_ugc_session(
+        session, retain_for_recovery=True,
+    )
+    assert steam_ugc_backend.active_ugc_session() is None
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert not error.finalize_confirmed_recovery()
+    session._proc.alive = False
+    assert error.finalize_confirmed_recovery()
+    assert session.finalized == 1
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
 
 
 def test_native_and_python_diagnostics_cannot_enter_protocol_stdout():

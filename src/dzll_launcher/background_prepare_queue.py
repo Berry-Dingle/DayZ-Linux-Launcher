@@ -99,6 +99,8 @@ class BackgroundQueueSnapshot:
     records: tuple[BackgroundServerPreparationRecord, ...]
     completed_batch: BackgroundBatchResult | None
     dispatch_reserved: bool
+    blocked_reap_failure: bool = False
+    blocked_error: str = ""
 
     @property
     def busy(self) -> bool:
@@ -154,6 +156,8 @@ class BackgroundPreparationQueue:
         self._cancelling = False
         self._shutdown = False
         self._completed_batch: BackgroundBatchResult | None = None
+        self._blocked_reap_failure = False
+        self._blocked_error = ""
 
     def _snapshot_locked(self) -> BackgroundQueueSnapshot:
         return BackgroundQueueSnapshot(
@@ -169,6 +173,8 @@ class BackgroundPreparationQueue:
             dispatch_reserved=bool(
                 self._active is not None and self._active_controller is None
             ),
+            blocked_reap_failure=self._blocked_reap_failure,
+            blocked_error=self._blocked_error,
         )
 
     def snapshot(self) -> BackgroundQueueSnapshot:
@@ -505,6 +511,92 @@ class BackgroundPreparationQueue:
                 accepted=True,
                 dispatch=dispatch,
                 completed=completed,
+            )
+
+    def finish_blocked_reap_failure(
+            self, request: BackgroundPreparationRequest,
+            outcome: PreparationOutcome,
+    ) -> BackgroundQueueTransition:
+        """Terminalize the active item without dispatching while Steam is unsafe."""
+
+        with self._lock:
+            if self._active != request:
+                return BackgroundQueueTransition(self._snapshot_locked())
+            record = self._records.get(request.identity)
+            if record is None or record.request_id != request.request_id:
+                return BackgroundQueueTransition(self._snapshot_locked())
+            completed_record = replace(
+                record,
+                state=BackgroundServerState.FAILED,
+                progress=None,
+                outcome=outcome,
+                error=str(outcome.error or outcome.reason or ""),
+            )
+            self._records[request.identity] = completed_record
+            completed = BackgroundBatchEntry(
+                identity=completed_record.identity,
+                request_id=completed_record.request_id,
+                batch_id=completed_record.batch_id,
+                batch_order=completed_record.batch_order,
+                display_name=completed_record.display_name,
+                state=completed_record.state,
+                outcome=outcome,
+                error=completed_record.error,
+            )
+            self._batch_entries[request.request_id] = completed
+            self._active = None
+            self._active_controller = None
+            self._accepting = False
+            self._cancelling = False
+            self._blocked_reap_failure = True
+            self._blocked_error = completed_record.error
+            if not self._pending:
+                self._finalize_batch_locked(cancelled_by_user=False)
+            return BackgroundQueueTransition(
+                self._snapshot_locked(),
+                accepted=True,
+                completed=completed,
+            )
+
+    def clear_reap_block(self) -> BackgroundQueueTransition:
+        """Resume dispatch only after the shared preparation gate recovered."""
+
+        with self._lock:
+            if not self._blocked_reap_failure:
+                return BackgroundQueueTransition(self._snapshot_locked())
+            self._blocked_reap_failure = False
+            self._blocked_error = ""
+            self._accepting = not self._shutdown
+            dispatch = self._promote_locked() if not self._shutdown else None
+            if (
+                dispatch is None
+                and not self._shutdown
+                and self._active_batch_id != 0
+                and not self._pending
+            ):
+                self._finalize_batch_locked(cancelled_by_user=False)
+            return BackgroundQueueTransition(
+                self._snapshot_locked(),
+                accepted=True,
+                dispatch=dispatch,
+            )
+
+    def cancel_blocked_pending(self) -> BackgroundQueueTransition:
+        """Clear queued work without pretending the terminal helper is cancelling."""
+
+        with self._lock:
+            if not self._blocked_reap_failure:
+                return BackgroundQueueTransition(self._snapshot_locked())
+            while self._pending:
+                pending = self._pending.popleft()
+                record = self._records.get(pending.identity)
+                if record is not None and record.request_id == pending.request_id:
+                    self._records.pop(pending.identity, None)
+            if self._active_batch_id != 0:
+                self._finalize_batch_locked(cancelled_by_user=True)
+            return BackgroundQueueTransition(
+                self._snapshot_locked(),
+                accepted=True,
             )
 
     def submission_failed(
