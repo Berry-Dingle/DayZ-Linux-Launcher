@@ -8,6 +8,10 @@ from .a2s_status_diagnostics import (
     result_classification,
 )
 from .a2s.exceptions import AliveButInfoUnavailable
+from .server_endpoint import (
+    ServerEndpointValidationError,
+    normalize_server_endpoint,
+)
 
 _TIME_RE = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 _QUEUE_RE = re.compile(r"^lqs(\d+)$", re.IGNORECASE)
@@ -55,7 +59,18 @@ def query_server_live(
     row_id="-",
     model_id="-",
 ) -> dict:
-    resolved_gport = int(qport if gport is None else gport)
+    try:
+        ip, resolved_gport, qport = normalize_server_endpoint(
+            ip,
+            qport if gport is None else gport,
+            qport,
+        )
+    except ServerEndpointValidationError as error:
+        return {
+            "ok": False,
+            "err": f"invalid server endpoint: {error}",
+            "a2s_classification": "socket-error",
+        }
     diag_identity = {
         "ip": ip,
         "gport": resolved_gport,

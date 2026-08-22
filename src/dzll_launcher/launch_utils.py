@@ -6,6 +6,11 @@ from dataclasses import dataclass
 
 from .launcher_user_config import set_launcher_shutdown_mode
 from .maps import standardize_map
+from .server_endpoint import (
+    ServerEndpointValidationError,
+    normalize_ipv4_address,
+    validate_server_port,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -40,9 +45,21 @@ def _sanitize_launch_command(cmd) -> tuple[str, ...]:
 
 def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
                             skip_dayz_launcher=None):
-    ip_port = f"{obj.ip}:{int(obj.gport)}"
     popen = popen_factory or subprocess.Popen
     try:
+        try:
+            ip = normalize_ipv4_address(getattr(obj, "ip", None))
+            game_port = validate_server_port(
+                getattr(obj, "gport", None), field_name="game port"
+            )
+        except ServerEndpointValidationError as exc:
+            logger.error("Refusing Steam launch for invalid server endpoint: %s", exc)
+            return SteamLaunchResult(
+                False,
+                error_kind="invalid_endpoint",
+                error=str(exc),
+            )
+        ip_port = f"{ip}:{game_port}"
         set_launcher_shutdown_mode(win.settings.get("minimize_dayz_launcher", False))
 
         cmd = win._steam_launch_prefix()
@@ -92,7 +109,7 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
             win._discord_last_join = {
                 "server_name": str(obj.name or ""),
                 "server_map": standardize_map(raw_map),
-                "ip_port": f"{obj.ip}:{int(obj.gport)}",
+                "ip_port": ip_port,
             }
         except Exception:
             win._discord_last_join = None

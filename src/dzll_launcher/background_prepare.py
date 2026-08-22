@@ -13,6 +13,7 @@ from .preparation_contracts import (
     PreparationPresenter,
     PreparationStatus,
 )
+from .server_endpoint import normalize_server_endpoint
 from .steam_ugc_backend import UGCHelperReapError
 
 
@@ -33,10 +34,15 @@ class BackgroundServerPreparationSnapshot:
 
     @classmethod
     def from_server(cls, server, required_mods):
+        ip, game_port, query_port = normalize_server_endpoint(
+            getattr(server, "ip", None),
+            getattr(server, "gport", None),
+            getattr(server, "qport", None),
+        )
         return cls(
-            ip=str(getattr(server, "ip", "") or ""),
-            game_port=int(getattr(server, "gport", 0) or 0),
-            query_port=int(getattr(server, "qport", 0) or 0),
+            ip=ip,
+            game_port=game_port,
+            query_port=query_port,
             name=str(getattr(server, "name", "") or ""),
             required_mods=tuple(
                 (int(mod_id), str(name or ""))

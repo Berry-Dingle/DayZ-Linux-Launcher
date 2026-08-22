@@ -95,6 +95,10 @@ from .storage import (
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
 from .live import query_server_live, is_valid_hhmm
+from .server_endpoint import (
+    ServerEndpointValidationError,
+    normalize_server_endpoint,
+)
 from .a2s_status_diagnostics import STATUS_DIAGNOSTICS, result_classification
 from .maps import standardize_map, map_choices_from_db_rows
 from .ui_row import ServerObject, hr, attach_pointer_cursor
@@ -3482,14 +3486,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
 
     def _server_companion_persisted_from_obj(self, obj: ServerObject) -> dict:
-        try:
-            gport = int(getattr(obj, "gport", 0) or 0)
-        except Exception:
-            gport = 0
-        try:
-            qport = int(getattr(obj, "qport", 0) or 0)
-        except Exception:
-            qport = 0
+        ip, gport, qport = normalize_server_endpoint(
+            getattr(obj, "ip", None),
+            getattr(obj, "gport", None),
+            getattr(obj, "qport", None),
+        )
         try:
             mod_count = int(getattr(obj, "mod_count", 0) or 0)
         except Exception:
@@ -3516,7 +3517,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             timewarp = 1.0
 
         return {
-            "ip": str(getattr(obj, "ip", "") or ""),
+            "ip": ip,
             "gport": gport,
             "qport": qport,
             "name": str(getattr(obj, "name", "") or ""),
@@ -3539,21 +3540,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _server_companion_obj_from_persisted(self, data: dict):
         if not isinstance(data, dict):
             return None
-        ip = str(data.get("ip") or "").strip()
-        if not ip:
-            return None
         try:
-            gport = int(data.get("gport", 0) or 0)
-        except Exception:
-            gport = 0
-        if gport <= 0:
+            ip, gport, qport = normalize_server_endpoint(
+                data.get("ip"),
+                data.get("gport"),
+                data.get("qport"),
+                allow_missing_query_port=True,
+            )
+        except ServerEndpointValidationError:
             return None
-        try:
-            qport = int(data.get("qport", 0) or 0)
-        except Exception:
-            qport = 0
-        if qport <= 0:
-            qport = gport + 1
 
         key = fav_key(ip, gport)
         current = self._obj_by_key.get(key)
@@ -4434,10 +4429,22 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return True
 
     def set_server_companion_server(self, obj: ServerObject, persist: bool = True):
+        try:
+            ip, gport, qport = normalize_server_endpoint(
+                getattr(obj, "ip", None),
+                getattr(obj, "gport", None),
+                getattr(obj, "qport", None),
+            )
+        except ServerEndpointValidationError as exc:
+            logger.warning(
+                "Rejected Server Companion endpoint before monitoring: %s", exc
+            )
+            return
+        obj.ip = ip
+        obj.gport = gport
+        obj.qport = qport
         old_key = self._server_companion_restart_learning_key()
         snapshot = self._server_companion_snapshot_from_obj(obj)
-        ip = str(getattr(obj, "ip", "") or "").strip()
-        gport = self._safe_positive_int(getattr(obj, "gport", 0))
         new_key = f"{ip}:{gport}" if ip and gport > 0 else None
         self._cancel_server_companion_recovery_confirmation()
         self._cancel_server_companion_pending_recovery_alert()
@@ -5632,13 +5639,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._update_executor.submit(worker)
 
     def _apply_db_rows(self, rows: list, fetched_ok: bool):
+        endpoint_valid_rows = []
+        for dbrow in rows or []:
+            try:
+                normalize_server_endpoint(
+                    dbrow.get("ip"),
+                    dbrow.get("gport"),
+                    dbrow.get("qport"),
+                    allow_missing_query_port=True,
+                )
+            except (AttributeError, ServerEndpointValidationError):
+                continue
+            endpoint_valid_rows.append(dbrow)
+
         try:
-            choices = map_choices_from_db_rows(rows)
+            choices = map_choices_from_db_rows(endpoint_valid_rows)
             self._set_map_choices(choices)
         except Exception:
             self._set_map_choices(["All Maps"])
 
-        loaded = self._load_rows_into_store(rows)
+        loaded = self._load_rows_into_store(endpoint_valid_rows)
         if not loaded:
             self._server_companion_rows_loaded = False
             msg = "No Servers Found."
@@ -5687,19 +5707,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
 
         for dbrow in rows:
-            ip = (dbrow.get("ip") or "").strip()
-            if not ip:
-                continue
-
             try:
-                gport = int(dbrow.get("gport"))
-            except Exception:
+                ip, gport, qport = normalize_server_endpoint(
+                    dbrow.get("ip"),
+                    dbrow.get("gport"),
+                    dbrow.get("qport"),
+                    allow_missing_query_port=True,
+                )
+            except (AttributeError, ServerEndpointValidationError):
                 continue
-
-            try:
-                qport = int(dbrow.get("qport"))
-            except Exception:
-                qport = gport + 1
 
             name = (dbrow.get("name") or "").strip()
             raw_map = (dbrow.get("map") or "").strip()
@@ -11383,6 +11399,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
         }
 
     def _join_server_for_obj(self, obj: ServerObject):
+        try:
+            join_ip, join_gport, join_qport = normalize_server_endpoint(
+                getattr(obj, "ip", None),
+                getattr(obj, "gport", None),
+                getattr(obj, "qport", None),
+            )
+        except ServerEndpointValidationError as exc:
+            logger.warning("Rejected Join for invalid server endpoint: %s", exc)
+            self._set_server_companion_join_status(
+                "The selected server has an invalid address or port.", flash=True,
+            )
+            return
+
         active = self._join_attempts.active
         if shared_join_preparation_busy(self):
             if active is not None:
@@ -11418,9 +11447,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
 
         attempt = self._join_attempts.begin(
-            ip=obj.ip,
-            game_port=int(obj.gport),
-            query_port=int(getattr(obj, "qport", 0) or 0),
+            ip=join_ip,
+            game_port=join_gport,
+            query_port=join_qport,
             name=str(getattr(obj, "name", "") or ""),
             skip_dayz_launcher=bool(self.settings.get("skip_dayz_launcher", True)),
         )
