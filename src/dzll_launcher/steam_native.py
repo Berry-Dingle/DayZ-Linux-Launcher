@@ -43,10 +43,28 @@ _FLATPAK_STEAM_PROCESS_NAMES = {
 
 
 def _vdf_unescape(value: str) -> str:
-    try:
-        return bytes(str(value), "utf-8").decode("unicode_escape")
-    except Exception:
-        return str(value or "")
+    """Decode quoted VDF escapes without reinterpreting filesystem text."""
+
+    raw = "" if value is None else str(value)
+    out: list[str] = []
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if char != "\\" or index + 1 >= len(raw):
+            out.append(char)
+            index += 1
+            continue
+
+        escaped = raw[index + 1]
+        if escaped in {'"', "\\"}:
+            out.append(escaped)
+        else:
+            # KeyValues files used here only need quoted backslash and quote
+            # handling. Preserve all other sequences literally; in particular,
+            # filesystem paths must not acquire Python-style control characters.
+            out.extend(("\\", escaped))
+        index += 2
+    return "".join(out)
 
 
 def _tokenize_vdf(text: str) -> list[str]:
@@ -355,7 +373,11 @@ def _steam_app_installdir(library: Path, appid: int) -> str:
         value = str(app_state.get("installdir") or "").strip()
         if value:
             return value
-    match = re.search(r'"installdir"\s*"([^"]+)"', text, re.IGNORECASE)
+    match = re.search(
+        r'"installdir"\s*"((?:\\.|[^"\\])*)"',
+        text,
+        re.IGNORECASE,
+    )
     return _vdf_unescape(match.group(1)).strip() if match else ""
 
 
