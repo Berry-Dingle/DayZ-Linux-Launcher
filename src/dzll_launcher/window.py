@@ -485,6 +485,48 @@ def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
     except Exception:
         return 0, ""
 
+
+def _initialize_companion_restart_runtime_for_window(
+    *,
+    active_path: str | Path,
+    legacy_path: str | Path,
+    authoritative_schema4_runtime_enabled: bool,
+    schema4_authority_consumer_shadow_enabled: bool,
+    schema4_authority_production_cutover_enabled: bool,
+) -> Phase2RestartRuntime:
+    """Production window boundary for restart-learning startup failures."""
+
+    return Phase2RestartRuntime.initialize_with_startup_fallback(
+        active_path=active_path,
+        legacy_path=legacy_path,
+        authoritative_schema4_runtime_enabled=(
+            authoritative_schema4_runtime_enabled
+        ),
+        schema4_authority_consumer_shadow_enabled=(
+            schema4_authority_consumer_shadow_enabled
+        ),
+        schema4_authority_production_cutover_enabled=(
+            schema4_authority_production_cutover_enabled
+        ),
+    )
+
+
+def _pending_import_startup_error_kind(result) -> str:
+    """Preserve the pending transaction stage in disabled-runtime diagnostics."""
+
+    status = str(getattr(result, "status", "") or "")
+    if status == "rollback_failed":
+        return "pending_import_rollback_failure"
+    if status == "apply_failed":
+        return "pending_import_apply_failure"
+    if status == "pending_invalid":
+        error = str(getattr(result, "error", "") or "").lower()
+        if "metadata" in error or "incomplete" in error:
+            return "pending_import_metadata_invalid"
+        return "pending_import_invalid"
+    return "pending_import_startup_failure"
+
+
 class DZLLWindow(Gtk.ApplicationWindow):
     SORT_KEYS = ("ping", "players", "played")  # (list sorting keys only)
     _ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
@@ -591,24 +633,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
             live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
         )
         if self._companion_import_startup_result.safe_to_initialize:
-            self._companion_restart_phase2 = Phase2RestartRuntime.initialize(
-                active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
-                legacy_path=COMPANION_RESTART_LEARNING_PATH,
-                authoritative_schema4_runtime_enabled=(
-                    AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED
-                ),
-                schema4_authority_consumer_shadow_enabled=(
-                    SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED
-                ),
-                schema4_authority_production_cutover_enabled=(
-                    SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
-                ),
+            self._companion_restart_phase2 = (
+                _initialize_companion_restart_runtime_for_window(
+                    active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+                    legacy_path=COMPANION_RESTART_LEARNING_PATH,
+                    authoritative_schema4_runtime_enabled=(
+                        AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED
+                    ),
+                    schema4_authority_consumer_shadow_enabled=(
+                        SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED
+                    ),
+                    schema4_authority_production_cutover_enabled=(
+                        SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
+                    ),
+                )
             )
         else:
             self._companion_restart_phase2 = (
                 Phase2RestartRuntime.disabled_for_startup_failure(
                     active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
                     error=self._companion_import_startup_result.error or "unsafe learning state",
+                    error_kind=_pending_import_startup_error_kind(
+                        self._companion_import_startup_result
+                    ),
                 )
             )
         self._pending_last_played_obj = None
@@ -3637,6 +3684,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 f"generation={int(getattr(self, '_server_companion_poll_token', 0) or 0)} "
                 f"error={exc!r}"
             )
+        DZLLWindow._surface_restart_learning_persistence_notice(self)
 
     def _record_server_companion_monitor_ended(
         self,
@@ -3772,12 +3820,36 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return phase2_alert_usability(None)
 
     def _refresh_server_companion_restart_learning_summary(self) -> None:
+        DZLLWindow._surface_restart_learning_persistence_notice(self)
         panel = getattr(self, "server_companion_panel", None)
         if panel is not None:
             panel.set_restart_learning_summary(self._server_companion_restart_learning_summary())
             if hasattr(panel, "set_restart_alert_usability"):
                 panel.set_restart_alert_usability(self._server_companion_restart_alert_usability_summary())
             self._update_server_companion_undocked_size()
+
+    def _surface_restart_learning_persistence_notice(self) -> bool:
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        notice = runtime.pending_notice if runtime is not None else None
+        if notice is None or notice.kind != "persistence_write_failed":
+            return False
+        signature = (notice.kind, str(getattr(runtime, "persistence_error", "") or ""))
+        if getattr(self, "_restart_learning_persistence_notice_signature", None) == signature:
+            return False
+        presenter = getattr(self, "restart_learning_notice_ui", None)
+        if presenter is None:
+            return False
+        try:
+            shown = bool(presenter.show(notice))
+        except Exception as exc:
+            debug = getattr(self, "_debug_server_companion_alert", None)
+            if callable(debug):
+                debug(f"restart-learning persistence notice unavailable: {exc!r}")
+            return False
+        if not shown:
+            return False
+        self._restart_learning_persistence_notice_signature = signature
+        return True
 
     def _safe_positive_int(self, value) -> int:
         try:

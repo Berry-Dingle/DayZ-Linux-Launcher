@@ -576,6 +576,12 @@ def test_atomic_save_failure_disables_future_persistence_without_corrupting_prev
     poll(value, 10, ok=False)
     assert value.persistence_status is runtime.RuntimePersistenceStatus.DISABLED_WRITE_FAILED
     assert active.read_bytes() == before
+    notice = value.pending_notice
+    assert notice.kind == "persistence_write_failed"
+    assert "not being saved" in notice.title.lower()
+    assert "OSError: disk" in notice.body
+    assert value.persistence_error == "OSError: disk"
+    assert value.pending_notice == notice
 
 
 def test_save_load_round_trip_preserves_events_coverage_and_suppression(tmp_path):

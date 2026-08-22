@@ -90,7 +90,10 @@ def test_user_visible_replacement_copy_is_not_additive():
 def test_startup_apply_precedes_runtime_initialization_and_power_path_is_unchanged():
     source = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
     init = source.split("class DZLLWindow", 1)[1].split("self._pending_last_played_obj", 1)[0]
-    assert init.index("apply_pending_import_at_startup(") < init.index("Phase2RestartRuntime.initialize(")
+    assert init.index("apply_pending_import_at_startup(") < init.index(
+        "_initialize_companion_restart_runtime_for_window("
+    )
+    assert "Phase2RestartRuntime.initialize_with_startup_fallback(" in source
     assert 'set_on_power_off(lambda *_: self.set_server_companion_enabled(False))' in source
     visible = source.split("    def set_server_companion_visible", 1)[1].split(
         "    def _refresh_server_companion_power_controls", 1
@@ -106,3 +109,4 @@ def test_post_restart_import_notice_buttons_are_equal_width():
     assert "buttons.set_homogeneous(True)" in source
     assert "self.copy_button.set_size_request(160, -1)" in source
     assert "ok_button.set_size_request(160, -1)" in source
+    assert '"persistence_write_failed"' in source

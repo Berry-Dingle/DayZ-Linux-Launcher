@@ -13,6 +13,7 @@ import pytest
 
 from dzll_launcher import companion_restart_phase2_continuity as continuity
 from dzll_launcher import companion_restart_phase2_authority_consumers as consumers4
+from dzll_launcher import config
 from dzll_launcher import companion_restart_phase2_detection as detection
 from dzll_launcher import companion_restart_phase2_runtime as runtime
 from dzll_launcher import companion_restart_phase2_schema4 as schema4
@@ -728,6 +729,334 @@ def test_phase2_feature_enabled_loads_schema4_without_schema3_migration(tmp_path
     assert value.authoritative_schema4_snapshot().enabled
     assert active.read_bytes() == before
     value.shutdown(wall_at=BASE + 11 * scoring.HOUR, monotonic_at=1)
+
+
+def _production_start(active: Path, legacy: Path, **kwargs):
+    return runtime.Phase2RestartRuntime.initialize_with_startup_fallback(
+        active_path=active,
+        legacy_path=legacy,
+        authoritative_schema4_runtime_enabled=(
+            config.AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED
+        ),
+        schema4_authority_consumer_shadow_enabled=(
+            config.SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED
+        ),
+        schema4_authority_production_cutover_enabled=(
+            config.SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
+        ),
+        now=BASE,
+        generation_id="11111111-1111-4111-8111-111111111111",
+        **kwargs,
+    )
+
+
+def test_production_startup_creates_valid_empty_schema4_when_fresh(tmp_path):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    value = _production_start(active, tmp_path / "legacy.json")
+    original_generation = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    ).state["state_generation_id"]
+    loaded = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    )
+    assert value.persistence_enabled
+    assert value.authoritative_schema4_snapshot().enabled
+    assert value.schema4_startup_preparation.status is (
+        schema4.Schema4StartupPreparationStatus.FRESH_CREATED
+    )
+    assert loaded.report.valid and loaded.state["servers"] == {}
+    new_server = "fresh.example:2302"
+    session = value.begin_monitoring(
+        new_server, wall_at=BASE + 1, monotonic_at=1, poll_generation=1
+    )
+    assert session and value.persistence_enabled
+    update = value.ingest_live_result(
+        new_server,
+        poll_generation=1,
+        info={"ok": True, "players": 7, "max_players": 60},
+        wall_at=BASE + 10,
+        monotonic_at=10,
+    )
+    assert update.accepted
+    value.shutdown(wall_at=BASE + 20, monotonic_at=20)
+
+    persisted = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    )
+    assert persisted.report.valid
+    assert persisted.state["state_generation_id"] == original_generation
+    record = persisted.state["servers"][new_server]
+    legacy_record = record["legacy_schema3_record"]
+    assert record["authority_status"] == "valid_authoritative_runtime"
+    assert legacy_record["monitoring_sessions"]
+    assert (
+        persisted.state["schema3_snapshot"]["servers"][new_server]
+        == legacy_record
+    )
+
+    reopened = _production_start(active, tmp_path / "legacy.json")
+    assert reopened.persistence_enabled
+    assert reopened.schema4_startup_preparation.status is (
+        schema4.Schema4StartupPreparationStatus.SCHEMA4_RETAINED
+    )
+    assert new_server in reopened.state["servers"]
+    reopened._authoritative_schema4_backend.close(flush=False)
+
+
+def test_existing_schema4_accepts_a_genuinely_new_server(tmp_path):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    _write(active)
+    before_generation = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    ).state["state_generation_id"]
+    value = _production_start(active, tmp_path / "legacy.json")
+    new_server = "new-after-cutover.example:2402"
+    assert value.begin_monitoring(
+        new_server, wall_at=BASE + 1, monotonic_at=1, poll_generation=4
+    )
+    assert value.persistence_enabled
+    value.shutdown(wall_at=BASE + 2, monotonic_at=2)
+    loaded = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    )
+    assert loaded.report.valid
+    assert set(loaded.state["servers"]) == {SERVER, new_server}
+    assert loaded.state["state_generation_id"] == before_generation
+
+
+def test_existing_authoritative_server_update_path_remains_writable(tmp_path):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    _write(active)
+    value = _production_start(active, tmp_path / "legacy.json")
+    assert value.begin_monitoring(
+        SERVER, wall_at=BASE + 1, monotonic_at=1, poll_generation=5
+    )
+    assert value.persistence_enabled
+    value.shutdown(wall_at=BASE + 2, monotonic_at=2)
+    loaded = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    )
+    assert loaded.report.valid
+    assert set(loaded.state["servers"]) == {SERVER}
+    assert (
+        loaded.state["servers"][SERVER]["authority_status"]
+        == "valid_authoritative_runtime"
+    )
+
+
+def test_new_server_creation_does_not_resurrect_blocked_records(tmp_path):
+    schema3_record = _schema3_state()["servers"][SERVER]
+
+    quarantined_state = _state()
+    quarantined_state["servers"][SERVER] = {"server_key": SERVER}
+    quarantined_path = tmp_path / "quarantined.json"
+    quarantined_path.write_bytes(schema4.canonical_json_bytes(quarantined_state))
+    quarantined = live4.AuthoritativeSchema4Runtime.open(
+        quarantined_path, enabled=True
+    )
+    before = quarantined.state["servers"][SERVER]
+    with pytest.raises(schema4.Schema4ValidationError, match="quarantined"):
+        quarantined.update_server_from_schema3(
+            SERVER, schema3_record, updated_at=BASE, durable_reason="test"
+        )
+    assert quarantined.state["servers"][SERVER] == before
+    quarantined.close(flush=False)
+
+    unavailable_state = _state()
+    unavailable_state["servers"][SERVER]["authority_status"] = "unavailable"
+    unavailable_path = tmp_path / "unavailable.json"
+    unavailable_path.write_bytes(schema4.serialize_schema4_state(unavailable_state))
+    unavailable = live4.AuthoritativeSchema4Runtime.open(
+        unavailable_path, enabled=True
+    )
+    before = unavailable.state["servers"][SERVER]
+    with pytest.raises(schema4.Schema4ValidationError, match="unavailable"):
+        unavailable.update_server_from_schema3(
+            SERVER, schema3_record, updated_at=BASE, durable_reason="test"
+        )
+    assert unavailable.state["servers"][SERVER] == before
+    unavailable.close(flush=False)
+
+
+def test_production_startup_migrates_schema3_with_exact_backup_and_history(tmp_path):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    source_state = _schema3_state()
+    source = schema4.canonical_json_bytes(source_state)
+    active.write_bytes(source)
+    value = _production_start(active, tmp_path / "legacy.json")
+    preparation = value.schema4_startup_preparation
+    loaded = schema4.deserialize_schema4_bytes(
+        active.read_bytes(), quarantine_invalid_servers=False
+    )
+    assert value.persistence_enabled
+    assert preparation.status is schema4.Schema4StartupPreparationStatus.SCHEMA3_MIGRATED
+    assert preparation.backup_path.read_bytes() == source
+    assert preparation.audit_path.exists()
+    assert loaded.report.valid
+    assert loaded.state["schema3_snapshot"]["servers"][SERVER] == source_state["servers"][SERVER]
+    assert loaded.state["servers"][SERVER]["legacy_schema3_record"] == source_state["servers"][SERVER]
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+@pytest.mark.parametrize("replacement_kind", ["valid", "malformed"])
+def test_schema3_startup_snapshot_conflicts_if_source_changes_before_backup(
+    tmp_path, monkeypatch, replacement_kind
+):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    original = schema4.canonical_json_bytes(_schema3_state())
+    replacement_state = _schema3_state()
+    replacement_state["state_generation_id"] = (
+        "33333333-3333-4333-8333-333333333333"
+    )
+    replacement = (
+        schema4.canonical_json_bytes(replacement_state)
+        if replacement_kind == "valid"
+        else schema4.canonical_json_bytes({
+            "schema_version": 3,
+            "migration_reset_version": 3,
+            "state_generation_id": "not-a-uuid",
+            "servers": "malformed",
+        })
+    )
+    active.write_bytes(original)
+    real_migrate = schema4.migrate_state_file
+
+    def replace_before_backup(**kwargs):
+        active.write_bytes(replacement)
+        return real_migrate(**kwargs)
+
+    monkeypatch.setattr(schema4, "migrate_state_file", replace_before_backup)
+    value = _production_start(active, tmp_path / "legacy.json")
+    digest = hashlib.sha256(original).hexdigest()
+    backup = active.with_name(f"{active.name}.pre-schema4-{digest}.json")
+    audit = active.with_name(
+        f"{active.name}.schema4-migration-audit-{digest}.json"
+    )
+    assert not value.persistence_enabled
+    assert active.read_bytes() == replacement
+    assert backup.read_bytes() == original
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == digest
+    audit_payload = json.loads(audit.read_bytes())
+    assert audit_payload["source_sha256"] == digest
+    assert audit_payload["source_size"] == len(original)
+    assert b'"schema_version": 4' not in replacement
+
+
+def test_schema3_startup_snapshot_conflicts_if_source_changes_before_apply(
+    tmp_path, monkeypatch
+):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    original = schema4.canonical_json_bytes(_schema3_state())
+    replacement_state = _schema3_state()
+    replacement_state["state_generation_id"] = (
+        "44444444-4444-4444-8444-444444444444"
+    )
+    replacement = schema4.canonical_json_bytes(replacement_state)
+    active.write_bytes(original)
+    real_apply = schema4.apply_prepared_schema4
+
+    def replace_before_apply(**kwargs):
+        active.write_bytes(replacement)
+        return real_apply(**kwargs)
+
+    monkeypatch.setattr(schema4, "apply_prepared_schema4", replace_before_apply)
+    value = _production_start(active, tmp_path / "legacy.json")
+    digest = hashlib.sha256(original).hexdigest()
+    backup = active.with_name(f"{active.name}.pre-schema4-{digest}.json")
+    audit = active.with_name(
+        f"{active.name}.schema4-migration-audit-{digest}.json"
+    )
+    assert not value.persistence_enabled
+    assert "active source hash changed" in value.persistence_error
+    assert active.read_bytes() == replacement
+    assert backup.read_bytes() == original
+    assert hashlib.sha256(backup.read_bytes()).hexdigest() == digest
+    assert json.loads(audit.read_bytes())["source_sha256"] == digest
+
+
+def test_production_startup_retains_valid_schema4_without_rewrite(tmp_path):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    original = _write(active)
+    before = active.stat()
+    value = _production_start(active, tmp_path / "legacy.json")
+    assert value.persistence_enabled
+    assert value.schema4_startup_preparation.status is (
+        schema4.Schema4StartupPreparationStatus.SCHEMA4_RETAINED
+    )
+    assert active.read_bytes() == original
+    assert active.stat().st_mtime_ns == before.st_mtime_ns
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+def test_production_startup_preserves_schema4_lkg_recovery(tmp_path):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    valid = _write(active)
+    active.with_name(active.name + ".last-known-good").write_bytes(valid)
+    active.write_bytes(b"broken-active")
+    value = _production_start(active, tmp_path / "legacy.json")
+    recovery = value.authoritative_schema4_snapshot().recovery
+    assert value.persistence_enabled
+    assert active.read_bytes() == valid
+    assert recovery.restored_last_known_good
+    assert value.pending_notice is None
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [b"broken-active", schema4.canonical_json_bytes({"schema_version": 99})],
+)
+def test_production_startup_unrecoverable_state_falls_back_unchanged(
+    tmp_path, payload
+):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    active.write_bytes(payload)
+    value = _production_start(active, tmp_path / "legacy.json")
+    assert not value.persistence_enabled
+    assert value.persistence_status is runtime.RuntimePersistenceStatus.DISABLED_INITIALIZATION_FAILED
+    assert value.pending_notice.kind == "initialization_failed"
+    assert value.persistence_error
+    assert active.read_bytes() == payload
+
+
+def test_production_startup_rolls_back_schema3_if_apply_reports_failure(
+    tmp_path, monkeypatch
+):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    source = schema4.canonical_json_bytes(_schema3_state())
+    active.write_bytes(source)
+    real_apply = schema4.apply_prepared_schema4
+
+    def fail_after_install(**kwargs):
+        real_apply(**kwargs)
+        raise OSError("injected failure after schema-4 replacement")
+
+    monkeypatch.setattr(schema4, "apply_prepared_schema4", fail_after_install)
+    value = _production_start(active, tmp_path / "legacy.json")
+    backups = list(tmp_path.glob("*.pre-schema4-*.json"))
+    assert not value.persistence_enabled
+    assert active.read_bytes() == source
+    assert len(backups) == 1 and backups[0].read_bytes() == source
+    assert "injected failure" in value.persistence_error
+
+
+def test_production_startup_open_permission_failure_is_logged_and_disabled(
+    tmp_path, monkeypatch, caplog
+):
+    active = tmp_path / "companion_restart_learning_phase2.json"
+    original = _write(active)
+    monkeypatch.setattr(
+        live4.AuthoritativeSchema4Runtime,
+        "open",
+        classmethod(lambda _cls, *_args, **_kwargs: (_ for _ in ()).throw(PermissionError("denied"))),
+    )
+    with caplog.at_level("ERROR"):
+        value = _production_start(active, tmp_path / "legacy.json")
+    assert not value.persistence_enabled
+    assert value.migration.error_kind == "permission"
+    assert value.persistence_error == "PermissionError: denied"
+    assert active.read_bytes() == original
+    assert "continuing with persistence disabled" in caplog.text
 
 
 def test_phase2_enabled_healthy_poll_soak_is_bounded(tmp_path):

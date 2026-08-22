@@ -237,6 +237,57 @@ def test_backup_collision_suffix_and_first_import(tmp_path):
     assert first.status == "applied" and first.backup_path is None and other.exists()
 
 
+def test_pending_schema4_replaces_valid_schema3_with_exact_backup(tmp_path):
+    live = tmp_path / "companion_restart_learning_phase2.json"
+    schema3 = storage.new_phase2_state(
+        now=1_800_000_000,
+        generation_id="11111111-1111-4111-8111-111111111111",
+    )
+    original = schema4.canonical_json_bytes(schema3)
+    imported = valid_bytes(marker="pending-over-schema3")
+    live.write_bytes(original)
+    stage_pending_import(
+        validate_external_learning_bytes(imported, source_filename="replacement.json"),
+        config_dir=tmp_path,
+    )
+    result = apply_pending_import_at_startup(config_dir=tmp_path, live_path=live)
+    assert result.status == "applied" and result.safe_to_initialize
+    assert result.backup_path.read_bytes() == original
+    assert live.read_bytes() == imported
+    assert not live.with_name(live.name + ".last-known-good").exists()
+    assert not any(path.exists() for path in pending_import_paths(tmp_path))
+
+
+def test_pending_schema4_failure_restores_schema3_bytes(tmp_path, monkeypatch):
+    live = tmp_path / "companion_restart_learning_phase2.json"
+    schema3 = storage.new_phase2_state(
+        now=1_800_000_000,
+        generation_id="22222222-2222-4222-8222-222222222222",
+    )
+    original = schema4.canonical_json_bytes(schema3)
+    imported = valid_bytes(marker="pending-failure-over-schema3")
+    live.write_bytes(original)
+    stage_pending_import(
+        validate_external_learning_bytes(imported, source_filename="replacement.json"),
+        config_dir=tmp_path,
+    )
+    real_install = transfer._install_verified
+    calls = {"count": 0}
+
+    def fail_after_import(path, payload):
+        calls["count"] += 1
+        real_install(path, payload)
+        if calls["count"] == 1:
+            raise OSError("injected schema3 replacement verification failure")
+
+    monkeypatch.setattr(transfer, "_install_verified", fail_after_import)
+    result = apply_pending_import_at_startup(config_dir=tmp_path, live_path=live)
+    assert result.status == "rolled_back" and result.safe_to_initialize
+    assert live.read_bytes() == original
+    assert result.backup_path.read_bytes() == original
+    assert all(path.exists() for path in pending_import_paths(tmp_path))
+
+
 def test_partial_or_corrupt_pending_never_changes_live(tmp_path):
     live = tmp_path / "companion_restart_learning_phase2.json"
     live.write_bytes(valid_bytes())
@@ -246,6 +297,20 @@ def test_partial_or_corrupt_pending_never_changes_live(tmp_path):
     result = apply_pending_import_at_startup(config_dir=tmp_path, live_path=live)
     assert result.status == "pending_invalid"
     assert live.read_bytes() == before and payload.exists()
+
+
+def test_corrupt_pending_metadata_has_distinct_diagnostic(tmp_path):
+    payload, metadata = pending_import_paths(tmp_path)
+    payload.write_bytes(valid_bytes())
+    metadata.write_bytes(b"not-json")
+    result = apply_pending_import_at_startup(
+        config_dir=tmp_path,
+        live_path=tmp_path / "missing-live.json",
+    )
+    assert result.status == "pending_invalid"
+    assert not result.safe_to_initialize
+    assert "metadata is invalid" in result.error
+    assert payload.exists() and metadata.exists()
 
 
 def test_backup_failure_leaves_live_and_pending_untouched(tmp_path, monkeypatch):

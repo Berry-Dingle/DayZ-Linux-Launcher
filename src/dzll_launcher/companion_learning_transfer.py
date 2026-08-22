@@ -24,6 +24,7 @@ from .companion_restart_phase2_schema4 import (
     Schema4ValidationError,
     Schema4VersionError,
     deserialize_schema4_bytes,
+    schema_version_from_bytes,
     serialize_schema4_state,
 )
 from .companion_restart_phase2_schema4_runtime import Schema4WriterLock
@@ -300,11 +301,16 @@ def read_pending_import(
             raise PendingImportError("Pending database replacement payload and metadata are incomplete.")
         return None
     try:
-        metadata = json.loads(
-            metadata_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_strict_object,
-            parse_constant=_reject_nonfinite,
-        )
+        try:
+            metadata = json.loads(
+                metadata_path.read_text(encoding="utf-8"),
+                object_pairs_hook=_strict_object,
+                parse_constant=_reject_nonfinite,
+            )
+        except Exception as exc:
+            raise PendingImportError(
+                f"Pending database replacement metadata is invalid: {exc}"
+            ) from exc
         if not isinstance(metadata, dict) or set(metadata) != PENDING_METADATA_FIELDS:
             raise PendingImportError("Pending database replacement metadata fields are incomplete or unknown.")
         if metadata.get("pending_format_version") != PENDING_FORMAT_VERSION:
@@ -386,6 +392,7 @@ def apply_pending_import_at_startup(
     imported = pending.canonical_bytes
     prior_exists = False
     prior = b""
+    prior_schema_version: int | None = None
     backup: Path | None = None
     installation_attempted = False
     try:
@@ -393,12 +400,13 @@ def apply_pending_import_at_startup(
             prior_exists = live.exists()
             if prior_exists:
                 prior = live.read_bytes()
-                _validate_live_authority_bytes(prior)
+                prior_schema_version = _validate_live_authority_bytes(prior)
                 backup = _next_backup_path(live.parent, now=now)
                 _write_new_verified(backup, prior)
-                _atomic_write_verified(
-                    live.with_name(live.name + ".last-known-good"), prior
-                )
+                if prior_schema_version == SCHEMA4_ROOT_VERSION:
+                    _atomic_write_verified(
+                        live.with_name(live.name + ".last-known-good"), prior
+                    )
             installation_attempted = True
             _install_verified(live, imported)
             installed = validate_external_learning_bytes(live.read_bytes(), source_filename=live.name)
@@ -413,7 +421,11 @@ def apply_pending_import_at_startup(
             try:
                 with Schema4WriterLock(live):
                     if prior_exists and backup is not None:
-                        _install_verified(live, backup.read_bytes())
+                        _restore_validated_live(
+                            live,
+                            backup.read_bytes(),
+                            schema_version=prior_schema_version,
+                        )
                         if live.read_bytes() != prior:
                             raise PendingImportError("Rollback bytes do not match the permanent backup.")
                     elif not prior_exists:
@@ -570,10 +582,50 @@ def _reject_boolean_numeric_fields(value: object, path: str = "root") -> None:
             _reject_boolean_numeric_fields(item, f"{path}[{index}]")
 
 
-def _validate_live_authority_bytes(raw: bytes) -> None:
-    loaded = deserialize_schema4_bytes(raw, quarantine_invalid_servers=True)
-    if not loaded.report.root_valid:
-        raise PendingImportError("Current live learning file has an invalid schema-4 root.")
+def _validate_live_authority_bytes(raw: bytes) -> int:
+    version = schema_version_from_bytes(raw)
+    if version == SCHEMA4_ROOT_VERSION:
+        loaded = deserialize_schema4_bytes(raw, quarantine_invalid_servers=True)
+        if not loaded.report.root_valid:
+            raise PendingImportError(
+                "Current live learning file has an invalid schema-4 root."
+            )
+        return version
+    if version == 3:
+        try:
+            decoded = json.loads(
+                raw.decode("utf-8", errors="strict"),
+                object_pairs_hook=_strict_object,
+                parse_constant=_reject_nonfinite,
+            )
+            normalize_phase2_state(decoded)
+        except Exception as exc:
+            raise PendingImportError(
+                f"Current live schema-3 learning file is invalid: {exc}"
+            ) from exc
+        return version
+    raise PendingImportError(
+        f"Current live learning schema {version} cannot be replaced safely."
+    )
+
+
+def _restore_validated_live(
+    destination: Path,
+    payload: bytes,
+    *,
+    schema_version: int | None,
+) -> None:
+    if schema_version == SCHEMA4_ROOT_VERSION:
+        _install_verified(destination, payload)
+        return
+    if schema_version == 3:
+        if _validate_live_authority_bytes(payload) != 3:
+            raise PendingImportError("Schema-3 rollback payload validation failed.")
+        _atomic_write_verified(destination, payload)
+        if destination.read_bytes() != payload:
+            raise PendingImportError("Schema-3 rollback byte verification failed.")
+        return
+    raise PendingImportError("The previous live learning schema is unknown.")
 
 
 def _canonical_metadata_bytes(value: Mapping[str, object]) -> bytes:

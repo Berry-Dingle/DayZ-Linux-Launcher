@@ -104,7 +104,7 @@ class RestartLearningNoticeUI:
                 self.card.add_css_class("restart-notice-reset")
             elif kind == "corrupt_state_recovered":
                 self.card.add_css_class("restart-notice-recovery")
-            elif kind == "initialization_failed":
+            elif kind in {"initialization_failed", "persistence_write_failed"}:
                 self.card.add_css_class("restart-notice-error")
         self.title_label.set_text(notice.title)
         self.body_label.set_text(notice.body)

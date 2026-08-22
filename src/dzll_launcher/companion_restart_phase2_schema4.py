@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -93,7 +94,12 @@ from .companion_restart_phase2_scoring import (
     RestartScheduleScorer,
     candidate_phase_tolerance,
 )
-from .companion_restart_phase2_storage import atomic_write_bytes
+from .companion_restart_phase2_storage import (
+    atomic_write_bytes,
+    initialize_phase2_state,
+    new_phase2_state,
+    normalize_phase2_state,
+)
 
 
 SCHEMA4_ROOT_VERSION = 4
@@ -124,6 +130,24 @@ class Schema4VersionError(Schema4Error):
 
 class Schema4ValidationError(Schema4Error):
     """Schema-4 content or immutable references are invalid."""
+
+
+class Schema4StartupPreparationStatus(str, enum.Enum):
+    FRESH_CREATED = "fresh_created"
+    SCHEMA3_MIGRATED = "schema3_migrated"
+    SCHEMA4_RETAINED = "schema4_retained"
+    DEFERRED_TO_RUNTIME_RECOVERY = "deferred_to_runtime_recovery"
+
+
+@dataclass(frozen=True)
+class Schema4StartupPreparationResult:
+    status: Schema4StartupPreparationStatus
+    active_path: Path
+    backup_path: Path | None = None
+    audit_path: Path | None = None
+    source_sha256: str | None = None
+    legacy_reset_performed: bool = False
+    legacy_backup_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -292,16 +316,51 @@ def migrate_state_file(
     audit_path: str | os.PathLike[str],
     backup_path: str | os.PathLike[str] | None,
     server_key: str | None = None,
+    source_snapshot: bytes | None = None,
+    source_snapshot_mtime_ns: int | None = None,
 ) -> Schema4MigrationResult:
     """Prepare schema 4 beside the source; never replace the source."""
 
     source = Path(source_path)
     prepared = Path(prepared_path)
     audit = Path(audit_path)
-    source_stat = source.stat()
-    source_bytes = source.read_bytes()
+    if source_snapshot is None:
+        source_stat = source.stat()
+        source_bytes = source.read_bytes()
+        source_mtime_ns = source_stat.st_mtime_ns
+    else:
+        source_bytes = bytes(source_snapshot)
+        if source_snapshot_mtime_ns is None:
+            raise Schema4Error(
+                "immutable source snapshot requires its captured mtime_ns"
+            )
+        source_mtime_ns = int(source_snapshot_mtime_ns)
     source_hash = _sha256(source_bytes)
     version = schema_version_from_bytes(source_bytes)
+
+    parsed_schema3 = None
+    schema4_load = None
+    if version == SCHEMA4_ROOT_VERSION:
+        schema4_load = deserialize_schema4_bytes(
+            source_bytes, quarantine_invalid_servers=False
+        )
+        if not schema4_load.report.valid:
+            raise Schema4ValidationError("schema-4 source failed validation")
+    elif version == 3:
+        try:
+            parsed_schema3 = json.loads(
+                source_bytes.decode("utf-8"), parse_constant=_reject_constant
+            )
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise Schema4ValidationError(f"invalid schema-3 JSON: {exc}") from exc
+        # Validate the exact immutable representation that conversion will use.
+        # Keep the original parsed mapping for migration so schema3_snapshot
+        # remains an exact semantic projection of the source bytes.
+        normalize_phase2_state(parsed_schema3)
+    else:
+        raise Schema4VersionError(
+            f"unsupported source schema {version}; no file was changed"
+        )
 
     backup: Path | None = None
     if backup_path is not None:
@@ -317,27 +376,20 @@ def migrate_state_file(
             raise Schema4Error("backup verification failed")
 
     if version == SCHEMA4_ROOT_VERSION:
-        load = deserialize_schema4_bytes(
-            source_bytes, quarantine_invalid_servers=False
-        )
-        if not load.report.valid:
-            raise Schema4ValidationError("schema-4 source failed validation")
+        assert schema4_load is not None
         prepared_bytes = source_bytes
-        state = load.state
+        state = schema4_load.state
         idempotent = True
     elif version == 3:
+        assert parsed_schema3 is not None
         state = migrate_schema3_state(
-            json.loads(source_bytes.decode("utf-8")),
+            parsed_schema3,
             source_bytes=source_bytes,
-            source_mtime_ns=source_stat.st_mtime_ns,
+            source_mtime_ns=source_mtime_ns,
             only_server_key=server_key,
         )
         prepared_bytes = serialize_schema4_state(state)
         idempotent = False
-    else:
-        raise Schema4VersionError(
-            f"unsupported source schema {version}; no file was changed"
-        )
 
     if prepared.resolve() == source.resolve():
         raise Schema4Error("prepared output must not replace source")
@@ -357,7 +409,7 @@ def migrate_state_file(
     return Schema4MigrationResult(
         source_schema_version=version,
         source_size=len(source_bytes),
-        source_mtime_ns=source_stat.st_mtime_ns,
+        source_mtime_ns=source_mtime_ns,
         source_sha256=source_hash,
         backup_path=backup,
         backup_size=None if backup is None else backup.stat().st_size,
@@ -370,6 +422,243 @@ def migrate_state_file(
         validation=validation,
         idempotent_noop=idempotent,
     )
+
+
+def prepare_schema4_state_for_startup(
+    *,
+    active_path: str | os.PathLike[str],
+    legacy_path: str | os.PathLike[str] | None = None,
+    now: int | float | None = None,
+    generation_id: str | None = None,
+) -> Schema4StartupPreparationResult:
+    """Prepare only expected fresh/schema-3 startup state for strict schema 4.
+
+    Existing corrupt, malformed, and unsupported state is deliberately left
+    untouched for ``AuthoritativeSchema4Runtime.open`` to recover from a valid
+    schema-4 LKG or reject.  Callers must provide their own failure boundary.
+    """
+
+    active = Path(active_path)
+    legacy = None if legacy_path is None else Path(legacy_path)
+    legacy_result = None
+    if not active.exists() and legacy is not None and legacy.exists():
+        legacy_result = initialize_phase2_state(
+            active_path=active,
+            legacy_path=legacy,
+            now=now,
+            generation_id=generation_id,
+        )
+        if not legacy_result.persistence_enabled:
+            raise Schema4Error(
+                "schema-4 startup could not safely prepare legacy phase-1 state: "
+                f"{legacy_result.error or legacy_result.failure or 'unknown failure'}"
+            )
+
+    if not active.exists():
+        result = _create_fresh_schema4_state(
+            active=active,
+            now=now,
+            generation_id=generation_id,
+        )
+        return dataclasses.replace(
+            result,
+            legacy_reset_performed=bool(
+                legacy_result is not None and legacy_result.reset_performed
+            ),
+            legacy_backup_path=(
+                None if legacy_result is None else legacy_result.backup_path
+            ),
+        )
+
+    with active.open("rb") as source_handle:
+        raw = source_handle.read()
+        source_mtime_ns = os.fstat(source_handle.fileno()).st_mtime_ns
+    try:
+        version = schema_version_from_bytes(raw)
+    except Schema4Error:
+        return Schema4StartupPreparationResult(
+            Schema4StartupPreparationStatus.DEFERRED_TO_RUNTIME_RECOVERY,
+            active,
+        )
+    if version == SCHEMA4_ROOT_VERSION:
+        return Schema4StartupPreparationResult(
+            Schema4StartupPreparationStatus.SCHEMA4_RETAINED,
+            active,
+            legacy_reset_performed=bool(
+                legacy_result is not None and legacy_result.reset_performed
+            ),
+            legacy_backup_path=(
+                None if legacy_result is None else legacy_result.backup_path
+            ),
+        )
+    if version != 3:
+        return Schema4StartupPreparationResult(
+            Schema4StartupPreparationStatus.DEFERRED_TO_RUNTIME_RECOVERY,
+            active,
+        )
+
+    try:
+        schema3_snapshot = json.loads(
+            raw.decode("utf-8"), parse_constant=_reject_constant
+        )
+        normalize_phase2_state(schema3_snapshot)
+    except Exception:
+        return Schema4StartupPreparationResult(
+            Schema4StartupPreparationStatus.DEFERRED_TO_RUNTIME_RECOVERY,
+            active,
+        )
+
+    result = _migrate_schema3_for_startup(
+        active,
+        source_snapshot=raw,
+        source_snapshot_mtime_ns=source_mtime_ns,
+    )
+    return dataclasses.replace(
+        result,
+        legacy_reset_performed=bool(
+            legacy_result is not None and legacy_result.reset_performed
+        ),
+        legacy_backup_path=(
+            None if legacy_result is None else legacy_result.backup_path
+        ),
+    )
+
+
+def _create_fresh_schema4_state(
+    *,
+    active: Path,
+    now: int | float | None,
+    generation_id: str | None,
+) -> Schema4StartupPreparationResult:
+    from .companion_restart_phase2_schema4_runtime import Schema4WriterLock
+
+    raced = False
+    with Schema4WriterLock(active):
+        if active.exists():
+            raced = True
+        else:
+            schema3 = new_phase2_state(now=now, generation_id=generation_id)
+            source = canonical_json_bytes(schema3)
+            state = migrate_schema3_state(
+                schema3,
+                source_bytes=source,
+                source_mtime_ns=0,
+            )
+            payload = serialize_schema4_state(state)
+            loaded = deserialize_schema4_bytes(
+                payload, quarantine_invalid_servers=False
+            )
+            if not loaded.report.valid:
+                raise Schema4ValidationError(
+                    "fresh schema-4 startup state failed strict validation"
+                )
+            atomic_write_bytes(active, payload)
+            installed = active.read_bytes()
+            if installed != payload:
+                raise Schema4Error(
+                    "fresh schema-4 startup state failed byte verification"
+                )
+            verified = deserialize_schema4_bytes(
+                installed, quarantine_invalid_servers=False
+            )
+            if not verified.report.valid:
+                raise Schema4ValidationError(
+                    "installed fresh schema-4 startup state failed validation"
+                )
+            return Schema4StartupPreparationResult(
+                Schema4StartupPreparationStatus.FRESH_CREATED,
+                active,
+                source_sha256=_sha256(source),
+            )
+    if raced:
+        return prepare_schema4_state_for_startup(
+            active_path=active,
+            now=now,
+            generation_id=generation_id,
+        )
+    raise Schema4Error("fresh schema-4 startup preparation did not complete")
+
+
+def _migrate_schema3_for_startup(
+    active: Path,
+    *,
+    source_snapshot: bytes,
+    source_snapshot_mtime_ns: int,
+) -> Schema4StartupPreparationResult:
+    source = bytes(source_snapshot)
+    source_sha256 = _sha256(source)
+    identity = source_sha256
+    backup = active.with_name(f"{active.name}.pre-schema4-{identity}.json")
+    audit = active.with_name(
+        f"{active.name}.schema4-migration-audit-{identity}.json"
+    )
+    prepared_fd, prepared_name = tempfile.mkstemp(
+        prefix=f".{active.name}.schema4-startup-prepared-",
+        suffix=".tmp",
+        dir=active.parent,
+    )
+    os.close(prepared_fd)
+    prepared = Path(prepared_name)
+    try:
+        result = migrate_state_file(
+            source_path=active,
+            prepared_path=prepared,
+            audit_path=audit,
+            backup_path=backup,
+            source_snapshot=source,
+            source_snapshot_mtime_ns=source_snapshot_mtime_ns,
+        )
+        apply_prepared_schema4(
+            active_path=active,
+            prepared_path=result.prepared_path,
+            verified_backup_path=result.backup_path,
+            expected_source_sha256=result.source_sha256,
+            approval_token=SCHEMA4_APPLY_APPROVAL_TOKEN,
+        )
+        installed = deserialize_schema4_bytes(
+            active.read_bytes(), quarantine_invalid_servers=False
+        )
+        if not installed.report.valid:
+            raise Schema4ValidationError(
+                "automatic schema-3 migration failed installed-state validation"
+            )
+        return Schema4StartupPreparationResult(
+            Schema4StartupPreparationStatus.SCHEMA3_MIGRATED,
+            active,
+            backup_path=result.backup_path,
+            audit_path=result.audit_path,
+            source_sha256=result.source_sha256,
+        )
+    except Exception as exc:
+        rollback_error = None
+        try:
+            # Roll back only bytes installed by this transaction.  A live
+            # schema-3 source changed concurrently is an apply conflict and
+            # must never be overwritten with the older snapshot.
+            if (
+                backup.exists()
+                and active.exists()
+                and prepared.exists()
+                and active.read_bytes() == prepared.read_bytes()
+            ):
+                rollback_whole_file(
+                    active_path=active,
+                    verified_backup_path=backup,
+                    expected_backup_sha256=source_sha256,
+                )
+        except Exception as restore_exc:
+            rollback_error = restore_exc
+        if rollback_error is not None:
+            raise Schema4Error(
+                "automatic schema-3 migration failed and byte-identical rollback "
+                f"also failed: migration={exc}; rollback={rollback_error}"
+            ) from rollback_error
+        raise
+    finally:
+        try:
+            prepared.unlink()
+        except OSError:
+            pass
 
 
 def migrate_schema3_state(

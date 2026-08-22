@@ -50,6 +50,11 @@ from .companion_restart_phase2_schema4 import (
 
 AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED_DEFAULT = False
 SCHEMA4_RUNTIME_WRITE_SEMANTICS_VERSION = 1
+SCHEMA4_RUNTIME_WRITABLE_AUTHORITY_STATUSES = frozenset(
+    {"valid_shadow_only", "valid_authoritative_runtime"}
+)
+
+
 class Schema4RuntimeError(Schema4Error):
     """Authoritative schema-4 runtime operation failed safely."""
 
@@ -530,35 +535,61 @@ class AuthoritativeSchema4Runtime:
             assert self._state is not None
             servers = self._state.setdefault("servers", {})
             existing = servers.get(server_key)
-            if not isinstance(existing, Mapping):
+            snapshot = self._state.get("schema3_snapshot")
+            snapshot_servers = (
+                snapshot.get("servers") if isinstance(snapshot, Mapping) else None
+            )
+            if not isinstance(snapshot_servers, Mapping):
+                raise Schema4ValidationError(
+                    "schema-4 state has no writable schema-3 server projection"
+                )
+            if existing is None:
+                if server_key in snapshot_servers:
+                    raise Schema4ValidationError(
+                        f"schema-4 server {server_key!r} is unavailable"
+                    )
+                existing_for_rebuild: Mapping[str, object] = {}
+            elif not isinstance(existing, Mapping):
                 raise Schema4ValidationError(
                     f"schema-4 server {server_key!r} is unavailable or quarantined"
                 )
+            elif (
+                existing.get("authority_status")
+                not in SCHEMA4_RUNTIME_WRITABLE_AUTHORITY_STATUSES
+            ):
+                raise Schema4ValidationError(
+                    f"schema-4 server {server_key!r} is unavailable or quarantined"
+                )
+            else:
+                existing_for_rebuild = existing
             rebuilt = rebuild_schema4_server_record(
-                existing,
+                existing_for_rebuild,
                 schema3_record,
                 server_key=server_key,
                 updated_at=updated_at,
             )
-            before = canonical_json_bytes(existing)
+            before = canonical_json_bytes(existing_for_rebuild)
             after = canonical_json_bytes(rebuilt)
             if before == after:
                 return False
             reasons = set(rebuilt.get("reason_codes", ()))
             reasons.add(str(durable_reason))
             rebuilt["reason_codes"] = sorted(reasons)
-            servers[server_key] = rebuilt
-            snapshot = self._state.get("schema3_snapshot")
-            if isinstance(snapshot, dict):
-                snapshot.setdefault("servers", {})[server_key] = copy.deepcopy(
-                    dict(schema3_record)
-                )
-                snapshot["updated_at"] = max(
-                    int(updated_at), int(snapshot.get("created_at", 0) or 0)
-                )
-            self._state["updated_at"] = max(
-                int(updated_at), int(self._state.get("created_at", 0) or 0)
+            candidate = copy.deepcopy(self._state)
+            candidate["servers"][server_key] = rebuilt
+            candidate_snapshot = candidate["schema3_snapshot"]
+            candidate_snapshot["servers"][server_key] = copy.deepcopy(
+                dict(schema3_record)
             )
+            candidate_snapshot["updated_at"] = max(
+                int(updated_at),
+                int(candidate_snapshot.get("created_at", 0) or 0),
+            )
+            candidate["updated_at"] = max(
+                int(updated_at), int(candidate.get("created_at", 0) or 0)
+            )
+            serialize_schema4_state(candidate)
+            self._state = candidate
             self._dirty_servers.add(server_key)
             return True
 

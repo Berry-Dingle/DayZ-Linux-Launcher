@@ -64,12 +64,11 @@ COMPANION_RESTART_LEARNING_PHASE2_PATH = os.path.join(
     CFG_DIR,
     "companion_restart_learning_phase2.json",
 )
-# Stage 3A backend soak switch.  It is deliberately development-only and
-# disabled until schema-4 migration and the later consumer cutover are
-# separately approved.
+# Authoritative schema-4 persistence.  Startup orchestration must prepare a
+# verified schema-4 active file before the strict runtime backend is opened.
 AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED = True
-# Stage 3B1 consumer evaluation and future production cutover are separately
-# gated.  Neither is exposed as a user setting and both remain disabled.
+# Consumer comparison and production presentation/action cutover remain
+# separately gated.  These are production constants, not user settings.
 SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED = True
 SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED = True
 

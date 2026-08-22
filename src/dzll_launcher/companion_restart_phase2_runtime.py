@@ -131,6 +131,31 @@ def atomic_write_json(path: str | Path, state: object) -> None:
     atomic_write_phase2_state(path, state)
 
 
+def _startup_failure_kind(exc: BaseException) -> str:
+    current = exc
+    seen: set[int] = set()
+    while (
+        getattr(current, "__cause__", None) is not None
+        and id(current) not in seen
+    ):
+        seen.add(id(current))
+        current = current.__cause__  # type: ignore[assignment]
+    if isinstance(current, PermissionError):
+        return "permission"
+    if isinstance(current, OSError):
+        return "io"
+    names = {type(exc).__name__, type(current).__name__}
+    if "Schema4WriterLockError" in names:
+        return "writer_lock"
+    if "Schema4VersionError" in names:
+        return "schema_version"
+    if "Schema4ValidationError" in names:
+        return "validation"
+    if "Schema4RuntimeError" in names:
+        return "schema4_runtime"
+    return type(current).__name__
+
+
 class RuntimePersistenceStatus(str, Enum):
     ENABLED = "enabled"
     DISABLED_INITIALIZATION_FAILED = "disabled_initialization_failed"
@@ -299,6 +324,7 @@ class Phase2RestartRuntime:
         schema4_authority_consumer_shadow_enabled: bool = False,
         schema4_authority_production_cutover_enabled: bool = False,
         _authoritative_schema4_backend: object | None = None,
+        _schema4_startup_preparation: object | None = None,
     ) -> None:
         self.migration = migration
         self.active_path = Path(migration.active_path)
@@ -331,6 +357,7 @@ class Phase2RestartRuntime:
             authoritative_schema4_runtime_enabled
         )
         self._authoritative_schema4_backend = _authoritative_schema4_backend
+        self.schema4_startup_preparation = _schema4_startup_preparation
         self.schema4_authority_consumer_shadow_enabled = bool(
             schema4_authority_consumer_shadow_enabled
         )
@@ -371,21 +398,45 @@ class Phase2RestartRuntime:
         schema4_authority_production_cutover_enabled: bool = False,
     ) -> "Phase2RestartRuntime":
         schema4_backend = None
+        schema4_startup_preparation = None
         if authoritative_schema4_runtime_enabled:
+            from .companion_restart_phase2_schema4 import (
+                Schema4StartupPreparationStatus,
+                prepare_schema4_state_for_startup,
+            )
             from .companion_restart_phase2_schema4_runtime import (
                 AuthoritativeSchema4Runtime,
             )
 
+            schema4_startup_preparation = prepare_schema4_state_for_startup(
+                active_path=active_path,
+                legacy_path=legacy_path,
+                now=now,
+                generation_id=generation_id,
+            )
             schema4_backend = AuthoritativeSchema4Runtime.open(
                 active_path, enabled=True
             )
+            fresh_created = (
+                schema4_startup_preparation.status
+                is Schema4StartupPreparationStatus.FRESH_CREATED
+            )
             migration = Phase2MigrationResult(
                 state=schema4_backend.schema3_projection(),
-                status=Phase2InitializationStatus.ACTIVE_LOADED,
-                reset_performed=False,
+                status=(
+                    Phase2InitializationStatus.FRESH_CREATED
+                    if fresh_created
+                    else Phase2InitializationStatus.ACTIVE_LOADED
+                ),
+                reset_performed=bool(
+                    schema4_startup_preparation.legacy_reset_performed
+                ),
                 recovery_performed=False,
                 active_path=Path(active_path),
-                backup_path=None,
+                backup_path=(
+                    schema4_startup_preparation.legacy_backup_path
+                    or schema4_startup_preparation.backup_path
+                ),
                 legacy_checksum=None,
                 persistence_enabled=True,
             )
@@ -417,6 +468,7 @@ class Phase2RestartRuntime:
                     schema4_authority_production_cutover_enabled
                 ),
                 _authoritative_schema4_backend=schema4_backend,
+                _schema4_startup_preparation=schema4_startup_preparation,
             )
         except Exception:
             if schema4_backend is not None:
@@ -424,8 +476,39 @@ class Phase2RestartRuntime:
             raise
 
     @classmethod
+    def initialize_with_startup_fallback(
+        cls,
+        *,
+        active_path: str | Path,
+        legacy_path: str | Path,
+        **kwargs: object,
+    ) -> "Phase2RestartRuntime":
+        """Keep the application usable when persistent startup fails safely."""
+
+        try:
+            return cls.initialize(
+                active_path=active_path,
+                legacy_path=legacy_path,
+                **kwargs,
+            )
+        except Exception as exc:
+            logger.exception(
+                "Server Companion restart-learning initialization failed; "
+                "continuing with persistence disabled"
+            )
+            return cls.disabled_for_startup_failure(
+                active_path=active_path,
+                error=f"{type(exc).__name__}: {exc}",
+                error_kind=_startup_failure_kind(exc),
+            )
+
+    @classmethod
     def disabled_for_startup_failure(
-        cls, *, active_path: str | Path, error: str
+        cls,
+        *,
+        active_path: str | Path,
+        error: str,
+        error_kind: str = "startup_initialization_failure",
     ) -> "Phase2RestartRuntime":
         """Create a non-persisting learner without reading or writing disk."""
 
@@ -438,7 +521,7 @@ class Phase2RestartRuntime:
             backup_path=None,
             legacy_checksum=None,
             persistence_enabled=False,
-            error_kind="PendingImportRollbackFailure",
+            error_kind=str(error_kind),
             error=str(error),
         )
         return cls(migration, now=0)
@@ -450,6 +533,18 @@ class Phase2RestartRuntime:
     @property
     def pending_notice(self) -> RuntimeNotice | None:
         result = self.migration
+        if self.persistence_status is RuntimePersistenceStatus.DISABLED_WRITE_FAILED:
+            detail = str(self.persistence_error or "unknown persistence failure")
+            return RuntimeNotice(
+                kind="persistence_write_failed",
+                title="Server Companion Learning Is Not Being Saved",
+                body=(
+                    "Current Server Companion information remains available, but new "
+                    "restart-learning changes cannot be saved or retained after this "
+                    "launch. Existing learning files were not reset or deleted. "
+                    f"Technical error: {detail}"
+                ),
+            )
         if result.reset_performed:
             return RuntimeNotice(
                 kind="legacy_reset",
