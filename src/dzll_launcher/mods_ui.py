@@ -13,6 +13,7 @@ from gi.repository import Gtk, GLib, Pango
 from .config import CACHE_DIR
 from .settings import autodetect_workshop_dir, save_settings
 from .steam_ugc_backend import delete_ugc_mod_local_files_after_unsubscribe
+from .steam_ugc_backend import _explicit_subscription_state
 from .steam_ugc_backend import query_ugc_inventory_checked
 from .steam_ugc_backend import probe_native_mod_manager_readiness
 from .steam_ugc_backend import query_ugc_state_checked
@@ -3966,7 +3967,6 @@ class ModsManagerOverlay:
         if mid <= 0:
             return "failed"
 
-        had_local_state_before = _has_local_workshop_state(workshop_roots, mid)
         try:
             steam_running = _supported_native_steam_running()
         except Exception:
@@ -4001,8 +4001,6 @@ class ModsManagerOverlay:
             except Exception:
                 steam_running = False
             if not steam_running:
-                if not local_state_present and had_local_state_before:
-                    return "removed"
                 return "steam_closed_unconfirmed"
             try:
                 ok, states = query_ugc_state_checked(
@@ -4019,19 +4017,18 @@ class ModsManagerOverlay:
                 except Exception:
                     steam_running = False
                 if not steam_running:
-                    if not _has_local_workshop_state(workshop_roots, mid) and had_local_state_before:
-                        return "removed"
                     return "steam_closed_unconfirmed"
                 return "steam_issue"
 
-            state = states.get(mid) or states.get(str(mid)) or {}
-            if ok and state and not bool(state.get("subscribed", False)):
+            subscription_state = _explicit_subscription_state(states, mid)
+            if subscription_state is None:
+                return "steam_issue"
+            if subscription_state is False:
                 if not local_state_present:
                     return "removed"
-                return self._settle_unsubscribed_local_state(mid, workshop_roots)
-            if not local_state_present:
-                if had_local_state_before or (ok and not state) or (ok and bool(state)):
-                    return "removed"
+                return self._settle_unsubscribed_local_state(
+                    mid, workshop_roots,
+                )
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:

@@ -85,6 +85,7 @@ class UGCSubscriptionSnapshot:
             mid = int(mod_id)
         except Exception:
             return False
+        state = self.states.get(mid) if isinstance(self.states, dict) else None
         return bool(
             self.valid
             and self.logged_on
@@ -94,9 +95,11 @@ class UGCSubscriptionSnapshot:
             # transient all-zero cache observed during native Steam handoff.
             and bool(self.subscribed_ids)
             and mid in self.requested_ids
+            and isinstance(self.states, dict)
             and mid in self.states
             and mid not in self.subscribed_ids
-            and not bool((self.states.get(mid) or {}).get("subscribed", False))
+            and isinstance(state, dict)
+            and state.get("subscribed") is False
         )
 
 
@@ -127,7 +130,7 @@ def _steam_launch_policy(value, allow_start_steam: bool) -> SteamLaunchPolicy:
 @dataclass
 class UGCModSession:
     id: int
-    was_subscribed_before: bool = False
+    was_subscribed_before: bool | None = None
     was_installed_before: bool = False
     subscribed_by_dzll_this_join: bool = False
     installed_now: bool = False
@@ -142,6 +145,7 @@ class UGCModSession:
     event_source: str = "initial"
     request_attempted: bool = False
     request_accepted: bool = False
+    helper_subscribe_attempted: bool = False
     filesystem_normalized_missing: bool = False
 
     def update_from_item(self, event: dict, *, source: str | None = None) -> None:
@@ -150,6 +154,9 @@ class UGCModSession:
         if self.event_source == "request":
             self.request_attempted = True
             self.request_accepted = bool(event.get("download_requested", False))
+            subscribe_call_result = event.get("subscribe_call_result")
+            if type(subscribe_call_result) is int:
+                self.helper_subscribe_attempted = True
         self.installed_now = bool(event.get("installed", False))
         self.needs_update = bool(event.get("needs_update", False))
         self.last_state_names = list(event.get("state_names") or [])
@@ -1596,7 +1603,8 @@ def _cleanup_subscriptions(
         mid
         for mid, session in sessions.items()
         if session.subscribed_by_dzll_this_join
-        and not session.was_subscribed_before
+        and session.was_subscribed_before is False
+        and session.helper_subscribe_attempted
         and not session.installed_now
         and (allowed_ids is None or mid in allowed_ids)
     )
@@ -1626,6 +1634,14 @@ def _cleanup_subscriptions(
         ok=bool(ok), cleanup_ids=cleanup_ids,
         cleanup_elapsed=f"{time.monotonic() - cleanup_started:.3f}s",
     )
+
+
+def _subscription_cleanup_candidates(parent_authorized_ids, helper_attempted_ids) -> list[int]:
+    """Intersect parent state authority with exact helper subscription attempts."""
+
+    parent_authorized = set(_dedupe_sorted_ids(parent_authorized_ids or []))
+    helper_attempted = set(_dedupe_sorted_ids(helper_attempted_ids or []))
+    return sorted(parent_authorized & helper_attempted)
 
 
 def _refresh_current_state(sessions: dict[int, UGCModSession], *, appid: int, progress_cb=None, names_by_id=None) -> None:
@@ -1688,6 +1704,20 @@ def query_ugc_state_checked(mod_ids, *, appid=DAYZ_APPID, timeout=60) -> tuple[b
     )
     _cache_ugc_state(snapshots)
     return bool(ok), snapshots
+
+
+def _explicit_subscription_state(states, mod_id: int) -> bool | None:
+    """Return a subscription value only when the target carries a real bool."""
+
+    if not isinstance(states, dict):
+        return None
+    state = states.get(int(mod_id))
+    if not isinstance(state, dict) or "subscribed" not in state:
+        return None
+    subscribed = state["subscribed"]
+    if type(subscribed) is not bool:
+        return None
+    return subscribed
 
 
 def refresh_subscribed_ugc_state_checked(
@@ -1833,9 +1863,14 @@ def query_ugc_inventory_checked(
         subscription_count = -1
 
     complete_states = set(snapshots) == set(ids)
-    consistent = complete_states and all(
-        bool((snapshots.get(mid) or {}).get("subscribed", False))
-        == (mid in subscribed)
+    subscription_fields_valid = complete_states and all(
+        isinstance(snapshots.get(mid), dict)
+        and "subscribed" in snapshots[mid]
+        and type(snapshots[mid]["subscribed"]) is bool
+        for mid in ids
+    )
+    consistent = subscription_fields_valid and all(
+        snapshots[mid]["subscribed"] == (mid in subscribed)
         for mid in ids
     )
     identity_verified, steam_id, logged_on, native_attachment_verified = (
@@ -1851,6 +1886,7 @@ def query_ugc_inventory_checked(
         and inventory_well_formed
         and subscription_count == len(subscribed)
         and complete_states
+        and subscription_fields_valid
         and consistent
     )
     if valid:
@@ -1994,11 +2030,16 @@ def wait_for_ugc_ready(
     )
 
 
-def unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=120) -> dict[int, dict]:
+def unsubscribe_ugc_items_checked(
+    mod_ids,
+    *,
+    appid=DAYZ_APPID,
+    timeout=120,
+) -> tuple[bool, dict[int, dict]]:
     ids = _dedupe_sorted_ids(mod_ids)
     snapshots: dict[int, dict] = {}
     if not ids:
-        return snapshots
+        return True, snapshots
     native_ok, _state = _supported_native_steam_mutation_state()
     if not native_ok:
         raise UGCSessionError(
@@ -2016,7 +2057,7 @@ def unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=120) -> dict[int
         if mid > 0:
             snapshots[mid] = dict(event)
 
-    _run_helper_json_lines(
+    ok, _rc = _run_helper_json_lines(
         "unsubscribe",
         appid=appid,
         timeout=float(timeout),
@@ -2026,6 +2067,17 @@ def unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=120) -> dict[int
         progress_cb=None,
     )
     _cache_ugc_state(snapshots)
+    return bool(ok), snapshots
+
+
+def unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=120) -> dict[int, dict]:
+    """Compatibility wrapper for callers which only consume item snapshots."""
+
+    _ok, snapshots = unsubscribe_ugc_items_checked(
+        mod_ids,
+        appid=appid,
+        timeout=timeout,
+    )
     return snapshots
 
 
@@ -2209,8 +2261,9 @@ def repair_ugc_item(
             raise
         except Exception:
             state_ok, state = False, {}
-        if state_ok and state:
-            unsubscribed = not bool(state.get("subscribed", False))
+        subscription_state = _explicit_subscription_state({mid: state}, mid)
+        if state_ok and subscription_state is not None:
+            unsubscribed = subscription_state is False
             if unsubscribed and not content_exists(state):
                 break
         remaining = deadline - monotonic_fn()
@@ -2281,7 +2334,8 @@ def repair_ugc_item(
             "error": "Steam finished without returning a verifiable final mod state.",
             "not_installed": True,
         }
-    if not bool(terminal.get("subscribed", False)):
+    terminal_subscription = _explicit_subscription_state({mid: terminal}, mid)
+    if terminal_subscription is not True:
         return {
             "ok": False,
             "id": mid,
@@ -2737,17 +2791,30 @@ def remove_workshop_acf_entries(mod_ids, *, appid=DAYZ_APPID, log_fn=None) -> di
         result["missing_ids"] = []
         return result
 
-    states: dict[int, dict] = {}
     try:
-        states = query_ugc_state(ids, appid=int(appid), timeout=20)
+        query_ok, states = query_ugc_state_checked(
+            ids, appid=int(appid), timeout=20,
+        )
     except Exception as exc:
-        log(f"[Steam UGC] ACF cleanup state check failed; continuing with folder guards only: {exc}")
-        states = {}
+        result["error"] = f"failed to verify UGC subscription state: {exc}"
+        return result
+    if not query_ok:
+        result["error"] = "failed to verify UGC subscription state"
+        return result
+
+    subscription_states = {
+        mid: _explicit_subscription_state(states, mid) for mid in ids
+    }
+    if any(value is None for value in subscription_states.values()):
+        result["error"] = (
+            "failed to verify explicit UGC subscription state for every item"
+        )
+        return result
 
     removable: list[int] = []
     for mid in ids:
         state = dict(states.get(mid) or {})
-        if bool(state.get("subscribed", False)):
+        if subscription_states[mid] is True:
             result["skipped_subscribed_ids"].append(mid)
             continue
         if _has_real_native_workshop_folder(mid, appid=int(appid), states=[state]):
@@ -2832,9 +2899,23 @@ def scrub_stale_dayz_workshop_acf(
         return result
 
     try:
-        states = query_ugc_state(ids, appid=int(appid), timeout=60)
+        query_ok, states = query_ugc_state_checked(
+            ids, appid=int(appid), timeout=60,
+        )
     except Exception as exc:
         result["error"] = f"failed to query UGC state: {exc}"
+        return result
+    if not query_ok:
+        result["error"] = "failed to query authoritative UGC state"
+        return result
+
+    subscription_states = {
+        mid: _explicit_subscription_state(states, mid) for mid in ids
+    }
+    if any(value is None for value in subscription_states.values()):
+        result["error"] = (
+            "failed to verify explicit UGC subscription state for every item"
+        )
         return result
 
     if bool(remove_non_subscribed_installed):
@@ -2842,7 +2923,7 @@ def scrub_stale_dayz_workshop_acf(
         delete_candidates: list[int] = []
         for mid in ids:
             state = dict(states.get(mid) or {})
-            if bool(state.get("subscribed", False)):
+            if subscription_states[mid] is True:
                 kept_subscribed.append(mid)
             else:
                 delete_candidates.append(mid)
@@ -2885,7 +2966,7 @@ def scrub_stale_dayz_workshop_acf(
     kept_subscribed: list[int] = []
     for mid in ids:
         state = dict(states.get(mid) or {})
-        subscribed = bool(state.get("subscribed", False))
+        subscribed = subscription_states[mid] is True
         has_real_folder = _has_real_native_workshop_folder(mid, appid=int(appid), states=[state])
         if subscribed:
             kept.append(mid)
@@ -2942,20 +3023,47 @@ def delete_ugc_mod(mod_id, *, appid=DAYZ_APPID, timeout=120, log_fn=None) -> dic
         return result
 
     try:
-        before_by_id = query_ugc_state([mid], appid=appid, timeout=min(float(timeout), 60.0))
+        before_ok, before_by_id = query_ugc_state_checked(
+            [mid], appid=appid, timeout=min(float(timeout), 60.0),
+        )
+        before_subscribed = _explicit_subscription_state(before_by_id, mid)
+        if not before_ok or before_subscribed is None:
+            result["error"] = "failed to verify authoritative UGC subscription state"
+            return result
         before = dict(before_by_id.get(mid) or {})
         result["before"] = before
 
-        if bool(before.get("subscribed", False)):
-            unsubscribe_ugc_items([mid], appid=appid, timeout=timeout)
-            after_unsub = query_ugc_state([mid], appid=appid, timeout=min(float(timeout), 60.0)).get(mid) or {}
-            if bool(after_unsub.get("subscribed", False)):
+        if before_subscribed is True:
+            unsubscribe_ok, _unsubscribe_states = unsubscribe_ugc_items_checked(
+                [mid], appid=appid, timeout=timeout,
+            )
+            if not unsubscribe_ok:
+                result["error"] = "Steam UGC unsubscribe command failed"
+                return result
+            after_unsub_ok, after_unsub_by_id = query_ugc_state_checked(
+                [mid], appid=appid, timeout=min(float(timeout), 60.0),
+            )
+            after_unsub_state = _explicit_subscription_state(
+                after_unsub_by_id, mid,
+            )
+            after_unsub = dict(after_unsub_by_id.get(mid) or {})
+            if not after_unsub_ok or after_unsub_state is not False:
                 result["after"] = dict(after_unsub)
-                result["error"] = "Steam still reports item subscribed after unsubscribe"
+                result["error"] = (
+                    "Steam did not authoritatively confirm the item is unsubscribed"
+                )
                 return result
             result["unsubscribed"] = True
 
-        after_by_id = query_ugc_state([mid], appid=appid, timeout=min(float(timeout), 60.0))
+        after_ok, after_by_id = query_ugc_state_checked(
+            [mid], appid=appid, timeout=min(float(timeout), 60.0),
+        )
+        after_subscribed = _explicit_subscription_state(after_by_id, mid)
+        if not after_ok or after_subscribed is not False:
+            result["error"] = (
+                "failed to confirm authoritative unsubscribed UGC state before deletion"
+            )
+            return result
         after = dict(after_by_id.get(mid) or {})
         result["after"] = after
 
@@ -3167,6 +3275,7 @@ def run_ugc_install(
         return True
 
     sessions = {mid: UGCModSession(id=mid) for mid in ids}
+    parent_cleanup_allowlist: list[int] = []
     _progress(progress_cb, {"type": "start", "appid": int(appid), "items": ids})
     _log_event(progress_cb, f"[JOIN] Steam UGC checking required mod readiness: {len(ids)} ids", ids=ids)
 
@@ -3182,7 +3291,9 @@ def run_ugc_install(
         session = sessions.get(mid)
         if session is None:
             return
-        session.was_subscribed_before = bool(event.get("subscribed", False))
+        session.was_subscribed_before = _explicit_subscription_state(
+            {mid: event}, mid,
+        )
         session.was_installed_before = bool(event.get("installed", False))
         session.update_from_item(event, source="initial")
         _cache_ugc_state({mid: event}, names_by_id=names_by_id)
@@ -3241,13 +3352,13 @@ def run_ugc_install(
 
         for mid in not_ready:
             session = sessions[mid]
-            if not session.was_subscribed_before:
+            if session.was_subscribed_before is False:
                 session.subscribed_by_dzll_this_join = True
-        cancel_cleanup_allowlist = sorted(
+        parent_cleanup_allowlist = sorted(
             mid
             for mid in not_ready
             if sessions[mid].subscribed_by_dzll_this_join
-            and not sessions[mid].was_subscribed_before
+            and sessions[mid].was_subscribed_before is False
         )
 
         _progress(progress_cb, {"backend": "steam_ugc", "type": "status", "message": "Checking/Updating Required Mods"})
@@ -3294,10 +3405,11 @@ def run_ugc_install(
                 helper_attempted = set(_dedupe_sorted_ids(
                     helper_handoff.get("helper_subscribe_attempted") or [],
                 ))
-                parent_allowed = set(cancel_cleanup_allowlist)
-                cleanup_candidates = sorted(parent_allowed & helper_attempted)
+                cleanup_candidates = _subscription_cleanup_candidates(
+                    parent_cleanup_allowlist, helper_attempted,
+                )
                 cancel_handoff = {
-                    "parent_allowlisted": sorted(parent_allowed),
+                    "parent_allowlisted": list(parent_cleanup_allowlist),
                     "helper_subscribe_attempted": sorted(helper_attempted),
                     "cleanup_candidates": cleanup_candidates,
                 }
@@ -3318,7 +3430,7 @@ def run_ugc_install(
             timeout=float(timeout),
             mod_ids=not_ready,
             cancel_event=cancel_event,
-            cancel_cleanup_ids=cancel_cleanup_allowlist,
+            cancel_cleanup_ids=parent_cleanup_allowlist,
             on_event=on_install_event,
             progress_cb=progress_cb,
         )
@@ -3347,14 +3459,34 @@ def run_ugc_install(
         installed = sorted(mid for mid, session in sessions.items() if session.installed_now)
         ready = sorted(mid for mid, session in sessions.items() if ugc_item_ready(session))
         failed = sorted(mid for mid in ids if mid not in ready)
-        _cleanup_subscriptions(sessions, appid=appid, progress_cb=progress_cb)
+        cleanup_candidates = _subscription_cleanup_candidates(
+            parent_cleanup_allowlist,
+            [
+                mid for mid, session in sessions.items()
+                if session.helper_subscribe_attempted
+            ],
+        )
+        _cleanup_subscriptions(
+            sessions, appid=appid, progress_cb=progress_cb,
+            only_ids=cleanup_candidates,
+        )
         _progress(progress_cb, {"type": "done", "ok": False, "installed": installed, "ready": ready, "failed": failed, "sessions": [s.event() for s in sessions.values()]})
         return False
     except KeyboardInterrupt:
         _progress(progress_cb, {"type": "cancelled", "reason": "keyboard_interrupt"})
         _log_event(progress_cb, "[Steam UGC] Cancel requested", reason="keyboard_interrupt")
         _refresh_current_state(sessions, appid=appid, progress_cb=progress_cb, names_by_id=names_by_id)
-        _cleanup_subscriptions(sessions, appid=appid, progress_cb=progress_cb)
+        cleanup_candidates = _subscription_cleanup_candidates(
+            parent_cleanup_allowlist,
+            [
+                mid for mid, session in sessions.items()
+                if session.helper_subscribe_attempted
+            ],
+        )
+        _cleanup_subscriptions(
+            sessions, appid=appid, progress_cb=progress_cb,
+            only_ids=cleanup_candidates,
+        )
         return False
     except Exception as exc:
         _progress(progress_cb, {"type": "error", "ok": False, "message": str(exc)})
@@ -3372,8 +3504,16 @@ def run_ugc_install(
                 sessions, appid=appid, progress_cb=progress_cb,
                 names_by_id=names_by_id,
             )
+            cleanup_candidates = _subscription_cleanup_candidates(
+                parent_cleanup_allowlist,
+                [
+                    mid for mid, install_session in sessions.items()
+                    if install_session.helper_subscribe_attempted
+                ],
+            )
             _cleanup_subscriptions(
                 sessions, appid=appid, progress_cb=progress_cb,
+                only_ids=cleanup_candidates,
             )
         return False
 
