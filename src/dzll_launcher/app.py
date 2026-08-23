@@ -21,6 +21,15 @@ class DZLLApp(Gtk.Application):
         self.restart_requested = True
         self.quit()
 
+    def quit(self):
+        try:
+            w = getattr(self, "window", None)
+            if w:
+                w._finish_start_steam_join_consent(False, always=False)
+        except Exception:
+            pass
+        return Gtk.Application.quit(self)
+
     def do_activate(self):
         if not self.window:
             self.window = DZLLWindow(self)

@@ -947,30 +947,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._start_steam_join_decision = None
         self._start_steam_join_loop = None
 
-        def _start_steam_join_finish(ok: bool):
-            always = False
-            try:
-                always = bool(self.start_steam_join_check.get_active())
-            except Exception:
-                always = False
-            self._start_steam_join_decision = (bool(ok), always)
-            try:
-                self.start_steam_join_box.set_visible(False)
-                self.start_steam_join_scrim.set_visible(False)
-            except Exception:
-                pass
-            try:
-                if self._start_steam_join_loop:
-                    self._start_steam_join_loop.quit()
-            except Exception:
-                pass
-
         start_steam_join_scrim_click = Gtk.GestureClick.new()
         start_steam_join_scrim_click.set_button(0)
-        start_steam_join_scrim_click.connect("pressed", lambda *_: _start_steam_join_finish(False))
+        start_steam_join_scrim_click.connect(
+            "pressed", lambda *_: self._finish_start_steam_join_consent(False)
+        )
         self.start_steam_join_scrim.add_controller(start_steam_join_scrim_click)
-        self.start_steam_join_cancel_btn.connect("clicked", lambda *_: _start_steam_join_finish(False))
-        self.start_steam_join_start_btn.connect("clicked", lambda *_: _start_steam_join_finish(True))
+        self.start_steam_join_cancel_btn.connect(
+            "clicked", lambda *_: self._finish_start_steam_join_consent(False)
+        )
+        self.start_steam_join_start_btn.connect(
+            "clicked", lambda *_: self._finish_start_steam_join_consent(True)
+        )
 
         # ESC closes settings
         key = Gtk.EventControllerKey.new()
@@ -1854,12 +1842,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steamcmd_cancel_event.set()
         except Exception:
             pass
+        DZLLWindow._finish_start_steam_join_consent(
+            self, False, always=False,
+        )
 
         self._steam_client_set_cancel_buttons(safe_cancel=True)
         self._steam_ugc_render_cancelling()
         return None
 
     def _steam_client_stop_waiting(self):
+        DZLLWindow._finish_start_steam_join_consent(
+            self, False, always=False,
+        )
         try:
             self._steamcmd_cancel_event.set()
         except Exception:
@@ -2965,6 +2959,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
         self._shutdown_cleanup_done = True
+        try:
+            self._finish_start_steam_join_consent(False, always=False)
+        except Exception:
+            logger.exception("Could not terminate Steam-start consent during shutdown")
         self._background_prepare_ui_generation = int(
             getattr(self, "_background_prepare_ui_generation", 0) or 0
         ) + 1
@@ -9737,11 +9735,49 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False, f"Failed to start native Steam: {exc}"
         return True, ""
 
+    def _finish_start_steam_join_consent(
+            self, ok: bool, *, expected_loop=None,
+            always: bool | None = None) -> bool:
+        """Complete the one active Steam-start consent loop at most once."""
+
+        loop = getattr(self, "_start_steam_join_loop", None)
+        if loop is None:
+            return False
+        if expected_loop is not None and loop is not expected_loop:
+            return False
+        if getattr(self, "_start_steam_join_decision", None) is not None:
+            return False
+
+        if always is None:
+            try:
+                always = bool(self.start_steam_join_check.get_active())
+            except Exception:
+                always = False
+        self._start_steam_join_decision = (bool(ok), bool(always))
+        try:
+            self.start_steam_join_box.set_visible(False)
+            self.start_steam_join_scrim.set_visible(False)
+        except Exception:
+            pass
+        try:
+            loop.quit()
+        except Exception:
+            logger.exception("Could not quit Steam-start consent loop")
+        return True
+
     def _show_start_steam_join_consent_blocking(
             self, *, caller: str = "join") -> tuple[bool, bool]:
+        if getattr(self, "_start_steam_join_loop", None) is not None:
+            logger.warning("Rejected overlapping Steam-start consent request")
+            return False, False
+        self._start_steam_join_decision = None
         try:
-            self._start_steam_join_decision = None
-            self._start_steam_join_loop = GLib.MainLoop()
+            loop = GLib.MainLoop()
+        except Exception as exc:
+            logger.error("Could not create Steam-start consent loop: %s", exc)
+            return False, False
+        self._start_steam_join_loop = loop
+        try:
             try:
                 background = str(caller) == "background"
                 self.start_steam_join_title.set_text(
@@ -9757,18 +9793,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self.start_steam_join_scrim.set_visible(True)
                 self.start_steam_join_box.set_visible(True)
                 self.start_steam_join_start_btn.grab_focus()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("Could not present Steam-start consent: %s", exc)
+                self._finish_start_steam_join_consent(
+                    False, expected_loop=loop, always=False,
+                )
+                return False, False
 
-            self._start_steam_join_loop.run()
+            try:
+                loop.run()
+            except Exception as exc:
+                logger.error("Steam-start consent loop failed: %s", exc)
+                return False, False
 
             decided = self._start_steam_join_decision
-            self._start_steam_join_loop = None
             if not isinstance(decided, tuple):
                 return False, False
             return bool(decided[0]), bool(decided[1])
-        except Exception:
-            return False, False
+        finally:
+            if getattr(self, "_start_steam_join_loop", None) is loop:
+                self._start_steam_join_loop = None
 
     def _sync_start_steam_on_join_setting_widget(self) -> None:
         try:
@@ -11155,19 +11199,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return value
 
     def _background_prepare_cancel_consent_ui(self) -> None:
-        loop = getattr(self, "_start_steam_join_loop", None)
-        if loop is None:
-            return
-        self._start_steam_join_decision = (False, False)
-        try:
-            self.start_steam_join_box.set_visible(False)
-            self.start_steam_join_scrim.set_visible(False)
-        except Exception:
-            pass
-        try:
-            loop.quit()
-        except Exception:
-            traceback.print_exc()
+        DZLLWindow._finish_start_steam_join_consent(
+            self, False, always=False,
+        )
 
     def _background_prepare_render_snapshot(self, generation: int, snapshot) -> None:
         if not self._background_prepare_is_current(generation):
