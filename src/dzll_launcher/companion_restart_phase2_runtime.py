@@ -158,6 +158,7 @@ def _startup_failure_kind(exc: BaseException) -> str:
 
 class RuntimePersistenceStatus(str, Enum):
     ENABLED = "enabled"
+    DEGRADED_RETRYABLE_WRITE_FAILED = "degraded_retryable_write_failed"
     DISABLED_INITIALIZATION_FAILED = "disabled_initialization_failed"
     DISABLED_WRITE_FAILED = "disabled_write_failed"
 
@@ -374,6 +375,7 @@ class Phase2RestartRuntime:
             else RuntimePersistenceStatus.DISABLED_INITIALIZATION_FAILED
         )
         self.persistence_error: str | None = migration.error
+        self._schema4_staged_runtime_server_keys: set[str] = set()
         self._servers: dict[str, _ServerRuntime] = {}
         self._shutdown = False
         self._load_servers(float(time.time() if now is None else now))
@@ -528,20 +530,37 @@ class Phase2RestartRuntime:
 
     @property
     def persistence_enabled(self) -> bool:
-        return self.persistence_status is RuntimePersistenceStatus.ENABLED
+        return self.persistence_status in {
+            RuntimePersistenceStatus.ENABLED,
+            RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED,
+        }
 
     @property
     def pending_notice(self) -> RuntimeNotice | None:
         result = self.migration
-        if self.persistence_status is RuntimePersistenceStatus.DISABLED_WRITE_FAILED:
+        if self.persistence_status in {
+            RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED,
+            RuntimePersistenceStatus.DISABLED_WRITE_FAILED,
+        }:
             detail = str(self.persistence_error or "unknown persistence failure")
+            retryable = (
+                self.persistence_status
+                is RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED
+            )
             return RuntimeNotice(
                 kind="persistence_write_failed",
                 title="Server Companion Learning Is Not Being Saved",
                 body=(
-                    "Current Server Companion information remains available, but new "
-                    "restart-learning changes cannot be saved or retained after this "
-                    "launch. Existing learning files were not reset or deleted. "
+                    "Current Server Companion information remains available. "
+                    + (
+                        "DZLL retained the pending learning changes and will retry "
+                        "them at the next safe save point. "
+                        if retryable
+                        else
+                        "New restart-learning changes cannot be saved or retained "
+                        "after this launch. "
+                    )
+                    + "Existing learning files were not reset or deleted. "
                     f"Technical error: {detail}"
                 ),
             )
@@ -599,6 +618,8 @@ class Phase2RestartRuntime:
                 wall_at=wall_at,
                 monotonic_at=monotonic_at,
             )
+            if not self.persistence_enabled:
+                return ""
         if server.engine.active_episode is None:
             server.engine = PhysicalEpisodeEngine(self.detection_config)
         else:
@@ -634,8 +655,19 @@ class Phase2RestartRuntime:
         })
         server.monitoring_sessions[:] = server.monitoring_sessions[-MAX_MONITORING_SESSIONS:]
         server.dirty = True
+        session_id = server.monitoring_session_id
         self._persist_server(server, force=True, now=wall_at)
-        return server.monitoring_session_id
+        if not self.persistence_enabled:
+            server.monitoring_sessions[:] = [
+                item for item in server.monitoring_sessions
+                if item.get("session_id") != session_id
+            ]
+            server.monitoring_session_id = ""
+            server.continuity_chain_id = ""
+            server.previous_sample = None
+            server.player_observations.clear()
+            return ""
+        return session_id
 
     def ensure_monitoring_session(
         self,
@@ -981,7 +1013,17 @@ class Phase2RestartRuntime:
             self._persist_server(server, force=True, now=wall_at)
         backend = self._authoritative_schema4_backend
         if backend is not None:
-            backend.close(flush=True)
+            flush_on_close = (
+                self.persistence_status
+                is not RuntimePersistenceStatus.DISABLED_WRITE_FAILED
+            )
+            try:
+                result = backend.close(flush=flush_on_close)
+            except Exception as exc:
+                self._record_schema4_persistence_failure(exc)
+                raise
+            if result is not None:
+                self._record_schema4_persistence_success(result, now=wall_at)
 
     def authoritative_schema4_snapshot(self) -> object | None:
         """Read-only backend diagnostics; never consumed by Stage 3A policy."""
@@ -1092,10 +1134,18 @@ class Phase2RestartRuntime:
             return AuthorityConsumerActionResult(
                 False, False, "schema3_safe_fallback", None, None, ("schema4_backend_unavailable",)
             )
-        reservation = backend.reserve_consumer_alert(
-            decision=decision,
-            key=key,
-            created_at=now,
+        try:
+            reservation = backend.reserve_consumer_alert(
+                decision=decision,
+                key=key,
+                created_at=now,
+            )
+        except Exception as exc:
+            self._record_schema4_persistence_failure(exc)
+            raise
+        self._record_schema4_persistence_success(
+            reservation.write_result,
+            now=now,
         )
         if not reservation.reserved:
             return AuthorityConsumerActionResult(
@@ -1115,12 +1165,17 @@ class Phase2RestartRuntime:
                 after_dispatch()
         except Exception:
             succeeded = False
-        completed = backend.complete_consumer_alert(
-            decision=decision,
-            reservation=reservation,
-            completed_at=now,
-            action_succeeded=succeeded,
-        )
+        try:
+            completed = backend.complete_consumer_alert(
+                decision=decision,
+                reservation=reservation,
+                completed_at=now,
+                action_succeeded=succeeded,
+            )
+        except Exception as exc:
+            self._record_schema4_persistence_failure(exc)
+            raise
+        self._record_schema4_persistence_success(completed, now=now)
         return AuthorityConsumerActionResult(
             True,
             succeeded,
@@ -2193,6 +2248,49 @@ class Phase2RestartRuntime:
             ),
         )
 
+    def _record_schema4_persistence_failure(self, exc: BaseException) -> None:
+        from .companion_restart_phase2_schema4_runtime import (
+            Schema4WriteFailure,
+            Schema4WriteFailurePhase,
+        )
+
+        if (
+            self.persistence_status
+            is RuntimePersistenceStatus.DISABLED_WRITE_FAILED
+        ):
+            return
+        retryable = bool(
+            isinstance(exc, Schema4WriteFailure)
+            and exc.phase is Schema4WriteFailurePhase.CONFIRMED_PRE_COMMIT
+        )
+        self.persistence_status = (
+            RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED
+            if retryable
+            else RuntimePersistenceStatus.DISABLED_WRITE_FAILED
+        )
+        detail = exc.cause if isinstance(exc, Schema4WriteFailure) else exc
+        self.persistence_error = f"{type(detail).__name__}: {detail}"
+
+    def _record_schema4_persistence_success(self, result, *, now: float) -> None:
+        backend = self._authoritative_schema4_backend
+        if backend is None:
+            return
+        if backend.dirty:
+            return
+        durable_runtime_keys = set(self._schema4_staged_runtime_server_keys)
+        self._schema4_staged_runtime_server_keys.clear()
+        for key in durable_runtime_keys:
+            item = self._servers.get(key)
+            if item is not None:
+                item.dirty = False
+                item.last_saved_at = now
+        if (
+            self.persistence_status
+            is RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED
+        ):
+            self.persistence_status = RuntimePersistenceStatus.ENABLED
+            self.persistence_error = None
+
     def _persist_server(self, server: _ServerRuntime, *, force: bool, now: float) -> bool:
         if not self.persistence_enabled or not server.dirty:
             return False
@@ -2216,11 +2314,13 @@ class Phase2RestartRuntime:
                         else "schema4_coalesced_runtime_update"
                     ),
                 )
+                self._schema4_staged_runtime_server_keys.add(server.key)
                 result = backend.flush() if force else None
             except Exception as exc:
-                self.persistence_status = RuntimePersistenceStatus.DISABLED_WRITE_FAILED
-                self.persistence_error = f"{type(exc).__name__}: {exc}"
+                self._record_schema4_persistence_failure(exc)
                 return False
+            if result is not None:
+                self._record_schema4_persistence_success(result, now=now)
             server.dirty = False
             server.last_saved_at = now
             return bool(changed and result is not None and result.wrote)

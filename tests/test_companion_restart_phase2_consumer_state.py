@@ -446,6 +446,54 @@ def test_cutover_warning_action_is_single_source_and_once(tmp_path):
     value.shutdown(wall_at=due + 1, monotonic_at=2)
 
 
+def test_consumer_reservation_flush_recovers_retryable_runtime_state(
+    tmp_path, monkeypatch
+):
+    value, path = _cutover_runtime(tmp_path)
+    auth = value._authoritative_schema4_backend.authority_decision(SERVER)
+    regime = auth.selected_shadow_regime
+    due = consumers.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE,
+    ) - 300
+    value.decision(SERVER, now=due, restart_alert_enabled=True)
+
+    real_replace = live4.os.replace
+    calls = []
+
+    def fail_once(source, destination):
+        if destination != path:
+            return real_replace(source, destination)
+        calls.append(source)
+        if len(calls) == 1:
+            raise OSError("injected pre-commit consumer interaction failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(live4.os, "replace", fail_once)
+    server = value._servers[SERVER]
+    server.dirty = True
+    assert not value._persist_server(server, force=True, now=due)
+    assert value.persistence_status is (
+        runtime.RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED
+    )
+
+    actions = []
+    result = value.dispatch_authority_consumer_action(
+        SERVER,
+        kind="scheduled_warning",
+        now=due,
+        action=lambda: actions.append("warning") or True,
+    )
+    assert result.emitted and actions == ["warning"]
+    assert value.persistence_status is runtime.RuntimePersistenceStatus.ENABLED
+    assert value.persistence_error is None
+    assert not value._authoritative_schema4_backend.dirty
+    assert not value._servers[SERVER].dirty
+    assert schema4.deserialize_schema4_bytes(path.read_bytes()).report.valid
+    value.shutdown(wall_at=due + 1, monotonic_at=2)
+
+
 def test_generation_conflict_prevents_alert_dispatch(tmp_path):
     value, path = _cutover_runtime(tmp_path)
     auth = value._authoritative_schema4_backend.authority_decision(SERVER)

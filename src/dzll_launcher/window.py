@@ -3847,7 +3847,27 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _surface_restart_learning_persistence_notice(self) -> bool:
         runtime = getattr(self, "_companion_restart_phase2", None)
         notice = runtime.pending_notice if runtime is not None else None
-        if notice is None or notice.kind != "persistence_write_failed":
+        if notice is None:
+            signature = getattr(
+                self, "_restart_learning_persistence_notice_signature", None
+            )
+            if isinstance(signature, tuple) and signature[:1] == (
+                "persistence_write_failed",
+            ):
+                presenter = getattr(self, "restart_learning_notice_ui", None)
+                try:
+                    if presenter is not None and presenter.visible():
+                        presenter.hide()
+                except Exception as exc:
+                    debug = getattr(self, "_debug_server_companion_alert", None)
+                    if callable(debug):
+                        debug(
+                            "restart-learning persistence recovery notice cleanup "
+                            f"failed: {exc!r}"
+                        )
+                self._restart_learning_persistence_notice_signature = None
+            return False
+        if notice.kind != "persistence_write_failed":
             return False
         signature = (notice.kind, str(getattr(runtime, "persistence_error", "") or ""))
         if getattr(self, "_restart_learning_persistence_notice_signature", None) == signature:

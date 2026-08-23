@@ -67,6 +67,26 @@ class Schema4GenerationConflict(Schema4RuntimeError):
     """The active file changed since this runtime loaded it."""
 
 
+class Schema4WriteFailurePhase(str, Enum):
+    """Commit certainty for a failed schema-4 atomic installation."""
+
+    CONFIRMED_PRE_COMMIT = "confirmed_pre_commit"
+    POST_COMMIT_OR_AMBIGUOUS = "post_commit_or_ambiguous"
+
+
+class Schema4WriteFailure(RuntimeError):
+    """An atomic install failed with an explicit commit-phase classification."""
+
+    def __init__(
+        self,
+        phase: Schema4WriteFailurePhase,
+        cause: BaseException,
+    ) -> None:
+        self.phase = phase
+        self.cause = cause
+        super().__init__(f"{phase.value}: {type(cause).__name__}: {cause}")
+
+
 class Schema4CrashPoint(str, Enum):
     BEFORE_TEMP_COMPLETE = "before_temp_complete"
     AFTER_TEMP_FSYNC_BEFORE_REPLACE = "after_temp_fsync_before_replace"
@@ -881,13 +901,26 @@ def _install_atomic_schema4(
     last_known_good_path: Path,
     crash_injector: Callable[[Schema4CrashPoint], None] | None,
 ) -> None:
-    active_path.parent.mkdir(parents=True, exist_ok=True)
-    fd, raw_name = tempfile.mkstemp(
-        prefix=f".{active_path.name}.schema4-runtime-",
-        suffix=".tmp",
-        dir=active_path.parent,
-    )
+    try:
+        active_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw_name = tempfile.mkstemp(
+            prefix=f".{active_path.name}.schema4-runtime-",
+            suffix=".tmp",
+            dir=active_path.parent,
+        )
+    except OSError as exc:
+        try:
+            unchanged = active_path.read_bytes() == previous_valid_bytes
+        except OSError:
+            unchanged = False
+        phase = (
+            Schema4WriteFailurePhase.CONFIRMED_PRE_COMMIT
+            if unchanged
+            else Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS
+        )
+        raise Schema4WriteFailure(phase, exc) from exc
     temp_path = Path(raw_name)
+    active_replaced = False
     try:
         if crash_injector is not None:
             crash_injector(Schema4CrashPoint.BEFORE_TEMP_COMPLETE)
@@ -909,11 +942,31 @@ def _install_atomic_schema4(
             crash_injector(Schema4CrashPoint.AFTER_TEMP_FSYNC_BEFORE_REPLACE)
         _replace_bytes_fsynced(last_known_good_path, previous_valid_bytes)
         os.replace(temp_path, active_path)
+        active_replaced = True
         _fsync_directory(active_path.parent)
         if crash_injector is not None:
             crash_injector(Schema4CrashPoint.AFTER_REPLACE)
         if active_path.read_bytes() != payload:
             raise Schema4RuntimeError("atomic schema-4 replacement verification failed")
+    except Schema4Error as exc:
+        if active_replaced:
+            raise Schema4WriteFailure(
+                Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS,
+                exc,
+            ) from exc
+        raise
+    except Exception as exc:
+        if not active_replaced and not isinstance(exc, OSError):
+            raise
+        phase = Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS
+        if not active_replaced:
+            try:
+                unchanged = active_path.read_bytes() == previous_valid_bytes
+            except OSError:
+                unchanged = False
+            if unchanged:
+                phase = Schema4WriteFailurePhase.CONFIRMED_PRE_COMMIT
+        raise Schema4WriteFailure(phase, exc) from exc
     finally:
         if fd >= 0:
             os.close(fd)
