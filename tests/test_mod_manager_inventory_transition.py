@@ -1044,7 +1044,11 @@ def test_backend_local_delete_retains_safe_path_guard(monkeypatch, tmp_path):
         lambda: (False, SteamClientState.OFFLINE),
     )
     monkeypatch.setattr(steam_ugc_backend, "_native_steam_roots", lambda: [tmp_path])
-    monkeypatch.setattr(steam_ugc_backend, "_safe_workshop_content_path", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_safe_native_workshop_path_for_root",
+        lambda *_args, **_kwargs: None,
+    )
     result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
         20,
         steam_absence_verified=True,

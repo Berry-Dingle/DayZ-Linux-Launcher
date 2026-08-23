@@ -14,10 +14,13 @@ import tempfile
 import time
 import pty
 import select
-import shutil
 from pathlib import Path
 from typing import Dict, List, Tuple
 from .settings import autodetect_workshop_dir, autodetect_steamcmd_path
+from .workshop_path_safety import (
+    canonical_trusted_root,
+    safe_configured_workshop_mutation_path,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -1312,7 +1315,12 @@ def scan_installed_mods_in_watch_folder(watch_folder: str) -> List[str]:
 # =============================
 # Delete Individual Mods Helper
 # =============================
-def remove_mid_from_appworkshop_acf(acf_path: str, mid: int) -> bool:
+def remove_mid_from_appworkshop_acf(
+    acf_path: str,
+    mid: int,
+    *,
+    path_validator=None,
+) -> bool:
     """
     Remove one workshop item block from known sections in appworkshop_221100.acf:
       - "WorkshopItemsInstalled"
@@ -1323,7 +1331,11 @@ def remove_mid_from_appworkshop_acf(acf_path: str, mid: int) -> bool:
     try:
         from .steam_ugc_backend import _remove_workshop_acf_entries_from_paths
 
-        result = _remove_workshop_acf_entries_from_paths([Path(acf_path)], [int(mid)])
+        result = _remove_workshop_acf_entries_from_paths(
+            [Path(acf_path)],
+            [int(mid)],
+            path_validator=path_validator,
+        )
         return int(mid) in set(result.get("removed_ids") or [])
     except Exception:
         return False
@@ -1351,11 +1363,45 @@ def delete_single_mod(mid: int, *, workshop_dir: str = "", proton_prefix: str = 
     home = str(Path.home())
     steamapps = os.path.join(home, ".local/share/Steam/steamapps")
     workshop = _resolve_path(workshop_dir) if workshop_dir else (_resolved_dayz_workshop_root() or os.path.join(steamapps, "workshop"))
+    workshop_anchor = canonical_trusted_root(workshop)
+    if workshop_anchor is None:
+        log(f"[MOD DELETE] refusing invalid Workshop root: {workshop}")
+        return False
 
-    content_dir = os.path.join(workshop, "content", "221100", str(mid))
-    downloads_dir = os.path.join(workshop, "downloads", "221100", str(mid))
-    patch_file = os.path.join(workshop, "downloads", f"state_221100_221100_{mid}.patch")
-    acf_path = os.path.join(workshop, "appworkshop_221100.acf")
+    content_relative = ("content", "221100", str(mid))
+    downloads_relative = ("downloads", "221100", str(mid))
+    patch_name = f"state_221100_221100_{mid}.patch"
+    patch_relative = ("downloads", patch_name)
+    acf_name = "appworkshop_221100.acf"
+    acf_relative = (acf_name,)
+
+    content_dir = workshop_anchor.joinpath(*content_relative)
+    downloads_dir = workshop_anchor.joinpath(*downloads_relative)
+    patch_file = workshop_anchor.joinpath(*patch_relative)
+    acf_path = workshop_anchor / acf_name
+
+    def configured_validator(relative_parts, leaf_kind):
+        return lambda candidate: safe_configured_workshop_mutation_path(
+            workshop_anchor,
+            candidate,
+            relative_parts=relative_parts,
+            leaf_kind=leaf_kind,
+        )
+
+    content_validator = configured_validator(content_relative, "directory")
+    downloads_validator = configured_validator(downloads_relative, "directory")
+    patch_validator = configured_validator(patch_relative, "file")
+    acf_validator = configured_validator(acf_relative, "file")
+    guarded_paths = (
+        (content_dir, content_validator),
+        (downloads_dir, downloads_validator),
+        (patch_file, patch_validator),
+        (acf_path, acf_validator),
+    )
+    for candidate, validator in guarded_paths:
+        if validator(candidate) is None:
+            log(f"[MOD DELETE] refusing unsafe Workshop path: {candidate}")
+            return False
 
     pfx = _resolve_path(proton_prefix) if proton_prefix else (_resolved_dayz_proton_prefix() or os.path.join(steamapps, "compatdata/221100/pfx"))
     pfx_user = os.path.join(pfx, "drive_c/users/steamuser")
@@ -1390,7 +1436,7 @@ def delete_single_mod(mid: int, *, workshop_dir: str = "", proton_prefix: str = 
                     tgt = os.path.realpath(p)
                 except Exception:
                     continue
-                if tgt == content_dir:
+                if tgt == str(content_dir):
                     log(f"[MOD DELETE] removing symlink: {p} -> {tgt}")
                     try:
                         os.unlink(p)
@@ -1401,27 +1447,40 @@ def delete_single_mod(mid: int, *, workshop_dir: str = "", proton_prefix: str = 
             pass
 
     # 2) Remove workshop content/staging for this mod
-    for path in (content_dir, downloads_dir):
-        if os.path.exists(path):
-            log(f"[MOD DELETE] removing dir: {path}")
-            try:
-                shutil.rmtree(path, ignore_errors=False)
-                changed = True
-            except Exception as e:
-                log(f"[MOD DELETE] failed to remove {path}: {e}")
-                return False
+    try:
+        from .steam_ugc_backend import (
+            _delete_dir_if_present,
+            _delete_file_if_present,
+        )
 
-    if os.path.exists(patch_file):
-        log(f"[MOD DELETE] removing patch: {patch_file}")
-        try:
-            os.remove(patch_file)
+        if _delete_dir_if_present(
+            content_dir,
+            log_fn=log,
+            path_validator=content_validator,
+        ):
             changed = True
-        except Exception as e:
-            log(f"[MOD DELETE] failed to remove {patch_file}: {e}")
-            return False
+        if _delete_dir_if_present(
+            downloads_dir,
+            log_fn=log,
+            path_validator=downloads_validator,
+        ):
+            changed = True
+        if _delete_file_if_present(
+            patch_file,
+            log_fn=log,
+            path_validator=patch_validator,
+        ):
+            changed = True
+    except Exception as e:
+        log(f"[MOD DELETE] failed guarded Workshop cleanup: {e}")
+        return False
 
     # 3) Remove from appworkshop_221100.acf (surgical)
-    ok_acf = remove_mid_from_appworkshop_acf(acf_path, mid)
+    ok_acf = remove_mid_from_appworkshop_acf(
+        str(acf_path),
+        mid,
+        path_validator=acf_validator,
+    )
     if ok_acf:
         log(f"[MOD DELETE] removed {mid} from appworkshop_221100.acf")
         changed = True

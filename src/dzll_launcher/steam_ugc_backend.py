@@ -15,6 +15,7 @@ import os
 import queue
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,8 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Iterable
+
+from .workshop_path_safety import safe_native_workshop_mutation_path
 
 
 logger = logging.getLogger(__name__)
@@ -2400,62 +2403,172 @@ def _native_steam_roots() -> list[Path]:
     return out
 
 
+def _safe_native_workshop_path_for_root(
+    root,
+    candidate,
+    *,
+    relative_parts,
+    leaf_kind: str,
+) -> Path | None:
+    return safe_native_workshop_mutation_path(
+        root,
+        candidate,
+        relative_parts=relative_parts,
+        leaf_kind=leaf_kind,
+    )
+
+
 def _safe_workshop_content_path(path: str, *, mod_id: int, appid: int) -> Path | None:
     if not path:
         return None
+    mid = _strict_cleanup_workshop_item_id(mod_id)
+    if mid is None:
+        return None
     try:
+        appid_i = int(appid)
         raw = Path(path).expanduser()
-        if raw.name != str(int(mod_id)):
-            return None
-        if raw.is_symlink():
-            return None
-        resolved = raw.resolve()
-        for root in _native_steam_roots():
-            allowed = (root / "steamapps/workshop/content" / str(int(appid)) / str(int(mod_id))).resolve()
-            if resolved == allowed:
-                return raw
     except Exception:
         return None
+    if raw.name != str(mid):
+        return None
+    for root in _native_steam_roots():
+        safe = _safe_native_workshop_path_for_root(
+            root,
+            raw,
+            relative_parts=("content", str(appid_i), str(mid)),
+            leaf_kind="directory",
+        )
+        if safe is not None:
+            return safe
     return None
 
 
 def _safe_workshop_download_dir(path: Path, *, mod_id: int, appid: int) -> Path | None:
+    mid = _strict_cleanup_workshop_item_id(mod_id)
+    if mid is None:
+        return None
     try:
+        appid_i = int(appid)
         raw = Path(path).expanduser()
-        if raw.name != str(int(mod_id)):
-            return None
-        if raw.is_symlink():
-            return None
-        resolved = raw.resolve()
-        for root in _native_steam_roots():
-            allowed = (root / "steamapps/workshop/downloads" / str(int(appid)) / str(int(mod_id))).resolve()
-            if resolved == allowed:
-                return raw
     except Exception:
         return None
+    if raw.name != str(mid):
+        return None
+    for root in _native_steam_roots():
+        safe = _safe_native_workshop_path_for_root(
+            root,
+            raw,
+            relative_parts=("downloads", str(appid_i), str(mid)),
+            leaf_kind="directory",
+        )
+        if safe is not None:
+            return safe
     return None
 
 
 def _safe_workshop_patch_file(path: Path, *, mod_id: int, appid: int) -> Path | None:
-    expected_name = f"state_{int(appid)}_{int(appid)}_{int(mod_id)}.patch"
+    mid = _strict_cleanup_workshop_item_id(mod_id)
+    if mid is None:
+        return None
     try:
+        appid_i = int(appid)
+        expected_name = f"state_{appid_i}_{appid_i}_{mid}.patch"
         raw = Path(path).expanduser()
-        if raw.name != expected_name:
-            return None
-        if raw.is_symlink():
-            return None
-        resolved = raw.resolve()
-        for root in _native_steam_roots():
-            allowed_paths = (
-                root / "steamapps/workshop/downloads" / expected_name,
-                root / "steamapps/workshop" / expected_name,
-            )
-            for allowed_path in allowed_paths:
-                if resolved == allowed_path.resolve():
-                    return raw
     except Exception:
         return None
+    if raw.name != expected_name:
+        return None
+    for root in _native_steam_roots():
+        for relative_parts in (
+            ("downloads", expected_name),
+            (expected_name,),
+        ):
+            safe = _safe_native_workshop_path_for_root(
+                root,
+                raw,
+                relative_parts=relative_parts,
+                leaf_kind="file",
+            )
+            if safe is not None:
+                return safe
     return None
+
+
+def _safe_workshop_acf_path(path: Path, *, appid: int) -> Path | None:
+    try:
+        appid_i = int(appid)
+        expected_name = f"appworkshop_{appid_i}.acf"
+        raw = Path(path).expanduser()
+    except Exception:
+        return None
+    if raw.name != expected_name:
+        return None
+    for root in _native_steam_roots():
+        safe = _safe_native_workshop_path_for_root(
+            root,
+            raw,
+            relative_parts=(expected_name,),
+            leaf_kind="file",
+        )
+        if safe is not None:
+            return safe
+    return None
+
+
+def _native_workshop_cleanup_plan(mod_id: int, appid: int) -> list[dict]:
+    """Resolve every per-library mutation path before any deletion begins."""
+
+    mid = _strict_cleanup_workshop_item_id(mod_id)
+    if mid is None:
+        raise RuntimeError(f"invalid Workshop item id: {mod_id!r}")
+    appid_i = int(appid)
+    patch_name = f"state_{appid_i}_{appid_i}_{mid}.patch"
+    plans: list[dict] = []
+    for root in _native_steam_roots():
+        candidates = {
+            "content": (
+                root / "steamapps/workshop/content" / str(appid_i) / str(mid),
+                ("content", str(appid_i), str(mid)),
+                "directory",
+            ),
+            "downloads": (
+                root / "steamapps/workshop/downloads" / str(appid_i) / str(mid),
+                ("downloads", str(appid_i), str(mid)),
+                "directory",
+            ),
+            "downloads_patch": (
+                root / "steamapps/workshop/downloads" / patch_name,
+                ("downloads", patch_name),
+                "file",
+            ),
+            "root_patch": (
+                root / "steamapps/workshop" / patch_name,
+                (patch_name,),
+                "file",
+            ),
+            "acf": (
+                root / "steamapps/workshop" / f"appworkshop_{appid_i}.acf",
+                (f"appworkshop_{appid_i}.acf",),
+                "file",
+            ),
+        }
+        plan = {"root": root}
+        for key, (candidate, relative_parts, leaf_kind) in candidates.items():
+            safe = _safe_native_workshop_path_for_root(
+                root,
+                candidate,
+                relative_parts=relative_parts,
+                leaf_kind=leaf_kind,
+            )
+            if safe is None:
+                if key == "content":
+                    raise RuntimeError(
+                        f"refusing unsafe install folder: {candidate}"
+                    )
+                raise RuntimeError(f"refusing unsafe Workshop path: {candidate}")
+            plan[key] = safe
+        plans.append(plan)
+    return plans
 
 
 def _candidate_content_dirs(mod_id: int, appid: int, before: dict, after: dict) -> list[Path]:
@@ -2481,22 +2594,44 @@ def _candidate_content_dirs(mod_id: int, appid: int, before: dict, after: dict) 
     return out
 
 
-def _delete_dir_if_present(path: Path, *, log_fn=None) -> bool:
+def _delete_dir_if_present(path: Path, *, log_fn=None, path_validator=None) -> bool:
+    if callable(path_validator):
+        path = path_validator(path)
+        if path is None:
+            raise RuntimeError("refusing to delete unsafe Workshop directory")
+    path = Path(path)
     if not path.exists():
         return False
     if path.is_symlink() or not path.is_dir():
         raise RuntimeError(f"refusing to delete unsafe path: {path}")
+    if callable(path_validator):
+        revalidated = path_validator(path)
+        if revalidated is None or Path(revalidated) != path:
+            raise RuntimeError(f"refusing changed Workshop directory: {path}")
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"refusing to delete unsafe path: {path}")
     if callable(log_fn):
         log_fn(f"[Steam UGC] deleting local mod folder: {path}")
     shutil.rmtree(path, ignore_errors=False)
     return True
 
 
-def _delete_file_if_present(path: Path, *, log_fn=None) -> bool:
+def _delete_file_if_present(path: Path, *, log_fn=None, path_validator=None) -> bool:
+    if callable(path_validator):
+        path = path_validator(path)
+        if path is None:
+            raise RuntimeError("refusing to delete unsafe Workshop file")
+    path = Path(path)
     if not path.exists():
         return False
     if path.is_symlink() or not path.is_file():
         raise RuntimeError(f"refusing to delete unsafe path: {path}")
+    if callable(path_validator):
+        revalidated = path_validator(path)
+        if revalidated is None or Path(revalidated) != path:
+            raise RuntimeError(f"refusing changed Workshop file: {path}")
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"refusing to delete unsafe path: {path}")
     if callable(log_fn):
         log_fn(f"[Steam UGC] deleting local staging file: {path}")
     path.unlink()
@@ -2522,9 +2657,17 @@ def _native_appworkshop_acf_paths(appid: int) -> list[Path]:
     seen = set()
     for root in _native_steam_roots():
         path = root / "steamapps/workshop" / f"appworkshop_{int(appid)}.acf"
-        key = str(path)
+        safe = _safe_native_workshop_path_for_root(
+            root,
+            path,
+            relative_parts=(f"appworkshop_{int(appid)}.acf",),
+            leaf_kind="file",
+        )
+        if safe is None:
+            raise RuntimeError(f"refusing unsafe Workshop ACF path: {path}")
+        key = str(safe)
         if key not in seen:
-            out.append(path)
+            out.append(safe)
             seen.add(key)
     return out
 
@@ -2686,15 +2829,141 @@ def _remove_workshop_acf_ids_from_text(text: str, mod_ids: Iterable[int]) -> tup
     return new_text, removed
 
 
-def _write_acf_atomically_with_backup(path: Path, original_bytes: bytes, new_text: str) -> str:
+def _write_all_and_fsync(fd: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(fd, payload[offset:])
+        if written <= 0:
+            raise OSError(f"short Workshop ACF write: {written!r}")
+        offset += written
+    os.fsync(fd)
+
+
+def _unlink_owned_regular_file(path: Path | None, identity) -> None:
+    """Remove only the unchanged regular inode created by this invocation."""
+
+    if path is None or identity is None:
+        return
+    try:
+        current = os.lstat(path)
+        if (
+            stat.S_ISREG(current.st_mode)
+            and (current.st_dev, current.st_ino) == identity
+        ):
+            path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _open_unique_acf_backup(path: Path, suffix: str) -> tuple[int, Path, tuple[int, int]]:
+    base_name = f"{path.name}.bak.{suffix}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    for counter in range(1000):
+        name = base_name if counter == 0 else f"{base_name}.{counter}"
+        candidate = path.with_name(name)
+        try:
+            fd = os.open(candidate, flags, 0o600)
+        except FileExistsError:
+            try:
+                mode = os.lstat(candidate).st_mode
+            except OSError as exc:
+                raise RuntimeError(
+                    f"failed to inspect Workshop ACF backup path: {candidate}"
+                ) from exc
+            if stat.S_ISLNK(mode):
+                raise RuntimeError(
+                    f"refusing symlinked Workshop ACF backup path: {candidate}"
+                )
+            continue
+        created = os.fstat(fd)
+        return fd, candidate, (created.st_dev, created.st_ino)
+    raise RuntimeError("could not allocate a unique Workshop ACF backup path")
+
+
+def _write_acf_atomically_with_backup(
+    path: Path,
+    original_bytes: bytes,
+    new_text: str,
+    *,
+    path_validator=None,
+) -> str:
+    path = Path(path)
+
+    def validate_authoritative_path() -> None:
+        if callable(path_validator):
+            validated = path_validator(path)
+            if validated is None or Path(validated) != path:
+                raise RuntimeError(f"refusing changed Workshop ACF path: {path}")
+        try:
+            current = os.lstat(path)
+        except OSError as exc:
+            raise RuntimeError(f"failed to validate Workshop ACF path: {path}") from exc
+        if not stat.S_ISREG(current.st_mode):
+            raise RuntimeError(f"refusing unsafe Workshop ACF path: {path}")
+
+    validate_authoritative_path()
+    original_mode = os.lstat(path).st_mode & 0o777
+    payload = new_text.encode("utf-8")
     ts = time.strftime("%Y%m%d-%H%M%S")
     suffix = f"{ts}.{os.getpid()}"
-    backup = path.with_name(f"{path.name}.bak.{suffix}")
-    tmp = path.with_name(f"{path.name}.tmp.{suffix}")
-    backup.write_bytes(original_bytes)
-    tmp.write_text(new_text, encoding="utf-8")
-    os.replace(tmp, path)
-    return str(backup)
+    temp_fd = -1
+    temp_path: Path | None = None
+    temp_identity = None
+    backup_fd = -1
+    backup_path: Path | None = None
+    backup_identity = None
+    backup_complete = False
+    try:
+        temp_fd, temp_name = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        temp_path = Path(temp_name)
+        temp_stat = os.fstat(temp_fd)
+        temp_identity = (temp_stat.st_dev, temp_stat.st_ino)
+        os.fchmod(temp_fd, original_mode)
+        _write_all_and_fsync(temp_fd, payload)
+        os.close(temp_fd)
+        temp_fd = -1
+
+        # Revalidate the authoritative file and its parent path before creating
+        # a persistent sibling backup.
+        validate_authoritative_path()
+        backup_fd, backup_path, backup_identity = _open_unique_acf_backup(
+            path, suffix,
+        )
+        os.fchmod(backup_fd, original_mode)
+        _write_all_and_fsync(backup_fd, original_bytes)
+        os.close(backup_fd)
+        backup_fd = -1
+        backup_complete = True
+
+        # This is the final current-state check before the atomic commit point.
+        validate_authoritative_path()
+        os.replace(temp_path, path)
+        temp_path = None
+        temp_identity = None
+        if path.is_symlink() or not path.is_file():
+            raise RuntimeError(f"Workshop ACF replacement is not a regular file: {path}")
+        return str(backup_path)
+    finally:
+        if temp_fd >= 0:
+            try:
+                os.close(temp_fd)
+            except OSError:
+                pass
+        if backup_fd >= 0:
+            try:
+                os.close(backup_fd)
+            except OSError:
+                pass
+        _unlink_owned_regular_file(temp_path, temp_identity)
+        if not backup_complete:
+            _unlink_owned_regular_file(backup_path, backup_identity)
 
 
 def _has_real_native_workshop_folder(mod_id: int, *, appid: int, states: Iterable[dict] = ()) -> bool:
@@ -2719,7 +2988,13 @@ def _has_real_native_workshop_folder(mod_id: int, *, appid: int, states: Iterabl
     return False
 
 
-def _remove_workshop_acf_entries_from_paths(paths: Iterable[Path], mod_ids: Iterable[int], *, log_fn=None) -> dict:
+def _remove_workshop_acf_entries_from_paths(
+    paths: Iterable[Path],
+    mod_ids: Iterable[int],
+    *,
+    log_fn=None,
+    path_validator=None,
+) -> dict:
     ids = _dedupe_sorted_ids(mod_ids)
     result = {
         "ok": False,
@@ -2739,6 +3014,11 @@ def _remove_workshop_acf_entries_from_paths(paths: Iterable[Path], mod_ids: Iter
         path = Path(raw_path).expanduser()
         result["paths"].append(str(path))
         try:
+            if callable(path_validator):
+                path = path_validator(path)
+                if path is None:
+                    raise RuntimeError("refusing unsafe Workshop ACF path")
+                path = Path(path)
             if not path.is_file():
                 continue
             original_bytes = path.read_bytes()
@@ -2746,7 +3026,18 @@ def _remove_workshop_acf_entries_from_paths(paths: Iterable[Path], mod_ids: Iter
             new_text, removed = _remove_workshop_acf_ids_from_text(text, ids)
             if not removed:
                 continue
-            backup = _write_acf_atomically_with_backup(path, original_bytes, new_text)
+            if callable(path_validator):
+                revalidated = path_validator(path)
+                if revalidated is None or Path(revalidated) != path:
+                    raise RuntimeError(f"refusing changed Workshop ACF path: {path}")
+                if path.is_symlink() or not path.is_file():
+                    raise RuntimeError(f"refusing unsafe Workshop ACF path: {path}")
+            backup = _write_acf_atomically_with_backup(
+                path,
+                original_bytes,
+                new_text,
+                path_validator=path_validator,
+            )
             result["backups"].append(backup)
             removed_any.update(removed)
             try:
@@ -2832,10 +3123,18 @@ def remove_workshop_acf_entries(mod_ids, *, appid=DAYZ_APPID, log_fn=None) -> di
         result["missing_ids"] = []
         return result
 
+    try:
+        acf_paths = _native_appworkshop_acf_paths(int(appid))
+    except Exception as exc:
+        result["error"] = str(exc)
+        return result
     path_result = _remove_workshop_acf_entries_from_paths(
-        _native_appworkshop_acf_paths(int(appid)),
+        acf_paths,
         removable,
         log_fn=log,
+        path_validator=lambda path: _safe_workshop_acf_path(
+            path, appid=int(appid),
+        ),
     )
     if not bool(path_result.get("ok", False)):
         result["paths"] = list(path_result.get("paths") or [])
@@ -3072,6 +3371,12 @@ def delete_ugc_mod(mod_id, *, appid=DAYZ_APPID, timeout=120, log_fn=None) -> dic
         after = dict(after_by_id.get(mid) or {})
         result["after"] = after
 
+        try:
+            cleanup_plan = _native_workshop_cleanup_plan(mid, int(appid))
+        except Exception as exc:
+            result["error"] = str(exc)
+            return result
+
         for state in (before, after):
             reported_folder = str(state.get("install_folder") or "").strip()
             if reported_folder and _safe_workshop_content_path(reported_folder, mod_id=mid, appid=int(appid)) is None:
@@ -3079,27 +3384,52 @@ def delete_ugc_mod(mod_id, *, appid=DAYZ_APPID, timeout=120, log_fn=None) -> dic
                 return result
 
         deleted_any_folder = False
-        for content_dir in _candidate_content_dirs(mid, int(appid), before, after):
-            safe = _safe_workshop_content_path(str(content_dir), mod_id=mid, appid=int(appid))
-            if safe is None:
-                result["error"] = f"refusing unsafe install folder: {content_dir}"
-                return result
-            if _delete_dir_if_present(safe, log_fn=log):
+        for plan in cleanup_plan:
+            root = plan["root"]
+            content_relative = ("content", str(int(appid)), str(mid))
+            if _delete_dir_if_present(
+                plan["content"],
+                log_fn=log,
+                path_validator=lambda path, root=root, relative=content_relative: (
+                    _safe_native_workshop_path_for_root(
+                        root,
+                        path,
+                        relative_parts=relative,
+                        leaf_kind="directory",
+                    )
+                ),
+            ):
                 deleted_any_folder = True
-
-        for root in _native_steam_roots():
-            downloads_dir = root / "steamapps/workshop/downloads" / str(int(appid)) / str(mid)
-            safe_dir = _safe_workshop_download_dir(downloads_dir, mod_id=mid, appid=int(appid))
-            if safe_dir is not None:
-                _delete_dir_if_present(safe_dir, log_fn=log)
-            patch_file = root / "steamapps/workshop/downloads" / f"state_{int(appid)}_{int(appid)}_{mid}.patch"
-            safe_patch = _safe_workshop_patch_file(patch_file, mod_id=mid, appid=int(appid))
-            if safe_patch is not None:
-                _delete_file_if_present(safe_patch, log_fn=log)
-            root_patch_file = root / "steamapps/workshop" / f"state_{int(appid)}_{int(appid)}_{mid}.patch"
-            safe_root_patch = _safe_workshop_patch_file(root_patch_file, mod_id=mid, appid=int(appid))
-            if safe_root_patch is not None:
-                _delete_file_if_present(safe_root_patch, log_fn=log)
+            downloads_relative = ("downloads", str(int(appid)), str(mid))
+            _delete_dir_if_present(
+                plan["downloads"],
+                log_fn=log,
+                path_validator=lambda path, root=root, relative=downloads_relative: (
+                    _safe_native_workshop_path_for_root(
+                        root,
+                        path,
+                        relative_parts=relative,
+                        leaf_kind="directory",
+                    )
+                ),
+            )
+            patch_name = f"state_{int(appid)}_{int(appid)}_{mid}.patch"
+            for key, relative in (
+                ("downloads_patch", ("downloads", patch_name)),
+                ("root_patch", (patch_name,)),
+            ):
+                _delete_file_if_present(
+                    plan[key],
+                    log_fn=log,
+                    path_validator=lambda path, root=root, relative=relative: (
+                        _safe_native_workshop_path_for_root(
+                            root,
+                            path,
+                            relative_parts=relative,
+                            leaf_kind="file",
+                        )
+                    ),
+                )
 
         result["deleted_folder"] = bool(deleted_any_folder)
 
@@ -3208,31 +3538,60 @@ def delete_ugc_mod_local_files_after_unsubscribe(
         return result
 
     try:
+        cleanup_plan = _native_workshop_cleanup_plan(mid, cleanup_appid)
         deleted_any_folder = False
         deleted_any_staging = False
 
-        for root in _native_steam_roots():
-            content_dir = root / "steamapps/workshop/content" / str(cleanup_appid) / str(mid)
-            safe_content = _safe_workshop_content_path(str(content_dir), mod_id=mid, appid=cleanup_appid)
-            if safe_content is None:
-                result["error"] = f"refusing unsafe install folder: {content_dir}"
-                return result
-            if _delete_dir_if_present(safe_content, log_fn=log):
+        for plan in cleanup_plan:
+            root = plan["root"]
+            content_relative = ("content", str(cleanup_appid), str(mid))
+            if _delete_dir_if_present(
+                plan["content"],
+                log_fn=log,
+                path_validator=lambda path, root=root, relative=content_relative: (
+                    _safe_native_workshop_path_for_root(
+                        root,
+                        path,
+                        relative_parts=relative,
+                        leaf_kind="directory",
+                    )
+                ),
+            ):
                 deleted_any_folder = True
 
-            downloads_dir = root / "steamapps/workshop/downloads" / str(cleanup_appid) / str(mid)
-            safe_downloads = _safe_workshop_download_dir(downloads_dir, mod_id=mid, appid=cleanup_appid)
-            if safe_downloads is not None and _delete_dir_if_present(safe_downloads, log_fn=log):
+            downloads_relative = ("downloads", str(cleanup_appid), str(mid))
+            if _delete_dir_if_present(
+                plan["downloads"],
+                log_fn=log,
+                path_validator=lambda path, root=root, relative=downloads_relative: (
+                    _safe_native_workshop_path_for_root(
+                        root,
+                        path,
+                        relative_parts=relative,
+                        leaf_kind="directory",
+                    )
+                ),
+            ):
                 deleted_any_staging = True
 
-            patch_file = root / "steamapps/workshop/downloads" / f"state_{cleanup_appid}_{cleanup_appid}_{mid}.patch"
-            safe_patch = _safe_workshop_patch_file(patch_file, mod_id=mid, appid=cleanup_appid)
-            if safe_patch is not None and _delete_file_if_present(safe_patch, log_fn=log):
-                deleted_any_staging = True
-            root_patch_file = root / "steamapps/workshop" / f"state_{cleanup_appid}_{cleanup_appid}_{mid}.patch"
-            safe_root_patch = _safe_workshop_patch_file(root_patch_file, mod_id=mid, appid=cleanup_appid)
-            if safe_root_patch is not None and _delete_file_if_present(safe_root_patch, log_fn=log):
-                deleted_any_staging = True
+            patch_name = f"state_{cleanup_appid}_{cleanup_appid}_{mid}.patch"
+            for key, relative in (
+                ("downloads_patch", ("downloads", patch_name)),
+                ("root_patch", (patch_name,)),
+            ):
+                if _delete_file_if_present(
+                    plan[key],
+                    log_fn=log,
+                    path_validator=lambda path, root=root, relative=relative: (
+                        _safe_native_workshop_path_for_root(
+                            root,
+                            path,
+                            relative_parts=relative,
+                            leaf_kind="file",
+                        )
+                    ),
+                ):
+                    deleted_any_staging = True
 
         result["deleted_folder"] = bool(deleted_any_folder)
         result["deleted_staging"] = bool(deleted_any_staging)
@@ -3249,6 +3608,9 @@ def delete_ugc_mod_local_files_after_unsubscribe(
             _native_appworkshop_acf_paths(cleanup_appid),
             [mid],
             log_fn=log,
+            path_validator=lambda path: _safe_workshop_acf_path(
+                path, appid=cleanup_appid,
+            ),
         )
         result["acf_cleanup"] = acf_cleanup
         if not bool(acf_cleanup.get("ok", False)):
