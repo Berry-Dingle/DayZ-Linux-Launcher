@@ -12,6 +12,19 @@ APPID = steam_ugc_backend.DAYZ_APPID
 MOD_ID = 424242
 
 
+class CoercibleWorkshopItemId:
+    def __int__(self):
+        return MOD_ID
+
+
+def test_cleanup_workshop_identity_requires_exact_uint64():
+    maximum = 0xFFFFFFFFFFFFFFFF
+    assert steam_ugc_backend._strict_cleanup_workshop_item_ids([
+        1, maximum, 0, -1, maximum + 1, True, "1", 1.0,
+        CoercibleWorkshopItemId(),
+    ]) == [1, maximum]
+
+
 def _state(subscribed, *, mod_id=MOD_ID, **extra):
     return {
         int(mod_id): {
@@ -116,6 +129,47 @@ def test_inventory_rejects_non_boolean_or_missing_subscription_state(
 
     assert snapshot.valid is False
     assert snapshot.proves_unsubscribed(MOD_ID) is False
+
+
+@pytest.mark.parametrize(
+    "malformed_id",
+    [MOD_ID + 0.9, str(MOD_ID), True, CoercibleWorkshopItemId()],
+)
+def test_inventory_rejects_coercible_item_identity(monkeypatch, malformed_id):
+    snapshot = _inventory_snapshot(
+        monkeypatch,
+        {
+            "type": "item", "id": malformed_id,
+            "subscribed": False, "installed": True,
+        },
+    )
+
+    assert snapshot.valid is False
+    assert snapshot.proves_unsubscribed(MOD_ID) is False
+
+
+@pytest.mark.parametrize(
+    "malformed_id",
+    [MOD_ID + 0.9, str(MOD_ID), True, CoercibleWorkshopItemId()],
+)
+def test_checked_state_query_rejects_coercible_item_identity(
+        monkeypatch, malformed_id):
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def helper(_command, **kwargs):
+        kwargs["on_event"]({
+            "type": "item", "id": malformed_id,
+            "subscribed": False, "installed": False,
+        })
+        return True, 0
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    ok, states = steam_ugc_backend.query_ugc_state_checked([MOD_ID])
+    assert ok is True
+    assert states == {}
 
 
 def test_malformed_inventory_cannot_reach_modm_local_deletion(monkeypatch):
@@ -828,6 +882,372 @@ def test_install_cancel_handoff_requires_both_provenance_factors(
         "helper_subscribe_attempted": expected_candidates,
         "cleanup_candidates": expected_candidates,
     }]
+
+
+def test_install_failed_terminal_cancel_race_exports_two_factor_handoff(
+        monkeypatch):
+    attempted_id = MOD_ID
+    unattempted_id = MOD_ID + 1
+    preexisting_id = MOD_ID + 2
+    unknown_id = MOD_ID + 3
+    wrong_id = MOD_ID + 99
+    ids = [attempted_id, unattempted_id, preexisting_id, unknown_id]
+    subscribed = {
+        attempted_id: False,
+        unattempted_id: False,
+        preexisting_id: True,
+    }
+    cancel = threading.Event()
+    handoffs = []
+    calls = []
+
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def item_event(mid, *, event_type="item"):
+        event = {
+            "type": event_type,
+            "id": mid,
+            "installed": False,
+            "needs_update": False,
+            "downloading": False,
+            "download_pending": False,
+            "state_names": [],
+        }
+        if mid in subscribed:
+            event["subscribed"] = subscribed[mid]
+        if event_type == "request":
+            event["subscribe_call_result"] = 1
+            event["download_requested"] = True
+        return event
+
+    def helper(command, **kwargs):
+        calls.append(command)
+        callback = kwargs.get("on_event")
+        if command == "state":
+            for mid in ids:
+                callback(item_event(mid))
+            return True, 0
+        if command == "subscribe-download":
+            assert kwargs["cancel_cleanup_ids"] == [
+                attempted_id, unattempted_id,
+            ]
+            callback(item_event(attempted_id, event_type="request"))
+            callback(item_event(attempted_id, event_type="request"))
+            callback(item_event(preexisting_id, event_type="request"))
+            callback(item_event(unknown_id, event_type="request"))
+            callback(item_event(wrong_id, event_type="request"))
+            callback({
+                "type": "command_result", "ok": False,
+                "reason": "timeout",
+            })
+            # Reproduce cancellation arriving after the session selected the
+            # normal terminal result, but before run_ugc_install branches on it.
+            cancel.set()
+            return False, 0
+        if command == "unsubscribe":
+            pytest.fail("cancel cleanup must be deferred until session close")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+
+    assert steam_ugc_backend.run_ugc_install(
+        ids, cancel_event=cancel, handoff_cb=handoffs.append,
+    ) is False
+    assert calls == ["state", "subscribe-download"]
+    assert handoffs == [{
+        "parent_allowlisted": [attempted_id, unattempted_id],
+        "helper_subscribe_attempted": [
+            attempted_id, preexisting_id, unknown_id,
+        ],
+        "cleanup_candidates": [attempted_id],
+    }]
+
+
+def test_install_failed_terminal_cancel_race_without_attempt_exports_nothing(
+        monkeypatch):
+    cancel = threading.Event()
+    handoffs = []
+    initial = {
+        "type": "item", "id": MOD_ID, "subscribed": False,
+        "installed": False, "needs_update": False,
+        "downloading": False, "download_pending": False,
+        "state_names": [],
+    }
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def helper(command, **kwargs):
+        if command == "state":
+            kwargs["on_event"](dict(initial))
+            return True, 0
+        if command == "subscribe-download":
+            kwargs["on_event"]({"type": "command_result", "ok": False})
+            cancel.set()
+            return False, 0
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    assert steam_ugc_backend.run_ugc_install(
+        [MOD_ID], cancel_event=cancel, handoff_cb=handoffs.append,
+    ) is False
+    assert handoffs == []
+
+
+def test_install_success_racing_cancel_does_not_export_fallback_cleanup(
+        monkeypatch):
+    cancel = threading.Event()
+    handoffs = []
+    initial = {
+        "type": "item", "id": MOD_ID, "subscribed": False,
+        "installed": False, "needs_update": False,
+        "downloading": False, "download_pending": False,
+        "state_names": [],
+    }
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def helper(command, **kwargs):
+        callback = kwargs.get("on_event")
+        if command == "state":
+            callback(dict(initial))
+            return True, 0
+        if command == "subscribe-download":
+            callback({
+                **initial, "type": "request",
+                "subscribe_call_result": 1,
+                "download_requested": True,
+            })
+            callback({
+                "type": "done", "ok": True,
+                "ready": [MOD_ID], "installed": [MOD_ID],
+            })
+            cancel.set()
+            return True, 0
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    assert steam_ugc_backend.run_ugc_install(
+        [MOD_ID], cancel_event=cancel, handoff_cb=handoffs.append,
+    ) is False
+    assert handoffs == []
+
+
+@pytest.mark.parametrize(
+    "malformed_id",
+    [
+        pytest.param(MOD_ID + 0.9, id="float"),
+        pytest.param(str(MOD_ID), id="numeric-string"),
+        pytest.param(True, id="true"),
+        pytest.param(False, id="false"),
+        pytest.param(CoercibleWorkshopItemId(), id="coercible-object"),
+    ],
+)
+def test_install_terminal_cancel_fallback_rejects_coercible_attempt_ids(
+        monkeypatch, malformed_id):
+    cancel = threading.Event()
+    handoffs = []
+    initial = {
+        "type": "item", "id": MOD_ID, "subscribed": False,
+        "installed": False, "needs_update": False,
+        "downloading": False, "download_pending": False,
+        "state_names": [],
+    }
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def helper(command, **kwargs):
+        callback = kwargs.get("on_event")
+        if command == "state":
+            callback(dict(initial))
+            return True, 0
+        if command == "subscribe-download":
+            callback({
+                **initial, "type": "request", "id": malformed_id,
+                "subscribe_call_result": 1,
+                "download_requested": True,
+            })
+            callback({"type": "command_result", "ok": False})
+            cancel.set()
+            return False, 0
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    assert steam_ugc_backend.run_ugc_install(
+        [MOD_ID], cancel_event=cancel, handoff_cb=handoffs.append,
+    ) is False
+    assert handoffs == []
+
+
+@pytest.mark.parametrize(
+    "malformed_id",
+    [
+        pytest.param(MOD_ID + 0.9, id="float"),
+        pytest.param(str(MOD_ID), id="numeric-string"),
+        pytest.param(True, id="bool"),
+        pytest.param(CoercibleWorkshopItemId(), id="coercible-object"),
+    ],
+)
+def test_install_genuine_cancel_handoff_rejects_coercible_attempt_ids(
+        monkeypatch, malformed_id):
+    cancel = threading.Event()
+    handoffs = []
+    initial = {
+        "type": "item", "id": MOD_ID, "subscribed": False,
+        "installed": False, "needs_update": False,
+        "downloading": False, "download_pending": False,
+        "state_names": [],
+    }
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def helper(command, **kwargs):
+        if command == "state":
+            kwargs["on_event"](dict(initial))
+            return True, 0
+        if command == "subscribe-download":
+            cancel.set()
+            kwargs["on_event"]({
+                "type": "command_result", "ok": False,
+                "cancelled": True,
+                "cancel_handoff": {
+                    "parent_allowlisted": [MOD_ID],
+                    "helper_subscribe_attempted": [malformed_id],
+                    "cleanup_candidates": [malformed_id],
+                },
+            })
+            return False, 0
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    assert steam_ugc_backend.run_ugc_install(
+        [MOD_ID], cancel_event=cancel, handoff_cb=handoffs.append,
+    ) is False
+    assert handoffs == [{
+        "parent_allowlisted": [MOD_ID],
+        "helper_subscribe_attempted": [],
+        "cleanup_candidates": [],
+    }]
+
+
+def test_install_terminal_cancel_fallback_keeps_only_exact_integer_identity(
+        monkeypatch):
+    exact_id = MOD_ID
+    float_target = MOD_ID + 1
+    string_target = MOD_ID + 2
+    bool_target = 1
+    ids = [exact_id, float_target, string_target, bool_target]
+    cancel = threading.Event()
+    handoffs = []
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def state(mid, *, event_type="item"):
+        event = {
+            "type": event_type, "id": mid, "subscribed": False,
+            "installed": False, "needs_update": False,
+            "downloading": False, "download_pending": False,
+            "state_names": [],
+        }
+        if event_type == "request":
+            event.update(
+                subscribe_call_result=1, download_requested=True,
+            )
+        return event
+
+    def helper(command, **kwargs):
+        callback = kwargs.get("on_event")
+        if command == "state":
+            for mid in ids:
+                callback(state(mid))
+            return True, 0
+        if command == "subscribe-download":
+            for raw in (
+                    exact_id, float(float_target), str(string_target), True,
+                    CoercibleWorkshopItemId()):
+                callback(state(raw, event_type="request"))
+            callback({"type": "command_result", "ok": False})
+            cancel.set()
+            return False, 0
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    assert steam_ugc_backend.run_ugc_install(
+        ids, cancel_event=cancel, handoff_cb=handoffs.append,
+    ) is False
+    assert handoffs == [{
+        "parent_allowlisted": sorted(ids),
+        "helper_subscribe_attempted": [exact_id],
+        "cleanup_candidates": [exact_id],
+    }]
+
+
+def test_fresh_cancel_cleanup_rejects_coercible_candidate_ids(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        steam_ugc_backend, "_supported_native_steam_mutation_state",
+        lambda: (True, None),
+    )
+
+    def helper(command, **kwargs):
+        calls.append((command, list(kwargs.get("mod_ids") or [])))
+        kwargs["on_event"]({
+            "type": "done", "candidates": kwargs["mod_ids"],
+            "attempted": [], "confirmed_unsubscribed": [],
+            "retained_installed": kwargs["mod_ids"],
+            "already_unsubscribed": [], "failed": [], "timed_out": [],
+        })
+        return True, 0
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+    result = steam_ugc_backend.cleanup_cancelled_ugc_subscriptions([
+        MOD_ID, MOD_ID + 0.9, str(MOD_ID), True,
+        CoercibleWorkshopItemId(),
+    ])
+    assert calls == [("cancel-cleanup-unsubscribe", [MOD_ID])]
+    assert result["candidates"] == [MOD_ID]
 
 
 def test_install_failure_cleanup_intersects_exact_per_item_attempts(monkeypatch):

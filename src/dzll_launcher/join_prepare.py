@@ -17,6 +17,7 @@ from .preparation_contracts import (
 )
 from .steam_native import dayz_paths_summary, dayz_workshop_content_dir
 from .steam_ugc_backend import (
+    _strict_cleanup_workshop_item_ids,
     CooperativeUGCSession,
     UGCHelperReapError,
     activate_ugc_session,
@@ -162,14 +163,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
     def collect_cancel_cleanup_handoff(handoff):
         if not isinstance(handoff, dict):
             return
-        collected = set()
-        for raw in handoff.get("cleanup_candidates") or []:
-            try:
-                mid = int(raw)
-            except Exception:
-                continue
-            if mid > 0:
-                collected.add(mid)
+        collected = set(_strict_cleanup_workshop_item_ids(
+            handoff.get("cleanup_candidates") or [],
+        ))
         if collected:
             with cancel_cleanup_lock:
                 cancel_cleanup_ids.update(collected)

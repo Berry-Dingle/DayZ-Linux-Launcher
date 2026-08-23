@@ -5,7 +5,7 @@ import threading
 
 import pytest
 
-from dzll_launcher import join_prepare
+from dzll_launcher import join_prepare, steam_ugc_backend
 from dzll_launcher import window as window_module
 from dzll_launcher.steamcmd_overlay_ui import SteamCMDOverlayUI
 from dzll_launcher.preparation_contracts import (
@@ -409,6 +409,100 @@ def test_cancel_closes_cooperative_context_before_fresh_cleanup(monkeypatch):
     ]
 
 
+def test_terminal_cancel_race_exports_before_close_then_fresh_cleanup(
+        monkeypatch):
+    order = []
+    initial = {
+        "type": "item", "id": 101, "subscribed": False,
+        "installed": False, "needs_update": False,
+        "downloading": False, "download_pending": False,
+        "state_names": [],
+    }
+
+    class FakeSession:
+        def close(self):
+            order.extend(("steamapi_shutdown", "helper_exited"))
+
+    monkeypatch.setattr(
+        join_prepare, "CooperativeUGCSession", lambda **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend,
+        "_run_ugc_native_steam_preflight",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_cache_ugc_state",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "active_ugc_session", lambda: None,
+    )
+
+    def helper(command, **kwargs):
+        callback = kwargs.get("on_event")
+        if command == "state":
+            callback(dict(initial))
+            return True, 0
+        if command == "subscribe-download":
+            callback({
+                **initial, "type": "request",
+                "subscribe_call_result": 1,
+                "download_requested": True,
+            })
+            callback({
+                "type": "command_result", "ok": False,
+                "reason": "timeout",
+            })
+            order.append("normal_terminal_result")
+            kwargs["cancel_event"].set()
+            return False, 0
+        if command == "unsubscribe":
+            pytest.fail("downloader context must not unsubscribe directly")
+        raise AssertionError(command)
+
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", helper)
+
+    def run_install(self, **kwargs):
+        def record_handoff(handoff):
+            order.append((
+                "handoff", list(handoff["cleanup_candidates"]),
+            ))
+            kwargs["handoff_cb"](handoff)
+
+        return steam_ugc_backend.run_ugc_install(
+            kwargs["mod_ids"],
+            cancel_event=kwargs["cancel_event"],
+            handoff_cb=record_handoff,
+            progress_cb=kwargs.get("progress_cb"),
+            allow_start_steam=False,
+        )
+
+    monkeypatch.setattr(
+        CharacterizationHarness, "run_steam_client_install", run_install,
+    )
+    monkeypatch.setattr(
+        join_prepare, "cleanup_cancelled_ugc_subscriptions",
+        lambda ids: order.append(("fresh_cleanup", list(ids))) or {
+            "candidates": list(ids), "attempted": list(ids),
+            "confirmed_unsubscribed": list(ids), "retained_installed": [],
+            "already_unsubscribed": [], "failed": [], "timed_out": [],
+        },
+    )
+
+    _win, outcome = prepare_characterized(
+        monkeypatch, backend_ok=False, cancelled=True,
+    )
+    assert outcome.status is PreparationStatus.CANCELLED
+    assert order == [
+        "normal_terminal_result",
+        ("handoff", [101]),
+        "steamapi_shutdown",
+        "helper_exited",
+        ("fresh_cleanup", [101]),
+    ]
+
+
 def test_cancel_skips_fresh_cleanup_without_confirmed_shutdown(monkeypatch):
     class FailedSession:
         def close(self):
@@ -434,6 +528,49 @@ def test_cancel_skips_fresh_cleanup_without_confirmed_shutdown(monkeypatch):
         monkeypatch, backend_ok=False, cancelled=True,
     )
     assert outcome.status is PreparationStatus.CANCELLED
+
+
+def test_cancel_handoff_collector_rejects_coercible_item_ids(monkeypatch):
+    cleanup_calls = []
+
+    class CoercibleItemId:
+        def __int__(self):
+            return 303
+
+    class FakeSession:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        join_prepare, "CooperativeUGCSession", lambda **_kwargs: FakeSession(),
+    )
+    monkeypatch.setattr(
+        join_prepare, "cleanup_cancelled_ugc_subscriptions",
+        lambda ids: cleanup_calls.append(list(ids)) or {
+            "candidates": list(ids), "attempted": list(ids),
+            "confirmed_unsubscribed": list(ids), "retained_installed": [],
+            "already_unsubscribed": [], "failed": [], "timed_out": [],
+        },
+    )
+
+    def cancelled_install(self, **kwargs):
+        kwargs["handoff_cb"]({
+            "cleanup_candidates": [
+                101, 202.9, "303", True, CoercibleItemId(),
+            ],
+        })
+        self._steamcmd_cancel_event.set()
+        return False
+
+    monkeypatch.setattr(
+        CharacterizationHarness, "run_steam_client_install",
+        cancelled_install,
+    )
+    _win, outcome = prepare_characterized(
+        monkeypatch, backend_ok=False, cancelled=True,
+    )
+    assert outcome.status is PreparationStatus.CANCELLED
+    assert cleanup_calls == [[101]]
 
 
 def test_initial_and_terminal_retry_calls_both_collect_cancel_handoff():

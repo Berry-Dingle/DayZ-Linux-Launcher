@@ -227,6 +227,26 @@ def _dedupe_sorted_ids(mod_ids: Iterable[int]) -> list[int]:
     return out
 
 
+def _strict_cleanup_workshop_item_id(value) -> int | None:
+    """Return an exact Workshop identity suitable for cleanup authority."""
+
+    if type(value) is not int:
+        return None
+    if value <= 0 or value > 0xFFFFFFFFFFFFFFFF:
+        return None
+    return value
+
+
+def _strict_cleanup_workshop_item_ids(values) -> list[int]:
+    """Deduplicate exact Workshop identities without coercing their values."""
+
+    return sorted({
+        item_id
+        for value in values or []
+        if (item_id := _strict_cleanup_workshop_item_id(value)) is not None
+    })
+
+
 def _helper_env(*, strict_native_attachment: bool = False) -> dict:
     env = dict(os.environ)
     for name in ("SteamAppId", "SteamGameId", "SteamOverlayGameId"):
@@ -778,7 +798,7 @@ class CooperativeUGCSession:
         command_item_id_set = set(command_item_ids)
         approved_cancel_cleanup_ids = (
             [
-                item_id for item_id in _dedupe_sorted_ids(
+                item_id for item_id in _strict_cleanup_workshop_item_ids(
                     cancel_cleanup_ids or [],
                 )
                 if item_id in command_item_id_set
@@ -1597,7 +1617,8 @@ def _cleanup_subscriptions(
 ) -> None:
     cleanup_started = time.monotonic()
     allowed_ids = (
-        set(_dedupe_sorted_ids(only_ids)) if only_ids is not None else None
+        set(_strict_cleanup_workshop_item_ids(only_ids))
+        if only_ids is not None else None
     )
     cleanup_ids = sorted(
         mid
@@ -1639,8 +1660,12 @@ def _cleanup_subscriptions(
 def _subscription_cleanup_candidates(parent_authorized_ids, helper_attempted_ids) -> list[int]:
     """Intersect parent state authority with exact helper subscription attempts."""
 
-    parent_authorized = set(_dedupe_sorted_ids(parent_authorized_ids or []))
-    helper_attempted = set(_dedupe_sorted_ids(helper_attempted_ids or []))
+    parent_authorized = set(_strict_cleanup_workshop_item_ids(
+        parent_authorized_ids or [],
+    ))
+    helper_attempted = set(_strict_cleanup_workshop_item_ids(
+        helper_attempted_ids or [],
+    ))
     return sorted(parent_authorized & helper_attempted)
 
 
@@ -1654,10 +1679,7 @@ def _refresh_current_state(sessions: dict[int, UGCModSession], *, appid: int, pr
             _progress(progress_cb, {"type": "refresh_event", "event": event})
             return
         event = _normalize_ugc_snapshot(event)
-        try:
-            mid = int(event.get("id") or 0)
-        except Exception:
-            mid = 0
+        mid = _strict_cleanup_workshop_item_id(event.get("id"))
         session = sessions.get(mid)
         if session is None:
             return
@@ -1686,11 +1708,8 @@ def query_ugc_state_checked(mod_ids, *, appid=DAYZ_APPID, timeout=60) -> tuple[b
         if event.get("type") != "item":
             return
         event = _normalize_ugc_snapshot(event)
-        try:
-            mid = int(event.get("id") or 0)
-        except Exception:
-            mid = 0
-        if mid > 0:
+        mid = _strict_cleanup_workshop_item_id(event.get("id"))
+        if mid is not None:
             snapshots[mid] = dict(event)
 
     ok, _rc = _run_helper_json_lines(
@@ -1743,11 +1762,8 @@ def refresh_subscribed_ugc_state_checked(
     def on_event(event: dict) -> None:
         if event.get("type") == "item":
             normalized = _normalize_ugc_snapshot(event)
-            try:
-                mid = int(normalized.get("id") or 0)
-            except Exception:
-                mid = 0
-            if mid > 0:
+            mid = _strict_cleanup_workshop_item_id(normalized.get("id"))
+            if mid is not None:
                 snapshots[mid] = dict(normalized)
             return
         if event.get("type") not in ("command_result", "done"):
@@ -1821,11 +1837,8 @@ def query_ugc_inventory_checked(
             init_event.update(event)
         elif event_type == "item":
             normalized = _normalize_ugc_snapshot(event)
-            try:
-                mid = int(normalized.get("id") or 0)
-            except Exception:
-                mid = 0
-            if mid > 0:
+            mid = _strict_cleanup_workshop_item_id(normalized.get("id"))
+            if mid is not None:
                 snapshots[mid] = dict(normalized)
         elif event_type in ("command_result", "done"):
             terminal.clear()
@@ -1848,12 +1861,8 @@ def query_ugc_inventory_checked(
     subscribed: set[int] = set()
     inventory_well_formed = True
     for raw_mid in terminal.get("subscribed_item_ids") or []:
-        try:
-            mid = int(raw_mid)
-        except Exception:
-            inventory_well_formed = False
-            continue
-        if mid <= 0:
+        mid = _strict_cleanup_workshop_item_id(raw_mid)
+        if mid is None:
             inventory_well_formed = False
             continue
         subscribed.add(mid)
@@ -2050,11 +2059,8 @@ def unsubscribe_ugc_items_checked(
         if event.get("type") != "item":
             return
         event = _normalize_ugc_snapshot(event)
-        try:
-            mid = int(event.get("id") or 0)
-        except Exception:
-            mid = 0
-        if mid > 0:
+        mid = _strict_cleanup_workshop_item_id(event.get("id"))
+        if mid is not None:
             snapshots[mid] = dict(event)
 
     ok, _rc = _run_helper_json_lines(
@@ -2089,7 +2095,7 @@ def cleanup_cancelled_ugc_subscriptions(
     progress_cb=None,
 ) -> dict:
     """Best-effort cleanup in a fresh, short-lived SteamAPI context."""
-    ids = _dedupe_sorted_ids(mod_ids)
+    ids = _strict_cleanup_workshop_item_ids(mod_ids)
     result = {
         "candidates": ids,
         "attempted": [],
@@ -2118,7 +2124,9 @@ def cleanup_cancelled_ugc_subscriptions(
             "retained_installed", "already_unsubscribed", "failed",
             "timed_out",
         ):
-            result[key] = _dedupe_sorted_ids(event.get(key) or [])
+            result[key] = _strict_cleanup_workshop_item_ids(
+                event.get(key) or [],
+            )
         result["failures"] = list(event.get("failures") or [])
 
     ok, _rc = _run_helper_json_lines(
@@ -2167,11 +2175,8 @@ def request_unsubscribe_ugc_items(mod_ids, *, appid=DAYZ_APPID, timeout=12) -> t
         if event.get("type") != "item":
             return
         event = _normalize_ugc_snapshot(event)
-        try:
-            mid = int(event.get("id") or 0)
-        except Exception:
-            mid = 0
-        if mid > 0:
+        mid = _strict_cleanup_workshop_item_id(event.get("id"))
+        if mid is not None:
             snapshots[mid] = dict(event)
 
     ok, _rc = _run_helper_json_lines(
@@ -3284,10 +3289,7 @@ def run_ugc_install(
             _progress(progress_cb, {"type": "helper_event", "event": event})
             return
         event = _normalize_ugc_snapshot(event)
-        try:
-            mid = int(event.get("id") or 0)
-        except Exception:
-            mid = 0
+        mid = _strict_cleanup_workshop_item_id(event.get("id"))
         session = sessions.get(mid)
         if session is None:
             return
@@ -3365,15 +3367,39 @@ def run_ugc_install(
 
         cancel_handoff: dict = {}
 
-        def on_install_event(event: dict) -> None:
+        def publish_cancel_handoff(helper_attempted_ids) -> bool:
+            """Publish this command's two-factor cleanup provenance once."""
+
             nonlocal cancel_handoff
+            if cancel_handoff:
+                return False
+            helper_attempted = set(_strict_cleanup_workshop_item_ids(
+                helper_attempted_ids or [],
+            ))
+            cleanup_candidates = _subscription_cleanup_candidates(
+                parent_cleanup_allowlist, helper_attempted,
+            )
+            cancel_handoff = {
+                "parent_allowlisted": list(parent_cleanup_allowlist),
+                "helper_subscribe_attempted": sorted(helper_attempted),
+                "cleanup_candidates": cleanup_candidates,
+            }
+            if callable(handoff_cb):
+                try:
+                    handoff_cb(dict(cancel_handoff))
+                except Exception as exc:
+                    _log_event(
+                        progress_cb,
+                        "[Steam UGC] Cancellation handoff callback failed",
+                        error=str(exc), cleanup_candidates=cleanup_candidates,
+                    )
+            return True
+
+        def on_install_event(event: dict) -> None:
             event_type = event.get("type")
             if event_type in ("item", "request"):
                 event = _normalize_ugc_snapshot(event)
-                try:
-                    mid = int(event.get("id") or 0)
-                except Exception:
-                    mid = 0
+                mid = _strict_cleanup_workshop_item_id(event.get("id"))
                 session = sessions.get(mid)
                 if session is not None:
                     source = "request" if event_type == "request" else (
@@ -3402,26 +3428,10 @@ def run_ugc_install(
                 event.get("cancel_handoff"), dict,
             ):
                 helper_handoff = dict(event["cancel_handoff"])
-                helper_attempted = set(_dedupe_sorted_ids(
+                helper_attempted = _strict_cleanup_workshop_item_ids(
                     helper_handoff.get("helper_subscribe_attempted") or [],
-                ))
-                cleanup_candidates = _subscription_cleanup_candidates(
-                    parent_cleanup_allowlist, helper_attempted,
                 )
-                cancel_handoff = {
-                    "parent_allowlisted": list(parent_cleanup_allowlist),
-                    "helper_subscribe_attempted": sorted(helper_attempted),
-                    "cleanup_candidates": cleanup_candidates,
-                }
-                if callable(handoff_cb):
-                    try:
-                        handoff_cb(dict(cancel_handoff))
-                    except Exception as exc:
-                        _log_event(
-                            progress_cb,
-                            "[Steam UGC] Cancellation handoff callback failed",
-                            error=str(exc), cleanup_candidates=cleanup_candidates,
-                        )
+                publish_cancel_handoff(helper_attempted)
             _progress(progress_cb, {"type": "helper_event", "event": event})
 
         ok, _rc = _run_helper_json_lines(
@@ -3436,6 +3446,22 @@ def run_ugc_install(
         )
 
         if cancel_event is not None and cancel_event.is_set():
+            if not ok and not cancel_handoff:
+                fallback_attempted = [
+                    mid for mid, session in sessions.items()
+                    if session.helper_subscribe_attempted
+                    and not session.installed_now
+                ]
+                fallback_candidates = _subscription_cleanup_candidates(
+                    parent_cleanup_allowlist, fallback_attempted,
+                )
+                if fallback_candidates:
+                    publish_cancel_handoff(fallback_attempted)
+                    _log_event(
+                        progress_cb,
+                        "[Steam UGC] Exported terminal-race cancel cleanup handoff",
+                        **cancel_handoff,
+                    )
             if cancel_handoff:
                 _log_event(
                     progress_cb,
