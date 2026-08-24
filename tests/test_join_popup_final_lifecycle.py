@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 
 import pytest
 
@@ -276,3 +277,236 @@ def test_fake_process_snapshots_obey_captured_launch_mode(skip_launcher, process
     result = harness._join_popup_process_detected(harness.attempt.attempt_id, process)
     assert result is expected
     assert harness.close_count == int(expected)
+
+
+class WatcherClock:
+    def __init__(self, advances, *, before_sleep=None):
+        self.wall = 0.0
+        self.monotonic_value = 0.0
+        self.advances = list(advances)
+        self.before_sleep = before_sleep
+
+    def time(self):
+        return self.wall
+
+    def monotonic(self):
+        return self.monotonic_value
+
+    def sleep(self, _seconds):
+        if self.before_sleep is not None:
+            self.before_sleep(self)
+        if not self.advances:
+            raise AssertionError("watcher performed an unexpected extra polling cycle")
+        delta = float(self.advances.pop(0))
+        self.wall += delta
+        self.monotonic_value += delta
+
+
+class SessionWatcherHarness(LifecycleHarness):
+    def __init__(self, *, skip_launcher, launcher_results, game_results):
+        super().__init__(skip_launcher=skip_launcher)
+        self._discord_watch_lock = threading.Lock()
+        self._discord_watch_active = False
+        self._discord = None
+        self._steamcmd_cancel_event = threading.Event()
+        self._steam_client_stop_waiting_event = threading.Event()
+        self.launcher_results = list(launcher_results)
+        self.game_results = list(game_results)
+        self.launcher_scans = 0
+        self.game_scans = 0
+        self.watcher_ui_calls = []
+        self.cleanup_reasons = []
+
+    @staticmethod
+    def _next_result(results):
+        if len(results) > 1:
+            return bool(results.pop(0))
+        return bool(results[0])
+
+    def _dayz_launcher_running(self):
+        self.launcher_scans += 1
+        return self._next_result(self.launcher_results)
+
+    def _dayz_game_running(self):
+        self.game_scans += 1
+        return self._next_result(self.game_results)
+
+    def _join_watcher_ui_call(self, callback, *args):
+        self.watcher_ui_calls.append(callback.__name__)
+        return callback(*args)
+
+    def _cleanup_join_attempt(self, attempt_id, reason, *, clear_pending=True):
+        self.cleanup_reasons.append(str(reason))
+        return super()._cleanup_join_attempt(
+            attempt_id, reason, clear_pending=clear_pending,
+        )
+
+    def _cleanup_active_join_attempt(self, reason):
+        return window_module.DZLLWindow._cleanup_active_join_attempt(self, reason)
+
+
+def run_session_watcher(monkeypatch, harness, clock):
+    monkeypatch.setattr(window_module.time, "time", clock.time)
+    monkeypatch.setattr(window_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(window_module.time, "sleep", clock.sleep)
+    window_module.DZLLWindow._watch_dayz_session_until_exit(
+        harness, harness.attempt.attempt_id,
+    )
+
+
+@pytest.mark.parametrize("skip_launcher", [False, True])
+def test_existing_initial_timeout_remains_120_seconds(monkeypatch, skip_launcher):
+    harness = SessionWatcherHarness(
+        skip_launcher=skip_launcher,
+        launcher_results=[False],
+        game_results=[False],
+    )
+    clock = WatcherClock([120.0])
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert clock.wall == 120.0
+    assert harness.errors == [
+        "DZLL could not detect the expected DayZ process before the launch wait timed out."
+    ]
+    assert harness.cleanup_reasons == ["watcher terminal failure"]
+    assert harness._join_attempts.active is None
+    assert harness._discord_watch_active is False
+
+
+def test_launcher_deadline_is_absolute_and_launcher_callback_is_one_shot(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True],
+        game_results=[False],
+    )
+
+    def verify_below_deadline(clock):
+        if clock.monotonic_value == 1799.0:
+            assert harness.errors == []
+            assert harness._join_attempts.active is harness.attempt
+
+    clock = WatcherClock([121.0, 1678.0, 1.0], before_sleep=verify_below_deadline)
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert clock.monotonic_value == 1800.0
+    assert harness.launcher_scans == 4
+    assert harness.game_scans == 3
+    assert harness.watcher_ui_calls.count("_join_popup_process_detected") == 1
+    assert harness.watcher_ui_calls.count("_join_popup_watcher_failure") == 1
+    assert harness.errors == [
+        "DayZ did not start after waiting 30 minutes for DayZ Launcher. "
+        "DZLL stopped waiting; you can try joining again."
+    ]
+    assert harness.cleanup_reasons == ["watcher terminal failure"]
+    assert harness._pending_join_attempt_id == 0
+    assert harness._pending_server_companion_obj is None
+    assert harness._discord_watch_active is False
+
+
+def test_dayz_can_start_well_after_initial_timeout_before_outer_deadline(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True],
+        game_results=[False, True, False],
+    )
+    clock = WatcherClock([600.0])
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert clock.monotonic_value == 600.0
+    assert harness.errors == []
+    assert harness.cleanup_reasons == ["DayZ detected"]
+    assert harness._pending_join_attempt_id == 0
+    assert harness._join_attempts.active is None
+    assert harness._discord_watch_active is False
+    assert harness.watcher_ui_calls == [
+        "_join_popup_process_detected",
+        "_join_popup_process_detected",
+    ]
+    assert harness.close_count == 1
+
+
+def test_launcher_exit_before_dayz_keeps_immediate_cleanup(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True, False],
+        game_results=[False],
+    )
+    clock = WatcherClock([10.0])
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert clock.monotonic_value == 10.0
+    assert harness.cleanup_reasons == ["launcher exited before DayZ"]
+    assert harness.errors == []
+    assert harness._join_attempts.active is None
+    assert harness._discord_watch_active is False
+
+
+@pytest.mark.parametrize("stop_kind", ["stop-waiting", "shutdown"])
+def test_attempt_invalidation_stops_launcher_watcher(monkeypatch, stop_kind):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True],
+        game_results=[False],
+    )
+
+    def invalidate(_clock):
+        if stop_kind == "stop-waiting":
+            window_module.DZLLWindow._steam_client_stop_waiting(harness)
+        else:
+            harness._join_attempts.close("application shutdown")
+
+    clock = WatcherClock([1.0], before_sleep=invalidate)
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert harness.launcher_scans == 1
+    assert harness.game_scans == 1
+    assert harness._join_attempts.active is None
+    assert harness._discord_watch_active is False
+
+
+def test_launcher_timeout_releases_attempt_for_subsequent_join(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True],
+        game_results=[False],
+    )
+    clock = WatcherClock([1800.0])
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    second = harness._join_attempts.begin(
+        ip="127.0.0.2", game_port=2402, query_port=27017,
+        name="Second", skip_dayz_launcher=False,
+    )
+    assert second is not None
+    assert second.attempt_id != harness.attempt.attempt_id
+
+
+def test_stale_launcher_watcher_cannot_clean_new_attempt(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True],
+        game_results=[False],
+    )
+    replacement = []
+
+    def replace_attempt(_clock):
+        assert harness._join_attempts.cleanup(harness.attempt.attempt_id, "old complete")
+        replacement.append(harness._join_attempts.begin(
+            ip="127.0.0.2", game_port=2402, query_port=27017,
+            name="Replacement", skip_dayz_launcher=False,
+        ))
+
+    clock = WatcherClock([1800.0], before_sleep=replace_attempt)
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert replacement[0] is not None
+    assert harness._join_attempts.active is replacement[0]
+    assert harness.errors == []
+    assert harness.cleanup_reasons == []

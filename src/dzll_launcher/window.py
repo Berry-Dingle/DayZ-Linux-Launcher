@@ -10150,6 +10150,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             skip_launcher = bool(active.skip_dayz_launcher) if active is not None else True
             saw_launcher = False
             saw_game = False
+            launcher_ui_notified = False
+            launcher_to_game_deadline = None
 
             # Wait up to 120s for the expected success process.  With the launcher
             # enabled, a detected launcher is success for popup ownership, while
@@ -10163,11 +10165,36 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     if not saw_launcher and attempt_id:
                         self._join_log(attempt_id, "first relevant process observation", process="DayZ Launcher")
                         self._join_log(attempt_id, "DayZ Launcher detected")
+                    if not saw_launcher and not skip_launcher:
+                        launcher_to_game_deadline = time.monotonic() + 1800.0
                     saw_launcher = True
-                    if not skip_launcher and attempt_id:
+                    if not skip_launcher and attempt_id and not launcher_ui_notified:
+                        launcher_ui_notified = True
                         self._join_watcher_ui_call(
                             self._join_popup_process_detected, attempt_id, "DayZ Launcher"
                         )
+
+                if (
+                    launcher_running
+                    and launcher_to_game_deadline is not None
+                    and time.monotonic() >= launcher_to_game_deadline
+                ):
+                    if attempt_id and self._join_attempt_is_active(attempt_id):
+                        self._join_log(
+                            attempt_id,
+                            "watcher launcher-to-game timeout",
+                            timeout_seconds=1800,
+                        )
+                        self._join_watcher_ui_call(
+                            self._join_popup_watcher_failure,
+                            attempt_id,
+                            (
+                                "DayZ did not start after waiting 30 minutes for "
+                                "DayZ Launcher. DZLL stopped waiting; you can try "
+                                "joining again."
+                            ),
+                        )
+                    return
 
                 if self._dayz_game_running():
                     saw_game = True
