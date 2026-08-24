@@ -74,6 +74,28 @@ DEFAULTS: Dict[str, Any] = {
     "website_url": "https://dzllauncher.uk",
 }
 
+_INT_RANGES = {
+    "server_companion_alert_volume": (0, 100),
+}
+
+
+def _validated_persisted_value(key: str, value: Any) -> Any:
+    """Return a known setting value, or its default when its JSON type is invalid."""
+
+    default = DEFAULTS[key]
+    if type(default) is bool:
+        return value if type(value) is bool else default
+    if type(default) is int:
+        if type(value) is not int:
+            return default
+        bounds = _INT_RANGES.get(key)
+        if bounds is not None and not bounds[0] <= value <= bounds[1]:
+            return default
+        return value
+    if type(default) is str:
+        return value if type(value) is str else default
+    return value if isinstance(value, type(default)) else default
+
 def _read_json(path: str) -> Dict[str, Any]:
     try:
         if os.path.exists(path):
@@ -93,13 +115,13 @@ def load_settings() -> Dict[str, Any]:
     out = dict(DEFAULTS)
     for k, v in raw.items():
         if k in DEFAULTS:
-            out[k] = v
+            out[k] = _validated_persisted_value(k, v)
     if (
         "auto_install_update_mods" in raw
         and "auto_install_missing_mods" not in raw
         and "auto_update_required_mods" not in raw
     ):
-        legacy = bool(raw["auto_install_update_mods"])
+        legacy = out["auto_install_update_mods"]
         out["auto_install_missing_mods"] = legacy
         out["auto_update_required_mods"] = legacy
     if out.get("mod_download_backend") not in ("steam_client", "steamcmd"):

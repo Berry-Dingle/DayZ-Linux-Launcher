@@ -452,10 +452,55 @@ def _schedule_column_view_header_refresh(view: Gtk.ColumnView) -> None:
         refresh_column_view_sort_header_handlers(view)
         return False
 
+    _add_column_view_idle(view, refresh_once)
+
+
+def _add_column_view_idle(view: Gtk.ColumnView, callback) -> int:
+    """Schedule a ColumnView-owned idle that can be cancelled during teardown."""
+    if not bool(getattr(view, "_dzll_construction_sources_active", True)):
+        return 0
+
+    source_ids = getattr(view, "_dzll_construction_source_ids", None)
+    if source_ids is None:
+        source_ids = set()
+        view._dzll_construction_source_ids = source_ids
+    view._dzll_construction_sources_active = True
+    holder = {"source_id": 0}
+
+    def dispatch():
+        source_id = int(holder["source_id"] or 0)
+        try:
+            source_ids.discard(source_id)
+        except Exception:
+            pass
+        if not bool(getattr(view, "_dzll_construction_sources_active", False)):
+            return False
+        return callback()
+
     try:
-        GLib.idle_add(refresh_once)
+        source_id = int(GLib.idle_add(dispatch) or 0)
     except Exception:
-        pass
+        return 0
+    holder["source_id"] = source_id
+    if source_id:
+        source_ids.add(source_id)
+    return source_id
+
+
+def cleanup_column_view_construction_sources(view: Gtk.ColumnView | None) -> None:
+    """Idempotently cancel construction/header idles owned by one ColumnView."""
+    if view is None:
+        return
+    view._dzll_construction_sources_active = False
+    source_ids = tuple(getattr(view, "_dzll_construction_source_ids", ()) or ())
+    view._dzll_construction_source_ids = set()
+    for source_id in source_ids:
+        if not source_id:
+            continue
+        try:
+            GLib.source_remove(int(source_id))
+        except Exception:
+            pass
 
 
 def _install_column_view_header_normalizer(view: Gtk.ColumnView) -> None:
@@ -465,20 +510,20 @@ def _install_column_view_header_normalizer(view: Gtk.ColumnView) -> None:
         return False
 
     def on_map(_view):
-        GLib.idle_add(normalize_once)
+        _add_column_view_idle(view, normalize_once)
 
     def on_realize(_view):
-        GLib.idle_add(normalize_once)
+        _add_column_view_idle(view, normalize_once)
 
     try:
         view.connect("map", on_map)
     except Exception:
-        GLib.idle_add(normalize_once)
+        _add_column_view_idle(view, normalize_once)
     try:
         view.connect("realize", on_realize)
     except Exception:
         pass
-    GLib.idle_add(normalize_once)
+    _add_column_view_idle(view, normalize_once)
 
 
 def _install_column_view_tree_dump(view: Gtk.ColumnView) -> None:
@@ -495,12 +540,12 @@ def _install_column_view_tree_dump(view: Gtk.ColumnView) -> None:
         return False
 
     def on_map(_view):
-        GLib.idle_add(dump_once)
+        _add_column_view_idle(view, dump_once)
 
     try:
         view.connect("map", on_map)
     except Exception:
-        GLib.idle_add(dump_once)
+        _add_column_view_idle(view, dump_once)
 
 
 def _set_column_width(column, width: int | None, *, expand: bool = False) -> None:

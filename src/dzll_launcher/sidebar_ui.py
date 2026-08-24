@@ -1375,8 +1375,13 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     logo_bmc_has_child = False
 
     icon_path = os.path.join(IMAGES_DIR, "dzll-new-logo.png")
+    icon_pixbuf = None
     if os.path.exists(icon_path):
-        icon_pixbuf = GdkPixbuf.Pixbuf.new_from_file(icon_path)
+        try:
+            icon_pixbuf = GdkPixbuf.Pixbuf.new_from_file(icon_path)
+        except (GLib.Error, OSError) as exc:
+            print(f"[UI] Could not load optional sidebar logo: {exc}")
+    if icon_pixbuf is not None:
         try:
             logo_height = max(1, round(SIDEBAR_LOGO_WIDTH * icon_pixbuf.get_height() / icon_pixbuf.get_width()))
         except Exception:

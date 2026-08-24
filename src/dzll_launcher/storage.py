@@ -1,5 +1,6 @@
 # storage.py
 import json
+import logging
 import os
 import time
 
@@ -13,6 +14,8 @@ from .config import (
     DEAD_PATH,
     CACHE_DIR,
 )
+
+logger = logging.getLogger(__name__)
 
 def load_json_dict(path: str) -> dict:
     try:
@@ -52,7 +55,15 @@ def load_last_played() -> dict:
         if now - ts <= cutoff:
             out[str(k)] = ts
     if out != raw:
-        save_last_played(out)  # persist prune
+        try:
+            save_last_played(out)  # persist prune
+        except Exception:
+            try:
+                logger.exception("Could not persist pruned last-played history")
+            except Exception:
+                # Startup pruning is best-effort; diagnostics must not turn a
+                # recoverable write failure back into a startup failure.
+                pass
     return out
 
 def save_last_played(lp: dict) -> None:

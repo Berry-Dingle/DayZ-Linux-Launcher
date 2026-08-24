@@ -104,6 +104,7 @@ from .maps import standardize_map, map_choices_from_db_rows
 from .ui_row import ServerObject, hr, attach_pointer_cursor
 from .column_view import (
     build_server_column_view,
+    cleanup_column_view_construction_sources,
     required_mods_popup_suppression_count,
     refresh_column_view_sort_header_handlers,
     refresh_column_view_sort_indicators,
@@ -542,6 +543,22 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def __init__(self, app: Gtk.Application):
         super().__init__(application=app, title="DayZ Linux Launcher")
 
+        # Keep construction-failure cleanup usable from the first fallible step.
+        self._shutdown_cleanup_done = False
+        self._perf_diagnostic_source_ids = []
+        self._steam_global_players_startup_source_id = 0
+        self._steam_global_players_poll_source_id = 0
+        self._settings_init_idle_id = 0
+        self._startup_update_idle_id = 0
+        self._companion_restart_phase2 = None
+        self.server_companion_panel = None
+        self._executor = None
+        self._db_executor = None
+        self._update_executor = None
+        self._hi_executor = None
+        self._browser_live_executor = None
+        self._startup_live_executor = None
+
         # ---- Optional desktop integration for venv/source runs ----
         try:
             ensure_user_desktop_integration(
@@ -564,7 +581,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             w, h = (1200, 690)
         self.set_default_size(int(w), int(h))
 
-        self._shutdown_cleanup_done = False
         self.connect("close-request", self._on_close_request)
         self.connect("unmap", self._on_browser_scrollbar_unmap)
         self._perf_row_binds = 0
@@ -604,8 +620,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         # Steam global players state
         self._steam_global_players = None
-        GLib.timeout_add_seconds(2, self._steam_global_players_startup_tick)
-        GLib.timeout_add_seconds(GLOBAL_PLAYERS_POLL_SECS, self._steam_global_players_tick)
+        self._steam_global_players_startup_source_id = int(
+            GLib.timeout_add_seconds(2, self._steam_global_players_startup_tick) or 0
+        )
+        self._steam_global_players_poll_source_id = int(
+            GLib.timeout_add_seconds(
+                GLOBAL_PLAYERS_POLL_SECS,
+                self._steam_global_players_tick,
+            ) or 0
+        )
 
         # Update check state
         self._update_info = None
@@ -1245,14 +1268,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._update_sort_indicators()
         self._apply_titlebar_counts()
         self._start_browser_live_refresh()
-        GLib.idle_add(self._begin_startup_update)
+        self._startup_update_idle_id = int(
+            GLib.idle_add(self._begin_startup_update_from_idle) or 0
+        )
 
     def _start_perf_diagnostics(self):
-        GLib.timeout_add(PERF_STALL_INTERVAL_MS, self._perf_main_loop_stall_tick)
-        GLib.timeout_add_seconds(1, self._perf_row_bind_tick)
-        GLib.timeout_add_seconds(1, self._perf_sort_tick)
-        GLib.timeout_add_seconds(1, self._perf_scroll_tick)
-        GLib.timeout_add_seconds(1, self._perf_model_pending_tick)
+        add = self._perf_diagnostic_source_ids.append
+        add(int(GLib.timeout_add(PERF_STALL_INTERVAL_MS, self._perf_main_loop_stall_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, self._perf_row_bind_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, self._perf_sort_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, self._perf_scroll_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, self._perf_model_pending_tick) or 0))
 
     def _perf_main_loop_stall_tick(self):
         if bool(getattr(self, "_shutdown_cleanup_done", False)):
@@ -1365,10 +1391,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # Steam Global Players
     # ----------------------------
     def _steam_global_players_startup_tick(self):
+        self._steam_global_players_startup_source_id = 0
         self._steam_global_players_tick()
         return False
 
     def _steam_global_players_tick(self):
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
         if not bool(self.settings.get("show_counts_in_title_bar", False)):
             return True
         if not bool(self.settings.get("show_counts_global_players", True)):
@@ -2955,6 +2984,47 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._shutdown_cleanup()
         return False
 
+    def _remove_construction_sources(self):
+        try:
+            cleanup_column_view_construction_sources(getattr(self, "list_view", None))
+        except Exception:
+            pass
+        source_attrs = (
+            "_steam_global_players_startup_source_id",
+            "_steam_global_players_poll_source_id",
+            "_settings_init_idle_id",
+            "_startup_update_idle_id",
+        )
+        source_ids = []
+        for name in source_attrs:
+            source_ids.append(int(getattr(self, name, 0) or 0))
+            setattr(self, name, 0)
+        source_ids.extend(
+            int(value or 0)
+            for value in tuple(getattr(self, "_perf_diagnostic_source_ids", ()) or ())
+        )
+        self._perf_diagnostic_source_ids = []
+
+        panel = getattr(self, "server_companion_panel", None)
+        if panel is not None:
+            for name in (
+                "_empty_breathe_timer_id",
+                "_empty_clock_timer_id",
+                "_restart_countdown_colon_timer_id",
+                "_join_status_flash_timer_id",
+                "_join_status_clear_timer_id",
+            ):
+                source_ids.append(int(getattr(panel, name, 0) or 0))
+                setattr(panel, name, 0)
+
+        for source_id in source_ids:
+            if not source_id:
+                continue
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+
     def _shutdown_cleanup(self):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
@@ -2963,6 +3033,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._finish_start_steam_join_consent(False, always=False)
         except Exception:
             logger.exception("Could not terminate Steam-start consent during shutdown")
+        DZLLWindow._remove_construction_sources(self)
         self._background_prepare_ui_generation = int(
             getattr(self, "_background_prepare_ui_generation", 0) or 0
         ) + 1
@@ -2977,7 +3048,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._preparation_reap_recovery_source_id = 0
         self._preparation_reap_recovery_generation = 0
         queue = getattr(self, "_background_prepare_queue", None)
-        transition = queue.shutdown() if queue is not None else None
+        try:
+            transition = queue.shutdown() if queue is not None else None
+        except Exception:
+            logger.exception("Background preparation shutdown failed")
+            transition = None
         controller = (
             transition.controller_to_cancel
             if transition is not None and transition.controller_to_cancel is not None
@@ -2994,10 +3069,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 queue.clear_reap_block()
         except Exception:
             logger.exception("Steam helper reap recovery check failed during shutdown")
-        self._settle_browser_scrollbar_interaction("shutdown")
+        try:
+            self._settle_browser_scrollbar_interaction("shutdown")
+        except Exception:
+            pass
         drag_light = getattr(self, "_scroll_drag_light", None)
         if drag_light is not None:
-            drag_light.clear()
+            try:
+                drag_light.clear()
+            except Exception:
+                pass
 
         try:
             active = self._join_attempts.close("application shutdown")
@@ -3020,9 +3101,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
-            self._companion_restart_phase2.shutdown(
-                wall_at=time.time(), monotonic_at=time.monotonic()
-            )
+            runtime = getattr(self, "_companion_restart_phase2", None)
+            if runtime is not None:
+                runtime.shutdown(wall_at=time.time(), monotonic_at=time.monotonic())
         except Exception:
             pass
 
@@ -5377,6 +5458,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._set_updating(False)
         self._apply_titlebar_counts()
         return False
+
+    def _begin_startup_update_from_idle(self):
+        self._startup_update_idle_id = 0
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        return self._begin_startup_update()
 
     def _begin_startup_update(self):
         if getattr(self, "_server_db_update_inflight", False):

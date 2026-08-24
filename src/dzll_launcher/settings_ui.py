@@ -1091,7 +1091,16 @@ class SettingsUI:
 
         # Apply runtime effects once panel is built (master toggles / dependent widgets / etc.)
         # If main.py doesn't recognize "settings_init", it's harmless.
-        GLib.idle_add(lambda: (self._win._apply_setting_runtime_effects("settings_init"), False)[1])
+        def apply_initial_runtime_effects():
+            self._win._settings_init_idle_id = 0
+            if bool(getattr(self._win, "_shutdown_cleanup_done", False)):
+                return False
+            self._win._apply_setting_runtime_effects("settings_init")
+            return False
+
+        self._win._settings_init_idle_id = int(
+            GLib.idle_add(apply_initial_runtime_effects) or 0
+        )
 
         return panel
 
