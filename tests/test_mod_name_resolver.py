@@ -315,3 +315,23 @@ def test_mod_manager_duplicate_name_uses_dayz_owning_library_first(
     assert [(item[1], item[0], item[3]) for item in items] == [
         (2002, "DayZ Library Name", True),
     ]
+
+
+def test_mod_manager_inventory_normalizes_local_name_before_search_and_sort(
+    monkeypatch, tmp_path,
+):
+    primary, dayz_library = _configure_real_mod_manager_libraries(
+        monkeypatch, tmp_path,
+    )
+    dayz_root = dayz_library / "steamapps/workshop"
+    _write_metadata(dayz_root, 2003, "LineA\nLineB\u202e\u200b")
+
+    items = ModsManagerOverlay.__new__(ModsManagerOverlay)._load_installed_items(
+        str(primary / "steamapps/workshop"),
+        "",
+        steam_state=SteamClientState.OFFLINE,
+    )
+
+    assert [(item[1], item[0], item[3]) for item in items] == [
+        (2003, "LineA LineB", True),
+    ]

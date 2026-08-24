@@ -7,6 +7,7 @@ from enum import Enum
 import threading
 
 from .join_prepare import prepare_required_mods
+from .mod_metadata import clean_display_mod_name
 from .preparation_contracts import (
     NoOpPreparationPresenter,
     PreparationOutcome,
@@ -45,7 +46,7 @@ class BackgroundServerPreparationSnapshot:
             query_port=query_port,
             name=str(getattr(server, "name", "") or ""),
             required_mods=tuple(
-                (int(mod_id), str(name or ""))
+                (int(mod_id), clean_display_mod_name(name, mod_id, fallback=False))
                 for mod_id, name in (required_mods or ())
             ),
         )

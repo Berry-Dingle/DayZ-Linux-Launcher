@@ -9,6 +9,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Pango, GLib, Gdk
 
+from .mod_metadata import clean_display_mod_name
 from .ui_row import (
     PING_MARKUP_COLORS,
     ServerObject,
@@ -1218,9 +1219,12 @@ def _required_mod_names_from_json(mods_json: str) -> list[str]:
     for item in arr:
         if not isinstance(item, dict):
             continue
-        name = str(item.get("name") or "").strip()
+        mod_id = str(item.get("steamWorkshopId") or "").strip()
+        name = clean_display_mod_name(
+            item.get("name"), mod_id if mod_id.isdigit() else None,
+            fallback=False,
+        )
         if not name:
-            mod_id = str(item.get("steamWorkshopId") or "").strip()
             name = mod_id
         if name:
             names.append(name)

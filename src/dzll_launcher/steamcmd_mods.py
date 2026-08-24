@@ -16,6 +16,7 @@ import pty
 import select
 from pathlib import Path
 from typing import Dict, List, Tuple
+from .mod_metadata import clean_display_mod_name
 from .settings import autodetect_workshop_dir, autodetect_steamcmd_path
 from .workshop_path_safety import (
     canonical_trusted_root,
@@ -149,7 +150,7 @@ def parse_mods_from_db(mods_json: str) -> List[Tuple[int, str]]:
             continue
         if sid_i <= 0 or sid_i in seen:
             continue
-        nm = (it.get("name") or "").strip()
+        nm = clean_display_mod_name(it.get("name"), sid_i, fallback=False)
         out.append((sid_i, nm))
         seen.add(sid_i)
 
@@ -1018,14 +1019,31 @@ def ensure_dir(path: str) -> str:
     return p
 
 
-def symlink_name_for_mod(mod_name: str, mod_id: int) -> str:
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    raw = str(text or "").encode("utf-8")
+    if len(raw) <= max_bytes:
+        return str(text or "")
+    return raw[:max(0, int(max_bytes))].decode("utf-8", errors="ignore")
+
+
+def _watch_name_max(watch_folder: str) -> int:
+    try:
+        value = int(os.pathconf(watch_folder, "PC_NAME_MAX"))
+        if value > 0:
+            return value
+    except (OSError, TypeError, ValueError):
+        pass
+    return 255
+
+
+def symlink_name_for_mod(mod_name: str, mod_id: int, *, name_max: int = 255) -> str:
     """
-    Prefer launcher-friendly @Name__<id> if available, fallback @<id>.
+    Prefer launcher-friendly @Name__<id>, with a deterministic @Mod fallback.
     We keep spaces (launcher sample shows '@Code Lock').
     """
-    nm = (mod_name or "").strip()
+    mid = int(mod_id)
+    nm = clean_display_mod_name(mod_name, mid, fallback=False)
     if nm:
-        nm = "".join(ch for ch in nm if ch >= " " and ch != "\x7f")
         nm = nm.replace("++", "pp").replace("+", "plus")
         nm = re.sub(r"\]\s*\[|\)\s*\(|}\s*{", "_", nm)
         nm = re.sub(r"[\[\](){}]", "", nm)
@@ -1033,11 +1051,24 @@ def symlink_name_for_mod(mod_name: str, mod_id: int) -> str:
         nm = re.sub(r"\s+", " ", nm)
         nm = re.sub(r"_+", "_", nm)
         nm = re.sub(r"\s*_\s*", "_", nm)
-        nm = nm.strip(" _.") or "Mod"
-        if not nm.startswith("@"):
-            nm = "@" + nm
-        return f"{nm}__{int(mod_id)}"
-    return f"@{int(mod_id)}"
+        nm = nm.strip(" _.")
+    nm = nm or "Mod"
+    if not nm.startswith("@"):
+        nm = "@" + nm
+
+    suffix = f"__{mid}"
+    limit = max(1, int(name_max or 255))
+    minimum_component = f"@Mod{suffix}"
+    minimum_bytes = len(minimum_component.encode("utf-8"))
+    if minimum_bytes > limit:
+        raise ValueError(
+            f"NAME_MAX {limit} cannot fit required watch-link name "
+            f"{minimum_component!r} ({minimum_bytes} bytes)"
+        )
+    prefix_budget = limit - len(suffix.encode("utf-8"))
+    nm = _truncate_utf8(nm, prefix_budget).strip(" _.") or "@Mod"
+    component = f"{nm}{suffix}"
+    return component
 
 
 def _is_dzll_owned_symlink_name(name: str) -> bool:
@@ -1195,6 +1226,7 @@ def ensure_watch_symlinks(
     """
     workshop_dir = _resolve_path(workshop_dir)
     watch_folder = ensure_dir(watch_folder)
+    watch_name_max = _watch_name_max(watch_folder)
     debug_join_paths = _debug_join_paths_enabled()
 
     result = {
@@ -1207,6 +1239,7 @@ def ensure_watch_symlinks(
     }
 
     desired_links: Dict[str, str] = {}  # link_path -> target_path
+    name_generation_failed = False
 
     for mid, name in (mods or []):
         try:
@@ -1224,9 +1257,20 @@ def ensure_watch_symlinks(
             logger.error("Join symlink missing target content: %s", msg)
             result["errors"].append(msg)
             continue
-        link_name = symlink_name_for_mod(name, mid_i)
+        try:
+            link_name = symlink_name_for_mod(name, mid_i, name_max=watch_name_max)
+        except ValueError as error:
+            result["errors"].append(f"mod {mid_i}: {error}")
+            name_generation_failed = True
+            continue
         link_path = os.path.join(watch_folder, link_name)
         desired_links[link_path] = target
+
+    # A component-sizing failure is terminal for this requested set.  Return
+    # before creating, replacing, or cleaning any links so the caller receives
+    # a bounded Join-preparation failure without partial filesystem changes.
+    if name_generation_failed:
+        return result
 
     # Create/update desired links
     for link_path, target in desired_links.items():

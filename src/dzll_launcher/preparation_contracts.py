@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Protocol
 
+from .mod_metadata import clean_display_mod_name
+
 
 class PreparationStatus(Enum):
     READY = "ready"
@@ -32,7 +34,10 @@ class PreparationOutcome:
     def __post_init__(self) -> None:
         object.__setattr__(
             self, "verified_mods",
-            tuple((int(mod_id), str(name or "")) for mod_id, name in self.verified_mods),
+            tuple(
+                (int(mod_id), clean_display_mod_name(name, mod_id, fallback=False))
+                for mod_id, name in self.verified_mods
+            ),
         )
 
 
@@ -104,13 +109,15 @@ class PreparationProgressEvent:
     payload: tuple = ()
 
     def __post_init__(self) -> None:
-        payload = self.payload
-        already_frozen = (
-            isinstance(payload, tuple) and len(payload) == 2
-            and payload[0] in {"dict", "list", "tuple", "set"}
+        thawed_payload = _thaw(self.payload)
+        source = dict(thawed_payload) if isinstance(thawed_payload, dict) else {}
+        canonical_name = clean_display_mod_name(
+            self.item_name or source.get("name"), self.item_id, fallback=False,
         )
-        if not already_frozen and payload:
-            object.__setattr__(self, "payload", _freeze(payload))
+        object.__setattr__(self, "item_name", canonical_name)
+        if canonical_name or "name" in source:
+            source["name"] = canonical_name
+        object.__setattr__(self, "payload", _freeze(source))
 
     @classmethod
     def from_authoritative_payload(cls, payload: dict) -> "PreparationProgressEvent":
@@ -136,7 +143,7 @@ class PreparationProgressEvent:
             backend=str(source.get("backend") or ""),
             backend_owner=str(source.get("backend_owner") or ""),
             item_id=item_id,
-            item_name=str(source.get("name") or ""),
+            item_name=source.get("name"),
             downloaded_bytes=_as_int(source.get("download_bytes")),
             total_bytes=_as_int(source.get("total_bytes")),
             fraction=_as_optional_float(source.get("fraction")),
@@ -144,7 +151,7 @@ class PreparationProgressEvent:
                 bool(source["indeterminate"])
                 if source.get("indeterminate") is not None else None
             ),
-            payload=_freeze(source),
+            payload=source,
         )
 
     def authoritative_payload(self) -> dict:

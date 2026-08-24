@@ -5,6 +5,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
+from .mod_metadata import clean_display_mod_name
+
 
 class JoinPopupPhase(Enum):
     CHECKING = 10
@@ -171,7 +173,9 @@ class JoinPopupActivityTracker:
         if activity.display_action not in ("download", "update"):
             return self._suppress(activity, "ambiguous display action", bytes_advanced)
 
-        name = str(event.get("name") or mid).strip() or str(mid)
+        name = clean_display_mod_name(
+            event.get("name"), mid, fallback=False,
+        ) or str(mid)
         phase = JoinPopupPhase.UPDATING if activity.display_action == "update" else JoinPopupPhase.DOWNLOADING
         verb = "Updating" if activity.display_action == "update" else "Downloading"
         presentation = JoinPopupPresentation(

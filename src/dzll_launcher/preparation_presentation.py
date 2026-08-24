@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .join_attempt import JoinAttemptTracker
+from .mod_metadata import clean_display_mod_name
 from .join_popup_presentation import (
     JoinPopupActivityOutcome,
     JoinPopupActivityTracker,
@@ -104,7 +105,12 @@ class PreparationPresentationReducer:
         if mid <= 0:
             return PreparationReduction(None)
 
-        payload["name"] = str(event.item_name or payload.get("name") or "").strip() or str(mid)
+        payload["name"] = (
+            clean_display_mod_name(
+                event.item_name or payload.get("name"), mid, fallback=False,
+            )
+            or str(mid)
+        )
         outcome = self._activity.observe(payload)
         if outcome.presentation is None:
             return PreparationReduction(None, outcome)

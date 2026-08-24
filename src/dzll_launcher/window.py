@@ -197,7 +197,7 @@ from .preparation_presentation import (
     PreparationPresentationReducer,
     PreparationProgressMode,
 )
-from .mod_metadata import mark_mods_used
+from .mod_metadata import clean_display_mod_name, mark_mods_used
 from .mod_search import (
     build_server_mod_index,
     compact_mod_text,
@@ -480,7 +480,11 @@ def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
         names = []
         for it in arr:
             if isinstance(it, dict):
-                nm = (it.get("name") or "").strip()
+                sid = str(it.get("steamWorkshopId") or "").strip()
+                nm = clean_display_mod_name(
+                    it.get("name"), sid if sid.isdigit() else None,
+                    fallback=False,
+                )
                 if nm:
                     names.append(nm)
 
@@ -1691,7 +1695,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return True
 
     def _join_popup_active_download_text(self, event: dict, *, current: int, total: int) -> str:
-        name = str(event.get("name") or event.get("id") or "").strip()
+        name = (
+            clean_display_mod_name(
+                event.get("name"), event.get("id"), fallback=False,
+            )
+            or str(event.get("id") or "")
+        )
         size = self._steam_ugc_format_size(event.get("total_bytes"))
         suffix = f" ({int(current)}/{int(total)})" if int(current) > 0 and int(total) > 0 else ""
         return f"Downloading Mod: {name} - {size}{suffix}"

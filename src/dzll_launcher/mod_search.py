@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from .mod_alias import alias_values_for, is_exact_alias
+from .mod_metadata import clean_display_mod_name
 
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -117,12 +118,16 @@ def build_server_mod_index(mods_json: Any) -> dict[str, frozenset[str]]:
             continue
 
         sid = item.get("steamWorkshopId")
+        sid_text = ""
         if sid is not None:
             sid_text = str(sid).strip()
             if sid_text.isdigit():
                 ids.add(sid_text)
 
-        name = item.get("name")
+        name = clean_display_mod_name(
+            item.get("name"), sid_text if sid_text.isdigit() else None,
+            fallback=False,
+        )
         normalized_name = normalize_mod_text(name)
         compact_name = compact_mod_text(name)
         if normalized_name:

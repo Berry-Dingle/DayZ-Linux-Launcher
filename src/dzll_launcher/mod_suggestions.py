@@ -4,6 +4,7 @@ import re
 from typing import Any, Iterable
 
 from .mod_alias import alias_values_for, is_exact_alias
+from .mod_metadata import clean_display_mod_name
 from .mod_search import compact_mod_text, normalize_mod_text
 
 
@@ -92,7 +93,7 @@ def _parse_mods_json(mods_json: Any) -> list[dict[str, Any]]:
 
 
 def display_mod_name(name: Any) -> str:
-    raw = str(name or "").strip()
+    raw = clean_display_mod_name(name)
     text = re.sub(r"[_\-\s]+", " ", raw).strip()
     if not text:
         return raw
@@ -234,11 +235,13 @@ def build_mod_suggestion_index(mods_json_values: Iterable[Any]) -> dict[str, Any
         seen_on_server: set[str] = set()
         seen_names_on_server: set[tuple[str, str]] = set()
         for item in _parse_mods_json(mods_json):
-            name = str(item.get("name") or "").strip()
+            workshop_id = _clean_workshop_id(item.get("steamWorkshopId"))
+            name = clean_display_mod_name(
+                item.get("name"), workshop_id or None, fallback=False,
+            )
             if not name:
                 continue
 
-            workshop_id = _clean_workshop_id(item.get("steamWorkshopId"))
             identity = _mod_identity(name, workshop_id)
             entry = mods_by_identity.get(identity)
             if entry is None:

@@ -8,6 +8,7 @@ import traceback
 
 from . import steamcmd_mods
 from .launcher_state import linux_to_win_path_under_prefix
+from .mod_metadata import clean_display_mod_name
 from .preparation_contracts import (
     JoinPopupPreparationPresenter,
     NoOpPreparationPresenter,
@@ -137,6 +138,10 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                           allow_backend_steam_start=True, cancel_event=None):
     """Run the existing Join preparation and stop before Join-only continuation."""
     attempt_id = int(operation_id or 0)
+    mods = [
+        (mod_id, clean_display_mod_name(name, mod_id, fallback=False))
+        for mod_id, name in (mods or [])
+    ]
     presenter = presenter or NoOpPreparationPresenter()
     is_operation_current = is_operation_current or (lambda: True)
     operation_cancel_event = (
