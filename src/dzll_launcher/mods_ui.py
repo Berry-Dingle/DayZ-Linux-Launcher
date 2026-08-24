@@ -1769,6 +1769,7 @@ class ModsManagerOverlay:
                 ids,
                 metadata=metadata,
                 workshop_dir=workshop_dir,
+                workshop_roots=workshop_roots,
                 symlink_names=name_map,
             )
         except Exception:

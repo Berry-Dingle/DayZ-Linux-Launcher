@@ -72,7 +72,36 @@ def names_from_server_db(mod_ids) -> dict[int, str]:
     return out
 
 
-def name_from_local_metadata(mod_id, *, workshop_dir: str = "") -> str:
+def _local_metadata_roots(*, workshop_dir: str = "", workshop_roots=None) -> tuple[Path, ...]:
+    if workshop_roots is None:
+        root = (
+            Path(workshop_dir).expanduser()
+            if workshop_dir
+            else Path.home() / ".local/share/Steam/steamapps/workshop"
+        )
+        return (root,)
+
+    out: list[Path] = []
+    seen = set()
+    for raw_root in workshop_roots:
+        try:
+            root = Path(raw_root).expanduser()
+        except Exception:
+            continue
+        key = str(root)
+        if key in seen:
+            continue
+        out.append(root)
+        seen.add(key)
+    return tuple(out)
+
+
+def name_from_local_metadata(
+    mod_id,
+    *,
+    workshop_dir: str = "",
+    workshop_roots=None,
+) -> str:
     try:
         mid = int(mod_id)
     except Exception:
@@ -80,30 +109,41 @@ def name_from_local_metadata(mod_id, *, workshop_dir: str = "") -> str:
     if mid <= 0:
         return ""
 
-    root = Path(workshop_dir).expanduser() if workshop_dir else Path.home() / ".local/share/Steam/steamapps/workshop"
-    mod_dir = root / "content" / "221100" / str(mid)
-    try:
-        if not mod_dir.is_dir() or mod_dir.is_symlink():
-            return ""
-    except Exception:
-        return ""
-
-    for filename in ("meta.cpp", "mod.cpp"):
-        path = mod_dir / filename
+    roots = _local_metadata_roots(
+        workshop_dir=workshop_dir,
+        workshop_roots=workshop_roots,
+    )
+    for root in roots:
+        mod_dir = root / "content" / "221100" / str(mid)
         try:
-            if not path.is_file() or path.is_symlink():
+            if not mod_dir.is_dir() or mod_dir.is_symlink():
                 continue
-            text = path.read_text(encoding="utf-8", errors="replace")[:32768]
         except Exception:
             continue
-        for match in _CPP_NAME_RE.finditer(text):
-            cleaned = _clean_candidate(match.group("value"), mid)
-            if cleaned:
-                return cleaned
+
+        for filename in ("meta.cpp", "mod.cpp"):
+            path = mod_dir / filename
+            try:
+                if not path.is_file() or path.is_symlink():
+                    continue
+                text = path.read_text(encoding="utf-8", errors="replace")[:32768]
+            except Exception:
+                continue
+            for match in _CPP_NAME_RE.finditer(text):
+                cleaned = _clean_candidate(match.group("value"), mid)
+                if cleaned:
+                    return cleaned
     return ""
 
 
-def resolve_best_mod_names(mod_ids, *, metadata=None, workshop_dir: str = "", symlink_names=None) -> dict[int, str]:
+def resolve_best_mod_names(
+    mod_ids,
+    *,
+    metadata=None,
+    workshop_dir: str = "",
+    workshop_roots=None,
+    symlink_names=None,
+) -> dict[int, str]:
     ids = []
     seen = set()
     for raw_mid in mod_ids or []:
@@ -118,6 +158,10 @@ def resolve_best_mod_names(mod_ids, *, metadata=None, workshop_dir: str = "", sy
     metadata = metadata or {}
     symlink_names = symlink_names or {}
     db_names = names_from_server_db(ids)
+    local_roots = _local_metadata_roots(
+        workshop_dir=workshop_dir,
+        workshop_roots=workshop_roots,
+    )
     out: dict[int, str] = {}
 
     for mid in ids:
@@ -126,7 +170,7 @@ def resolve_best_mod_names(mod_ids, *, metadata=None, workshop_dir: str = "", sy
         for candidate in (
             meta_name,
             db_names.get(mid, ""),
-            name_from_local_metadata(mid, workshop_dir=workshop_dir),
+            name_from_local_metadata(mid, workshop_roots=local_roots),
             symlink_names.get(mid, "") if isinstance(symlink_names, dict) else "",
             "",
         ):
