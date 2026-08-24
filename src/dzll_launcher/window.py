@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Gio, Pango, GLib, Gdk, Graphene
 from .discord_rpc import DiscordRPC
+from .dayz_process import DayZProcessSnapshot, scan_dayz_processes
 from .steam_native import (
     dayz_compatdata_dir,
     dayz_paths_summary,
@@ -10037,36 +10038,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     # Watch Steam Game State
     # ----------------------------
-    def _dayz_game_running(self) -> bool:
+    def _dayz_process_snapshot(self) -> DayZProcessSnapshot:
         try:
-            for pattern in ("DayZ_x64.exe", "DayZ.exe"):
-                result = subprocess.run(
-                    ["pgrep", "-fa", pattern],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                if result.returncode == 0:
-                    return True
+            return scan_dayz_processes()
         except Exception:
-            pass
-        return False
+            return DayZProcessSnapshot()
+
+    def _dayz_game_running(self) -> bool:
+        return bool(self._dayz_process_snapshot().dayz_running)
 
     def _dayz_launcher_running(self) -> bool:
-        try:
-            # Deliberately exclude generic "Launcher" and Proton/Steam helpers.
-            for pattern in ("DayZ Launcher", "DayZLauncher", "DayZLauncher.exe"):
-                result = subprocess.run(
-                    ["pgrep", "-fa", pattern],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    check=False,
-                )
-                if result.returncode == 0:
-                    return True
-        except Exception:
-            pass
-        return False
+        return bool(self._dayz_process_snapshot().launcher_running)
 
     def _join_watcher_ui_call(self, callback, *args):
         """Run a watcher UI transition on GTK and wait briefly for ordering."""
@@ -10160,7 +10142,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             while True:
                 if attempt_id and not self._join_attempt_is_active(attempt_id):
                     return
-                launcher_running = self._dayz_launcher_running()
+                process_snapshot = self._dayz_process_snapshot()
+                launcher_running = bool(process_snapshot.launcher_running)
                 if launcher_running:
                     if not saw_launcher and attempt_id:
                         self._join_log(attempt_id, "first relevant process observation", process="DayZ Launcher")
@@ -10196,7 +10179,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         )
                     return
 
-                if self._dayz_game_running():
+                if process_snapshot.dayz_running:
                     saw_game = True
                     if attempt_id:
                         self._join_log(attempt_id, "DayZ detected")
@@ -10336,7 +10319,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
 
             # Wait until the actual game exits
-            while self._dayz_game_running():
+            while self._dayz_process_snapshot().dayz_running:
                 time.sleep(5.0)
 
             # GAME EXITED -> reset presence

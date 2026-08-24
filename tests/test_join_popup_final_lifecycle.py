@@ -235,13 +235,12 @@ def test_popen_success_path_does_not_hide_popup():
     assert "_hide_steamcmd_auth_overlay" not in launch
 
 
-def test_watcher_process_matchers_exclude_generic_proton_and_launcher():
-    launcher = WINDOW_SOURCE.split("def _dayz_launcher_running", 1)[1]
-    launcher = launcher.split("def _join_watcher_ui_call", 1)[0]
-    assert '"DayZ Launcher"' in launcher
-    assert '"DayZLauncher"' in launcher
-    assert '("Launcher")' not in launcher
-    assert '"Proton"' not in launcher
+def test_watcher_process_matchers_use_shared_strict_snapshot():
+    process_helpers = WINDOW_SOURCE.split("def _dayz_process_snapshot", 1)[1]
+    process_helpers = process_helpers.split("def _join_watcher_ui_call", 1)[0]
+    assert "scan_dayz_processes()" in process_helpers
+    assert "pgrep" not in process_helpers
+    assert "DayZ Launcher" not in process_helpers
 
 
 def test_one_bounded_mod_retry_cannot_add_a_second_launch_handoff():
@@ -323,13 +322,13 @@ class SessionWatcherHarness(LifecycleHarness):
             return bool(results.pop(0))
         return bool(results[0])
 
-    def _dayz_launcher_running(self):
+    def _dayz_process_snapshot(self):
         self.launcher_scans += 1
-        return self._next_result(self.launcher_results)
-
-    def _dayz_game_running(self):
         self.game_scans += 1
-        return self._next_result(self.game_results)
+        return window_module.DayZProcessSnapshot(
+            launcher_running=self._next_result(self.launcher_results),
+            dayz_running=self._next_result(self.game_results),
+        )
 
     def _join_watcher_ui_call(self, callback, *args):
         self.watcher_ui_calls.append(callback.__name__)
@@ -392,7 +391,7 @@ def test_launcher_deadline_is_absolute_and_launcher_callback_is_one_shot(monkeyp
 
     assert clock.monotonic_value == 1800.0
     assert harness.launcher_scans == 4
-    assert harness.game_scans == 3
+    assert harness.game_scans == 4
     assert harness.watcher_ui_calls.count("_join_popup_process_detected") == 1
     assert harness.watcher_ui_calls.count("_join_popup_watcher_failure") == 1
     assert harness.errors == [
