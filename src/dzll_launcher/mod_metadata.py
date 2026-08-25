@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import tempfile
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from typing import Callable, Iterable
 
 from .config import CACHE_DIR
@@ -18,6 +21,7 @@ MOD_DISPLAY_NAME_MAX_CHARS = 512
 _CLEARABLE_FIELDS = {"install_folder"}
 _MOD_METADATA_LOCK = threading.RLock()
 _MOD_METADATA_TRANSACTION = threading.local()
+logger = logging.getLogger(__name__)
 
 # Explicit directional formatting can visually reorder otherwise harmless text.
 # ZWJ/ZWNJ are deliberately absent: both are meaningful in scripts and emoji.
@@ -38,6 +42,37 @@ _NON_SEMANTIC_FORMAT_CONTROLS = frozenset(
         "\ufeff",  # ZERO WIDTH NO-BREAK SPACE / stray BOM
     }
 )
+
+
+class MetadataCacheReadError(OSError):
+    """Operational cache read failure that must abort metadata mutation."""
+
+
+class MetadataCacheUnsupportedVersionError(RuntimeError):
+    """Existing cache uses a schema that this DZLL version cannot mutate."""
+
+
+class _LoadStatus(Enum):
+    MISSING = "missing"
+    LOADED = "loaded"
+    CORRUPT = "corrupt"
+    UNSUPPORTED_VERSION = "unsupported_version"
+    IO_ERROR = "io_error"
+
+
+@dataclass(frozen=True)
+class _LoadResult:
+    status: _LoadStatus
+    data: dict
+    error: OSError | None = None
+
+
+class _LoadedMetadata(dict):
+    """Dictionary-compatible public result retaining its internal load status."""
+
+    def __init__(self, data: dict, status: _LoadStatus):
+        super().__init__(data)
+        self.load_status = status
 
 
 def _utc_now() -> str:
@@ -118,21 +153,99 @@ def _normalize_cached_mods(mods: dict) -> dict:
     return normalized
 
 
-def load_mod_metadata() -> dict:
-    try:
-        if os.path.exists(MOD_METADATA_PATH):
-            with open(MOD_METADATA_PATH, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
-                if isinstance(data, dict):
-                    mods = data.get("mods")
-                    if isinstance(mods, dict):
-                        return {
-                            "version": int(data.get("version") or SCHEMA_VERSION),
-                            "mods": _normalize_cached_mods(mods),
-                        }
-    except Exception:
-        pass
+def _empty_mod_metadata() -> dict:
     return {"version": SCHEMA_VERSION, "mods": {}}
+
+
+def _version_diagnostic(value) -> str:
+    """Describe a schema value without rendering arbitrary-length content."""
+    if isinstance(value, bool):
+        return repr(value)
+    if isinstance(value, int):
+        if -999_999_999_999_999_999 <= value <= 999_999_999_999_999_999:
+            return str(value)
+        magnitude = abs(value)
+        digits = max(1, int((magnitude.bit_length() - 1) * 0.3010299956639812) + 1)
+        if magnitude >= 10**digits:
+            digits += 1
+        return f"<int, approximately {digits} digits>"
+    if isinstance(value, str):
+        if len(value) <= 32:
+            return repr(value)
+        return f"<str, {len(value)} characters>"
+    if isinstance(value, (list, tuple, dict, set)):
+        return f"<{type(value).__name__}, {len(value)} items>"
+    return f"<{type(value).__name__}>"
+
+
+def _load_mod_metadata_result() -> _LoadResult:
+    try:
+        with open(MOD_METADATA_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except FileNotFoundError:
+        return _LoadResult(_LoadStatus.MISSING, _empty_mod_metadata())
+    except OSError as error:
+        logger.warning(
+            "Could not read mod metadata cache %s: %s",
+            MOD_METADATA_PATH,
+            type(error).__name__,
+        )
+        return _LoadResult(_LoadStatus.IO_ERROR, _empty_mod_metadata(), error)
+    except Exception as error:
+        logger.warning(
+            "Ignoring malformed mod metadata cache %s: %s",
+            MOD_METADATA_PATH,
+            type(error).__name__,
+        )
+        return _LoadResult(_LoadStatus.CORRUPT, _empty_mod_metadata())
+
+    if not isinstance(data, dict) or not isinstance(data.get("mods"), dict):
+        logger.warning(
+            "Ignoring malformed mod metadata cache %s: expected object with mods object",
+            MOD_METADATA_PATH,
+        )
+        return _LoadResult(_LoadStatus.CORRUPT, _empty_mod_metadata())
+
+    raw_version = data.get("version")
+    if raw_version is None:
+        version = SCHEMA_VERSION
+    else:
+        try:
+            version = int(raw_version)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning(
+                "Mod metadata cache %s has malformed version %s; treating valid mods as schema %s",
+                MOD_METADATA_PATH,
+                _version_diagnostic(raw_version),
+                SCHEMA_VERSION,
+            )
+            version = SCHEMA_VERSION
+
+    if version != SCHEMA_VERSION:
+        logger.warning(
+            "Ignoring mod metadata cache %s with unsupported schema version %s (expected %s)",
+            MOD_METADATA_PATH,
+            _version_diagnostic(version),
+            SCHEMA_VERSION,
+        )
+        return _LoadResult(_LoadStatus.UNSUPPORTED_VERSION, _empty_mod_metadata())
+
+    return _LoadResult(
+        _LoadStatus.LOADED,
+        {
+            "version": SCHEMA_VERSION,
+            "mods": _normalize_cached_mods(data["mods"]),
+        },
+    )
+
+
+def load_mod_metadata() -> dict:
+    result = _load_mod_metadata_result()
+    if result.status is _LoadStatus.IO_ERROR:
+        raise MetadataCacheReadError(
+            f"Could not read mod metadata cache: {MOD_METADATA_PATH}"
+        ) from result.error
+    return _LoadedMetadata(result.data, result.status)
 
 
 def save_mod_metadata(data: dict) -> None:
@@ -176,6 +289,10 @@ def _mutate_mod_metadata(mutate: Callable[[dict], None]) -> None:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             try:
                 data = load_mod_metadata()
+                if getattr(data, "load_status", None) is _LoadStatus.UNSUPPORTED_VERSION:
+                    raise MetadataCacheUnsupportedVersionError(
+                        f"Cannot update unsupported mod metadata cache: {MOD_METADATA_PATH}"
+                    )
                 _MOD_METADATA_TRANSACTION.data = data
                 try:
                     mutate(data)
