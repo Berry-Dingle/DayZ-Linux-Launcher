@@ -2857,6 +2857,171 @@ def _unlink_owned_regular_file(path: Path | None, identity) -> None:
         pass
 
 
+ACF_BACKUP_RETENTION_COUNT = 5
+
+
+@dataclass(frozen=True)
+class _ACFBackupCandidate:
+    path: Path
+    timestamp: str
+    mtime_ns: int
+    collision_counter: int
+    identity: tuple[int, int]
+
+
+def _acf_backup_name_match(source_name: str, candidate_name: str):
+    match = re.fullmatch(
+        rf"{re.escape(source_name)}\.bak\."
+        r"(\d{8}-\d{6})\.(\d+)(?:\.(\d+))?",
+        candidate_name,
+    )
+    if match is None:
+        return None
+    timestamp = match.group(1)
+    try:
+        time.strptime(timestamp, "%Y%m%d-%H%M%S")
+    except (OverflowError, ValueError):
+        return None
+    raw_counter = match.group(3)
+    if raw_counter is None:
+        collision_counter = 0
+    else:
+        # _open_unique_acf_backup emits only .1 through .999.  Values outside
+        # that range are not attributable to this writer.
+        if len(raw_counter) > 3:
+            return None
+        collision_counter = int(raw_counter)
+        if not 1 <= collision_counter <= 999:
+            return None
+    return timestamp, collision_counter
+
+
+def _log_acf_backup_prune_warning(log_fn, source: Path, candidate, reason) -> None:
+    message = (
+        f"[Steam UGC] could not prune old ACF backup for {source}: "
+        f"{candidate}: {reason}"
+    )
+    if callable(log_fn):
+        try:
+            log_fn(message)
+            return
+        except Exception:
+            pass
+    try:
+        logger.warning(message)
+    except Exception:
+        pass
+
+
+def _prune_old_acf_backups(
+    path: Path,
+    *,
+    validate_authoritative_path,
+    log_fn=None,
+    protected_backup_path: Path | None = None,
+    protected_backup_identity: tuple[int, int] | None = None,
+) -> None:
+    """Keep only the newest completed DZLL backups for one exact ACF."""
+
+    path = Path(path)
+    try:
+        validate_authoritative_path()
+        with os.scandir(path.parent) as directory:
+            entries = list(directory)
+    except OSError as exc:
+        _log_acf_backup_prune_warning(log_fn, path, path.parent, exc)
+        return
+    except Exception as exc:
+        _log_acf_backup_prune_warning(log_fn, path, path.parent, exc)
+        return
+
+    protected_path = (
+        None if protected_backup_path is None else Path(protected_backup_path)
+    )
+    protected_candidate: _ACFBackupCandidate | None = None
+    candidates: list[_ACFBackupCandidate] = []
+    for entry in entries:
+        parsed = _acf_backup_name_match(path.name, entry.name)
+        if parsed is None:
+            continue
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError as exc:
+            _log_acf_backup_prune_warning(
+                log_fn, path, path.parent / entry.name, exc,
+            )
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        timestamp, collision_counter = parsed
+        candidate = _ACFBackupCandidate(
+            path=path.parent / entry.name,
+            timestamp=timestamp,
+            mtime_ns=info.st_mtime_ns,
+            collision_counter=collision_counter,
+            identity=(info.st_dev, info.st_ino),
+        )
+        if protected_path is not None and candidate.path == protected_path:
+            if candidate.identity == protected_backup_identity:
+                protected_candidate = candidate
+            else:
+                _log_acf_backup_prune_warning(
+                    log_fn,
+                    path,
+                    candidate.path,
+                    "new backup identity changed before retention",
+                )
+            continue
+        candidates.append(candidate)
+
+    candidates.sort(
+        key=lambda candidate: (
+            candidate.timestamp,
+            candidate.mtime_ns,
+            candidate.collision_counter,
+            candidate.path.name,
+        ),
+        reverse=True,
+    )
+    historical_keep_count = ACF_BACKUP_RETENTION_COUNT
+    if protected_candidate is not None:
+        historical_keep_count -= 1
+    for candidate in candidates[historical_keep_count:]:
+        try:
+            validate_authoritative_path()
+        except Exception as exc:
+            _log_acf_backup_prune_warning(
+                log_fn, path, candidate.path, exc,
+            )
+            return
+        try:
+            current = os.lstat(candidate.path)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            _log_acf_backup_prune_warning(
+                log_fn, path, candidate.path, exc,
+            )
+            continue
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or (current.st_dev, current.st_ino) != candidate.identity
+        ):
+            _log_acf_backup_prune_warning(
+                log_fn,
+                path,
+                candidate.path,
+                "candidate identity or file type changed",
+            )
+            continue
+        try:
+            candidate.path.unlink()
+        except OSError as exc:
+            _log_acf_backup_prune_warning(
+                log_fn, path, candidate.path, exc,
+            )
+
+
 def _open_unique_acf_backup(path: Path, suffix: str) -> tuple[int, Path, tuple[int, int]]:
     base_name = f"{path.name}.bak.{suffix}"
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -2889,6 +3054,7 @@ def _write_acf_atomically_with_backup(
     new_text: str,
     *,
     path_validator=None,
+    log_fn=None,
 ) -> str:
     path = Path(path)
 
@@ -2917,6 +3083,17 @@ def _write_acf_atomically_with_backup(
     backup_identity = None
     backup_complete = False
     try:
+        # Preserve the exact authoritative bytes before preparing a replacement.
+        validate_authoritative_path()
+        backup_fd, backup_path, backup_identity = _open_unique_acf_backup(
+            path, suffix,
+        )
+        os.fchmod(backup_fd, original_mode)
+        _write_all_and_fsync(backup_fd, original_bytes)
+        os.close(backup_fd)
+        backup_fd = -1
+        backup_complete = True
+
         temp_fd, temp_name = tempfile.mkstemp(
             prefix=f".{path.name}.",
             suffix=".tmp",
@@ -2930,25 +3107,24 @@ def _write_acf_atomically_with_backup(
         os.close(temp_fd)
         temp_fd = -1
 
-        # Revalidate the authoritative file and its parent path before creating
-        # a persistent sibling backup.
-        validate_authoritative_path()
-        backup_fd, backup_path, backup_identity = _open_unique_acf_backup(
-            path, suffix,
-        )
-        os.fchmod(backup_fd, original_mode)
-        _write_all_and_fsync(backup_fd, original_bytes)
-        os.close(backup_fd)
-        backup_fd = -1
-        backup_complete = True
-
         # This is the final current-state check before the atomic commit point.
         validate_authoritative_path()
         os.replace(temp_path, path)
         temp_path = None
         temp_identity = None
-        if path.is_symlink() or not path.is_file():
-            raise RuntimeError(f"Workshop ACF replacement is not a regular file: {path}")
+        validate_authoritative_path()
+        try:
+            _prune_old_acf_backups(
+                path,
+                validate_authoritative_path=validate_authoritative_path,
+                log_fn=log_fn,
+                protected_backup_path=backup_path,
+                protected_backup_identity=backup_identity,
+            )
+        except Exception as exc:
+            # Retention happens after the authoritative commit and must never
+            # turn that successful rewrite into a reported failure.
+            _log_acf_backup_prune_warning(log_fn, path, path.parent, exc)
         return str(backup_path)
     finally:
         if temp_fd >= 0:
@@ -3037,6 +3213,7 @@ def _remove_workshop_acf_entries_from_paths(
                 original_bytes,
                 new_text,
                 path_validator=path_validator,
+                log_fn=log_fn,
             )
             result["backups"].append(backup)
             removed_any.update(removed)
