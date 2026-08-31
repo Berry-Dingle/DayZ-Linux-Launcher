@@ -192,6 +192,10 @@ def test_unsupported_numeric_version_aborts_upsert_without_touching_bytes(
             }),
             id="ugc-bulk-upsert",
         ),
+        pytest.param(
+            lambda: mod_metadata.upsert_many_names({103: "Gamma"}),
+            id="name-bulk-upsert",
+        ),
     ],
 )
 def test_all_metadata_mutation_entry_points_reject_unsupported_cache(

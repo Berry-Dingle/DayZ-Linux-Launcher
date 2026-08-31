@@ -6,7 +6,7 @@ import sqlite3
 from pathlib import Path
 
 from .config import DB_LOCAL_PATH
-from .mod_metadata import clean_display_mod_name, upsert_mod_metadata
+from .mod_metadata import clean_display_mod_name, upsert_many_names
 from .steamcmd_mods import parse_mods_from_db
 
 
@@ -181,10 +181,15 @@ def resolve_best_mod_names(
         if mid not in out:
             out[mid] = clean_display_mod_name("", mid)
 
-    for mid, name in out.items():
-        if not _is_weak_name(name, mid):
-            try:
-                upsert_mod_metadata(mid, name=name)
-            except Exception:
-                pass
+    strong_names = {
+        mid: name for mid, name in out.items()
+        if not _is_weak_name(name, mid)
+    }
+    if strong_names:
+        try:
+            # The cache is non-authoritative: persistence is one best-effort,
+            # all-or-nothing batch and must never hide successfully resolved names.
+            upsert_many_names(strong_names)
+        except Exception:
+            pass
     return out

@@ -267,8 +267,8 @@ def test_actual_server_database_resolver_normalizes_before_caching(
     monkeypatch.setattr(mod_name_resolver, "DB_LOCAL_PATH", str(database))
     monkeypatch.setattr(
         mod_name_resolver,
-        "upsert_mod_metadata",
-        lambda mod_id, *, name: cached.append((mod_id, name)),
+        "upsert_many_names",
+        lambda names_by_id: cached.append(dict(names_by_id)),
     )
 
     resolved = mod_name_resolver.resolve_best_mod_names(
@@ -276,7 +276,7 @@ def test_actual_server_database_resolver_normalizes_before_caching(
     )
 
     assert resolved == {2002: "Server Name"}
-    assert cached == [(2002, "Server Name")]
+    assert cached == [{2002: "Server Name"}]
 
 
 def test_resolver_falls_through_when_normalized_source_is_empty(monkeypatch, tmp_path):
@@ -285,7 +285,7 @@ def test_resolver_falls_through_when_normalized_source_is_empty(monkeypatch, tmp
     item.mkdir(parents=True)
     (item / "meta.cpp").write_text('name = "Local Valid";\n', encoding="utf-8")
     monkeypatch.setattr(mod_name_resolver, "names_from_server_db", lambda _ids: {})
-    monkeypatch.setattr(mod_name_resolver, "upsert_mod_metadata", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod_name_resolver, "upsert_many_names", lambda *_a, **_k: None)
 
     assert mod_name_resolver.resolve_best_mod_names(
         [2003],
@@ -305,7 +305,7 @@ def test_long_local_metadata_is_bounded_by_actual_parser_and_resolver(
         f'name = "{"L" * 30000}";\n', encoding="utf-8",
     )
     monkeypatch.setattr(mod_name_resolver, "names_from_server_db", lambda _ids: {})
-    monkeypatch.setattr(mod_name_resolver, "upsert_mod_metadata", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod_name_resolver, "upsert_many_names", lambda *_a, **_k: None)
 
     assert mod_name_resolver.name_from_local_metadata(
         2004, workshop_roots=[root],
@@ -317,7 +317,7 @@ def test_symlink_display_fallback_is_normalized_without_renaming_source(
 ):
     raw_name = "@Local\nBidi\u202eZero\u200b__2005"
     monkeypatch.setattr(mod_name_resolver, "names_from_server_db", lambda _ids: {})
-    monkeypatch.setattr(mod_name_resolver, "upsert_mod_metadata", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod_name_resolver, "upsert_many_names", lambda *_a, **_k: None)
 
     resolved = mod_name_resolver.resolve_best_mod_names(
         [2005], metadata={}, workshop_roots=[], symlink_names={2005: raw_name},

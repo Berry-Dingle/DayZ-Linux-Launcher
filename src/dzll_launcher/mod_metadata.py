@@ -384,6 +384,38 @@ def upsert_mod_metadata(
     _mutate_mod_metadata(mutate)
 
 
+def upsert_many_names(names_by_id) -> None:
+    """Persist strong Workshop names atomically with one shared update timestamp.
+
+    Empty and weak-only inputs are no-ops.  Once a transaction begins, either
+    every eligible name reaches the cache together or the prior cache remains.
+    """
+    updates: dict[str, tuple[int, str]] = {}
+    for raw_mid, name in (names_by_id or {}).items():
+        mid = int(raw_mid)
+        cleaned_name = clean_display_mod_name(name, mid, fallback=False)
+        if not cleaned_name or _is_fallback_name(cleaned_name, mid):
+            continue
+        updates[str(mid)] = (mid, cleaned_name)
+
+    if not updates:
+        return
+
+    now = _utc_now()
+
+    def mutate(data: dict) -> None:
+        mods = data.setdefault("mods", {})
+        for key, (mid, cleaned_name) in updates.items():
+            existing = mods.get(key) if isinstance(mods.get(key), dict) else {}
+            entry = dict(existing)
+            entry["id"] = mid
+            entry["name"] = cleaned_name
+            entry["updated_at"] = now
+            mods[key] = entry
+
+    _mutate_mod_metadata(mutate)
+
+
 def upsert_many_from_ugc_state(state_by_id, *, names_by_id=None) -> None:
     names = names_by_id or {}
     now = _utc_now()

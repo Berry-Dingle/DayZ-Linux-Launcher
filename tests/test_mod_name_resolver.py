@@ -28,7 +28,7 @@ def _write_metadata(
 @pytest.fixture(autouse=True)
 def _isolate_non_local_name_sources(monkeypatch):
     monkeypatch.setattr(mod_name_resolver, "names_from_server_db", lambda _ids: {})
-    monkeypatch.setattr(mod_name_resolver, "upsert_mod_metadata", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod_name_resolver, "upsert_many_names", lambda *_args, **_kwargs: None)
 
 
 def test_single_workshop_dir_compatibility_resolves_meta_cpp(tmp_path):

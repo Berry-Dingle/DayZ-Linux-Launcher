@@ -114,6 +114,21 @@ def test_bulk_update_and_mark_used_both_survive(isolated_metadata, monkeypatch):
     assert mods["2"]["installed"] is True
 
 
+def test_bulk_names_and_ugc_update_both_survive(isolated_metadata, monkeypatch):
+    _run_controlled_threads(
+        monkeypatch,
+        lambda: mod_metadata.upsert_many_names({2: "Resolved Two", 3: "Resolved Three"}),
+        lambda: mod_metadata.upsert_many_from_ugc_state(
+            {4: {"id": 4, "subscribed": True, "installed": True}}
+        ),
+    )
+
+    mods = _read(isolated_metadata)["mods"]
+    assert set(mods) == {"1", "2", "3", "4"}
+    assert mods["2"]["name"] == "Resolved Two"
+    assert mods["4"]["installed"] is True
+
+
 def test_individual_upsert_and_mark_used_preserve_same_mod_fields(isolated_metadata, monkeypatch):
     _run_controlled_threads(
         monkeypatch,
