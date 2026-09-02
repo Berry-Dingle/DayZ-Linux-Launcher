@@ -881,6 +881,166 @@ def test_steam_client_boundary_activates_shared_session_on_worker(monkeypatch):
     assert steam_ugc_backend.active_ugc_session() is None
 
 
+def test_steam_client_boundary_borrows_same_session_without_clearing_owner(
+        monkeypatch):
+    class Session:
+        def __init__(self):
+            self.commands = []
+
+        def run_command(self, command, **_kwargs):
+            self.commands.append(command)
+            return True, 0
+
+    session = Session()
+    observed = []
+
+    def run_install(_ids, **_kwargs):
+        observed.append(steam_ugc_backend.active_ugc_session())
+        return steam_ugc_backend._run_helper_json_lines(
+            "state", appid=221100, timeout=2, mod_ids=[7],
+        )[0]
+
+    monkeypatch.setattr(
+        steam_client_mods,
+        "run_ugc_install",
+        run_install,
+    )
+
+    steam_ugc_backend.activate_ugc_session(session)
+    try:
+        assert steam_client_mods.run_steam_client_install(
+            workshop_dir="/unused",
+            mod_ids=[7],
+            ugc_session=session,
+        )
+        assert observed == [session]
+        assert session.commands == ["state"]
+        assert steam_ugc_backend.active_ugc_session() is session
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(session)
+
+
+def test_steam_client_boundary_borrow_exception_preserves_owner(monkeypatch):
+    session = object()
+
+    def fail_install(*_args, **_kwargs):
+        assert steam_ugc_backend.active_ugc_session() is session
+        raise RuntimeError("synthetic install failure")
+
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", fail_install)
+    steam_ugc_backend.activate_ugc_session(session)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic install failure"):
+            steam_client_mods.run_steam_client_install(
+                workshop_dir="/unused",
+                mod_ids=[7],
+                ugc_session=session,
+            )
+        assert steam_ugc_backend.active_ugc_session() is session
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(session)
+
+
+def test_steam_client_boundary_rejects_different_active_session(monkeypatch):
+    active_session = object()
+    supplied_session = object()
+    monkeypatch.setattr(
+        steam_client_mods,
+        "run_ugc_install",
+        lambda *_args, **_kwargs: pytest.fail("UGC install must not start"),
+    )
+
+    steam_ugc_backend.activate_ugc_session(active_session)
+    try:
+        with pytest.raises(
+            steam_ugc_backend.UGCSessionError,
+            match="already active on this worker",
+        ):
+            steam_client_mods.run_steam_client_install(
+                workshop_dir="/unused",
+                mod_ids=[7],
+                ugc_session=supplied_session,
+            )
+        assert steam_ugc_backend.active_ugc_session() is active_session
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(active_session)
+
+
+def test_steam_client_boundary_owned_activation_cleans_after_exception(monkeypatch):
+    session = object()
+
+    def fail_install(*_args, **_kwargs):
+        assert steam_ugc_backend.active_ugc_session() is session
+        raise RuntimeError("synthetic install failure")
+
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", fail_install)
+    with pytest.raises(RuntimeError, match="synthetic install failure"):
+        steam_client_mods.run_steam_client_install(
+            workshop_dir="/unused",
+            mod_ids=[7],
+            ugc_session=session,
+        )
+    assert steam_ugc_backend.active_ugc_session() is None
+
+
+def test_steam_client_boundary_without_session_remains_unbound(monkeypatch):
+    observed = []
+    monkeypatch.setattr(
+        steam_client_mods,
+        "run_ugc_install",
+        lambda *_args, **_kwargs: (
+            observed.append(steam_ugc_backend.active_ugc_session()) or True
+        ),
+    )
+
+    assert steam_client_mods.run_steam_client_install(
+        workshop_dir="/unused",
+        mod_ids=[7],
+        ugc_session=None,
+    )
+    assert observed == [None]
+    assert steam_ugc_backend.active_ugc_session() is None
+
+
+def test_stop_waiting_wrapper_preserves_outer_session_across_fresh_worker(
+        monkeypatch):
+    from dzll_launcher.window import DZLLWindow
+
+    session = object()
+    outer_thread = threading.get_ident()
+    observed = []
+
+    def run_install(_ids, **_kwargs):
+        observed.append(
+            (
+                threading.get_ident(),
+                steam_ugc_backend.active_ugc_session(),
+            )
+        )
+        return True
+
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", run_install)
+    host = SimpleNamespace(
+        _steam_client_stop_waiting_event=threading.Event(),
+        _run_steam_client_install_impl=steam_client_mods.run_steam_client_install,
+    )
+
+    steam_ugc_backend.activate_ugc_session(session)
+    try:
+        assert DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host,
+            workshop_dir="/unused",
+            mod_ids=[7],
+            ugc_session=session,
+        )
+        assert len(observed) == 1
+        assert observed[0][1] is session
+        assert observed[0][0] != outer_thread
+        assert steam_ugc_backend.active_ugc_session() is session
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(session)
+
+
 def test_helper_environment_scrubs_inherited_app_identity(monkeypatch):
     monkeypatch.setenv("SteamAppId", "999")
     monkeypatch.setenv("SteamGameId", "999")

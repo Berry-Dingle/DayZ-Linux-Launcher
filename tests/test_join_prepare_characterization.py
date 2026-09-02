@@ -912,6 +912,27 @@ def test_outdated_mod_requires_fresh_terminal_currentness_before_launch(monkeypa
     assert win.launches == 1
 
 
+def test_locally_present_mod_still_runs_steam_install_when_ugc_reports_update(
+        monkeypatch):
+    mod = (101, "Locally Present But Stale")
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[mod],
+        # The harness reports no local filesystem miss. Steam remains
+        # authoritative for whether the Workshop item needs update work.
+        initial_states={101: ugc_state(needs_update=True)},
+        backend_results=[True],
+        terminal_results=[(True, {101: ugc_state()})],
+    )
+
+    assert trace[:3] == [
+        ("initial_query", (101,)),
+        ("backend", (101,)),
+        ("terminal_query", (101,)),
+    ]
+    assert win.launches == 1
+
+
 def test_single_retry_uses_only_unresolved_ids_then_validates_every_original_id(
         monkeypatch):
     mods = [

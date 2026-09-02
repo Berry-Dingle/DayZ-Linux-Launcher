@@ -6,6 +6,7 @@ from typing import Callable, List
 
 from .steamcmd_mods import DAYZ_APPID
 from .steam_ugc_backend import (
+    active_ugc_session,
     activate_ugc_session,
     deactivate_ugc_session,
     run_ugc_install,
@@ -141,8 +142,15 @@ def run_steam_client_install(
 
     log("[Steam UGC] Backend enabled")
     log(f"[Steam UGC] Checking/updating {total} required Workshop item(s)")
+    owns_ugc_session_activation = False
     if ugc_session is not None:
-        activate_ugc_session(ugc_session)
+        current_session = active_ugc_session()
+        if current_session is None:
+            activate_ugc_session(ugc_session)
+            owns_ugc_session_activation = True
+        elif current_session is not ugc_session:
+            # Preserve the fail-closed different-session ownership rule.
+            activate_ugc_session(ugc_session)
     try:
         ok = run_ugc_install(
             ids,
@@ -156,7 +164,7 @@ def run_steam_client_install(
             timeout=STEAM_CLIENT_STALL_TIMEOUT_S,
         )
     finally:
-        if ugc_session is not None:
+        if owns_ugc_session_activation:
             deactivate_ugc_session(ugc_session)
     if ok:
         log("[Steam UGC] Finished")
