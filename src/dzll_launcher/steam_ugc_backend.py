@@ -367,16 +367,16 @@ class UGCHelperReapError(RuntimeError):
         session = self._recovery_session
         if session is not None:
             try:
-                session._finalize_confirmed_reap_recovery()
+                finalized = bool(session._finalize_confirmed_reap_recovery())
             except Exception as exc:
                 logger.warning(
                     "Steam UGC helper exited but local recovery cleanup was incomplete: %s",
                     exc,
                 )
-            finally:
-                deactivate_ugc_session(session)
-                self._recovery_session = None
-        self._recovery_process = None
+            else:
+                if finalized:
+                    self._recovery_session = None
+                    self._recovery_process = None
         return True
 
 
@@ -412,16 +412,27 @@ def activate_ugc_session(session) -> None:
     if getattr(_ACTIVE_UGC_SESSION, "value", None) is not None:
         raise UGCSessionError("a Steam UGC session is already active on this worker")
     _ACTIVE_UGC_SESSION.value = session
+
+
+def deactivate_ugc_session(session) -> bool:
+    if getattr(_ACTIVE_UGC_SESSION, "value", None) is not session:
+        return False
+    _ACTIVE_UGC_SESSION.value = None
+    return True
+
+
+def register_owned_ugc_session(session) -> None:
+    """Record a cooperative session whose resources DZLL still owns."""
+
     with _ACTIVE_UGC_SESSIONS_LOCK:
         _ACTIVE_UGC_SESSIONS.add(session)
 
 
-def deactivate_ugc_session(session, *, retain_for_recovery: bool = False) -> None:
-    if getattr(_ACTIVE_UGC_SESSION, "value", None) is session:
-        _ACTIVE_UGC_SESSION.value = None
-    if not retain_for_recovery:
-        with _ACTIVE_UGC_SESSIONS_LOCK:
-            _ACTIVE_UGC_SESSIONS.discard(session)
+def unregister_owned_ugc_session(session) -> None:
+    """Forget a cooperative session after confirmed resource teardown."""
+
+    with _ACTIVE_UGC_SESSIONS_LOCK:
+        _ACTIVE_UGC_SESSIONS.discard(session)
 
 
 def active_ugc_session():
@@ -439,33 +450,27 @@ def close_active_ugc_sessions() -> list[str]:
             session.close()
         except Exception as exc:
             close_error = exc
-        finally:
-            with _ACTIVE_UGC_SESSIONS_LOCK:
-                _ACTIVE_UGC_SESSIONS.discard(session)
-        proc = getattr(session, "_proc", None)
-        process_reaped = proc is None
-        if proc is not None:
-            try:
-                process_reaped = proc.poll() is not None
-            except Exception:
-                process_reaped = False
-        readers_reaped = True
-        for thread in (
-            getattr(session, "_stdout_thread", None),
-            getattr(session, "_stderr_thread", None),
-        ):
-            if thread is not None and thread.is_alive():
-                readers_reaped = False
-                break
-        if close_error is not None and process_reaped and readers_reaped:
+        try:
+            resources_released = bool(
+                session._owned_resources_release_confirmed()
+            )
+        except Exception:
+            resources_released = False
+        if resources_released:
+            unregister_owned_ugc_session(session)
+        if close_error is not None and resources_released:
             eprint(
                 "[Steam UGC] Recovery retained helper shutdown diagnostic: "
                 f"{close_error}"
             )
         elif close_error is not None:
             errors.append(str(close_error))
-        elif not process_reaped or not readers_reaped:
+        elif not resources_released:
             errors.append("Steam UGC helper could not be confirmed reaped")
+    with _ACTIVE_UGC_SESSIONS_LOCK:
+        remaining_sessions = list(_ACTIVE_UGC_SESSIONS)
+    if remaining_sessions and not errors:
+        errors.append("Steam UGC helper cleanup remains incomplete")
     return errors
 
 
@@ -562,6 +567,9 @@ class CooperativeUGCSession:
         self._shutdown_complete = False
         self._stdin_closed = False
         self._read_pipes_closed = False
+        self._temp_cleanup_complete = True
+        self._owned_resources_released = False
+        self._teardown_error = None
         self._fatal = False
         self._active_request_id = ""
         self._abandoned_request_ids: set[str] = set()
@@ -701,6 +709,7 @@ class CooperativeUGCSession:
             )
         if event.get("type") == "session_starting":
             self._temp_dir = str(event.get("temp_dir") or "")
+            self._temp_cleanup_complete = not bool(self._temp_dir)
         if event.get("type") == "session_ready":
             self._ready = True
         if event.get("type") == "fatal_session_error":
@@ -735,6 +744,7 @@ class CooperativeUGCSession:
         if self._read_pipes_closed:
             return
         proc = self._proc
+        errors = []
         for stream in (
             getattr(proc, "stdout", None),
             getattr(proc, "stderr", None),
@@ -743,8 +753,12 @@ class CooperativeUGCSession:
             if callable(close):
                 try:
                     close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    errors.append(exc)
+        if errors:
+            raise UGCSessionError(
+                "; ".join(str(error) for error in errors)
+            )
         self._read_pipes_closed = True
 
     def _wait_until_ready(self, *, timeout: float | None, cancel_event=None) -> bool:
@@ -976,6 +990,7 @@ class CooperativeUGCSession:
     def _cleanup_temp_dir(self) -> None:
         path_text = str(self._temp_dir or "")
         if not path_text:
+            self._temp_cleanup_complete = True
             return
         path = Path(path_text)
         temp_root = Path(tempfile.gettempdir()).resolve()
@@ -990,44 +1005,130 @@ class CooperativeUGCSession:
             shutil.rmtree(path)
         if path.exists():
             raise UGCSessionError("temporary Steam AppID directory survived session cleanup")
+        self._temp_cleanup_complete = True
 
-    def close(self) -> None:
-        # Signal first so an in-flight command observes cancellation, then wait
-        # for its exactly-once finalization before beginning shutdown.
-        self._close_requested.set()
+    def _mark_owned_resources_released_locked(self) -> bool:
+        if self._owned_resources_released:
+            return True
+        proc = self._proc
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    return False
+            except Exception:
+                return False
+            if not self._stdin_closed or not self._read_pipes_closed:
+                return False
+        for thread in (self._stdout_thread, self._stderr_thread):
+            if thread is not None and thread.is_alive():
+                return False
+        if not self._temp_cleanup_complete:
+            return False
+        self._owned_resources_released = True
+        return True
+
+    def _owned_resources_release_confirmed(self) -> bool:
+        """Return authoritative process/reader/local cleanup completion."""
+
         with self._close_lock:
-            if self._closed:
-                return
-            with self._request_lock:
-                if self._closed:
-                    return
-                self._closed = True
-                try:
-                    self._close_session()
-                except UGCHelperReapError as exc:
-                    exc.bind_session(self)
-                    raise
+            return bool(self._owned_resources_released)
 
-    def _finalize_confirmed_reap_recovery(self) -> None:
-        """Best-effort local cleanup after the retained Process is confirmed dead."""
-
+    def _finalize_owned_recovery_if_confirmed_locked(self) -> bool:
+        if self._owned_resources_released:
+            return True
+        proc = self._proc
+        if proc is not None:
+            try:
+                if proc.poll() is None:
+                    return False
+            except Exception:
+                return False
         errors = []
         for cleanup in (self._close_stdin, self._close_read_pipes):
             try:
                 cleanup()
             except Exception as exc:
                 errors.append(exc)
+        surviving_readers = []
         for thread in (self._stdout_thread, self._stderr_thread):
             if thread is not None and thread.is_alive():
                 thread.join(timeout=0.0)
+                if thread.is_alive():
+                    surviving_readers.append(thread)
         try:
             self._cleanup_temp_dir()
         except Exception as exc:
             errors.append(exc)
+        if surviving_readers:
+            errors.append(UGCSessionError(
+                "Steam UGC helper reader cleanup remains incomplete"
+            ))
         if errors:
-            raise UGCSessionError(
-                "; ".join(str(error) for error in errors)
-            )
+            raise UGCSessionError("; ".join(str(error) for error in errors))
+        return self._mark_owned_resources_released_locked()
+
+    def close(self) -> None:
+        # Signal first so an in-flight command observes cancellation, then wait
+        # for its exactly-once finalization before beginning shutdown.
+        self._close_requested.set()
+        try:
+            with self._close_lock:
+                if self._owned_resources_released:
+                    return
+                if self._closed:
+                    try:
+                        finalized = self._finalize_owned_recovery_if_confirmed_locked()
+                    except Exception as exc:
+                        self._teardown_error = exc
+                        raise
+                    if finalized:
+                        self._teardown_error = None
+                        return
+                    if self._teardown_error is not None:
+                        raise self._teardown_error
+                    raise UGCSessionError(
+                        "Steam UGC session resource teardown is not confirmed"
+                    )
+                with self._request_lock:
+                    if self._closed:
+                        return
+                    self._closed = True
+                    try:
+                        self._close_session()
+                    except UGCHelperReapError as exc:
+                        self._teardown_error = exc.bind_session(self)
+                        self._mark_owned_resources_released_locked()
+                        raise
+                    except Exception as exc:
+                        self._teardown_error = exc
+                        self._mark_owned_resources_released_locked()
+                        raise
+                    if not self._mark_owned_resources_released_locked():
+                        self._teardown_error = UGCSessionError(
+                            "Steam UGC session resource teardown is not confirmed"
+                        )
+                        raise self._teardown_error
+                    self._teardown_error = None
+        finally:
+            if self._owned_resources_release_confirmed():
+                unregister_owned_ugc_session(self)
+
+    def _finalize_confirmed_reap_recovery(self) -> bool:
+        """Best-effort local cleanup after the retained Process is confirmed dead."""
+
+        try:
+            with self._close_lock:
+                try:
+                    finalized = self._finalize_owned_recovery_if_confirmed_locked()
+                except Exception as exc:
+                    self._teardown_error = exc
+                    raise
+                if finalized:
+                    self._teardown_error = None
+                return bool(finalized)
+        finally:
+            if self._owned_resources_release_confirmed():
+                unregister_owned_ugc_session(self)
 
     def _close_session(self) -> None:
         proc = self._proc

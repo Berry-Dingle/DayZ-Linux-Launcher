@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dzll_launcher import mods_ui, settings_ui
+from dzll_launcher import mods_ui, settings_ui, steam_ugc_backend
 from dzll_launcher.mods_ui import InventoryValidity, ModsManagerOverlay
 from dzll_launcher.settings_ui import SettingsUI
 from dzll_launcher.steam_native import SteamClientState, SteamRuntimeEvidence
@@ -235,6 +235,104 @@ def test_continue_orders_shutdown_reset_launch_readiness_and_open(monkeypatch):
         "Waiting for Steam login…",
         "Opening Mod Manager…",
     ]
+
+
+def test_recovery_blocks_native_start_for_owned_unconfirmed_helper(monkeypatch):
+    class Process:
+        alive = True
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None if self.alive else 0
+
+    ui = _ui_gate()
+    failures = []
+    old_cancel = threading.Event()
+    ui._win._steamcmd_cancel_event = old_cancel
+    ui._win._background_prepare_ui_generation = 0
+    ui._win._background_prepare_controller = None
+    ui._mods_mgr_overlay = None
+    ui._finish_flatpak_recovery_failure = (
+        lambda _generation, _cancel, message: failures.append(message)
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    process = Process()
+    close_calls = []
+    session._proc = process
+
+    def fail_close():
+        close_calls.append("close")
+        raise steam_ugc_backend.UGCHelperReapError(
+            "owned helper still alive", process=process,
+        )
+
+    session._close_session = fail_close
+    steam_ugc_backend.register_owned_ugc_session(session)
+    steam_ugc_backend.activate_ugc_session(session)
+    inner_done = threading.Event()
+
+    def inner():
+        steam_ugc_backend.activate_ugc_session(session)
+        assert steam_ugc_backend.deactivate_ugc_session(session)
+        inner_done.set()
+
+    inner_worker = threading.Thread(target=inner)
+    inner_worker.start()
+    assert inner_done.wait(2)
+    inner_worker.join(timeout=2)
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    monkeypatch.setattr(
+        settings_ui, "resolve_steam_runtime_state",
+        lambda: SteamRuntimeEvidence(SteamClientState.OFFLINE),
+    )
+    monkeypatch.setattr(
+        settings_ui, "launch_native_steam",
+        lambda: pytest.fail("native Steam must remain blocked"),
+    )
+    _install_immediate_threads(monkeypatch)
+    try:
+        assert ui._start_flatpak_mod_manager_recovery()
+        assert old_cancel.is_set()
+        assert close_calls == ["close"]
+        assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        assert failures == ["DZLL could not reset Steam. Retry."]
+    finally:
+        process.alive = False
+        session.close()
+        steam_ugc_backend.deactivate_ugc_session(session)
+        steam_ugc_backend.unregister_owned_ugc_session(session)
+
+
+def test_recovery_may_start_native_after_owned_session_closes(monkeypatch):
+    ui = _ui_gate()
+    events = []
+    ui._win._steamcmd_cancel_event = threading.Event()
+    ui._win._background_prepare_ui_generation = 0
+    ui._win._background_prepare_controller = None
+    ui._mods_mgr_overlay = None
+    ui._finish_flatpak_recovery_failure = (
+        lambda _generation, _cancel, message: events.append(("failure", message))
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    steam_ugc_backend.register_owned_ugc_session(session)
+    monkeypatch.setattr(
+        settings_ui, "resolve_steam_runtime_state",
+        lambda: SteamRuntimeEvidence(SteamClientState.OFFLINE),
+    )
+
+    def launch():
+        assert session._owned_resources_release_confirmed()
+        assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        events.append("launch")
+        return False, "deliberate test stop"
+
+    monkeypatch.setattr(settings_ui, "launch_native_steam", launch)
+    _install_immediate_threads(monkeypatch)
+    assert ui._start_flatpak_mod_manager_recovery()
+    assert events[0] == "launch"
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
 
 
 def test_shutdown_timeout_keeps_manager_closed_and_offers_retry(monkeypatch):

@@ -25,7 +25,9 @@ from .steam_ugc_backend import (
     cleanup_cancelled_ugc_subscriptions,
     deactivate_ugc_session,
     query_ugc_state_checked,
+    register_owned_ugc_session,
     refresh_subscribed_ugc_state_checked,
+    unregister_owned_ugc_session,
     ugc_item_ready,
     wait_for_ugc_ready,
 )
@@ -204,6 +206,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             ugc_session = CooperativeUGCSession(
                 cancel_event=operation_cancel_event,
             )
+            register_owned_ugc_session(ugc_session)
             activate_ugc_session(ugc_session)
         if attempt_id:
             win._join_log(attempt_id, "chosen backend", backend="Steam client UGC" if backend == "steam_client" else "SteamCMD")
@@ -940,9 +943,11 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
 
     ugc_shutdown_confirmed = False
     if ugc_session is not None:
-        retain_ugc_recovery = False
         try:
             ugc_session.close()
+            # CooperativeUGCSession owns this transition; keep the caller-side
+            # discard as an idempotent compatibility guard for session doubles.
+            unregister_owned_ugc_session(ugc_session)
             ugc_shutdown_confirmed = True
             if attempt_id:
                 win._join_log(
@@ -952,11 +957,6 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                     cancelled=bool(operation_cancel_event.is_set()),
                 )
         except UGCHelperReapError as exc:
-            retain_ugc_recovery = bool(exc.helper_process_may_be_alive)
-            deactivate_ugc_session(
-                ugc_session,
-                retain_for_recovery=retain_ugc_recovery,
-            )
             raise
         except Exception as exc:
             secondary_error = f"Steam UGC session shutdown failed: {exc}"
@@ -975,8 +975,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
             # operation failure, and do not turn confirmed preparation success
             # into a false failure solely because teardown diagnostics failed.
         finally:
-            if not retain_ugc_recovery:
-                deactivate_ugc_session(ugc_session)
+            deactivate_ugc_session(ugc_session)
     if operation_cancel_event.is_set():
         with cancel_cleanup_lock:
             deferred_cleanup_ids = sorted(cancel_cleanup_ids)

@@ -281,6 +281,7 @@ def test_parent_reuses_one_helper_for_multiple_commands_and_cleans_temp(monkeypa
 
     monkeypatch.setattr(steam_ugc_backend.subprocess, "Popen", popen)
     session = steam_ugc_backend.CooperativeUGCSession()
+    steam_ugc_backend.register_owned_ugc_session(session)
     steam_ugc_backend.activate_ugc_session(session)
     events = []
     try:
@@ -318,6 +319,8 @@ def test_parent_reuses_one_helper_for_multiple_commands_and_cleans_temp(monkeypa
     assert not appid_dir.exists()
     assert processes[0].signals == []
     assert processes[0].stdin_closed
+    assert session._owned_resources_release_confirmed()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
     assert [event["id"] for event in events if event.get("type") == "item"] == [1, 2, 2, 2, 2]
 
 
@@ -1039,6 +1042,67 @@ def test_stop_waiting_wrapper_preserves_outer_session_across_fresh_worker(
         assert steam_ugc_backend.active_ugc_session() is session
     finally:
         steam_ugc_backend.deactivate_ugc_session(session)
+
+
+def test_stop_waiting_inner_deactivation_preserves_owned_session(monkeypatch):
+    from dzll_launcher.window import DZLLWindow
+
+    session = steam_ugc_backend.CooperativeUGCSession()
+    stop_waiting = threading.Event()
+    inner_started = threading.Event()
+    release_inner = threading.Event()
+    inner_deactivated = threading.Event()
+    original_deactivate = steam_client_mods.deactivate_ugc_session
+
+    def install(_ids, **_kwargs):
+        inner_started.set()
+        assert release_inner.wait(2)
+        return False
+
+    def observed_deactivate(active_session):
+        result = original_deactivate(active_session)
+        if active_session is session:
+            inner_deactivated.set()
+        return result
+
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", install)
+    monkeypatch.setattr(
+        steam_client_mods, "deactivate_ugc_session", observed_deactivate,
+    )
+    host = SimpleNamespace(
+        _steam_client_stop_waiting_event=stop_waiting,
+        _run_steam_client_install_impl=steam_client_mods.run_steam_client_install,
+    )
+    steam_ugc_backend.register_owned_ugc_session(session)
+    steam_ugc_backend.activate_ugc_session(session)
+
+    def request_stop():
+        assert inner_started.wait(2)
+        stop_waiting.set()
+
+    stopper = threading.Thread(target=request_stop)
+    stopper.start()
+    try:
+        assert not DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host,
+            workshop_dir="/unused",
+            mod_ids=[7],
+            ugc_session=session,
+            stop_waiting_event=stop_waiting,
+        )
+        assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        assert not inner_deactivated.is_set()
+        release_inner.set()
+        assert inner_deactivated.wait(2)
+        assert steam_ugc_backend.active_ugc_session() is session
+        assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        session.close()
+        assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    finally:
+        release_inner.set()
+        stopper.join(timeout=2)
+        steam_ugc_backend.deactivate_ugc_session(session)
+        steam_ugc_backend.unregister_owned_ugc_session(session)
 
 
 class ObservedStopWaitingEvent:
@@ -2089,15 +2153,16 @@ def test_unconfirmed_session_ownership_is_retained_until_process_recovery():
 
         def _finalize_confirmed_reap_recovery(self):
             self.finalized += 1
+            steam_ugc_backend.unregister_owned_ugc_session(self)
+            return True
 
     session = Session()
+    steam_ugc_backend.register_owned_ugc_session(session)
     steam_ugc_backend.activate_ugc_session(session)
     error = steam_ugc_backend.UGCHelperReapError(
         "unconfirmed", process=session._proc,
     ).bind_session(session)
-    steam_ugc_backend.deactivate_ugc_session(
-        session, retain_for_recovery=True,
-    )
+    steam_ugc_backend.deactivate_ugc_session(session)
     assert steam_ugc_backend.active_ugc_session() is None
     assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
     assert not error.finalize_confirmed_recovery()
@@ -2105,6 +2170,424 @@ def test_unconfirmed_session_ownership_is_retained_until_process_recovery():
     assert error.finalize_confirmed_recovery()
     assert session.finalized == 1
     assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+
+def test_routing_deactivation_does_not_change_process_ownership():
+    session = object()
+    inner_active = threading.Event()
+    release_inner = threading.Event()
+    inner_done = threading.Event()
+    observations = []
+    steam_ugc_backend.register_owned_ugc_session(session)
+    steam_ugc_backend.activate_ugc_session(session)
+
+    def inner():
+        steam_ugc_backend.activate_ugc_session(session)
+        observations.append(steam_ugc_backend.active_ugc_session() is session)
+        inner_active.set()
+        assert release_inner.wait(2)
+        observations.append(steam_ugc_backend.deactivate_ugc_session(session))
+        inner_done.set()
+
+    worker = threading.Thread(target=inner)
+    worker.start()
+    try:
+        assert inner_active.wait(2)
+        assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        release_inner.set()
+        assert inner_done.wait(2)
+        assert steam_ugc_backend.active_ugc_session() is session
+        assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        assert observations == [True, True]
+    finally:
+        release_inner.set()
+        worker.join(timeout=2)
+        steam_ugc_backend.deactivate_ugc_session(session)
+        steam_ugc_backend.unregister_owned_ugc_session(session)
+
+
+def test_wrong_session_deactivation_is_safe_routing_noop():
+    active = object()
+    other = object()
+    steam_ugc_backend.register_owned_ugc_session(active)
+    steam_ugc_backend.register_owned_ugc_session(other)
+    steam_ugc_backend.activate_ugc_session(active)
+    try:
+        assert not steam_ugc_backend.deactivate_ugc_session(other)
+        assert steam_ugc_backend.active_ugc_session() is active
+        assert active in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        assert other in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(active)
+        steam_ugc_backend.unregister_owned_ugc_session(active)
+        steam_ugc_backend.unregister_owned_ugc_session(other)
+
+
+def test_owned_never_started_session_close_is_idempotent():
+    session = steam_ugc_backend.CooperativeUGCSession()
+    steam_ugc_backend.register_owned_ugc_session(session)
+    session.close()
+    assert session._owned_resources_release_confirmed()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    session.close()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+
+def test_failed_close_is_not_success_merely_because_closed_flag_is_set():
+    class Process:
+        alive = True
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None if self.alive else 0
+
+    session = steam_ugc_backend.CooperativeUGCSession()
+    process = Process()
+    session._proc = process
+
+    def fail_close():
+        raise steam_ugc_backend.UGCHelperReapError(
+            "unconfirmed owned helper", process=process,
+        )
+
+    session._close_session = fail_close
+    steam_ugc_backend.register_owned_ugc_session(session)
+    with pytest.raises(steam_ugc_backend.UGCHelperReapError):
+        session.close()
+    assert session._closed
+    assert not session._owned_resources_release_confirmed()
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    with pytest.raises(steam_ugc_backend.UGCHelperReapError):
+        session.close()
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+    process.alive = False
+    session.close()
+    assert session._owned_resources_release_confirmed()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+
+def test_dead_process_reader_and_temp_failures_retain_until_retry(
+        monkeypatch):
+    class Process:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        @staticmethod
+        def poll():
+            return 0
+
+    class Reader:
+        alive = True
+
+        def join(self, timeout):
+            assert timeout == 0.0
+
+        def is_alive(self):
+            return self.alive
+
+    session = steam_ugc_backend.CooperativeUGCSession()
+    reader = Reader()
+    session._proc = Process()
+    session._closed = True
+    session._stdout_thread = reader
+    steam_ugc_backend.register_owned_ugc_session(session)
+    with pytest.raises(steam_ugc_backend.UGCSessionError, match="reader cleanup"):
+        session.close()
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+    reader.alive = False
+    temp_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_owned_retry_"))
+    session._temp_dir = str(temp_dir)
+    session._temp_cleanup_complete = False
+    original_rmtree = steam_ugc_backend.shutil.rmtree
+    monkeypatch.setattr(steam_ugc_backend.shutil, "rmtree", lambda _path: None)
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError,
+        match="temporary Steam AppID directory survived",
+    ):
+        session.close()
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+    monkeypatch.setattr(steam_ugc_backend.shutil, "rmtree", original_rmtree)
+    session.close()
+    assert session._owned_resources_release_confirmed()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert not temp_dir.exists()
+
+
+def test_resource_complete_close_diagnostic_releases_ownership():
+    class Process:
+        returncode = 1
+
+        @staticmethod
+        def poll():
+            return 1
+
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._proc = Process()
+
+    def diagnostic_close():
+        session._stdin_closed = True
+        session._read_pipes_closed = True
+        session._temp_cleanup_complete = True
+        raise steam_ugc_backend.UGCSessionError("shutdown protocol diagnostic")
+
+    session._close_session = diagnostic_close
+    steam_ugc_backend.register_owned_ugc_session(session)
+    with pytest.raises(
+        steam_ugc_backend.UGCSessionError, match="shutdown protocol diagnostic",
+    ):
+        session.close()
+    assert session._owned_resources_release_confirmed()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+
+def test_failed_retained_finalization_keeps_owned_session(monkeypatch):
+    class Process:
+        alive = True
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None if self.alive else 0
+
+    session = steam_ugc_backend.CooperativeUGCSession()
+    process = Process()
+    session._proc = process
+    session._closed = True
+    temp_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_retained_retry_"))
+    session._temp_dir = str(temp_dir)
+    session._temp_cleanup_complete = False
+    error = steam_ugc_backend.UGCHelperReapError(
+        "retained helper", process=process,
+    ).bind_session(session)
+    steam_ugc_backend.register_owned_ugc_session(session)
+    process.alive = False
+    original_rmtree = steam_ugc_backend.shutil.rmtree
+    monkeypatch.setattr(steam_ugc_backend.shutil, "rmtree", lambda _path: None)
+    assert error.finalize_confirmed_recovery()
+    assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert not session._owned_resources_release_confirmed()
+
+    monkeypatch.setattr(steam_ugc_backend.shutil, "rmtree", original_rmtree)
+    session.close()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert not temp_dir.exists()
+
+
+def test_global_closer_removes_success_and_retains_unconfirmed_session():
+    class Process:
+        alive = True
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None if self.alive else 0
+
+    success = steam_ugc_backend.CooperativeUGCSession()
+    failed = steam_ugc_backend.CooperativeUGCSession()
+    process = Process()
+    failed_close_calls = []
+    failed._proc = process
+    failed._close_session = lambda: (
+        failed_close_calls.append("close"),
+        (_ for _ in ()).throw(steam_ugc_backend.UGCHelperReapError(
+            "global unconfirmed helper", process=process,
+        )),
+    )
+    steam_ugc_backend.register_owned_ugc_session(success)
+    steam_ugc_backend.register_owned_ugc_session(failed)
+    errors = steam_ugc_backend.close_active_ugc_sessions()
+    assert success not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert failed in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert any("global unconfirmed helper" in error for error in errors)
+    retry_errors = steam_ugc_backend.close_active_ugc_sessions()
+    assert failed in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert retry_errors
+    assert failed_close_calls == ["close"]
+
+    process.alive = False
+    assert steam_ugc_backend.close_active_ugc_sessions() == []
+    assert failed not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+
+def test_gate_and_registry_recovery_finalize_owned_resources_once():
+    from dzll_launcher.background_prepare import PreparationOperationGate
+
+    class Process:
+        stdin = None
+        stdout = None
+        stderr = None
+
+        @staticmethod
+        def poll():
+            return 0
+
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._proc = Process()
+    session._closed = True
+    session._temp_cleanup_complete = False
+    calls = {"stdin": 0, "pipes": 0, "temp": 0}
+
+    def close_stdin():
+        if not session._stdin_closed:
+            calls["stdin"] += 1
+            session._stdin_closed = True
+
+    def close_pipes():
+        if not session._read_pipes_closed:
+            calls["pipes"] += 1
+            session._read_pipes_closed = True
+
+    def clean_temp():
+        if not session._temp_cleanup_complete:
+            calls["temp"] += 1
+            session._temp_cleanup_complete = True
+
+    session._close_stdin = close_stdin
+    session._close_read_pipes = close_pipes
+    session._cleanup_temp_dir = clean_temp
+    error = steam_ugc_backend.UGCHelperReapError(
+        "concurrent recovery", process=session._proc,
+    ).bind_session(session)
+    steam_ugc_backend.register_owned_ugc_session(session)
+    gate = PreparationOperationGate()
+    lease = gate.try_acquire("foreground_join")
+    assert gate.mark_reap_failure(lease, error)
+    start = threading.Barrier(3)
+    results = []
+
+    def recover_gate():
+        start.wait()
+        results.append(gate.try_recover_reap_failure())
+
+    def recover_registry():
+        start.wait()
+        results.append(steam_ugc_backend.close_active_ugc_sessions() == [])
+
+    gate_worker = threading.Thread(target=recover_gate)
+    registry_worker = threading.Thread(target=recover_registry)
+    gate_worker.start()
+    registry_worker.start()
+    start.wait()
+    gate_worker.join(timeout=2)
+    registry_worker.join(timeout=2)
+    assert not gate_worker.is_alive() and not registry_worker.is_alive()
+    assert results.count(True) == 2
+    assert calls == {"stdin": 1, "pipes": 1, "temp": 1}
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+
+
+def test_same_session_borrow_and_different_rejection_do_not_change_ownership(
+        monkeypatch):
+    owned = object()
+    rejected = object()
+    steam_ugc_backend.register_owned_ugc_session(owned)
+    steam_ugc_backend.register_owned_ugc_session(rejected)
+    monkeypatch.setattr(
+        steam_client_mods, "run_ugc_install", lambda *_args, **_kwargs: True,
+    )
+    steam_ugc_backend.activate_ugc_session(owned)
+    try:
+        before = set(steam_ugc_backend._ACTIVE_UGC_SESSIONS)
+        assert steam_client_mods.run_steam_client_install(
+            workshop_dir="/unused", mod_ids=[7], ugc_session=owned,
+        )
+        assert set(steam_ugc_backend._ACTIVE_UGC_SESSIONS) == before
+        with pytest.raises(steam_ugc_backend.UGCSessionError):
+            steam_client_mods.run_steam_client_install(
+                workshop_dir="/unused", mod_ids=[7], ugc_session=rejected,
+            )
+        assert steam_ugc_backend.active_ugc_session() is owned
+        assert set(steam_ugc_backend._ACTIVE_UGC_SESSIONS) == before
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(owned)
+        steam_ugc_backend.unregister_owned_ugc_session(owned)
+        steam_ugc_backend.unregister_owned_ugc_session(rejected)
+
+
+def test_registry_snapshot_cannot_lose_session_to_inner_deactivation():
+    session = steam_ugc_backend.CooperativeUGCSession()
+    inner_active = threading.Event()
+    deactivate_started = threading.Event()
+    inner_deactivated = threading.Event()
+    recovery_started = threading.Event()
+    recovery_done = threading.Event()
+    recovery_result = []
+    steam_ugc_backend.register_owned_ugc_session(session)
+    steam_ugc_backend.activate_ugc_session(session)
+
+    def inner():
+        steam_ugc_backend.activate_ugc_session(session)
+        inner_active.set()
+        deactivate_started.wait()
+        assert steam_ugc_backend.deactivate_ugc_session(session)
+        inner_deactivated.set()
+
+    def recover():
+        recovery_started.set()
+        recovery_result.append(steam_ugc_backend.close_active_ugc_sessions())
+        recovery_done.set()
+
+    inner_worker = threading.Thread(target=inner)
+    recovery_worker = threading.Thread(target=recover)
+    inner_worker.start()
+    assert inner_active.wait(2)
+    steam_ugc_backend._ACTIVE_UGC_SESSIONS_LOCK.acquire()
+    try:
+        recovery_worker.start()
+        assert recovery_started.wait(2)
+        deactivate_started.set()
+        assert inner_deactivated.wait(2)
+        assert session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    finally:
+        steam_ugc_backend._ACTIVE_UGC_SESSIONS_LOCK.release()
+    assert recovery_done.wait(2)
+    inner_worker.join(timeout=2)
+    recovery_worker.join(timeout=2)
+    assert recovery_result == [[]]
+    assert session._owned_resources_release_confirmed()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert steam_ugc_backend.active_ugc_session() is session
+    steam_ugc_backend.deactivate_ugc_session(session)
+
+
+def test_registry_snapshot_racing_successful_close_is_idempotent():
+    close_entered = threading.Event()
+    release_registry_close = threading.Event()
+
+    class Session(steam_ugc_backend.CooperativeUGCSession):
+        def close(self):
+            if threading.current_thread().name == "registry-recovery":
+                close_entered.set()
+                assert release_registry_close.wait(2)
+            return super().close()
+
+    session = Session()
+    steam_ugc_backend.register_owned_ugc_session(session)
+    errors = []
+
+    def recover():
+        errors.extend(steam_ugc_backend.close_active_ugc_sessions())
+
+    recovery_worker = threading.Thread(
+        target=recover, name="registry-recovery",
+    )
+    recovery_worker.start()
+    assert close_entered.wait(2)
+    session.close()
+    assert session not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    release_registry_close.set()
+    recovery_worker.join(timeout=2)
+    assert not recovery_worker.is_alive()
+    assert errors == []
+    assert session._owned_resources_release_confirmed()
 
 
 def test_native_and_python_diagnostics_cannot_enter_protocol_stdout():

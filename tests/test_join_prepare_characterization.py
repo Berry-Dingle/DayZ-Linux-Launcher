@@ -556,6 +556,7 @@ def test_terminal_cancel_race_exports_before_close_then_fresh_cleanup(
 def test_cancel_skips_fresh_cleanup_without_confirmed_shutdown(monkeypatch):
     class FailedSession:
         def close(self):
+            steam_ugc_backend.unregister_owned_ugc_session(self)
             raise RuntimeError("shutdown not confirmed")
 
     monkeypatch.setattr(
@@ -801,6 +802,7 @@ def test_ugc_teardown_error_is_secondary_to_operation_or_confirmed_success(
             pass
 
         def close(self):
+            steam_ugc_backend.unregister_owned_ugc_session(self)
             raise RuntimeError("synthetic teardown failure")
 
     monkeypatch.setattr(join_prepare, "CooperativeUGCSession", TeardownFailingSession)
@@ -849,7 +851,8 @@ def ugc_state(*, installed=True, needs_update=False, downloading=False, pending=
 def run_terminal_validation_route(
         monkeypatch, *, mods, initial_states, terminal_results,
         backend_results=(), final_missing=None, background=False,
-        refresh_details=None, initial_ok=True, backend_install=None):
+        refresh_details=None, initial_ok=True, backend_install=None,
+        ownership_probe=None):
     win = CharacterizationHarness(
         initial_missing=[],
         final_missing=list(final_missing or []),
@@ -872,6 +875,8 @@ def run_terminal_validation_route(
         nonlocal checked_call_count
         phase = "initial_query" if checked_call_count == 0 else "terminal_query"
         checked_call_count += 1
+        if callable(ownership_probe):
+            ownership_probe(phase)
         trace.append((phase, tuple(ids)))
         assert checked_results
         return checked_results.pop(0)
@@ -882,6 +887,8 @@ def run_terminal_validation_route(
 
     def install(**kwargs):
         assert kwargs.pop("stop_waiting_event") is win._steam_client_stop_waiting_event
+        if callable(ownership_probe):
+            ownership_probe("backend")
         trace.append(("backend", tuple(kwargs["mod_ids"])))
         if callable(backend_install):
             return bool(backend_install(kwargs))
@@ -1042,6 +1049,82 @@ def test_single_retry_uses_only_unresolved_ids_then_validates_every_original_id(
     ]
     assert len(retry_events) == 1
     assert win.launches == 1
+
+
+def test_owned_session_is_continuous_through_terminal_validation_and_retry(
+        monkeypatch):
+    registered = []
+    ownership_phases = []
+    transitions = {"register": 0, "unregister": 0}
+    original_register = steam_ugc_backend.register_owned_ugc_session
+    original_unregister = steam_ugc_backend.unregister_owned_ugc_session
+
+    def register(session):
+        was_owned = session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        original_register(session)
+        registered.append(session)
+        transitions["register"] += int(not was_owned)
+
+    def unregister(session):
+        was_owned = session in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        original_unregister(session)
+        transitions["unregister"] += int(was_owned)
+
+    def probe(phase):
+        assert len(registered) == 1
+        assert registered[0] in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        ownership_phases.append(phase)
+
+    monkeypatch.setattr(join_prepare, "register_owned_ugc_session", register)
+    monkeypatch.setattr(join_prepare, "unregister_owned_ugc_session", unregister)
+    monkeypatch.setattr(
+        steam_ugc_backend, "unregister_owned_ugc_session", unregister,
+    )
+    win, trace, _outcome = run_terminal_validation_route(
+        monkeypatch,
+        mods=[(101, "Required")],
+        initial_states={101: ugc_state(needs_update=True)},
+        backend_results=[True, True],
+        terminal_results=[
+            (True, {101: ugc_state(needs_update=True)}),
+            (True, {101: ugc_state()}),
+        ],
+        ownership_probe=probe,
+    )
+    assert ownership_phases == [
+        "initial_query", "backend", "terminal_query", "backend",
+        "terminal_query",
+    ]
+    assert [item for item in trace if item[0] == "backend"] == [
+        ("backend", (101,)), ("backend", (101,)),
+    ]
+    assert transitions == {"register": 1, "unregister": 1}
+    assert registered[0] not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+    assert win.launches == 1
+
+
+def test_outer_activation_failure_closes_owned_session_without_clearing_other(
+        monkeypatch):
+    other = object()
+    registered = []
+    original_register = join_prepare.register_owned_ugc_session
+
+    def register(session):
+        registered.append(session)
+        original_register(session)
+
+    monkeypatch.setattr(join_prepare, "register_owned_ugc_session", register)
+    steam_ugc_backend.activate_ugc_session(other)
+    try:
+        _win, outcome = prepare_characterized(monkeypatch)
+        assert outcome.status is PreparationStatus.FAILED
+        assert "already active" in str(outcome.error)
+        assert len(registered) == 1
+        assert registered[0]._owned_resources_release_confirmed()
+        assert registered[0] not in steam_ugc_backend._ACTIVE_UGC_SESSIONS
+        assert steam_ugc_backend.active_ugc_session() is other
+    finally:
+        steam_ugc_backend.deactivate_ugc_session(other)
 
 
 @pytest.mark.parametrize(
