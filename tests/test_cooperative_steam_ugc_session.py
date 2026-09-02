@@ -1041,6 +1041,344 @@ def test_stop_waiting_wrapper_preserves_outer_session_across_fresh_worker(
         steam_ugc_backend.deactivate_ugc_session(session)
 
 
+class ObservedStopWaitingEvent:
+    def __init__(self, *, pause_first_unset_read=False):
+        self._event = threading.Event()
+        self.pause_first_unset_read = bool(pause_first_unset_read)
+        self.first_unset_read = threading.Event()
+        self.release_first_unset_read = threading.Event()
+        self.any_read = threading.Event()
+        self.set_read = threading.Event()
+        self.read_count = 0
+
+    def set(self):
+        self._event.set()
+
+    def is_set(self):
+        self.read_count += 1
+        self.any_read.set()
+        snapshot = self._event.is_set()
+        if (
+            self.pause_first_unset_read
+            and self.read_count == 1
+            and not snapshot
+        ):
+            self.first_unset_read.set()
+            self.release_first_unset_read.wait()
+        if snapshot:
+            self.set_read.set()
+        return snapshot
+
+
+def test_stop_waiting_wrapper_keeps_e1_after_window_field_replacement():
+    from dzll_launcher.window import DZLLWindow
+
+    e1 = ObservedStopWaitingEvent(pause_first_unset_read=True)
+    e2 = ObservedStopWaitingEvent()
+    operation_cancel = threading.Event()
+    inner_started = threading.Event()
+    inner_saw_cancel = threading.Event()
+    release_inner_teardown = threading.Event()
+    inner_finished = threading.Event()
+    wrapper_returned = threading.Event()
+    result = []
+
+    def install(*_args, cancel_event, **_kwargs):
+        assert cancel_event is operation_cancel
+        inner_started.set()
+        cancel_event.wait()
+        inner_saw_cancel.set()
+        release_inner_teardown.wait()
+        inner_finished.set()
+        return False
+
+    host = SimpleNamespace(
+        _steam_client_stop_waiting_event=e1,
+        _run_steam_client_install_impl=install,
+    )
+
+    def invoke_wrapper():
+        result.append(DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host,
+            cancel_event=operation_cancel,
+            stop_waiting_event=e1,
+        ))
+        wrapper_returned.set()
+
+    wrapper = threading.Thread(target=invoke_wrapper)
+    wrapper.start()
+    assert inner_started.wait(2)
+    assert e1.first_unset_read.wait(2)
+
+    operation_cancel.set()
+    e1.set()
+    host._steam_client_stop_waiting_event = e2
+    assert host._steam_client_stop_waiting_event is e2
+    assert inner_saw_cancel.wait(2)
+    e1.release_first_unset_read.set()
+
+    assert e1.set_read.wait(2)
+    assert wrapper_returned.wait(2)
+    wrapper.join()
+    assert result == [False]
+    assert not release_inner_teardown.is_set()
+    assert e1.read_count == 2
+    assert e2.read_count == 0
+    assert operation_cancel.is_set()
+
+    release_inner_teardown.set()
+    assert inner_finished.wait(2)
+
+
+def test_stop_waiting_wrapper_good_ordering_returns_before_replacement():
+    from dzll_launcher.window import DZLLWindow
+
+    e1 = ObservedStopWaitingEvent()
+    e2 = ObservedStopWaitingEvent()
+    inner_started = threading.Event()
+    release_inner_teardown = threading.Event()
+    inner_finished = threading.Event()
+    wrapper_returned = threading.Event()
+    result = []
+
+    def install(*_args, **_kwargs):
+        inner_started.set()
+        release_inner_teardown.wait()
+        inner_finished.set()
+        return False
+
+    host = SimpleNamespace(
+        _steam_client_stop_waiting_event=e1,
+        _run_steam_client_install_impl=install,
+    )
+    e1.set()
+
+    def invoke_wrapper():
+        result.append(DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host, stop_waiting_event=e1,
+        ))
+        wrapper_returned.set()
+
+    wrapper = threading.Thread(target=invoke_wrapper)
+    wrapper.start()
+    assert inner_started.wait(2)
+    assert e1.set_read.wait(2)
+    assert wrapper_returned.wait(2)
+    wrapper.join()
+
+    host._steam_client_stop_waiting_event = e2
+    assert result == [False]
+    assert e1.read_count == 1
+    assert e2.read_count == 0
+    assert not release_inner_teardown.is_set()
+    release_inner_teardown.set()
+    assert inner_finished.wait(2)
+
+
+def test_stop_waiting_wrapper_isolates_attempt_e1_from_attempt_e2():
+    from dzll_launcher.window import DZLLWindow
+
+    e1 = ObservedStopWaitingEvent()
+    e2 = ObservedStopWaitingEvent()
+    started = {"A": threading.Event(), "B": threading.Event()}
+    release_inner = {"A": threading.Event(), "B": threading.Event()}
+    inner_finished = {"A": threading.Event(), "B": threading.Event()}
+    returned = {"A": threading.Event(), "B": threading.Event()}
+    results = {}
+
+    def install(*_args, attempt, **_kwargs):
+        started[attempt].set()
+        release_inner[attempt].wait()
+        inner_finished[attempt].set()
+        return False
+
+    host = SimpleNamespace(
+        _steam_client_stop_waiting_event=e1,
+        _run_steam_client_install_impl=install,
+    )
+
+    def invoke(attempt, stop_event):
+        results[attempt] = DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host, attempt=attempt, stop_waiting_event=stop_event,
+        )
+        returned[attempt].set()
+
+    wrapper_a = threading.Thread(target=invoke, args=("A", e1))
+    wrapper_a.start()
+    assert started["A"].wait(2)
+
+    host._steam_client_stop_waiting_event = e2
+    wrapper_b = threading.Thread(target=invoke, args=("B", e2))
+    wrapper_b.start()
+    assert started["B"].wait(2)
+    assert e2.any_read.wait(2)
+
+    e1.set()
+    assert returned["A"].wait(2)
+    wrapper_a.join()
+    assert not returned["B"].is_set()
+    assert e2.read_count > 0
+
+    e2.set()
+    assert returned["B"].wait(2)
+    wrapper_b.join()
+    assert results == {"A": False, "B": False}
+    assert e1.set_read.is_set()
+    assert e2.set_read.is_set()
+
+    release_inner["A"].set()
+    release_inner["B"].set()
+    assert inner_finished["A"].wait(2)
+    assert inner_finished["B"].wait(2)
+
+
+def test_stop_waiting_wrapper_preserves_foreground_gate_until_outer_finishes():
+    from dzll_launcher.background_prepare import preparation_operation_gate
+    from dzll_launcher.join_attempt import JoinAttemptTracker
+    from dzll_launcher.join_preparation_busy import shared_join_preparation_busy
+    from dzll_launcher.window import DZLLWindow
+
+    e1 = ObservedStopWaitingEvent()
+    e2 = ObservedStopWaitingEvent()
+    operation_cancel = threading.Event()
+    inner_started = threading.Event()
+    release_inner_teardown = threading.Event()
+    inner_finished = threading.Event()
+    wrapper_returned = threading.Event()
+    outer_finished = threading.Event()
+
+    attempts = JoinAttemptTracker(log_sink=lambda _line: None)
+    attempt_a = attempts.begin(
+        ip="127.0.0.1", game_port=2302, query_port=27016, name="A",
+    )
+
+    def install(*_args, cancel_event, **_kwargs):
+        inner_started.set()
+        cancel_event.wait()
+        release_inner_teardown.wait()
+        inner_finished.set()
+        return False
+
+    host = SimpleNamespace(
+        _join_attempts=attempts,
+        _steam_client_stop_waiting_event=e1,
+        _run_steam_client_install_impl=install,
+    )
+    gate = preparation_operation_gate(host)
+    lease = gate.try_acquire("foreground_join")
+    assert lease is not None
+
+    def outer_worker():
+        assert not DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host,
+            cancel_event=operation_cancel,
+            stop_waiting_event=e1,
+        )
+        wrapper_returned.set()
+        inner_finished.wait()
+        assert gate.release(lease)
+        outer_finished.set()
+
+    outer = threading.Thread(target=outer_worker)
+    outer.start()
+    assert inner_started.wait(2)
+    assert e1.any_read.wait(2)
+
+    operation_cancel.set()
+    e1.set()
+    assert attempts.cleanup(attempt_a.attempt_id, "stop waiting/cancel")
+    host._steam_client_stop_waiting_event = e2
+
+    assert wrapper_returned.wait(2)
+    assert gate.active_owner == "foreground_join"
+    assert shared_join_preparation_busy(host)
+    assert e2.read_count == 0
+
+    release_inner_teardown.set()
+    assert outer_finished.wait(2)
+    outer.join()
+    assert not shared_join_preparation_busy(host)
+    attempt_b = attempts.begin(
+        ip="127.0.0.2", game_port=2302, query_port=27017, name="B",
+    )
+    assert attempt_b is not None
+    assert attempt_b.attempt_id != attempt_a.attempt_id
+
+
+def test_shutdown_cancels_active_wrapper_without_stop_event_swap_hang():
+    from dzll_launcher.join_attempt import JoinAttemptTracker
+    from dzll_launcher.window import DZLLWindow
+
+    e1 = ObservedStopWaitingEvent()
+    e2 = ObservedStopWaitingEvent()
+    operation_cancel = threading.Event()
+    inner_started = threading.Event()
+    inner_saw_cancel = threading.Event()
+    release_inner_teardown = threading.Event()
+    wrapper_returned = threading.Event()
+    result = []
+    attempts = JoinAttemptTracker(log_sink=lambda _line: None)
+    attempts.begin(
+        ip="127.0.0.1", game_port=2302, query_port=27016, name="A",
+    )
+
+    def install(*_args, cancel_event, **_kwargs):
+        assert cancel_event is operation_cancel
+        inner_started.set()
+        cancel_event.wait()
+        inner_saw_cancel.set()
+        release_inner_teardown.wait()
+        return False
+
+    host = SimpleNamespace(
+        _shutdown_cleanup_done=False,
+        _background_prepare_ui_generation=0,
+        _preparation_reap_recovery_source_id=0,
+        _background_prepare_queue=None,
+        _background_prepare_controller=None,
+        _scroll_drag_light=None,
+        _discord=None,
+        _join_attempts=attempts,
+        _join_popup_item_activity=SimpleNamespace(
+            clear_attempt=lambda _attempt_id: None,
+        ),
+        _steamcmd_cancel_event=operation_cancel,
+        _steam_client_stop_waiting_event=e1,
+        _run_steam_client_install_impl=install,
+        _finish_start_steam_join_consent=lambda *_args, **_kwargs: False,
+        _clear_join_pending_state=lambda _attempt_id: True,
+    )
+
+    def invoke_wrapper():
+        result.append(DZLLWindow._run_steam_client_install_with_stop_waiting(
+            host,
+            cancel_event=operation_cancel,
+            stop_waiting_event=e1,
+        ))
+        wrapper_returned.set()
+
+    wrapper = threading.Thread(target=invoke_wrapper)
+    wrapper.start()
+    assert inner_started.wait(2)
+    assert e1.any_read.wait(2)
+    host._steam_client_stop_waiting_event = e2
+
+    DZLLWindow._shutdown_cleanup(host)
+
+    assert host._shutdown_cleanup_done
+    assert operation_cancel.is_set()
+    assert inner_saw_cancel.wait(2)
+    assert attempts.active is None
+    assert e1.set_read.is_set() is False
+    assert e2.read_count == 0
+    assert wrapper_returned.is_set() is False
+
+    release_inner_teardown.set()
+    assert wrapper_returned.wait(2)
+    wrapper.join()
+    assert result == [False]
+
+
 def test_helper_environment_scrubs_inherited_app_identity(monkeypatch):
     monkeypatch.setenv("SteamAppId", "999")
     monkeypatch.setenv("SteamGameId", "999")

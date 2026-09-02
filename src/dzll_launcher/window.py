@@ -2308,7 +2308,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             print(f"[Steam client] Failed to open Steam Downloads: {e}", flush=True)
         return None
 
-    def _run_steam_client_install_with_stop_waiting(self, *args, **kwargs):
+    def _run_steam_client_install_with_stop_waiting(
+            self, *args, stop_waiting_event=None, **kwargs):
+        if stop_waiting_event is None:
+            stop_waiting_event = self._steam_client_stop_waiting_event
         done = threading.Event()
         result = {"ok": False}
 
@@ -2324,7 +2327,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         while not done.is_set():
             try:
-                if self._steam_client_stop_waiting_event.is_set():
+                if stop_waiting_event.is_set():
                     return False
             except Exception:
                 pass

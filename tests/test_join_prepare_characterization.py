@@ -161,6 +161,7 @@ class CharacterizationHarness:
         self.events.append(("steamcmd_line", line))
 
     def run_steam_client_install(self, **kwargs):
+        assert kwargs["stop_waiting_event"] is self._steam_client_stop_waiting_event
         self.events.append(("steam_client", tuple(kwargs["mod_ids"])))
         if self.cancelled:
             self._steamcmd_cancel_event.set()
@@ -880,6 +881,7 @@ def run_terminal_validation_route(
         return ok, states, dict(refresh_details or {})
 
     def install(**kwargs):
+        assert kwargs.pop("stop_waiting_event") is win._steam_client_stop_waiting_event
         trace.append(("backend", tuple(kwargs["mod_ids"])))
         if callable(backend_install):
             return bool(backend_install(kwargs))

@@ -149,6 +149,9 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
         if cancel_event is not None
         else win._steamcmd_cancel_event
     )
+    stop_waiting_event = getattr(
+        win, "_steam_client_stop_waiting_event", None,
+    )
 
     def deliver_event(event):
         if is_operation_current():
@@ -680,6 +683,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                                 workshop_dir=effective_workshop_dir,
                                 mod_ids=download_ids,
                                 cancel_event=operation_cancel_event,
+                                stop_waiting_event=stop_waiting_event,
                                 state_cb=_steam_client_state,
                                 progress_cb=_steam_ugc_progress,
                                 handoff_cb=collect_cancel_cleanup_handoff,
@@ -839,6 +843,7 @@ def prepare_required_mods(win, mods, workshop_dir, steamcmd_path, steam_user, va
                             workshop_dir=effective_workshop_dir,
                             mod_ids=unresolved_ids,
                             cancel_event=operation_cancel_event,
+                            stop_waiting_event=stop_waiting_event,
                             state_cb=_retry_state,
                             progress_cb=_retry_progress,
                             handoff_cb=collect_cancel_cleanup_handoff,
