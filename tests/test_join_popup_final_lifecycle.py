@@ -306,6 +306,9 @@ class SessionWatcherHarness(LifecycleHarness):
         super().__init__(skip_launcher=skip_launcher)
         self._discord_watch_lock = threading.Lock()
         self._discord_watch_active = False
+        self._discord_watch_generation = 0
+        self._discord_committed_watch_generation = None
+        self._dayz_watch_shutdown_event = threading.Event()
         self._discord = None
         self._steamcmd_cancel_event = threading.Event()
         self._steam_client_stop_waiting_event = threading.Event()
@@ -344,12 +347,12 @@ class SessionWatcherHarness(LifecycleHarness):
         return window_module.DZLLWindow._cleanup_active_join_attempt(self, reason)
 
 
-def run_session_watcher(monkeypatch, harness, clock):
+def run_session_watcher(monkeypatch, harness, clock, attempt_id=None):
     monkeypatch.setattr(window_module.time, "time", clock.time)
     monkeypatch.setattr(window_module.time, "monotonic", clock.monotonic)
     monkeypatch.setattr(window_module.time, "sleep", clock.sleep)
     window_module.DZLLWindow._watch_dayz_session_until_exit(
-        harness, harness.attempt.attempt_id,
+        harness, harness.attempt.attempt_id if attempt_id is None else attempt_id,
     )
 
 
@@ -509,3 +512,282 @@ def test_stale_launcher_watcher_cannot_clean_new_attempt(monkeypatch):
     assert harness._join_attempts.active is replacement[0]
     assert harness.errors == []
     assert harness.cleanup_reasons == []
+
+
+class PostDetectionBarrier(threading.Event):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def wait(self, _timeout):
+        self.entered.set()
+        return self.release.wait(2.0)
+
+    def is_set(self):
+        return self.release.is_set()
+
+    def set(self):
+        self.release.set()
+
+
+def test_post_detection_monitor_does_not_block_new_watcher(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=True, launcher_results=[False], game_results=[True],
+    )
+    barrier = PostDetectionBarrier()
+    harness._dayz_watch_shutdown_event = barrier
+    watcher_a = threading.Thread(
+        target=window_module.DZLLWindow._watch_dayz_session_until_exit,
+        args=(harness, harness.attempt.attempt_id), daemon=True,
+    )
+    watcher_a.start()
+    assert barrier.entered.wait(2.0)
+    assert harness._join_attempts.active is None
+    assert harness._discord_watch_active is False
+
+    attempt_b = harness._join_attempts.begin(
+        ip="127.0.0.2", game_port=2402, query_port=27017,
+        name="Second", skip_dayz_launcher=True,
+    )
+    assert attempt_b is not None
+    harness._pending_join_attempt_id = attempt_b.attempt_id
+
+    started = threading.Event()
+    finished = threading.Event()
+    seen_ids = []
+    original_watcher = window_module.DZLLWindow._watch_dayz_session_until_exit
+
+    def run_b(attempt_id):
+        seen_ids.append(attempt_id)
+        started.set()
+        try:
+            original_watcher(harness, attempt_id)
+        finally:
+            finished.set()
+
+    harness._watch_dayz_session_until_exit = run_b
+    monkeypatch.setattr(
+        window_module.DZLLWindow, "_watch_dayz_session_until_exit", run_b,
+    )
+    window_module.DZLLWindow._start_dayz_session_watch(
+        harness, attempt_id=attempt_b.attempt_id,
+    )
+    assert started.wait(2.0)
+    assert seen_ids == [attempt_b.attempt_id]
+
+    barrier.set()
+    watcher_a.join(2.0)
+    assert finished.wait(2.0)
+    assert not watcher_a.is_alive()
+    assert harness._join_attempts.active is None
+    assert harness._discord_watch_active is False
+
+
+def test_stale_post_detection_discord_reset_cannot_overwrite_newer_watcher(
+        monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=True, launcher_results=[False], game_results=[True, False],
+    )
+    queued = []
+    monkeypatch.setattr(
+        window_module.GLib, "idle_add",
+        lambda callback, *args: queued.append((callback, args)) or 1,
+    )
+
+    window_module.DZLLWindow._watch_dayz_session_until_exit(
+        harness, harness.attempt.attempt_id,
+    )
+
+    reset_callbacks = [callback for callback, _args in queued
+                       if callback.__name__ == "reset_discord_if_current"]
+    assert len(reset_callbacks) == 1
+    with harness._discord_watch_lock:
+        harness._discord_committed_watch_generation = 2
+    assert reset_callbacks[0]() is False
+
+
+def test_shutdown_interrupts_post_detection_monitor_without_reset_callback():
+    harness = SessionWatcherHarness(
+        skip_launcher=True, launcher_results=[False], game_results=[True],
+    )
+    shutdown = PostDetectionBarrier()
+    harness._dayz_watch_shutdown_event = shutdown
+    watcher = threading.Thread(
+        target=window_module.DZLLWindow._watch_dayz_session_until_exit,
+        args=(harness, harness.attempt.attempt_id), daemon=True,
+    )
+    watcher.start()
+    assert shutdown.entered.wait(2.0)
+    harness._shutdown_cleanup_done = True
+    shutdown.set()
+    watcher.join(2.0)
+    assert not watcher.is_alive()
+    assert harness._join_attempts.active is None
+
+
+class DiscordAuthorityProbe:
+    def __init__(self):
+        self._mode = "menus"
+        self.state = "menus"
+        self.menu_resets = 0
+        self.playing_updates = 0
+
+    def update(self):
+        self.state = self._mode
+        if self._mode == "ingame":
+            self.playing_updates += 1
+
+    def set_menu(self):
+        self._mode = "menus"
+        self.state = "menus"
+        self.menu_resets += 1
+
+
+def _authority_harness(*, game_results):
+    harness = SessionWatcherHarness(
+        skip_launcher=True, launcher_results=[False], game_results=game_results,
+    )
+    harness.settings = {"discord_detail_level": "ingame"}
+    harness._discord = DiscordAuthorityProbe()
+    return harness
+
+
+def _cancel_attempt_before_next_poll(harness, attempt_id):
+    assert harness._cleanup_join_attempt(attempt_id, "synthetic cancellation")
+
+
+def test_cancelled_provisional_watcher_preserves_committed_owner(monkeypatch):
+    harness = _authority_harness(game_results=[True, False])
+    queued = []
+    monkeypatch.setattr(
+        window_module.GLib, "idle_add",
+        lambda callback, *args: queued.append((callback, args)) or 1,
+    )
+    run_session_watcher(monkeypatch, harness, WatcherClock([]))
+    for callback, args in queued:
+        if callback.__name__ == "apply":
+            callback(*args)
+    assert harness._discord.state == "ingame"
+    assert harness._discord_committed_watch_generation == 1
+
+    attempt_b = harness._join_attempts.begin(
+        ip="127.0.0.2", game_port=2402, query_port=27017,
+        name="B", skip_dayz_launcher=True,
+    )
+    assert attempt_b is not None
+    harness._pending_join_attempt_id = attempt_b.attempt_id
+    harness.game_results = [False]
+
+    reset_a = next(callback for callback, _args in queued
+                   if callback.__name__ == "reset_discord_if_current")
+
+    def reset_a_while_b_is_provisional(_clock):
+        reset_a()
+        _cancel_attempt_before_next_poll(harness, attempt_b.attempt_id)
+
+    clock = WatcherClock(
+        [1.0],
+        before_sleep=reset_a_while_b_is_provisional,
+    )
+    run_session_watcher(monkeypatch, harness, clock, attempt_b.attempt_id)
+
+    assert harness._discord_committed_watch_generation is None
+    assert harness._discord.state == "menus"
+    assert harness._discord.menu_resets == 1
+    assert harness._join_attempts.active is None
+
+
+def test_successful_new_watcher_commits_and_supersedes_old_owner(monkeypatch):
+    harness = _authority_harness(game_results=[True, False])
+    queued = []
+    monkeypatch.setattr(
+        window_module.GLib, "idle_add",
+        lambda callback, *args: queued.append((callback, args)) or 1,
+    )
+    run_session_watcher(monkeypatch, harness, WatcherClock([]))
+    assert harness._discord_committed_watch_generation == 1
+
+    attempt_b = harness._join_attempts.begin(
+        ip="127.0.0.2", game_port=2402, query_port=27017,
+        name="B", skip_dayz_launcher=True,
+    )
+    assert attempt_b is not None
+    harness._pending_join_attempt_id = attempt_b.attempt_id
+    harness.game_results = [True, False]
+    run_session_watcher(monkeypatch, harness, WatcherClock([]), attempt_b.attempt_id)
+    assert harness._discord_committed_watch_generation == 2
+
+    resets = [callback for callback, _args in queued
+              if callback.__name__ == "reset_discord_if_current"]
+    assert len(resets) == 2
+    resets[0]()
+    assert harness._discord.menu_resets == 0
+    resets[1]()
+    assert harness._discord.menu_resets == 1
+    assert harness._discord_committed_watch_generation is None
+
+
+def test_cancelled_watcher_without_prior_owner_leaves_no_discord_authority(
+        monkeypatch):
+    harness = _authority_harness(game_results=[False])
+    clock = WatcherClock(
+        [1.0],
+        before_sleep=lambda _clock: _cancel_attempt_before_next_poll(
+            harness, harness.attempt.attempt_id,
+        ),
+    )
+    run_session_watcher(monkeypatch, harness, clock)
+    assert harness._discord_committed_watch_generation is None
+    assert harness._discord.state == "menus"
+    assert harness._discord.menu_resets == 0
+
+
+def test_cancelled_provisional_then_successful_third_watcher(monkeypatch):
+    harness = _authority_harness(game_results=[True, False])
+    queued = []
+    monkeypatch.setattr(
+        window_module.GLib, "idle_add",
+        lambda callback, *args: queued.append((callback, args)) or 1,
+    )
+    run_session_watcher(monkeypatch, harness, WatcherClock([]))
+    assert harness._discord_committed_watch_generation == 1
+
+    attempt_b = harness._join_attempts.begin(
+        ip="127.0.0.2", game_port=2402, query_port=27017,
+        name="B", skip_dayz_launcher=True,
+    )
+    assert attempt_b is not None
+    harness._pending_join_attempt_id = attempt_b.attempt_id
+    harness.game_results = [False]
+    run_session_watcher(
+        monkeypatch,
+        harness,
+        WatcherClock(
+            [1.0],
+            before_sleep=lambda _clock: _cancel_attempt_before_next_poll(
+                harness, attempt_b.attempt_id,
+            ),
+        ),
+        attempt_b.attempt_id,
+    )
+    assert harness._discord_committed_watch_generation == 1
+
+    attempt_c = harness._join_attempts.begin(
+        ip="127.0.0.3", game_port=2502, query_port=28017,
+        name="C", skip_dayz_launcher=True,
+    )
+    assert attempt_c is not None
+    harness._pending_join_attempt_id = attempt_c.attempt_id
+    harness.game_results = [True, False]
+    run_session_watcher(monkeypatch, harness, WatcherClock([]), attempt_c.attempt_id)
+    assert harness._discord_committed_watch_generation == 3
+
+    resets = [callback for callback, _args in queued
+              if callback.__name__ == "reset_discord_if_current"]
+    assert len(resets) == 2
+    resets[0]()
+    assert harness._discord.menu_resets == 0
+    resets[1]()
+    assert harness._discord.menu_resets == 1
+    assert harness._discord_committed_watch_generation is None

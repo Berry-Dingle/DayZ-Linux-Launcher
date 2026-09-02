@@ -906,6 +906,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         self._discord_watch_lock = threading.Lock()
         self._discord_watch_active = False
+        self._discord_watch_generation = 0
+        self._discord_committed_watch_generation = None
+        self._dayz_watch_shutdown_event = threading.Event()
 
         # ----------------------------
         # SteamCMD AUTH OVERLAY (3-line layout)
@@ -3052,6 +3055,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
         self._shutdown_cleanup_done = True
+        try:
+            self._dayz_watch_shutdown_event.set()
+        except Exception:
+            pass
         try:
             self._finish_start_steam_join_consent(False, always=False)
         except Exception:
@@ -10146,9 +10153,49 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if self._discord_watch_active:
                     return
                 self._discord_watch_active = True
+                self._discord_watch_generation = int(
+                    getattr(self, "_discord_watch_generation", 0) or 0
+                ) + 1
+                watch_generation = self._discord_watch_generation
         except Exception:
             # If locking fails for any reason, fail-open (still try to run)
-            pass
+            watch_generation = None
+
+        def queue_discord_watcher_callback(callback):
+            try:
+                with self._discord_watch_lock:
+                    scheduled_owner = getattr(
+                        self, "_discord_committed_watch_generation", None,
+                    )
+            except Exception:
+                scheduled_owner = None
+
+            def apply():
+                shutdown_event = getattr(self, "_dayz_watch_shutdown_event", None)
+                if (
+                    bool(getattr(self, "_shutdown_cleanup_done", False))
+                    or isinstance(shutdown_event, threading.Event)
+                    and shutdown_event.is_set()
+                ):
+                    return False
+                try:
+                    with self._discord_watch_lock:
+                        current_owner = getattr(
+                            self, "_discord_committed_watch_generation", None,
+                        )
+                        if scheduled_owner is None:
+                            if current_owner is not None:
+                                return False
+                        elif (
+                            current_owner != scheduled_owner
+                            or watch_generation != scheduled_owner
+                        ):
+                            return False
+                    callback()
+                except Exception:
+                    pass
+                return False
+            return apply
 
         try:
             active = self._join_attempts.active
@@ -10215,7 +10262,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if saw_launcher and not skip_launcher and not launcher_running:
                     try:
                         if getattr(self, "_discord", None):
-                            GLib.idle_add(self._discord.set_menu)
+                            GLib.idle_add(
+                                queue_discord_watcher_callback(self._discord.set_menu)
+                            )
                     except Exception:
                         pass
                     if attempt_id:
@@ -10230,7 +10279,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if elapsed >= 120.0 and not (saw_launcher and not skip_launcher):
                     try:
                         if getattr(self, "_discord", None):
-                            GLib.idle_add(self._discord.set_menu)
+                            GLib.idle_add(
+                                queue_discord_watcher_callback(self._discord.set_menu)
+                            )
                     except Exception:
                         pass
                     if attempt_id:
@@ -10303,13 +10354,36 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._pending_join_attempt_id = 0
                 self._cleanup_join_attempt(attempt_id, "DayZ detected", clear_pending=False)
 
+            # Starting a watcher creates only provisional authority.  A watcher
+            # becomes the Discord owner only after it has actually detected DayZ.
+            try:
+                with self._discord_watch_lock:
+                    self._discord_committed_watch_generation = watch_generation
+            except Exception:
+                pass
+
+            # Phase 1 owns launch/detection only.  Phase 2 continues monitoring
+            # this game's process, but must not block a later Join watcher.
+            try:
+                with self._discord_watch_lock:
+                    if (
+                        watch_generation is None
+                        or int(getattr(self, "_discord_watch_generation", 0) or 0)
+                        == int(watch_generation)
+                    ):
+                        self._discord_watch_active = False
+            except Exception:
+                pass
+
             # GAME STARTED -> set Discord "playing" state according to user setting
             try:
                 if getattr(self, "_discord", None):
                     detail = str(self.settings.get("discord_detail_level", "menus") or "menus").strip().lower()
 
                     if detail == "menus":
-                        GLib.idle_add(self._discord.set_menu)
+                        GLib.idle_add(
+                            queue_discord_watcher_callback(self._discord.set_menu)
+                        )
 
                     elif detail == "ingame":
                         def _set_ingame():
@@ -10320,7 +10394,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                                 pass
                             return False
 
-                        GLib.idle_add(_set_ingame)
+                        GLib.idle_add(queue_discord_watcher_callback(_set_ingame))
 
                     else:
                         # detail == "server" (privacy handled inside discord_rpc.py)
@@ -10337,18 +10411,69 @@ class DZLLWindow(Gtk.ApplicationWindow):
                                 pass
                             return False
 
-                        GLib.idle_add(_set_server_from_info)
+                        GLib.idle_add(
+                            queue_discord_watcher_callback(_set_server_from_info)
+                        )
             except Exception:
                 pass
 
             # Wait until the actual game exits
             while self._dayz_process_snapshot().dayz_running:
-                time.sleep(5.0)
+                shutdown_event = getattr(self, "_dayz_watch_shutdown_event", None)
+                if isinstance(shutdown_event, threading.Event):
+                    if shutdown_event.wait(5.0):
+                        return
+                else:
+                    time.sleep(5.0)
 
             # GAME EXITED -> reset presence
             try:
-                if getattr(self, "_discord", None):
-                    GLib.idle_add(self._discord.set_menu)
+                shutdown_event = getattr(self, "_dayz_watch_shutdown_event", None)
+                if (
+                    bool(getattr(self, "_shutdown_cleanup_done", False))
+                    or isinstance(shutdown_event, threading.Event)
+                    and shutdown_event.is_set()
+                ):
+                    return
+
+                with self._discord_watch_lock:
+                    if (
+                        watch_generation is None
+                        or getattr(
+                            self, "_discord_committed_watch_generation", None,
+                        ) != watch_generation
+                    ):
+                        return
+                    scheduled_owner = watch_generation
+
+                def reset_discord_if_current(
+                        generation=scheduled_owner,
+                        shutdown_event=shutdown_event):
+                    if bool(getattr(self, "_shutdown_cleanup_done", False)):
+                        return False
+                    if (
+                        isinstance(shutdown_event, threading.Event)
+                        and shutdown_event.is_set()
+                    ):
+                        return False
+                    try:
+                        with self._discord_watch_lock:
+                            if getattr(
+                                self, "_discord_committed_watch_generation", None,
+                            ) != generation:
+                                return False
+                            self._discord_committed_watch_generation = None
+                    except Exception:
+                        return False
+                    try:
+                        discord = getattr(self, "_discord", None)
+                        if discord:
+                            discord.set_menu()
+                    except Exception:
+                        pass
+                    return False
+
+                GLib.idle_add(reset_discord_if_current)
             except Exception:
                 pass
 
@@ -10356,7 +10481,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             # Always release the watcher flag
             try:
                 with self._discord_watch_lock:
-                    self._discord_watch_active = False
+                    if (
+                        watch_generation is None
+                        or int(getattr(self, "_discord_watch_generation", 0) or 0)
+                        == int(watch_generation)
+                    ):
+                        self._discord_watch_active = False
             except Exception:
                 pass
 
