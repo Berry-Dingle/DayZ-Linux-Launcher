@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dzll_launcher import steam_native, steam_ugc_backend
+from dzll_launcher import join_prepare, steam_native, steam_ugc_backend
 from dzll_launcher import window as window_module
 from dzll_launcher.background_prepare import (
     BackgroundConsentResult,
@@ -14,6 +14,7 @@ from dzll_launcher.background_prepare import (
     BackgroundServerPreparationSnapshot,
     SingleServerBackgroundPreparation,
 )
+from dzll_launcher.preparation_contracts import PreparationStatus
 
 
 class ConsentHarness:
@@ -217,6 +218,188 @@ def test_wait_only_readiness_cancel_is_prompt_and_launches_nothing(monkeypatch):
     assert time.monotonic() - started < 0.2
 
 
+def test_preset_cancelled_backend_allowed_starts_no_steam_or_ugc_work(monkeypatch):
+    cancel = threading.Event()
+    cancel.set()
+    calls = []
+    events = []
+
+    monkeypatch.setattr(
+        steam_native, "is_flatpak_steam_running",
+        lambda: calls.append("flatpak") or False,
+    )
+    monkeypatch.setattr(
+        steam_native, "resolve_native_steam_cmd",
+        lambda: calls.append("resolve") or "/native/steam",
+    )
+    monkeypatch.setattr(
+        steam_native, "is_native_steam_running",
+        lambda: calls.append("running") or False,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen",
+        lambda *_a, **_k: calls.append("popen") or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines",
+        lambda *_a, **_k: calls.append("helper") or (True, 0),
+    )
+
+    assert not steam_ugc_backend.wait_for_ugc_ready(
+        [7], cancel_event=cancel, launch_policy="backend_allowed",
+        progress_cb=events.append,
+    )
+    assert calls == []
+    assert events == [{
+        "backend": "steam_ugc",
+        "type": "preflight",
+        "message": "Steam startup cancelled.",
+        "ok": False,
+        "reason": "cancelled",
+        "error": True,
+    }]
+
+
+def test_preset_cancelled_already_running_skips_all_steam_queries(monkeypatch):
+    cancel = threading.Event()
+    cancel.set()
+    calls = []
+    events = []
+
+    monkeypatch.setattr(
+        steam_native, "is_flatpak_steam_running",
+        lambda: calls.append("flatpak") or False,
+    )
+    monkeypatch.setattr(
+        steam_native, "resolve_native_steam_cmd",
+        lambda: calls.append("resolve") or "/native/steam",
+    )
+    monkeypatch.setattr(
+        steam_native, "is_native_steam_running",
+        lambda: calls.append("running") or True,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines",
+        lambda *_a, **_k: calls.append("helper") or (True, 0),
+    )
+
+    assert not steam_ugc_backend.wait_for_ugc_ready(
+        [7], cancel_event=cancel, launch_policy="backend_allowed",
+        progress_cb=events.append,
+    )
+    assert calls == []
+    assert [event["message"] for event in events] == [
+        "Steam startup cancelled.",
+    ]
+
+
+def test_cancel_between_running_probe_and_backend_launch_starts_nothing(monkeypatch):
+    cancel = threading.Event()
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+    launches = []
+    events = []
+    results = []
+
+    monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
+    monkeypatch.setattr(steam_native, "resolve_native_steam_cmd", lambda: "/native/steam")
+
+    def running_probe():
+        probe_entered.set()
+        assert release_probe.wait(timeout=2.0)
+        return False
+
+    monkeypatch.setattr(steam_native, "is_native_steam_running", running_probe)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen",
+        lambda *_a, **_k: launches.append(1) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines",
+        lambda *_a, **_k: pytest.fail("cancelled preflight must not start UGC work"),
+    )
+
+    worker = threading.Thread(target=lambda: results.append(
+        steam_ugc_backend.wait_for_ugc_ready(
+            [7], cancel_event=cancel, launch_policy="backend_allowed",
+            progress_cb=events.append,
+        )
+    ))
+    worker.start()
+    assert probe_entered.wait(timeout=2.0)
+    cancel.set()
+    release_probe.set()
+    worker.join(timeout=2.0)
+
+    assert not worker.is_alive()
+    assert results == [False]
+    assert launches == []
+    assert [event["message"] for event in events] == [
+        "Starting Steam...", "Steam startup cancelled.",
+    ]
+
+
+def test_starting_progress_callback_can_cancel_before_backend_launch(monkeypatch):
+    cancel = threading.Event()
+    launches = []
+    events = []
+
+    monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
+    monkeypatch.setattr(steam_native, "resolve_native_steam_cmd", lambda: "/native/steam")
+    monkeypatch.setattr(steam_native, "is_native_steam_running", lambda: False)
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen",
+        lambda *_a, **_k: launches.append(1) or SimpleNamespace(),
+    )
+
+    def progress(event):
+        events.append(event)
+        if event.get("message") == "Starting Steam...":
+            cancel.set()
+
+    assert not steam_ugc_backend.wait_for_ugc_ready(
+        [7], cancel_event=cancel, launch_policy="backend_allowed",
+        progress_cb=progress,
+    )
+    assert launches == []
+    assert [event["message"] for event in events] == [
+        "Starting Steam...", "Steam startup cancelled.",
+    ]
+
+
+def test_cancel_immediately_after_backend_launch_stops_before_ugc_work(monkeypatch):
+    cancel = threading.Event()
+    process_actions = []
+    helper_calls = []
+
+    class StartedSteam:
+        def terminate(self):
+            process_actions.append("terminate")
+
+        def kill(self):
+            process_actions.append("kill")
+
+    def launch(_args, **_kwargs):
+        process_actions.append("launch")
+        cancel.set()
+        return StartedSteam()
+
+    monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
+    monkeypatch.setattr(steam_native, "resolve_native_steam_cmd", lambda: "/native/steam")
+    monkeypatch.setattr(steam_native, "is_native_steam_running", lambda: False)
+    monkeypatch.setattr(steam_ugc_backend.subprocess, "Popen", launch)
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines",
+        lambda command, **_kwargs: helper_calls.append(command) or (True, 0),
+    )
+
+    assert not steam_ugc_backend.run_ugc_install(
+        [7], cancel_event=cancel, launch_policy="backend_allowed",
+    )
+    assert process_actions == ["launch"]
+    assert helper_calls == []
+
+
 def test_direct_backend_launch_policy_still_launches(monkeypatch):
     monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
     monkeypatch.setattr(steam_native, "is_native_steam_running", lambda: False)
@@ -233,6 +416,84 @@ def test_direct_backend_launch_policy_still_launches(monkeypatch):
         [7], launch_policy="backend_allowed", timeout_s=1.0,
     )
     assert launches == [("/native/steam", "-silent")]
+
+
+def test_require_running_preflight_still_refuses_to_launch(monkeypatch):
+    launches = []
+    events = []
+    monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
+    monkeypatch.setattr(steam_native, "is_native_steam_running", lambda: False)
+    monkeypatch.setattr(steam_native, "resolve_native_steam_cmd", lambda: "/native/steam")
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen",
+        lambda *_a, **_k: launches.append(1) or SimpleNamespace(),
+    )
+
+    assert not steam_ugc_backend.wait_for_ugc_ready(
+        [7], launch_policy="require_running", progress_cb=events.append,
+    )
+    assert launches == []
+    assert events[-1]["reason"] == "native_steam_not_running"
+
+
+def test_background_cancel_before_shared_preflight_starts_no_steam(monkeypatch):
+    calls = []
+    host = SimpleNamespace(
+        GLib=SimpleNamespace(
+            idle_add=lambda callback, *args: callback(*args) or 1,
+        ),
+        threading=threading,
+        _join_attempts=SimpleNamespace(active=None),
+        _join_steam_start_allowed=False,
+        _steamcmd_cancel_event=threading.Event(),
+        _steamcmd_install_in_progress=False,
+        _mod_download_backend_active="",
+        compute_missing_mods=lambda *_a, **_k: [],
+        _join_log=lambda *_a, **_k: None,
+        _show_join_progress_overlay=lambda *_a, **_k: None,
+        _set_updating=lambda *_a, **_k: None,
+    )
+    controller = SingleServerBackgroundPreparation(host)
+
+    monkeypatch.setattr(join_prepare, "_choose_initial_workshop_dir", lambda *_a: "/workshop")
+    monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
+    monkeypatch.setattr(
+        steam_native, "is_flatpak_steam_running",
+        lambda: calls.append("flatpak") or False,
+    )
+    monkeypatch.setattr(
+        steam_native, "resolve_native_steam_cmd",
+        lambda: calls.append("resolve") or "/native/steam",
+    )
+    monkeypatch.setattr(
+        steam_native, "is_native_steam_running",
+        lambda: calls.append("running") or False,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen",
+        lambda *_a, **_k: calls.append("popen") or SimpleNamespace(),
+    )
+
+    def cancel_after_consent():
+        controller.cancel_event.set()
+        return BackgroundConsentResult(
+            BackgroundConsentStatus.ALLOWED,
+            backend_may_launch=True,
+        )
+
+    outcome = controller.run(
+        BackgroundServerPreparationSnapshot(
+            "127.0.0.1", 2302, 27016, "Server", ((7, "Mod"),),
+        ),
+        BackgroundPreparationRuntime(
+            "/workshop", "/steamcmd", "", False, False, True,
+            "steam_client", True, False,
+        ),
+        ensure_steam_consent=cancel_after_consent,
+    )
+
+    assert outcome.status is PreparationStatus.CANCELLED
+    assert calls == []
 
 
 class UnreapableProcess:

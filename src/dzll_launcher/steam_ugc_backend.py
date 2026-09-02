@@ -1454,6 +1454,13 @@ def _run_ugc_native_steam_preflight(
     launch_policy=None,
     timeout_s: float = UGC_PREFLIGHT_TIMEOUT_S,
 ) -> bool:
+    if cancel_event is not None and cancel_event.is_set():
+        _ugc_preflight_event(
+            progress_cb, "Steam startup cancelled.",
+            ok=False, reason="cancelled", error=True,
+        )
+        return False
+
     try:
         from .steam_native import is_flatpak_steam_running, is_native_steam_running, resolve_native_steam_cmd
     except Exception as exc:
@@ -1495,6 +1502,12 @@ def _run_ugc_native_steam_preflight(
             return False
         if policy is SteamLaunchPolicy.BACKEND_ALLOWED:
             _ugc_preflight_event(progress_cb, "Starting Steam...")
+            if cancel_event is not None and cancel_event.is_set():
+                _ugc_preflight_event(
+                    progress_cb, "Steam startup cancelled.",
+                    ok=False, reason="cancelled", error=True,
+                )
+                return False
             try:
                 subprocess.Popen(
                     [steam_cmd, "-silent"],

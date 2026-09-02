@@ -5,7 +5,12 @@ import threading
 
 import pytest
 
-from dzll_launcher import join_prepare, steam_ugc_backend
+from dzll_launcher import (
+    join_prepare,
+    steam_client_mods,
+    steam_native,
+    steam_ugc_backend,
+)
 from dzll_launcher import window as window_module
 from dzll_launcher.steamcmd_overlay_ui import SteamCMDOverlayUI
 from dzll_launcher.preparation_contracts import (
@@ -367,6 +372,50 @@ def test_backend_failure_or_cancel_never_reaches_symlinks_or_launch(
     assert win.launches == 0
     expected = "Mod download cancelled" if cancelled else "Mod download failed"
     assert any(expected in error for error in win.errors)
+
+
+def test_foreground_preset_cancel_stops_before_steam_links_and_launch(monkeypatch):
+    mod = (101, "Mod 101")
+    win = CharacterizationHarness(initial_missing=[mod])
+    win._steamcmd_cancel_event.set()
+    obj = SimpleNamespace(name="Cancelled", ip="127.0.0.1", gport=2302)
+    steam_calls = []
+
+    monkeypatch.setattr(join_prepare, "_choose_initial_workshop_dir", lambda *_a: "/workshop")
+    monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
+    monkeypatch.setattr(
+        steam_native, "is_flatpak_steam_running",
+        lambda: steam_calls.append("flatpak") or False,
+    )
+    monkeypatch.setattr(
+        steam_native, "resolve_native_steam_cmd",
+        lambda: steam_calls.append("resolve") or "/native/steam",
+    )
+    monkeypatch.setattr(
+        steam_native, "is_native_steam_running",
+        lambda: steam_calls.append("running") or False,
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen",
+        lambda *_a, **_k: steam_calls.append("popen") or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        steam_ugc_backend, "_run_helper_json_lines",
+        lambda *_a, **_k: steam_calls.append("helper") or (True, 0),
+    )
+
+    join_prepare.join_prepare_and_launch(
+        win, obj, [mod], "/workshop", "/steamcmd", "", False, False,
+        "/prefix", "/watch", True, "steam_client", True, False,
+        attempt_id=1,
+    )
+
+    assert steam_calls == []
+    assert not {
+        "steam_client", "symlinks", "preset", "launch",
+    } & set(event_names(win))
+    assert win.launches == 0
+    assert any("cancel" in error.lower() for error in win.errors)
 
 
 def test_cancel_closes_cooperative_context_before_fresh_cleanup(monkeypatch):
@@ -799,7 +848,7 @@ def ugc_state(*, installed=True, needs_update=False, downloading=False, pending=
 def run_terminal_validation_route(
         monkeypatch, *, mods, initial_states, terminal_results,
         backend_results=(), final_missing=None, background=False,
-        refresh_details=None, initial_ok=True):
+        refresh_details=None, initial_ok=True, backend_install=None):
     win = CharacterizationHarness(
         initial_missing=[],
         final_missing=list(final_missing or []),
@@ -832,6 +881,8 @@ def run_terminal_validation_route(
 
     def install(**kwargs):
         trace.append(("backend", tuple(kwargs["mod_ids"])))
+        if callable(backend_install):
+            return bool(backend_install(kwargs))
         assert backend_results
         result = backend_results.pop(0)
         if result == "cancel":
@@ -915,14 +966,25 @@ def test_outdated_mod_requires_fresh_terminal_currentness_before_launch(monkeypa
 def test_locally_present_mod_still_runs_steam_install_when_ugc_reports_update(
         monkeypatch):
     mod = (101, "Locally Present But Stale")
+    ugc_install_calls = []
+
+    def run_ugc_install(ids, **_kwargs):
+        ugc_install_calls.append(tuple(ids))
+        return True
+
+    monkeypatch.setattr(
+        steam_client_mods, "run_ugc_install", run_ugc_install,
+    )
     win, trace, _outcome = run_terminal_validation_route(
         monkeypatch,
         mods=[mod],
         # The harness reports no local filesystem miss. Steam remains
         # authoritative for whether the Workshop item needs update work.
         initial_states={101: ugc_state(needs_update=True)},
-        backend_results=[True],
         terminal_results=[(True, {101: ugc_state()})],
+        backend_install=lambda kwargs: (
+            steam_client_mods.run_steam_client_install(**kwargs)
+        ),
     )
 
     assert trace[:3] == [
@@ -930,6 +992,7 @@ def test_locally_present_mod_still_runs_steam_install_when_ugc_reports_update(
         ("backend", (101,)),
         ("terminal_query", (101,)),
     ]
+    assert ugc_install_calls == [(101,)]
     assert win.launches == 1
 
 
