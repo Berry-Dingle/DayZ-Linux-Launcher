@@ -500,6 +500,16 @@ def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
         return 0, ""
 
 
+def _db_advisory_text(value) -> str:
+    """Return one DB display string without manufacturing text from bad types."""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def _db_advisory_flag(value) -> bool:
+    """Accept the integer 0/1 representation used by the server database."""
+    return bool(value) if type(value) is int and value in (0, 1) else False
+
+
 def _initialize_companion_restart_runtime_for_window(
     *,
     active_path: str | Path,
@@ -5832,8 +5842,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except (AttributeError, ServerEndpointValidationError):
                 continue
 
-            name = (dbrow.get("name") or "").strip()
-            raw_map = (dbrow.get("map") or "").strip()
+            name = _db_advisory_text(dbrow.get("name"))
+            raw_map = _db_advisory_text(dbrow.get("map"))
             map_name = standardize_map(raw_map)
 
             try:
@@ -5845,10 +5855,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 maxp = 0
 
-            password = bool(int(dbrow.get("password") or 0))
-            third_person = bool(int(dbrow.get("third_person") or 0))
+            password = _db_advisory_flag(dbrow.get("password"))
+            third_person = _db_advisory_flag(dbrow.get("third_person"))
 
-            mods_json = dbrow.get("mods") or ""
+            raw_mods_json = dbrow.get("mods")
+            mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
             mod_count_db = dbrow.get("modCount")
             cnt, preview = parse_mods_preview(mods_json, max_names=8)
             if mod_count_db is not None:
@@ -5861,11 +5872,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 timewarp = float(dbrow.get("timeWarp")) if dbrow.get("timeWarp") is not None else 1.0
             except Exception:
                 timewarp = 1.0
-            time_str = (dbrow.get("time") or "").strip()
+            time_str = _db_advisory_text(dbrow.get("time"))
             if not is_valid_hhmm(time_str):
                 time_str = "--:--"
 
-            country = (dbrow.get("country") or "").strip()
+            country = _db_advisory_text(dbrow.get("country"))
             try:
                 ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
             except Exception:

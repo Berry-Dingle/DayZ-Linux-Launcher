@@ -57,7 +57,10 @@ def map_choices_from_db_rows(rows: list[dict]) -> list[str]:
     counts: dict[str, int] = {}
 
     for r in rows or []:
-        nm = standardize_map((r.get("map") or "").strip())
+        raw_map = r.get("map")
+        if not isinstance(raw_map, str):
+            continue
+        nm = standardize_map(raw_map.strip())
         if not nm:
             continue
         counts[nm] = counts.get(nm, 0) + 1
