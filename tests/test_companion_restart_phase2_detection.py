@@ -555,22 +555,23 @@ def test_event_fingerprint_and_id_are_deterministic():
     assert event1.event_id == event2.event_id
 
 
-def test_stable_normal_period_allows_a_later_separate_event():
+def test_post_finalization_cleanup_allows_a_later_separate_event():
     engine = detection.PhysicalEpisodeEngine()
     first = offline_sequence(engine)[0]
+    assert engine.pre_roll == []
+    assert engine.provisional_drain is None
     feed(engine, [sample(160, 8), sample(220, 8), sample(230, MISSING, info=detection.InfoStatus.TIMEOUT), sample(240, MISSING, info=detection.InfoStatus.TIMEOUT)])
     assert engine.state is detection.EpisodeState.OFFLINE
     assert engine.active_episode.event_id != first.event_id
 
 
-def test_idle_lifecycle_boundary_clears_positive_event_cooldown_and_transient_history():
+def test_idle_lifecycle_boundary_clears_transient_detector_history():
     engine = detection.PhysicalEpisodeEngine()
     event = offline_sequence(engine)[0]
 
     assert event.schedule_weight_suggestion > 0.0
     assert engine.state is detection.EpisodeState.IDLE
     assert engine.active_episode is None
-    assert engine._cooldown_until_stable
 
     feed(
         engine,
@@ -584,23 +585,19 @@ def test_idle_lifecycle_boundary_clears_positive_event_cooldown_and_transient_hi
     )
     assert engine.pre_roll
     assert engine.provisional_drain is not None
-    assert engine._normal_since_mono == 160
 
     assert engine.ingest(
         sample(205, MISSING, lifecycle=detection.LifecycleMarker.PAUSE)
     ) == ()
     assert engine.state is detection.EpisodeState.IDLE
     assert engine.active_episode is None
-    assert not engine._cooldown_until_stable
     assert engine._pending_failure is None
     assert engine.provisional_drain is None
     assert engine.pre_roll == []
-    assert engine._normal_since_mono is None
 
     engine.ingest(sample(210, 9, monitor="monitor-2"))
     assert len(engine.pre_roll) == 1
     assert engine.pre_roll[0].players == 9
-    assert not engine._cooldown_until_stable
 
 
 @pytest.mark.parametrize(
@@ -650,7 +647,6 @@ def test_lifecycle_interrupts_active_confirmed_outage_and_resets_for_next_sessio
     assert engine.pre_roll == []
     assert engine.provisional_drain is None
     assert engine._pending_failure is None
-    assert not engine._cooldown_until_stable
 
     engine.ingest(sample(50, 9, monitor="monitor-2", server="other:2302"))
     engine.ingest(

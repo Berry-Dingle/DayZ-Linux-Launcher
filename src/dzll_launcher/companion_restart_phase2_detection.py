@@ -148,7 +148,6 @@ class DetectionConfig:
     queue_to_player_maximum: float = 120.0
     finalization_grace: float = 30.0
     finalization_maximum: float = 60.0
-    stable_normal_reset: float = 60.0
     pre_roll_seconds: float = 600.0
     pre_roll_sample_cap: int = 60
     event_pre_roll_sample_cap: int = 36
@@ -176,7 +175,6 @@ class DetectionConfig:
             "queue_to_player_maximum",
             "finalization_grace",
             "finalization_maximum",
-            "stable_normal_reset",
             "pre_roll_seconds",
             "drain_relative_drop_minimum",
             "gradual_drain_maximum",
@@ -398,8 +396,6 @@ class PhysicalEpisodeEngine:
         self._last_sample: ObservationSample | None = None
         self._pending_failure: ObservationSample | None = None
         self._provisional_drain: _ProvisionalDrain | None = None
-        self._normal_since_mono: float | None = None
-        self._cooldown_until_stable = False
         self._visible_history_interruption_mono: float | None = None
 
     @property
@@ -521,10 +517,8 @@ class PhysicalEpisodeEngine:
                 )
             ):
                 self._pending_failure = sample
-                self._normal_since_mono = None
                 return completed
             self._pending_failure = None
-            self._cooldown_until_stable = False
             self._open_episode(pending, "outage")
             self._inherit_provisional_drain(pending)
             self._record_failure(pending)
@@ -546,19 +540,6 @@ class PhysicalEpisodeEngine:
             self._visible_history_interruption_mono = sample.monotonic_at
         elif not _is_qualifying_failure(sample):
             self._visible_history_interruption_mono = sample.monotonic_at
-
-        if self._cooldown_until_stable:
-            if _is_healthy_normal(sample):
-                if self._normal_since_mono is None:
-                    self._normal_since_mono = sample.monotonic_at
-                if sample.monotonic_at - self._normal_since_mono >= self.config.stable_normal_reset:
-                    self._cooldown_until_stable = False
-            else:
-                self._normal_since_mono = None
-            return completed
-
-        if not _is_detector_evidence(sample):
-            return completed
 
         return completed
 
@@ -1457,13 +1438,6 @@ class PhysicalEpisodeEngine:
         self.pre_roll.clear()
         self._pending_failure = None
         self._provisional_drain = None
-        self._cooldown_until_stable = outcome in {
-            EventOutcome.CORROBORATED_OFFLINE_RESTART,
-            EventOutcome.CONFIRMED_OFFLINE_RESTART,
-            EventOutcome.STRONG_QUERY_VISIBLE_RESTART,
-            EventOutcome.PROBABLE_QUERY_VISIBLE_RESTART,
-        }
-        self._normal_since_mono = None
         return event
 
     def _same_continuity(self, current: ObservationSample, previous: ObservationSample) -> bool:
@@ -1480,8 +1454,6 @@ class PhysicalEpisodeEngine:
         self.pre_roll.clear()
         self._pending_failure = None
         self._provisional_drain = None
-        self._normal_since_mono = None
-        self._cooldown_until_stable = False
         self._visible_history_interruption_mono = None
 
 

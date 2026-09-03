@@ -361,7 +361,7 @@ def test_weak_recovery_then_independent_outage_uses_new_failure_clock(tmp_path):
     assert episode.confirmed_offline_mono == 210
 
 
-def test_cooldown_suppresses_duplicate_drain_but_not_new_two_strike_outage(tmp_path):
+def test_post_finalization_cleanup_allows_new_two_strike_outage(tmp_path):
     value, *_ = make_runtime(tmp_path)
     begin(value)
     update = conventional(value)
