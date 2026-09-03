@@ -10,8 +10,10 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Callable, Iterable
 
+from .atomic_json import _fsync_directory_best_effort
 from .config import CACHE_DIR
 
 
@@ -263,12 +265,36 @@ def save_mod_metadata(data: dict) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, MOD_METADATA_PATH)
+        _fsync_directory_best_effort(Path(CACHE_DIR))
     except Exception:
         try:
             os.unlink(tmp_path)
         except Exception:
             pass
         raise
+
+
+def _cleanup_stale_metadata_temps() -> None:
+    """Keep only the ten newest abandoned metadata writer temporaries."""
+    try:
+        entries = []
+        for entry in Path(CACHE_DIR).iterdir():
+            if entry.name.startswith("mod_metadata.") and entry.name.endswith(".tmp"):
+                try:
+                    if entry.is_symlink() or not entry.is_file():
+                        continue
+                    entries.append((entry.stat().st_mtime_ns, entry.name, entry))
+                except OSError:
+                    continue
+        entries.sort(key=lambda item: (-item[0], item[1]))
+        for _mtime_ns, _name, entry in entries[10:]:
+            try:
+                if not entry.is_symlink() and entry.is_file():
+                    entry.unlink()
+            except OSError:
+                continue
+    except OSError:
+        return
 
 
 def _mod_metadata_lock_path() -> str:
@@ -297,6 +323,7 @@ def _mutate_mod_metadata(mutate: Callable[[dict], None]) -> None:
                 try:
                     mutate(data)
                     save_mod_metadata(data)
+                    _cleanup_stale_metadata_temps()
                 finally:
                     del _MOD_METADATA_TRANSACTION.data
             finally:

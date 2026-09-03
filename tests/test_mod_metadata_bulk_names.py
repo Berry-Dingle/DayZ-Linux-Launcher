@@ -3,13 +3,14 @@ from __future__ import annotations
 import builtins
 import json
 import os
+import stat
 import threading
 import time
 from pathlib import Path
 
 import pytest
 
-from dzll_launcher import mod_metadata, mod_name_resolver, mods_ui
+from dzll_launcher import atomic_json, mod_metadata, mod_name_resolver, mods_ui
 from dzll_launcher.mods_ui import ModsManagerOverlay
 from dzll_launcher.steam_native import SteamClientState
 
@@ -95,6 +96,241 @@ def test_bulk_names_empty_or_all_weak_do_not_open_transaction(monkeypatch):
 
     mod_metadata.upsert_many_names({})
     mod_metadata.upsert_many_names({101: "", 102: "@Mod-ID - 102", 103: "@103"})
+
+
+def test_save_fsyncs_directory_after_replacement(isolated_metadata_cache, monkeypatch):
+    events = []
+    original_replace = mod_metadata.os.replace
+
+    def replace(*args):
+        events.append("replace")
+        return original_replace(*args)
+
+    def fsync_directory(path):
+        events.append(("directory-fsync", Path(path)))
+
+    monkeypatch.setattr(mod_metadata.os, "replace", replace)
+    monkeypatch.setattr(mod_metadata, "_fsync_directory_best_effort", fsync_directory)
+
+    mod_metadata.save_mod_metadata({"version": 1, "mods": {"101": {"name": "Name"}}})
+
+    assert events == ["replace", ("directory-fsync", isolated_metadata_cache.parent)]
+    assert mod_metadata.load_mod_metadata()["mods"]["101"]["name"] == "Name"
+
+
+def test_directory_fsync_failure_preserves_successful_replacement(
+    isolated_metadata_cache, monkeypatch,
+):
+    real_fsync = mod_metadata.os.fsync
+
+    def fsync(fd):
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError("directory fsync unavailable")
+        return real_fsync(fd)
+
+    monkeypatch.setattr(
+        mod_metadata.os, "fsync", fsync,
+    )
+
+    mod_metadata.save_mod_metadata({"version": 1, "mods": {"102": {"name": "Name"}}})
+
+    assert mod_metadata.load_mod_metadata()["mods"]["102"]["name"] == "Name"
+
+
+def test_directory_fsync_helper_closes_directory_descriptor(tmp_path, monkeypatch):
+    real_open = atomic_json.os.open
+    real_close = atomic_json.os.close
+    opened = []
+    closed = []
+
+    def open_directory(*args, **kwargs):
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
+
+    def close_directory(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(atomic_json.os, "open", open_directory)
+    monkeypatch.setattr(atomic_json.os, "close", close_directory)
+
+    atomic_json._fsync_directory_best_effort(tmp_path)
+
+    assert len(opened) == 1
+    assert closed == opened
+    with pytest.raises(OSError):
+        os.fsync(opened[0])
+
+
+def test_pre_replace_failure_skips_directory_fsync_and_cleans_temp(
+    isolated_metadata_cache, monkeypatch,
+):
+    events = []
+    real_fsync = mod_metadata.os.fsync
+    real_replace = mod_metadata.os.replace
+
+    def fsync(fd):
+        events.append("file-fsync")
+        return real_fsync(fd)
+
+    def replace(*args):
+        events.append("replace")
+        return real_replace(*args)
+
+    monkeypatch.setattr(mod_metadata.os, "fsync", fsync)
+    monkeypatch.setattr(mod_metadata.os, "replace", replace)
+    monkeypatch.setattr(
+        mod_metadata,
+        "_fsync_directory_best_effort",
+        lambda _path: events.append("directory-fsync"),
+    )
+    monkeypatch.setattr(
+        mod_metadata.json,
+        "dump",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failure")),
+    )
+
+    with pytest.raises(OSError, match="write failure"):
+        mod_metadata.save_mod_metadata({"version": 1, "mods": {"103": {"name": "Name"}}})
+
+    assert events == []
+    assert not list(isolated_metadata_cache.parent.glob("mod_metadata.*.tmp"))
+
+
+def test_replace_failure_skips_directory_fsync_and_cleans_temp(
+    isolated_metadata_cache, monkeypatch,
+):
+    events = []
+    monkeypatch.setattr(
+        mod_metadata.os,
+        "replace",
+        lambda *_args: (events.append("replace"), (_ for _ in ()).throw(OSError("replace failure")))[1],
+    )
+    monkeypatch.setattr(
+        mod_metadata,
+        "_fsync_directory_best_effort",
+        lambda _path: events.append("directory-fsync"),
+    )
+
+    with pytest.raises(OSError, match="replace failure"):
+        mod_metadata.save_mod_metadata({"version": 1, "mods": {"104": {"name": "Name"}}})
+
+    assert events == ["replace"]
+    assert not list(isolated_metadata_cache.parent.glob("mod_metadata.*.tmp"))
+
+
+def test_preexisting_stale_temp_is_not_swept(isolated_metadata_cache):
+    stale = isolated_metadata_cache.parent / "mod_metadata.old.tmp"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("stale", encoding="utf-8")
+
+    mod_metadata.save_mod_metadata({"version": 1, "mods": {"105": {"name": "Name"}}})
+
+    assert stale.read_text(encoding="utf-8") == "stale"
+
+
+@pytest.mark.parametrize("count", [0, 5, 10, 11, 25])
+def test_stale_metadata_temps_retain_newest_ten(isolated_metadata_cache, count):
+    isolated_metadata_cache.parent.mkdir(parents=True, exist_ok=True)
+    stale = []
+    for index in range(count):
+        path = isolated_metadata_cache.parent / f"mod_metadata.stale-{index:02d}.tmp"
+        path.write_text("stale", encoding="utf-8")
+        os.utime(path, (index + 1, index + 1))
+        stale.append(path)
+
+    mod_metadata.upsert_many_names({106: "Name"})
+
+    retained = [path for path in stale if path.exists()]
+    assert retained == stale[max(0, count - 10):]
+
+
+def test_stale_metadata_equal_mtimes_use_deterministic_filename_order(
+    isolated_metadata_cache,
+):
+    isolated_metadata_cache.parent.mkdir(parents=True, exist_ok=True)
+    stale = [
+        isolated_metadata_cache.parent / f"mod_metadata.equal-{index:02d}.tmp"
+        for index in range(11)
+    ]
+    for path in stale:
+        path.write_text("stale", encoding="utf-8")
+        os.utime(path, (100, 100))
+
+    mod_metadata.upsert_many_names({107: "Name"})
+
+    assert stale[-1].exists() is False
+    assert all(path.exists() for path in stale[:-1])
+
+
+def test_stale_cleanup_ignores_unrelated_files_symlinks_and_directories(
+    isolated_metadata_cache,
+):
+    isolated_metadata_cache.parent.mkdir(parents=True, exist_ok=True)
+    regular = [
+        isolated_metadata_cache.parent / f"mod_metadata.regular-{index:02d}.tmp"
+        for index in range(11)
+    ]
+    for index, path in enumerate(regular):
+        path.write_text("stale", encoding="utf-8")
+        os.utime(path, (index + 1, index + 1))
+    unrelated = isolated_metadata_cache.parent / "other-owner.tmp"
+    unrelated.write_text("keep", encoding="utf-8")
+    target = isolated_metadata_cache.parent / "symlink-target"
+    target.write_text("keep", encoding="utf-8")
+    symlink = isolated_metadata_cache.parent / "mod_metadata.link.tmp"
+    symlink.symlink_to(target)
+    directory = isolated_metadata_cache.parent / "mod_metadata.directory.tmp"
+    directory.mkdir()
+
+    mod_metadata.upsert_many_names({108: "Name"})
+
+    assert regular[0].exists() is False
+    assert all(path.exists() for path in regular[1:])
+    assert unrelated.read_text(encoding="utf-8") == "keep"
+    assert symlink.is_symlink()
+    assert directory.is_dir()
+    assert target.read_text(encoding="utf-8") == "keep"
+
+
+def test_stale_cleanup_failure_is_non_fatal(isolated_metadata_cache, monkeypatch):
+    isolated_metadata_cache.parent.mkdir(parents=True, exist_ok=True)
+    stale = isolated_metadata_cache.parent / "mod_metadata.old.tmp"
+    stale.write_text("stale", encoding="utf-8")
+    original_unlink = Path.unlink
+
+    def fail_stale_unlink(path, *args, **kwargs):
+        if path == stale:
+            raise PermissionError("injected cleanup failure")
+        return original_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_stale_unlink)
+    mod_metadata.upsert_many_names({109: "Name"})
+
+    assert isolated_metadata_cache.is_file()
+    assert stale.is_file()
+
+
+def test_failed_save_does_not_trigger_stale_cleanup(
+    isolated_metadata_cache, monkeypatch,
+):
+    isolated_metadata_cache.parent.mkdir(parents=True, exist_ok=True)
+    stale = []
+    for index in range(11):
+        path = isolated_metadata_cache.parent / f"mod_metadata.failed-{index:02d}.tmp"
+        path.write_text("stale", encoding="utf-8")
+        stale.append(path)
+    monkeypatch.setattr(
+        mod_metadata.json,
+        "dump",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("write failure")),
+    )
+
+    with pytest.raises(OSError, match="write failure"):
+        mod_metadata.upsert_many_names({110: "Name"})
+
+    assert all(path.exists() for path in stale)
 
 
 def test_bulk_names_persist_one_valid_name(isolated_metadata_cache):
@@ -187,7 +423,7 @@ def test_bulk_names_nested_transaction_reuses_one_load_and_save(
         "transactions": 2,
         "serializations": 1,
         "tempfiles": 1,
-        "fsyncs": 1,
+        "fsyncs": 2,
         "replaces": 1,
     }
 
@@ -286,7 +522,7 @@ def test_resolver_strong_names_use_one_physical_save(
         "transactions": 1,
         "serializations": 1,
         "tempfiles": 1,
-        "fsyncs": 1,
+        "fsyncs": 2,
         "replaces": 1,
     }
 
@@ -313,7 +549,7 @@ def test_resolver_strong_cache_hits_use_one_confirmation_save(
         "transactions": 1,
         "serializations": 1,
         "tempfiles": 1,
-        "fsyncs": 1,
+        "fsyncs": 2,
         "replaces": 1,
     }
 
@@ -343,7 +579,7 @@ def test_resolver_mixed_hits_and_misses_use_one_save(
         "transactions": 1,
         "serializations": 1,
         "tempfiles": 1,
-        "fsyncs": 1,
+        "fsyncs": 2,
         "replaces": 1,
     }
 
@@ -530,7 +766,7 @@ def test_resolver_save_count_is_bounded_by_batch_not_cache_size(
     assert counts["transactions"] == 1
     assert counts["serializations"] == 1
     assert counts["tempfiles"] == 1
-    assert counts["fsyncs"] == 1
+    assert counts["fsyncs"] == 2
     assert counts["replaces"] == 1
 
 
