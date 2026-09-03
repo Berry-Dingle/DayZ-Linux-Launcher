@@ -972,31 +972,6 @@ class Phase2RestartRuntime:
             predicted_occurrence_at=prediction,
         )
 
-    def scheduled_outage_relaxation_usable(
-        self, server_key: str, *, observed_at: float
-    ) -> bool:
-        server = self._servers.get(str(server_key))
-        if server is None:
-            return False
-        decision = self._evaluate(server, now=observed_at)
-        if (
-            not decision.prediction_usable
-            or decision.selected_period_seconds is None
-            or server.score is None
-        ):
-            return False
-        candidate = server.score.candidate(decision.selected_period_seconds)
-        if candidate.phase_offset is None:
-            return False
-        residual = abs(
-            (
-                (observed_at - candidate.phase_offset + candidate.period_seconds / 2)
-                % candidate.period_seconds
-            )
-            - candidate.period_seconds / 2
-        )
-        return residual <= candidate_phase_tolerance(candidate.period_seconds)
-
     def shutdown(self, *, wall_at: float, monotonic_at: float) -> None:
         if self._shutdown:
             return

@@ -1,5 +1,8 @@
+import ast
 import hashlib
+import inspect
 import json
+import textwrap
 from dataclasses import replace
 from pathlib import Path
 
@@ -665,12 +668,6 @@ def test_crowbar_query_only_covered_4h_model_reaches_active_consumer_gates(tmp_p
     assert decision.period_confirmed
     assert decision.prediction_usable
     assert decision.query_visible_recovery_eligible
-    assert value.scheduled_outage_relaxation_usable(
-        SERVER, observed_at=BASE + 28 * scoring.HOUR
-    )
-    assert not value.scheduled_outage_relaxation_usable(
-        SERVER, observed_at=BASE + 30 * scoring.HOUR
-    )
 
 
 @pytest.mark.parametrize("inactive_days", [7, 31])
@@ -1153,16 +1150,22 @@ def test_window_has_one_central_startup_completion_contract():
     assert "_complete_startup_presentation" not in manual
 
 
-def test_window_preserves_immediate_generic_recovery_and_records_suppression():
-    root = Path(__file__).resolve().parents[1]
-    source = (root / "src/dzll_launcher/window.py").read_text()
-    live = source[source.index("def _apply_server_companion_live_result"):source.index("def _maybe_play_server_companion_restart_warning")]
-    assert "_server_companion_alert_armed" in live
-    assert "COMPANION_ALERT_REARM_OFFLINE_SECONDS" in live
-    assert "_server_companion_alert_back_online" in live
-    assert "provisional_event_id" in live
-    assert "AlertKeyKind.GENERIC_RECOVERY" in live
-    assert "mark_fired" in live
+def test_window_live_result_has_no_pre_cutover_immediate_recovery_branch():
+    from dzll_launcher.window import DZLLWindow
+
+    tree = ast.parse(
+        textwrap.dedent(inspect.getsource(DZLLWindow._apply_server_companion_live_result))
+    )
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    attributes = {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+
+    assert "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED" not in names
+    assert "_server_companion_alert_armed" not in attributes
+    assert "scheduled_outage_relaxation_usable" not in attributes
+    assert "_maybe_hold_server_companion_confirmed_recovery_alert" in attributes
+    assert "_emit_server_companion_confirmed_recovery_alert" in attributes
 
 
 def test_phase2_integration_has_no_release_or_packaging_side_effects():

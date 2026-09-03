@@ -47,7 +47,6 @@ def companion_host():
         _server_companion_pending_recovery_alert=None,
         _server_companion_pending_recovery_alert_source_id=0,
         _server_companion_offline_since=None,
-        _server_companion_alert_armed=False,
         _server_companion_restart_alert_enabled=False,
         _server_companion_obj=None,
         server_companion_panel=None,
@@ -349,6 +348,40 @@ def test_only_one_recovery_confirmation_candidate_can_be_pending(monkeypatch):
     assert alerts == []
 
 
+def test_outage_sequence_advances_once_per_outage_and_again_after_recovery(
+    monkeypatch,
+):
+    clock = [0.0]
+    monkeypatch.setattr(window_module.time, "monotonic", lambda: clock[0])
+    host, _intervals, _alerts, _scheduled, _removed = recovery_host(monkeypatch)
+    failure = {
+        "ok": False,
+        "err": "timed out",
+        "a2s_classification": "timeout",
+    }
+
+    establish_offline(host, clock)
+    first_offline_since = host._server_companion_offline_since
+    assert host._server_companion_recovery_outage_sequence == 1
+
+    clock[0] += 3.0
+    apply(host, failure)
+    assert host._server_companion_recovery_outage_sequence == 1
+    assert host._server_companion_offline_since == first_offline_since
+
+    start_recovery_candidate(host, clock)
+    finish_recovery_confirmation(
+        host,
+        clock,
+        {"ok": True, "ping_ms": 24, "players": 1, "max_players": 60},
+    )
+    assert host._server_companion_offline_since is None
+
+    establish_offline(host, clock)
+    assert host._server_companion_recovery_outage_sequence == 2
+    assert host._server_companion_offline_since > first_offline_since
+
+
 def test_dedicated_timer_launches_exactly_one_confirmation_query(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(window_module.time, "monotonic", lambda: clock[0])
@@ -424,7 +457,7 @@ class RecoveryRuntimeStub:
         return True
 
 
-@pytest.mark.parametrize("stale_kind", ["generation", "session"])
+@pytest.mark.parametrize("stale_kind", ["generation", "session", "outage"])
 def test_stale_recovery_confirmation_is_ignored(monkeypatch, stale_kind):
     clock = [0.0]
     monkeypatch.setattr(window_module.time, "monotonic", lambda: clock[0])
@@ -438,8 +471,10 @@ def test_stale_recovery_confirmation_is_ignored(monkeypatch, stale_kind):
     assert len(runtime.ingested) == 2
     if stale_kind == "generation":
         host._server_companion_poll_token += 1
-    else:
+    elif stale_kind == "session":
         runtime.session_id = "session-2"
+    else:
+        host._server_companion_recovery_outage_sequence += 1
 
     host._server_companion_recovery_confirmation_source_id = 91
     host._server_companion_recovery_confirmation_inflight = True
@@ -803,12 +838,16 @@ def test_stopping_companion_polling_clears_pending_visible_strike():
     host, _intervals = companion_host()
     host._server_companion_consecutive_offline_polls = 1
     host._server_companion_first_offline_strike_mono = 12.0
+    host._server_companion_offline_since = 11.0
+    host._server_companion_recovery_outage_sequence = 4
     host._server_companion_poll_timer_id = 0
 
     DZLLWindow._stop_server_companion_polling(host)
 
     assert host._server_companion_consecutive_offline_polls == 0
     assert host._server_companion_first_offline_strike_mono is None
+    assert host._server_companion_offline_since == 11.0
+    assert host._server_companion_recovery_outage_sequence == 4
 
 
 @pytest.mark.parametrize(

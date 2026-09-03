@@ -1211,7 +1211,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_snapshot = None
         self._server_companion_obj = None
         self._server_companion_offline_since = None
-        self._server_companion_alert_armed = False
         self._server_companion_restart_warning_fired = set()
         self._server_companion_poll_interval_secs = COMPANION_POLL_ONLINE_SECONDS
         self._server_companion_poll_timer_id = 0
@@ -4592,7 +4591,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_visible_snapshot = dict(snapshot)
         self._server_companion_observation_samples.clear()
         self._server_companion_offline_since = None
-        self._server_companion_alert_armed = False
         self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
         self._server_companion_obj = obj
         self._server_companion_snapshot = snapshot
@@ -4627,7 +4625,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_visible_snapshot = None
         self._server_companion_observation_samples.clear()
         self._server_companion_offline_since = None
-        self._server_companion_alert_armed = False
         self._server_companion_recovery_alert_suppressed = False
         self._server_companion_recovery_online_since = None
         self._server_companion_recovery_outage_sequence = 0
@@ -4863,57 +4860,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if live_time:
                 snapshot["time"] = live_time
             snapshot["online"] = True
-            offline_since = getattr(self, "_server_companion_offline_since", None)
-            offline_long_enough = (
-                offline_since is not None
-                and now - float(offline_since) >= COMPANION_ALERT_REARM_OFFLINE_SECONDS
-            )
-            scheduled_restart_long_enough = False
-            if offline_since is not None and key:
-                try:
-                    scheduled_restart_long_enough = (
-                        now - float(offline_since) >= 30
-                        and int(getattr(self, "_server_companion_consecutive_offline_polls", 0) or 0) >= 2
-                        and self._companion_restart_phase2.scheduled_outage_relaxation_usable(
-                            key, observed_at=now_wall
-                        )
-                    )
-                except Exception:
-                    scheduled_restart_long_enough = False
-            online_again_alert_fired = False
-            if (
-                bool(getattr(self, "_server_companion_alert_armed", False))
-                or offline_long_enough
-                or scheduled_restart_long_enough
-            ) and bool(
-                getattr(self, "_server_companion_restart_alert_enabled", False)
-            ) and not SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED and confirmed_recovery is None:
-                self._debug_server_companion_alert(
-                    "back-online alert emitted: "
-                    f"armed={bool(getattr(self, '_server_companion_alert_armed', False))} "
-                    f"offline_long_enough={bool(offline_long_enough)} "
-                    f"scheduled_restart_long_enough={bool(scheduled_restart_long_enough)}"
-                )
-                self._server_companion_alert_back_online(snapshot, alert_type="back online")
-                online_again_alert_fired = True
-                if key:
-                    event_id = self._companion_restart_phase2.provisional_event_id(key)
-                    if event_id:
-                        suppression = self._companion_restart_phase2.event_suppression_key(
-                            key,
-                            kind=AlertKeyKind.GENERIC_RECOVERY,
-                            event_id=event_id,
-                        )
-                        self._companion_restart_phase2.mark_fired(key, suppression, now=now_wall)
-            elif offline_since is not None:
-                self._debug_server_companion_alert(
-                    "back-online alert not emitted: "
-                    f"enabled={bool(getattr(self, '_server_companion_restart_alert_enabled', False))} "
-                    f"armed={bool(getattr(self, '_server_companion_alert_armed', False))} "
-                    f"offline_seconds={now - float(offline_since):.1f} "
-                    f"required_seconds={int(COMPANION_ALERT_REARM_OFFLINE_SECONDS)}"
-                )
-            self._server_companion_alert_armed = False
             self._server_companion_offline_since = None
             self._server_companion_consecutive_offline_polls = 0
             self._server_companion_first_offline_strike_mono = None
@@ -4972,12 +4918,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         or 0
                     ) + 1
                 self._set_server_companion_poll_interval(COMPANION_POLL_OFFLINE_SECONDS)
-                if now - float(offline_since) >= COMPANION_ALERT_REARM_OFFLINE_SECONDS:
-                    self._server_companion_alert_armed = True
                 self._debug_server_companion_alert(
                     f"poll result: offline consecutive={failure_count} "
-                    f"offline_seconds={now - float(offline_since):.1f} "
-                    f"armed={bool(getattr(self, '_server_companion_alert_armed', False))}"
+                    f"offline_seconds={now - float(offline_since):.1f}"
                 )
 
         new_online = bool(snapshot.get("online", False))
