@@ -10208,7 +10208,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             # Wait up to 120s for the expected success process.  With the launcher
             # enabled, a detected launcher is success for popup ownership, while
             # this same watcher remains alive to consume metadata if DayZ follows.
-            t0 = time.time()
+            t0 = time.monotonic()
             while True:
                 if attempt_id and not self._join_attempt_is_active(attempt_id):
                     return
@@ -10275,7 +10275,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         self._cleanup_join_attempt(attempt_id, "launcher exited before DayZ")
                     return
 
-                elapsed = time.time() - t0
+                elapsed = time.monotonic() - t0
                 if elapsed >= 120.0 and not (saw_launcher and not skip_launcher):
                     try:
                         if getattr(self, "_discord", None):

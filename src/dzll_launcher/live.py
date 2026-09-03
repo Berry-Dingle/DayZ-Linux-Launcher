@@ -150,12 +150,12 @@ def query_server_live(
                 **diag_identity,
             )
     try:
-        t0 = time.time()
+        t0 = time.monotonic()
         if packet_trace is None:
             info = a2s.info(addr, timeout=float(timeout))
         else:
             info = a2s.info(addr, timeout=float(timeout), _trace=packet_trace)
-        t1 = time.time()
+        t1 = time.monotonic()
 
         ping_s = None
         try:

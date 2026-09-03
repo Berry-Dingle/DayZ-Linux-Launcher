@@ -3,6 +3,7 @@ from types import MethodType, SimpleNamespace
 import pytest
 
 from dzll_launcher import a2s_status_diagnostics as diagnostics_module
+from dzll_launcher import a2s, live as live_module
 from dzll_launcher.ui_row import ServerObject
 from dzll_launcher.window import DZLLWindow, fav_key
 
@@ -10,6 +11,73 @@ from dzll_launcher.window import DZLLWindow, fav_key
 IP = "172.111.51.149"
 GPORT = 2502
 QPORT = 2503
+
+
+class QueryClock:
+    def __init__(self, wall_values, monotonic_values):
+        self.wall_values = iter(wall_values)
+        self.monotonic_values = list(monotonic_values)
+        self.monotonic_index = 0
+
+    def time(self):
+        return next(self.wall_values)
+
+    def monotonic(self):
+        value = self.monotonic_values[min(self.monotonic_index, len(self.monotonic_values) - 1)]
+        self.monotonic_index += 1
+        return value
+
+
+class FallbackInfo:
+    ping = 0
+    player_count = 4
+    max_players = 60
+    keywords = ""
+    password_protected = False
+
+
+@pytest.mark.parametrize(
+    "wall_values, monotonic_values, expected_ping",
+    [
+        ([100.0, 100.125], [0.0, 10.0, 10.125], 125),
+        ([100.0, 1.0], [0.0, 10.0, 10.125], 125),
+        ([100.0, 10000.0], [0.0, 10.0, 10.125], 125),
+    ],
+    ids=["normal", "wall-clock-backward", "wall-clock-forward"],
+)
+def test_fallback_ping_uses_monotonic_elapsed_time(
+    monkeypatch, wall_values, monotonic_values, expected_ping,
+):
+    clock = QueryClock(wall_values, monotonic_values)
+    monkeypatch.setattr(live_module.time, "time", clock.time)
+    monkeypatch.setattr(live_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(a2s, "info", lambda _addr, timeout: FallbackInfo())
+
+    result = live_module.query_server_live(IP, QPORT)
+
+    assert result["ok"] is True
+    assert result["ping_ms"] == expected_ping
+
+
+def test_positive_a2s_ping_remains_authoritative_over_elapsed_timer(monkeypatch):
+    clock = QueryClock([100.0, 10000.0], [0.0, 10.0, 10.125])
+    monkeypatch.setattr(live_module.time, "time", clock.time)
+    monkeypatch.setattr(live_module.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(
+        a2s,
+        "info",
+        lambda _addr, timeout: SimpleNamespace(
+            ping=0.027,
+            player_count=4,
+            max_players=60,
+            keywords="",
+            password_protected=False,
+        ),
+    )
+
+    result = live_module.query_server_live(IP, QPORT)
+
+    assert result["ping_ms"] == 27
 
 
 def make_host(*, ping=27, streak=0):

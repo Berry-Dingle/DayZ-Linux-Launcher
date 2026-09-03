@@ -301,6 +301,29 @@ class WatcherClock:
         self.monotonic_value += delta
 
 
+class IndependentWatcherClock:
+    def __init__(self, wall_after_first_sleep, monotonic_advances):
+        self.wall = 100.0
+        self.monotonic_value = 0.0
+        self.wall_after_first_sleep = wall_after_first_sleep
+        self.monotonic_advances = list(monotonic_advances)
+        self.sleeps = 0
+
+    def time(self):
+        return self.wall
+
+    def monotonic(self):
+        return self.monotonic_value
+
+    def sleep(self, _seconds):
+        self.sleeps += 1
+        if self.sleeps == 1:
+            self.wall = self.wall_after_first_sleep
+        if not self.monotonic_advances:
+            raise AssertionError("watcher performed an unexpected extra polling cycle")
+        self.monotonic_value += float(self.monotonic_advances.pop(0))
+
+
 class SessionWatcherHarness(LifecycleHarness):
     def __init__(self, *, skip_launcher, launcher_results, game_results):
         super().__init__(skip_launcher=skip_launcher)
@@ -374,6 +397,44 @@ def test_existing_initial_timeout_remains_120_seconds(monkeypatch, skip_launcher
     assert harness.cleanup_reasons == ["watcher terminal failure"]
     assert harness._join_attempts.active is None
     assert harness._discord_watch_active is False
+
+
+@pytest.mark.parametrize("wall_after_first_sleep", [10000.0, -10000.0])
+def test_initial_timeout_uses_monotonic_time_when_wall_clock_jumps(
+    monkeypatch, wall_after_first_sleep,
+):
+    harness = SessionWatcherHarness(
+        skip_launcher=True,
+        launcher_results=[False],
+        game_results=[False],
+    )
+    clock = IndependentWatcherClock(wall_after_first_sleep, [1.0] * 120)
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert clock.monotonic_value == 120.0
+    assert clock.sleeps == 120
+    assert harness.cleanup_reasons == ["watcher terminal failure"]
+    assert harness.errors == [
+        "DZLL could not detect the expected DayZ process before the launch wait timed out."
+    ]
+
+
+def test_launcher_deadline_remains_monotonic_when_wall_clock_jumps(monkeypatch):
+    harness = SessionWatcherHarness(
+        skip_launcher=False,
+        launcher_results=[True],
+        game_results=[False],
+    )
+    clock = IndependentWatcherClock(-10000.0, [1.0, 1799.0])
+
+    run_session_watcher(monkeypatch, harness, clock)
+
+    assert clock.monotonic_value == 1800.0
+    assert harness.errors == [
+        "DayZ did not start after waiting 30 minutes for DayZ Launcher. "
+        "DZLL stopped waiting; you can try joining again."
+    ]
 
 
 def test_launcher_deadline_is_absolute_and_launcher_callback_is_one_shot(monkeypatch):
