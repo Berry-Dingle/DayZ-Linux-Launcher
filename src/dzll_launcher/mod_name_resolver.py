@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
+import logging
 from pathlib import Path
 
 from .config import DB_LOCAL_PATH
@@ -11,6 +12,7 @@ from .steamcmd_mods import parse_mods_from_db
 
 
 _CPP_NAME_RE = re.compile(r"\b(?:name|title)\s*=\s*(['\"])(?P<value>.*?)\1\s*;", re.IGNORECASE | re.DOTALL)
+logger = logging.getLogger(__name__)
 
 
 def _is_weak_name(name: str, mod_id=None) -> bool:
@@ -114,6 +116,10 @@ def name_from_local_metadata(
         workshop_roots=workshop_roots,
     )
     for root in roots:
+        try:
+            canonical_root = root.resolve()
+        except Exception:
+            continue
         mod_dir = root / "content" / "221100" / str(mid)
         try:
             if not mod_dir.is_dir() or mod_dir.is_symlink():
@@ -125,6 +131,15 @@ def name_from_local_metadata(
             path = mod_dir / filename
             try:
                 if not path.is_file() or path.is_symlink():
+                    continue
+                canonical_path = path.resolve()
+                try:
+                    canonical_path.relative_to(canonical_root)
+                except ValueError:
+                    logger.debug(
+                        "Skipping local mod metadata outside Workshop root for mod %s",
+                        mid,
+                    )
                     continue
                 text = path.read_text(encoding="utf-8", errors="replace")[:32768]
             except Exception:

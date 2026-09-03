@@ -192,6 +192,104 @@ def test_symlinked_item_directory_is_skipped_for_later_root(tmp_path):
     ) == "Real Secondary Item"
 
 
+def test_intermediate_content_symlink_outside_root_is_rejected(tmp_path):
+    root = tmp_path / "workshop"
+    external = tmp_path / "external"
+    _write_metadata(external, 1018, "External Content Name")
+    root.mkdir()
+    (root / "content").symlink_to(external / "content", target_is_directory=True)
+
+    assert mod_name_resolver.name_from_local_metadata(
+        1018, workshop_roots=[root],
+    ) == ""
+
+
+def test_intermediate_appid_symlink_outside_root_is_rejected(tmp_path):
+    root = tmp_path / "workshop"
+    external = tmp_path / "external"
+    _write_metadata(external, 1019, "External App ID Name")
+    (root / "content").mkdir(parents=True)
+    (root / "content/221100").symlink_to(
+        external / "content/221100", target_is_directory=True,
+    )
+
+    assert mod_name_resolver.name_from_local_metadata(
+        1019, workshop_roots=[root],
+    ) == ""
+
+
+def test_intermediate_symlink_inside_root_is_accepted(tmp_path):
+    root = tmp_path / "workshop"
+    actual_content = root / "content-real"
+    item = actual_content / "221100" / "1020"
+    item.mkdir(parents=True)
+    (item / "meta.cpp").write_text(
+        'name = "Internal Content Name";\n', encoding="utf-8",
+    )
+    (root / "content").symlink_to(actual_content, target_is_directory=True)
+
+    assert mod_name_resolver.name_from_local_metadata(
+        1020, workshop_roots=[root],
+    ) == "Internal Content Name"
+
+
+def test_symlinked_workshop_root_alias_is_accepted(tmp_path):
+    physical = tmp_path / "physical-workshop"
+    alias = tmp_path / "workshop-alias"
+    _write_metadata(physical, 1021, "Aliased Root Name")
+    alias.symlink_to(physical, target_is_directory=True)
+
+    assert mod_name_resolver.name_from_local_metadata(
+        1021, workshop_roots=[alias],
+    ) == "Aliased Root Name"
+
+
+def test_escaped_primary_root_falls_back_to_valid_secondary_root(tmp_path):
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    external = tmp_path / "external"
+    _write_metadata(external, 1022, "Escaped Primary Name")
+    _write_metadata(secondary, 1022, "Valid Secondary Name")
+    primary.mkdir()
+    (primary / "content").symlink_to(external / "content", target_is_directory=True)
+
+    assert mod_name_resolver.name_from_local_metadata(
+        1022, workshop_roots=[primary, secondary],
+    ) == "Valid Secondary Name"
+
+
+def test_escaped_local_metadata_does_not_override_strong_cache(tmp_path):
+    root = tmp_path / "workshop"
+    external = tmp_path / "external"
+    _write_metadata(external, 1023, "Escaped Local Name")
+    root.mkdir()
+    (root / "content").symlink_to(external / "content", target_is_directory=True)
+
+    assert mod_name_resolver.resolve_best_mod_names(
+        [1023], metadata={"1023": {"name": "Cached Name"}},
+        workshop_roots=[root],
+    ) == {1023: "Cached Name"}
+
+
+def test_escaped_meta_cpp_does_not_bypass_mod_cpp_precedence(tmp_path):
+    root = tmp_path / "workshop"
+    external = tmp_path / "external"
+    item = _item_dir(root, 1024)
+    external_item = external / "content/221100/1024"
+    external_item.mkdir(parents=True)
+    (external_item / "meta.cpp").write_text(
+        'name = "Escaped Meta Name";\n', encoding="utf-8",
+    )
+    (item / "meta.cpp").symlink_to(external_item / "meta.cpp")
+    (item / "mod.cpp").write_text(
+        'name = "Local Mod Name";\n', encoding="utf-8",
+    )
+
+    assert mod_name_resolver.name_from_local_metadata(
+        1024, workshop_roots=[root],
+    ) == "Local Mod Name"
+
+
 def test_no_usable_local_metadata_preserves_symlink_then_numeric_fallback(tmp_path):
     root = tmp_path / "workshop"
 
