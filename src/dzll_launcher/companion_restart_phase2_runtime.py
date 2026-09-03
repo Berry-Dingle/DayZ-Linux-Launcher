@@ -283,6 +283,11 @@ class _ServerRuntime:
     previous_sample: ObservationSample | None = None
     app_session_id: str = ""
     monitoring_session_id: str = ""
+    # Session-local gate used when startup must durably retire a restored
+    # boot-local episode before observations from the new boot are accepted.
+    # This is intentionally not persisted: the session record and episode
+    # closure are committed atomically by the existing persistence layer.
+    monitoring_session_durable: bool = True
     poll_generation: int = 0
     continuity_chain_id: str = ""
     dirty: bool = False
@@ -611,6 +616,19 @@ class Phase2RestartRuntime:
         if not self.persistence_enabled:
             return ""
         server = self._server(server_key)
+        if (
+            server.monitoring_session_id
+            and not server.monitoring_session_durable
+        ):
+            # A confirmed pre-commit failure leaves the combined stale-episode
+            # closure and replacement session staged in the schema-4 backend.
+            # Retry that exact state before exposing or replacing the session.
+            self._persist_server(server, force=True, now=wall_at)
+            if not self._server_state_is_durable(server):
+                return ""
+            server.monitoring_session_durable = True
+            if server.poll_generation == _nonnegative_int(poll_generation, 0):
+                return server.monitoring_session_id
         if server.monitoring_session_id:
             self.end_monitoring(
                 server_key,
@@ -620,18 +638,41 @@ class Phase2RestartRuntime:
             )
             if not self.persistence_enabled:
                 return ""
+        monotonic_discontinuity = False
         if server.engine.active_episode is None:
             server.engine = PhysicalEpisodeEngine(self.detection_config)
         else:
-            # A confirmed durable episode may span an application restart.  Keep
-            # its immutable event identity and semantic state, while explicitly
-            # breaking high-authority continuity across the process boundary.
-            server.engine.active_episode.coverage_complete = False
-            server.engine.active_episode.reason_codes.add(
-                "application_restart_episode_resumed"
+            episode = server.engine.active_episode
+            watermark = _active_episode_monotonic_watermark(episode)
+            monotonic_discontinuity = bool(
+                server.engine.state is EpisodeState.RECOVERING
+                and watermark is not None
+                and monotonic_at < watermark
             )
+            if monotonic_discontinuity:
+                # Boot-local references cannot safely resume in the new
+                # monotonic epoch. Reuse the detector's lifecycle-neutral flush
+                # and route the ledger event internally; begin_monitoring never
+                # exposes finalized events to live alert dispatch.
+                finalized = server.engine.flush(
+                    monotonic_at,
+                    wall_at,
+                    reason="monotonic_clock_discontinuity_on_resume",
+                )
+                self._route_finalized(server, finalized, now=wall_at)
+                self._evaluate(server, now=wall_at)
+            else:
+                # A confirmed durable episode may span an application restart.
+                # Keep its immutable event identity and semantic state, while
+                # explicitly breaking high-authority continuity across the
+                # process boundary.
+                episode.coverage_complete = False
+                episode.reason_codes.add(
+                    "application_restart_episode_resumed"
+                )
         server.app_session_id = self.app_session_id
         server.monitoring_session_id = str(uuid.uuid4())
+        server.monitoring_session_durable = not monotonic_discontinuity
         server.poll_generation = _nonnegative_int(poll_generation, 0)
         server.continuity_chain_id = deterministic_continuity_chain_id(
             server.key,
@@ -657,12 +698,17 @@ class Phase2RestartRuntime:
         server.dirty = True
         session_id = server.monitoring_session_id
         self._persist_server(server, force=True, now=wall_at)
+        if monotonic_discontinuity:
+            if not self._server_state_is_durable(server):
+                return ""
+            server.monitoring_session_durable = True
         if not self.persistence_enabled:
             server.monitoring_sessions[:] = [
                 item for item in server.monitoring_sessions
                 if item.get("session_id") != session_id
             ]
             server.monitoring_session_id = ""
+            server.monitoring_session_durable = True
             server.continuity_chain_id = ""
             server.previous_sample = None
             server.player_observations.clear()
@@ -686,6 +732,7 @@ class Phase2RestartRuntime:
         if (
             server is not None
             and server.monitoring_session_id
+            and server.monitoring_session_durable
             and server.poll_generation == generation
         ):
             return server.monitoring_session_id, False
@@ -701,7 +748,9 @@ class Phase2RestartRuntime:
 
     def active_monitoring_session_id(self, server_key: str) -> str:
         server = self._servers.get(str(server_key))
-        return "" if server is None else server.monitoring_session_id
+        if server is None or not server.monitoring_session_durable:
+            return ""
+        return server.monitoring_session_id
 
     def end_monitoring_if_current(
         self,
@@ -716,7 +765,11 @@ class Phase2RestartRuntime:
         """End only the exact session/generation that requested the lifecycle."""
 
         server = self._servers.get(str(server_key))
-        if server is None or not server.monitoring_session_id:
+        if (
+            server is None
+            or not server.monitoring_session_id
+            or not server.monitoring_session_durable
+        ):
             return RuntimeUpdate(
                 accepted=False,
                 rejected_reason="no_active_monitoring_session",
@@ -746,7 +799,11 @@ class Phase2RestartRuntime:
         monotonic_at: float,
     ) -> RuntimeUpdate:
         server = self._servers.get(str(server_key))
-        if server is None or not server.monitoring_session_id:
+        if (
+            server is None
+            or not server.monitoring_session_id
+            or not server.monitoring_session_durable
+        ):
             return RuntimeUpdate(accepted=False, rejected_reason="no_active_monitoring_session")
         sample = ObservationSample(
             wall_at=wall_at,
@@ -769,6 +826,7 @@ class Phase2RestartRuntime:
                 session["reason"] = marker.value
                 break
         server.monitoring_session_id = ""
+        server.monitoring_session_durable = True
         server.continuity_chain_id = ""
         server.previous_sample = None
         server.player_observations.clear()
@@ -788,7 +846,11 @@ class Phase2RestartRuntime:
         if not self.persistence_enabled:
             return RuntimeUpdate(accepted=False, rejected_reason="learning_disabled")
         server = self._servers.get(str(server_key))
-        if server is None or not server.monitoring_session_id:
+        if (
+            server is None
+            or not server.monitoring_session_id
+            or not server.monitoring_session_durable
+        ):
             return RuntimeUpdate(accepted=False, rejected_reason="no_active_monitoring_session")
         if poll_generation != server.poll_generation:
             return RuntimeUpdate(accepted=False, rejected_reason="stale_poll_generation")
@@ -809,7 +871,11 @@ class Phase2RestartRuntime:
         if not self.persistence_enabled:
             return RuntimeUpdate(accepted=False, rejected_reason="learning_disabled")
         server = self._servers.get(sample.server_key)
-        if server is None or not server.monitoring_session_id:
+        if (
+            server is None
+            or not server.monitoring_session_id
+            or not server.monitoring_session_durable
+        ):
             return RuntimeUpdate(accepted=False, rejected_reason="no_active_monitoring_session")
         if (
             sample.app_session_id != server.app_session_id
@@ -2266,6 +2332,17 @@ class Phase2RestartRuntime:
             self.persistence_status = RuntimePersistenceStatus.ENABLED
             self.persistence_error = None
 
+    def _server_state_is_durable(self, server: _ServerRuntime) -> bool:
+        """Return true only after the current staged server state is durable."""
+
+        if self.persistence_status is not RuntimePersistenceStatus.ENABLED:
+            return False
+        backend = self._authoritative_schema4_backend
+        return bool(
+            not server.dirty
+            and (backend is None or not backend.dirty)
+        )
+
     def _persist_server(self, server: _ServerRuntime, *, force: bool, now: float) -> bool:
         if not self.persistence_enabled or not server.dirty:
             return False
@@ -3356,6 +3433,39 @@ def _active_episode_persistence_signature(
         getattr(episode, "coverage_complete", None),
         getattr(episode, "lifecycle_interruption", None),
     )
+
+
+def _active_episode_monotonic_watermark(episode: object) -> float | None:
+    """Latest retained observation time from the episode's monotonic epoch."""
+
+    values: list[float] = []
+    for name in (
+        "started_mono",
+        "baseline_mono",
+        "last_positive_mono",
+        "drain_mono",
+        "low_start_mono",
+        "first_failure_mono",
+        "last_failure_mono",
+        "confirmed_offline_mono",
+        "info_return_mono",
+        "first_queue_mono",
+        "first_player_mono",
+        "stable_recovery_mono",
+    ):
+        parsed = _finite_number(getattr(episode, name, None))
+        if parsed is not None and parsed >= 0:
+            values.append(parsed)
+    for name in ("low_samples", "recovery_positive_times"):
+        for item in getattr(episode, name, ()) or ():
+            parsed = _finite_number(item)
+            if parsed is not None and parsed >= 0:
+                values.append(parsed)
+    for sample in getattr(episode, "samples", ()) or ():
+        parsed = _finite_number(getattr(sample, "monotonic_at", None))
+        if parsed is not None and parsed >= 0:
+            values.append(parsed)
+    return max(values) if values else None
 
 
 def _expected_window_v2_episode_evidence(

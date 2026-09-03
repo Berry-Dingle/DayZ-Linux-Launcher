@@ -1130,6 +1130,405 @@ def test_active_episode_signature_uses_semantic_threshold_buckets():
     ) == threshold
 
 
+OLD_BOOT_MONOTONIC = 172_800.0
+RECOVERY_MONOTONIC = 172_900.0
+
+
+def _persist_resumable_episode(
+    tmp_path: Path,
+    name: str,
+    *,
+    recovering: bool = True,
+    retain_stable_reference: bool = True,
+):
+    active = tmp_path / f"{name}.json"
+    value = runtime.Phase2RestartRuntime.initialize(
+        active_path=active,
+        legacy_path=tmp_path / f"{name}-legacy.json",
+        now=BASE,
+        app_session_id=f"{name}-old-boot",
+        authoritative_schema4_runtime_enabled=True,
+    )
+    assert value.begin_monitoring(
+        SERVER,
+        wall_at=BASE,
+        monotonic_at=OLD_BOOT_MONOTONIC,
+        poll_generation=1,
+    )
+
+    def ingest(monotonic_at, info):
+        return value.ingest_live_result(
+            SERVER,
+            poll_generation=1,
+            info=info,
+            wall_at=BASE + monotonic_at - OLD_BOOT_MONOTONIC,
+            monotonic_at=monotonic_at,
+        )
+
+    ingest(OLD_BOOT_MONOTONIC, {"ok": True, "players": 12, "max_players": 60})
+    ingest(OLD_BOOT_MONOTONIC + 10, {"ok": False, "err": "timeout"})
+    assert ingest(
+        OLD_BOOT_MONOTONIC + 20, {"ok": False, "err": "timeout"}
+    ).persisted
+    if recovering:
+        assert ingest(RECOVERY_MONOTONIC, {"ok": True}).persisted
+    server = value._servers[SERVER]
+    episode = server.engine.active_episode
+    assert episode is not None
+    expected_state = (
+        detection.EpisodeState.RECOVERING
+        if recovering
+        else detection.EpisodeState.OFFLINE
+    )
+    assert server.engine.state is expected_state
+    if recovering and not retain_stable_reference:
+        episode.stable_recovery_mono = None
+        episode.stable_recovery_wall = None
+        server.dirty = True
+        assert value._persist_server(server, force=True, now=BASE + 101)
+    event_id = episode.event_id
+    watermark = runtime._active_episode_monotonic_watermark(episode)
+    value._authoritative_schema4_backend.close(flush=False)
+    return active, event_id, watermark
+
+
+def _resume_schema4(active: Path, tmp_path: Path, name: str):
+    return runtime.Phase2RestartRuntime.initialize(
+        active_path=active,
+        legacy_path=tmp_path / f"{name}-unused.json",
+        now=BASE + 200,
+        app_session_id=f"{name}-new-process",
+        authoritative_schema4_runtime_enabled=True,
+    )
+
+
+def test_active_episode_monotonic_watermark_includes_all_retained_observations():
+    episode = SimpleNamespace(
+        started_mono=1,
+        baseline_mono=2,
+        last_positive_mono=3,
+        drain_mono=4,
+        low_start_mono=5,
+        low_samples=[6, 7],
+        first_failure_mono=8,
+        last_failure_mono=9,
+        confirmed_offline_mono=10,
+        info_return_mono=11,
+        first_queue_mono=12,
+        first_player_mono=13,
+        recovery_positive_times=[14, 15],
+        stable_recovery_mono=None,
+        samples=[SimpleNamespace(monotonic_at=16)],
+    )
+    assert runtime._active_episode_monotonic_watermark(episode) == 16
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "started_mono",
+        "baseline_mono",
+        "last_positive_mono",
+        "drain_mono",
+        "low_start_mono",
+        "first_failure_mono",
+        "last_failure_mono",
+        "confirmed_offline_mono",
+        "info_return_mono",
+        "first_queue_mono",
+        "first_player_mono",
+        "stable_recovery_mono",
+    ],
+)
+def test_active_episode_monotonic_watermark_includes_each_scalar(field_name):
+    values = {
+        name: None
+        for name in (
+            "started_mono",
+            "baseline_mono",
+            "last_positive_mono",
+            "drain_mono",
+            "low_start_mono",
+            "first_failure_mono",
+            "last_failure_mono",
+            "confirmed_offline_mono",
+            "info_return_mono",
+            "first_queue_mono",
+            "first_player_mono",
+            "stable_recovery_mono",
+        )
+    }
+    values[field_name] = 99
+    episode = SimpleNamespace(
+        **values,
+        low_samples=[],
+        recovery_positive_times=[],
+        samples=[],
+    )
+    assert runtime._active_episode_monotonic_watermark(episode) == 99
+
+
+@pytest.mark.parametrize(
+    ("resume_mono", "before_deadline", "finalize_mono"),
+    [
+        (RECOVERY_MONOTONIC + 10, RECOVERY_MONOTONIC + 29, RECOVERY_MONOTONIC + 30),
+        (RECOVERY_MONOTONIC + 40, None, RECOVERY_MONOTONIC + 40),
+    ],
+)
+def test_same_boot_recovering_resume_uses_observation_watermark_not_deadline(
+    tmp_path, resume_mono, before_deadline, finalize_mono
+):
+    name = f"same-boot-{int(resume_mono)}"
+    active, event_id, watermark = _persist_resumable_episode(tmp_path, name)
+    value = _resume_schema4(active, tmp_path, name)
+
+    assert watermark == RECOVERY_MONOTONIC
+    assert resume_mono >= watermark
+    session = value.begin_monitoring(
+        SERVER,
+        wall_at=BASE + 200,
+        monotonic_at=resume_mono,
+        poll_generation=2,
+    )
+    assert session
+    episode = value._servers[SERVER].engine.active_episode
+    assert episode is not None and episode.event_id == event_id
+    assert not value._servers[SERVER].events
+    if before_deadline is not None:
+        assert value.tick(
+            SERVER, wall_at=BASE + 219, monotonic_at=before_deadline
+        ).finalized_events == ()
+    completed = value.tick(
+        SERVER, wall_at=BASE + 220, monotonic_at=finalize_mono
+    )
+    assert len(completed.finalized_events) == 1
+    assert completed.finalized_events[0].event_id == event_id
+    assert completed.finalized_events[0].outcome is (
+        detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
+    )
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+def test_reboot_closure_is_durable_neutral_and_allows_distinct_next_episode(tmp_path):
+    name = "reboot-close"
+    active, stale_id, watermark = _persist_resumable_episode(tmp_path, name)
+    value = _resume_schema4(active, tmp_path, name)
+    server = value._servers[SERVER]
+    fired_before = set(server.fired_keys)
+
+    session = value.begin_monitoring(
+        SERVER, wall_at=BASE + 200, monotonic_at=20, poll_generation=2
+    )
+    assert session and 20 < watermark
+    assert server.engine.active_episode is None
+    assert server.fired_keys == fired_before
+    assert len(server.events) == 1
+    closed = server.events[0]
+    assert closed.event_id == stale_id
+    assert closed.outcome is detection.EventOutcome.INCOMPLETE
+    assert "monotonic_clock_discontinuity_on_resume" in closed.reason_codes
+    assert scoring._event_weight(closed) == 0
+    assert scoring._hint_event_weight(closed) == 0
+    assert server.expected_misses == []
+    assert server.score.schedule_existence_confidence == 0
+    assert server.score.selected_period_seconds is None
+    assert all(
+        candidate.direct_support == 0
+        and candidate.hints.weighted_alignment == 0
+        and candidate.covered_miss_count == 0
+        and not candidate.high_gates_passed
+        for candidate in server.score.candidates
+    )
+
+    persisted = schema4.deserialize_schema4_bytes(active.read_bytes()).state
+    legacy = persisted["servers"][SERVER]["legacy_schema3_record"]
+    assert legacy["active_episode"] is None
+    assert any(
+        item["event_id"] == stale_id
+        and item["outcome"] == detection.EventOutcome.INCOMPLETE.value
+        for item in legacy["events"]
+    )
+    authority = schema4.persisted_authority_decision(persisted["servers"][SERVER])
+    assert not authority.cycle_visible
+    assert not authority.prediction_usable
+    assert all(
+        not candidate.h1_gate
+        and not candidate.h2_gate
+        and not candidate.h3_gate
+        and not candidate.h4_gate
+        for candidate in authority.candidates
+    )
+
+    value._authoritative_schema4_backend.close(flush=False)
+    value = _resume_schema4(active, tmp_path, f"{name}-reload")
+    server = value._servers[SERVER]
+    assert server.engine.active_episode is None
+    assert any(item.event_id == stale_id for item in server.events)
+    session = value.begin_monitoring(
+        SERVER, wall_at=BASE + 210, monotonic_at=30, poll_generation=3
+    )
+    assert session
+
+    def ingest(at, info):
+        return value.ingest_live_result(
+            SERVER,
+            poll_generation=3,
+            info=info,
+            wall_at=BASE + 210 + at,
+            monotonic_at=30 + at,
+        )
+
+    assert ingest(0, {"ok": True, "players": 12, "max_players": 60}).accepted
+    ingest(10, {"ok": False, "err": "timeout"})
+    ingest(20, {"ok": False, "err": "timeout"})
+    next_episode = server.engine.active_episode
+    assert next_episode is not None
+    assert next_episode.event_id != stale_id
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+@pytest.mark.parametrize(("resume_mono", "closes"), [(20.0, True), (RECOVERY_MONOTONIC, False)])
+def test_recovering_without_stable_reference_uses_full_watermark(
+    tmp_path, resume_mono, closes
+):
+    name = f"no-stable-{int(resume_mono)}"
+    active, stale_id, watermark = _persist_resumable_episode(
+        tmp_path, name, retain_stable_reference=False
+    )
+    assert watermark == RECOVERY_MONOTONIC
+    value = _resume_schema4(active, tmp_path, name)
+    assert value.begin_monitoring(
+        SERVER,
+        wall_at=BASE + 200,
+        monotonic_at=resume_mono,
+        poll_generation=2,
+    )
+    server = value._servers[SERVER]
+    if closes:
+        assert server.engine.active_episode is None
+        assert server.events[-1].event_id == stale_id
+        assert server.events[-1].outcome is detection.EventOutcome.INCOMPLETE
+    else:
+        assert server.engine.active_episode is not None
+        assert server.engine.active_episode.event_id == stale_id
+        assert not server.events
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+def test_reboot_discontinuity_retryable_write_failure_blocks_session_until_retry(
+    tmp_path,
+):
+    name = "retryable-barrier"
+    active, _stale_id, _watermark = _persist_resumable_episode(tmp_path, name)
+    value = _resume_schema4(active, tmp_path, name)
+    backend = value._authoritative_schema4_backend
+
+    def fail_precommit(point):
+        if point is live4.Schema4CrashPoint.BEFORE_TEMP_COMPLETE:
+            raise OSError("confirmed pre-commit failure")
+
+    backend._crash_injector = fail_precommit
+    assert value.begin_monitoring(
+        SERVER, wall_at=BASE + 200, monotonic_at=20, poll_generation=2
+    ) == ""
+    server = value._servers[SERVER]
+    pending_id = server.monitoring_session_id
+    assert pending_id and not server.monitoring_session_durable
+    assert value.persistence_status is (
+        runtime.RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED
+    )
+    assert value.active_monitoring_session_id(SERVER) == ""
+    rejected = value.ingest_live_result(
+        SERVER,
+        poll_generation=2,
+        info={"ok": True, "players": 12, "max_players": 60},
+        wall_at=BASE + 201,
+        monotonic_at=21,
+    )
+    assert not rejected.accepted
+    persisted = schema4.deserialize_schema4_bytes(active.read_bytes()).state
+    assert persisted["servers"][SERVER]["legacy_schema3_record"]["active_episode"]
+
+    backend._crash_injector = None
+    assert value.begin_monitoring(
+        SERVER, wall_at=BASE + 202, monotonic_at=22, poll_generation=2
+    ) == pending_id
+    assert server.monitoring_session_durable
+    assert value.active_monitoring_session_id(SERVER) == pending_id
+    persisted = schema4.deserialize_schema4_bytes(active.read_bytes()).state
+    assert persisted["servers"][SERVER]["legacy_schema3_record"]["active_episode"] is None
+    backend.close(flush=False)
+
+
+def test_reboot_discontinuity_ambiguous_write_failure_fails_closed(tmp_path):
+    name = "ambiguous-barrier"
+    active, _stale_id, _watermark = _persist_resumable_episode(tmp_path, name)
+    value = _resume_schema4(active, tmp_path, name)
+    backend = value._authoritative_schema4_backend
+
+    def fail_after_replace(point):
+        if point is live4.Schema4CrashPoint.AFTER_REPLACE:
+            raise RuntimeError("ambiguous post-commit failure")
+
+    backend._crash_injector = fail_after_replace
+    assert value.begin_monitoring(
+        SERVER, wall_at=BASE + 200, monotonic_at=20, poll_generation=2
+    ) == ""
+    server = value._servers[SERVER]
+    assert value.persistence_status is runtime.RuntimePersistenceStatus.DISABLED_WRITE_FAILED
+    assert not server.monitoring_session_durable
+    assert value.active_monitoring_session_id(SERVER) == ""
+    rejected = value.ingest_live_result(
+        SERVER,
+        poll_generation=2,
+        info={"ok": True, "players": 12, "max_players": 60},
+        wall_at=BASE + 201,
+        monotonic_at=21,
+    )
+    assert not rejected.accepted and rejected.rejected_reason == "learning_disabled"
+    backend.close(flush=False)
+
+
+def test_restored_offline_episode_is_not_closed_by_monotonic_regression(tmp_path):
+    name = "offline-unchanged"
+    active, event_id, watermark = _persist_resumable_episode(
+        tmp_path, name, recovering=False
+    )
+    value = _resume_schema4(active, tmp_path, name)
+    assert value.begin_monitoring(
+        SERVER, wall_at=BASE + 200, monotonic_at=20, poll_generation=2
+    )
+    server = value._servers[SERVER]
+    assert 20 < watermark
+    assert server.engine.state is detection.EpisodeState.OFFLINE
+    assert server.engine.active_episode is not None
+    assert server.engine.active_episode.event_id == event_id
+    assert not server.events
+    value._authoritative_schema4_backend.close(flush=False)
+
+
+def test_same_boot_clean_shutdown_during_recovery_keeps_existing_policy(tmp_path):
+    name = "clean-shutdown-policy"
+    active, stale_id, _watermark = _persist_resumable_episode(tmp_path, name)
+    value = _resume_schema4(active, tmp_path, name)
+    assert value.begin_monitoring(
+        SERVER,
+        wall_at=BASE + 200,
+        monotonic_at=RECOVERY_MONOTONIC + 10,
+        poll_generation=2,
+    )
+    value.shutdown(
+        wall_at=BASE + 210,
+        monotonic_at=RECOVERY_MONOTONIC + 20,
+    )
+    persisted = schema4.deserialize_schema4_bytes(active.read_bytes()).state
+    legacy = persisted["servers"][SERVER]["legacy_schema3_record"]
+    event = next(item for item in legacy["events"] if item["event_id"] == stale_id)
+    assert event["outcome"] == detection.EventOutcome.INCOMPLETE.value
+    assert event["lifecycle_interruption"] == detection.LifecycleMarker.SHUTDOWN.value
+    assert "monotonic_clock_discontinuity_on_resume" not in event["reason_codes"]
+
+
 def test_confirmed_offline_counter_polls_coalesce_and_finalize_once(tmp_path):
     active = tmp_path / "schema4.json"
     _write(active)
