@@ -4,6 +4,7 @@ import sqlite3
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from .config import APP_VERSION, DB_URL, DB_LOCAL_DIR, DB_LOCAL_PATH
 
@@ -122,8 +123,11 @@ def fetch_db_overwrite_local() -> bool:
 def read_servers_from_db() -> list:
     if not os.path.exists(DB_LOCAL_PATH):
         return []
+    con = None
     try:
-        con = sqlite3.connect(DB_LOCAL_PATH)
+        db_path = Path(DB_LOCAL_PATH).expanduser().resolve()
+        db_uri = f"{db_path.as_uri()}?mode=ro"
+        con = sqlite3.connect(db_uri, uri=True)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
         cur.execute("""
@@ -139,8 +143,10 @@ def read_servers_from_db() -> list:
             ORDER BY players DESC, ping ASC
         """)
         rows = cur.fetchall()
-        con.close()
         return [dict(r) for r in rows]
     except Exception as e:
         print(f"[DB] Read failed: {e}")
         return []
+    finally:
+        if con is not None:
+            con.close()

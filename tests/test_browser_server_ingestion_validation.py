@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
@@ -116,6 +117,125 @@ def _write_server_database(path, rows):
     )
     connection.commit()
     connection.close()
+
+
+def test_read_servers_uses_safe_read_only_uri_for_unusual_path(tmp_path, monkeypatch):
+    path = tmp_path / "servers space ? # café.sqlite"
+    _write_server_database(path, [_row("127.0.0.1", name="First"),
+                                  _row("127.0.0.2", name="Second")])
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(path))
+
+    calls = []
+    real_connect = sqlite3.connect
+
+    def connect(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(db.sqlite3, "connect", connect)
+    assert [row["name"] for row in db.read_servers_from_db()] == [
+        "First", "Second",
+    ]
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert kwargs == {"uri": True}
+    assert args == (f"{Path(path).resolve().as_uri()}?mode=ro",)
+
+    read_only = real_connect(args[0], uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            read_only.execute("CREATE TABLE must_fail (value INTEGER)")
+    finally:
+        read_only.close()
+
+
+def test_read_servers_closes_connection_after_post_connect_failure(
+        tmp_path, monkeypatch):
+    path = tmp_path / "servers.sqlite"
+    _write_server_database(path, [_row("127.0.0.1")])
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(path))
+
+    real_connect = sqlite3.connect
+    tracked = []
+
+    class TrackingCursor:
+        def __init__(self, cursor):
+            self._cursor = cursor
+
+        def execute(self, *args, **kwargs):
+            self._cursor.execute(*args, **kwargs)
+            return self
+
+        def fetchall(self):
+            raise RuntimeError("injected fetch failure")
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+            self.close_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def cursor(self):
+            return TrackingCursor(self._connection.cursor())
+
+        def close(self):
+            self.close_calls += 1
+            return self._connection.close()
+
+    def connect(*args, **kwargs):
+        connection = TrackingConnection(real_connect(*args, **kwargs))
+        tracked.append(connection)
+        return connection
+
+    monkeypatch.setattr(db.sqlite3, "connect", connect)
+    assert db.read_servers_from_db() == []
+    assert len(tracked) == 1
+    assert tracked[0].close_calls == 1
+
+
+def test_read_servers_missing_database_does_not_connect(tmp_path, monkeypatch):
+    path = tmp_path / "missing.sqlite"
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(path))
+    connect_called = []
+    monkeypatch.setattr(
+        db.sqlite3, "connect", lambda *args, **kwargs: connect_called.append(True),
+    )
+
+    assert db.read_servers_from_db() == []
+    assert connect_called == []
+
+
+def test_read_servers_corrupt_database_closes_connection(tmp_path, monkeypatch):
+    path = tmp_path / "corrupt.sqlite"
+    path.write_bytes(b"not a sqlite database")
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(path))
+
+    real_connect = sqlite3.connect
+    tracked = []
+
+    class TrackingConnection:
+        def __init__(self, connection):
+            self._connection = connection
+            self.close_calls = 0
+
+        def __getattr__(self, name):
+            return getattr(self._connection, name)
+
+        def close(self):
+            self.close_calls += 1
+            return self._connection.close()
+
+    def connect(*args, **kwargs):
+        connection = TrackingConnection(real_connect(*args, **kwargs))
+        tracked.append(connection)
+        return connection
+
+    monkeypatch.setattr(db.sqlite3, "connect", connect)
+    assert db.read_servers_from_db() == []
+    assert len(tracked) == 1
+    assert tracked[0].close_calls == 1
 
 
 def test_malformed_row_is_dropped_without_aborting_surrounding_valid_rows():
