@@ -548,6 +548,73 @@ def test_strong_query_visible_event_remains_normal_only():
     assert "high_ineligible_endpoint_class" in relationships[0].reason_codes
 
 
+@pytest.mark.parametrize(
+    "marker",
+    [
+        detection.LifecycleMarker.PAUSE,
+        detection.LifecycleMarker.SHUTDOWN,
+        detection.LifecycleMarker.SERVER_SWITCH,
+        detection.LifecycleMarker.CLEAR,
+        detection.LifecycleMarker.SLEEP_GAP,
+        detection.LifecycleMarker.APP_RESTART,
+        detection.LifecycleMarker.RESUME,
+    ],
+)
+def test_lifecycle_interrupted_event_is_never_a_relationship_endpoint(marker):
+    interrupted = replace(
+        event(0, 1, outcome=detection.EventOutcome.AMBIGUOUS_DRAIN),
+        authenticity=0.35,
+        schedule_weight_suggestion=0.15,
+        coverage_complete=False,
+        lifecycle_interruption=marker,
+        reason_codes=(f"lifecycle_{marker.value}",),
+    )
+    eligible = event(3, 2)
+
+    relationships = continuity.extract_interval_relationships(
+        (interrupted, eligible),
+        (span(0, 3),),
+        candidate_periods=(3 * HOUR,),
+    )
+
+    assert not scoring.event_learning_eligible(interrupted)
+    assert relationships == ()
+
+
+def test_coverage_incomplete_uncertain_a2s_event_is_not_relationship_endpoint():
+    interrupted = replace(
+        event(0, 1, outcome=detection.EventOutcome.UNCERTAIN_A2S_INTERRUPTION),
+        coverage_complete=False,
+    )
+
+    assert continuity.extract_interval_relationships(
+        (interrupted, event(3, 2)),
+        (span(0, 3),),
+        candidate_periods=(3 * HOUR,),
+    ) == ()
+
+
+def test_ineligible_events_remain_in_ledger_for_relationship_lookahead_bounds():
+    interrupted = tuple(
+        replace(
+            event(hour, sequence, outcome=detection.EventOutcome.AMBIGUOUS_DRAIN),
+            authenticity=0.35,
+            schedule_weight_suggestion=0.15,
+            coverage_complete=False,
+            lifecycle_interruption=detection.LifecycleMarker.SLEEP_GAP,
+        )
+        for sequence, hour in ((2, 2), (3, 4))
+    )
+
+    relationships = continuity.extract_interval_relationships(
+        (event(0, 1), *interrupted, event(6, 4)),
+        (span(0, 6),),
+        candidate_periods=(6 * HOUR,),
+    )
+
+    assert relationships == ()
+
+
 def test_missing_schema_three_provenance_is_normal_and_unproven():
     relationship = continuity.extract_interval_relationships(
         (event(0, 1, provenance=0), event(3, 2, provenance=0)),

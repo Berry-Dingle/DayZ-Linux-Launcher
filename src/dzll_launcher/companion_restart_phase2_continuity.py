@@ -26,6 +26,7 @@ from .companion_restart_phase2_scoring import (
     PHASE_UNCERTAINTY_CAP,
     SKIP_OVER_WEIGHT_FACTOR,
     candidate_phase_tolerance,
+    event_learning_eligible,
 )
 
 
@@ -583,7 +584,10 @@ def extract_interval_relationships(
     span_values = tuple(spans)
     relationships: dict[str, IntervalRelationship] = {}
     for left_index, left in enumerate(unique):
-        if _schedule_neutral_attribution_anomaly(left):
+        if (
+            not event_learning_eligible(left)
+            or _schedule_neutral_attribution_anomaly(left)
+        ):
             continue
         left_at = _event_at(left)
         if left_at is None:
@@ -591,7 +595,10 @@ def extract_interval_relationships(
         upper = min(len(unique), left_index + MAX_INTERVENING_EVENTS + 2)
         for right_index in range(left_index + 1, upper):
             right = unique[right_index]
-            if _schedule_neutral_attribution_anomaly(right):
+            if (
+                not event_learning_eligible(right)
+                or _schedule_neutral_attribution_anomaly(right)
+            ):
                 continue
             right_at = _event_at(right)
             if right_at is None or right_at <= left_at:

@@ -373,6 +373,33 @@ def test_sanitized_bob_sequence_22_suspicion_is_cleared_by_aligned_sequence_23()
     )
 
 
+def test_incomplete_confirmed_off_phase_event_is_not_suspicion_evidence():
+    events, relationships, streaks = sanitized_bob_evidence()
+    incumbent = evaluate(events, relationships, streaks)
+    incomplete = replace(
+        event(
+            22,
+            1_784_735_860.1699753,
+            event_id="incomplete-confirmed-off-phase",
+            authenticity=0.97,
+        ),
+        coverage_complete=False,
+    )
+
+    value = evaluate(
+        (*events, incomplete), relationships, streaks, prior=incumbent
+    )
+
+    assert not scoring.event_learning_eligible(incomplete)
+    assert value.state is authority.RegimeState.ESTABLISHED
+    assert value.suspicion_level == 0
+    assert incomplete.event_id not in value.active_suspicion_evidence_ids
+    assert all(
+        incomplete.event_id not in item.off_phase_event_ids
+        for item in value.normal_ledger.candidates
+    )
+
+
 def test_false_legacy_misses_cannot_cancel_bob_high_authority():
     events, relationships, streaks = bob_shape()
     period = 3 * HOUR
@@ -497,6 +524,28 @@ def test_later_aligned_hit_clears_level_one_suspicion():
     assert cleared.state is authority.RegimeState.ESTABLISHED
     assert cleared.suspicion_level == 0
     assert not cleared.active_suspicion_evidence_ids
+
+
+def test_incomplete_confirmed_aligned_event_cannot_clear_suspicion():
+    events, relationships, streaks = cadence(3 * HOUR, 4)
+    incumbent = evaluate(events, relationships, streaks)
+    expected = events[-1].canonical_phase_at + 3 * HOUR
+    miss = legacy_miss(3 * HOUR, expected, key="incomplete-aligned-miss")
+    suspected = evaluate(events, relationships, streaks, ledger=(miss,), prior=incumbent)
+    incomplete = replace(event(99, expected + 3 * HOUR), coverage_complete=False)
+
+    value = evaluate(
+        (*events, incomplete),
+        relationships,
+        streaks,
+        ledger=(miss,),
+        prior=suspected,
+    )
+
+    assert not scoring.event_learning_eligible(incomplete)
+    assert value.state is authority.RegimeState.CHANGE_SUSPECTED
+    assert value.suspicion_level == 1
+    assert value.active_suspicion_evidence_ids == (miss.result_id,)
 
 
 def established_three_hour():

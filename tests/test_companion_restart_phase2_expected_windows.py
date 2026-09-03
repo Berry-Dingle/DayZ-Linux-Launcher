@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import asdict, FrozenInstanceError
+from dataclasses import asdict, FrozenInstanceError, replace
 
 import pytest
 
@@ -163,6 +163,31 @@ def test_qualifying_finalized_event_is_hit_before_outage_semantics():
     assert value.qualifying_finalized_event_id == "restart-1"
     assert not value.negative_penalty_active
     assert "classification_order_hit_first" in value.reason_codes
+
+
+def test_incomplete_confirmed_event_blocks_window_without_hit_or_miss_retraction():
+    incomplete = replace(event(), coverage_complete=False)
+    value = classify(events=(incomplete,))
+
+    assert not scoring.event_learning_eligible(incomplete)
+    assert value.outcome is windows.ExpectedWindowOutcome.AMBIGUOUS
+    assert value.qualifying_finalized_event_id is None
+    assert value.overlapping_outage_episode_ids == (incomplete.event_id,)
+    assert value.unresolved_episode
+    assert not value.outage_observed
+    assert not value.negative_penalty_active
+
+    original = legacy_miss()
+    assert reconcile((original,), (value,)) == (original,)
+
+
+def test_complete_confirmed_event_retains_expected_window_hit_contract():
+    complete = event()
+    value = classify(events=(complete,))
+
+    assert scoring.event_learning_eligible(complete)
+    assert value.outcome is windows.ExpectedWindowOutcome.HIT
+    assert value.qualifying_finalized_event_id == complete.event_id
 
 
 def test_offline_observed_is_ambiguous_never_a_miss():

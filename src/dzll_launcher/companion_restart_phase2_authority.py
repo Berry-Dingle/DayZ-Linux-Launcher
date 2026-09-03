@@ -23,6 +23,7 @@ from .companion_restart_phase2_scoring import (
     CandidateScore,
     ScheduleScore,
     candidate_phase_tolerance,
+    event_learning_eligible,
 )
 
 
@@ -1829,7 +1830,8 @@ def _unique_events(
 
 def _authentic_event(event: PhysicalRestartEvent) -> bool:
     return bool(
-        event.authenticity >= 0.50
+        event_learning_eligible(event)
+        and event.authenticity >= 0.50
         and event.outcome
         not in {
             EventOutcome.AMBIGUOUS_DRAIN,

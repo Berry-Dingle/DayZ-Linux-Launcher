@@ -440,6 +440,112 @@ def test_lifecycle_closes_active_episode_and_breaks_coverage(tmp_path):
     assert record["monitoring_sessions"][-1]["reason"] == detection.LifecycleMarker.PAUSE.value
 
 
+def test_runtime_fold_does_not_persist_learning_hints_for_lifecycle_events(tmp_path):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    server.events = [
+        replace(
+            scored_event(hour, sequence, detection.EventOutcome.AMBIGUOUS_DRAIN),
+            authenticity=0.35,
+            schedule_weight_suggestion=0.15,
+            coverage_complete=False,
+            lifecycle_interruption=detection.LifecycleMarker.SHUTDOWN,
+            reason_codes=("lifecycle_shutdown",),
+        )
+        for sequence, hour in enumerate((0, 3), 1)
+    ]
+    server.event_seq = 2
+
+    value._fold_old_events(server, now=BASE + 3 * scoring.HOUR, target_limit=0)
+
+    assert server.events == []
+    assert all(
+        candidate.hint_count == 0 and candidate.hint_weight == 0
+        for candidate in server.aggregate.candidates
+    )
+    assert dict(server.aggregate.source_quality_counts) == {
+        detection.EventOutcome.AMBIGUOUS_DRAIN.value: 2
+    }
+    assert server.aggregate.anomaly_count == 2
+
+
+def test_lifecycle_event_remains_diagnostic_but_neutral_after_reload(tmp_path):
+    value, active, legacy = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    interrupted = replace(
+        scored_event(0, 1, detection.EventOutcome.AMBIGUOUS_DRAIN),
+        authenticity=0.35,
+        schedule_weight_suggestion=0.15,
+        coverage_complete=False,
+        lifecycle_interruption=detection.LifecycleMarker.SHUTDOWN,
+        reason_codes=("lifecycle_shutdown",),
+    )
+    value._route_finalized(server, (interrupted,), now=BASE)
+    value._evaluate(server, now=BASE)
+    assert value._persist_server(server, force=True, now=BASE)
+
+    stored = json.loads(active.read_text())["servers"][SERVER]
+    assert stored["events"][0]["lifecycle_interruption"] == "shutdown"
+    assert not stored["events"][0]["coverage_complete"]
+
+    again = runtime.Phase2RestartRuntime.initialize(
+        active_path=active,
+        legacy_path=legacy,
+        now=BASE + 1,
+        app_session_id="reloaded-app-session",
+    )
+    loaded = again._servers[SERVER]
+    result = scoring.RestartScheduleScorer().score(
+        loaded.events,
+        scoring.CoverageTimeline(tuple(loaded.coverage)),
+        now=BASE + 1,
+    )
+
+    assert len(loaded.events) == 1
+    assert loaded.events[0].lifecycle_interruption is detection.LifecycleMarker.SHUTDOWN
+    assert all(
+        candidate.hints.event_count == 0
+        and candidate.hints.weighted_alignment == 0
+        for candidate in result.candidates
+    )
+    assert result.schedule_existence_confidence == 0
+
+
+def test_incomplete_confirmed_event_cannot_unlock_consumer_pattern(tmp_path, monkeypatch):
+    value, *_ = make_runtime(tmp_path)
+    server = value._server(SERVER)
+    complete = [scored_event(hour, sequence) for sequence, hour in enumerate((0, 3), 1)]
+    incomplete = replace(scored_event(6, 3), coverage_complete=False)
+    server.events = [*complete, incomplete]
+    server.coverage = [
+        scoring.CoverageSegment(
+            BASE,
+            BASE + 7 * scoring.HOUR,
+            scoring.CoverageKind.ONLINE_HEALTHY,
+        )
+    ]
+    observed_policies = []
+    real_evaluate_consumers = runtime.evaluate_consumers
+
+    def capture_policy(policy):
+        observed_policies.append(policy)
+        return real_evaluate_consumers(policy)
+
+    monkeypatch.setattr(runtime, "evaluate_consumers", capture_policy)
+
+    value._evaluate(server, now=BASE + 7 * scoring.HOUR)
+    assert incomplete.outcome is detection.EventOutcome.CORROBORATED_OFFLINE_RESTART
+    assert not scoring.event_learning_eligible(incomplete)
+    assert observed_policies[-1].independent_authentic_event_count == 2
+    assert server.decision.model_status is consumers.ConsumerModelStatus.NO_PATTERN
+    assert consumers.BlockReason.INSUFFICIENT_EVENTS in server.decision.model_reasons
+
+    server.events[-1] = replace(incomplete, coverage_complete=True)
+    value._evaluate(server, now=BASE + 7 * scoring.HOUR)
+    assert observed_policies[-1].independent_authentic_event_count == 3
+    assert server.decision.model_status is not consumers.ConsumerModelStatus.NO_PATTERN
+
+
 def test_poll_coverage_is_dense_and_large_callback_gap_is_explicit(tmp_path):
     value, *_ = make_runtime(tmp_path)
     begin(value)

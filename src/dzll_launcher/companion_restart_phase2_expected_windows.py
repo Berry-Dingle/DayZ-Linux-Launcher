@@ -19,6 +19,7 @@ from .companion_restart_phase2_scoring import (
     CANDIDATE_PERIODS,
     CoverageKind,
     CoverageSegment,
+    event_learning_eligible,
 )
 
 
@@ -290,12 +291,13 @@ def classify_expected_window(
             event, window_start_at, window_end_at
         ):
             continue
+        learning_eligible = event_learning_eligible(event)
         if _event_has_restart_like_activity(event):
             outage_ids.add(event.event_id)
             ambiguous_reasons.add("overlapping_restart_like_event")
-            if _event_has_direct_outage_or_recovery(event):
+            if learning_eligible and _event_has_direct_outage_or_recovery(event):
                 positive_outage_observed = True
-        if event.outcome in {
+        if not learning_eligible or event.outcome in {
             EventOutcome.AMBIGUOUS_DRAIN,
             EventOutcome.UNCERTAIN_A2S_INTERRUPTION,
             EventOutcome.INCOMPLETE,
@@ -865,7 +867,11 @@ def _span_from_coverage_segment(segment: CoverageSegment) -> ContinuitySpan:
 
 
 def _qualifying_event(event: PhysicalRestartEvent) -> bool:
-    return event.outcome in _QUALIFYING_OUTCOMES and event.authenticity >= 0.50
+    return bool(
+        event_learning_eligible(event)
+        and event.outcome in _QUALIFYING_OUTCOMES
+        and event.authenticity >= 0.50
+    )
 
 
 def _event_has_restart_like_activity(event: PhysicalRestartEvent) -> bool:

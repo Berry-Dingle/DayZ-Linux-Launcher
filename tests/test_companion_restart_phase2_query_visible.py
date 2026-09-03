@@ -416,6 +416,27 @@ def test_no_repopulation_by_grace_expiry_becomes_weak_drain_evidence_without_ale
     assert fired == set()
 
 
+def test_completed_repopulation_timeout_retains_intended_weak_hint_weight():
+    left = no_repopulation_event()
+    right = no_repopulation_event(wall_shift=PERIOD)
+    result = scoring.RestartScheduleScorer().score(
+        (left, right),
+        scoring.CoverageTimeline(),
+        now=right.finalized_at,
+    )
+    hint = result.candidate(PERIOD).hints
+
+    assert left.coverage_complete and right.coverage_complete
+    assert left.lifecycle_interruption is None
+    assert right.lifecycle_interruption is None
+    assert scoring.event_learning_eligible(left)
+    assert scoring.event_learning_eligible(right)
+    assert scoring._hint_event_weight(left) == 0.15
+    assert scoring._hint_event_weight(right) == 0.15
+    assert hint.event_count == 2
+    assert hint.weighted_alignment == pytest.approx(0.045)
+
+
 def test_no_repopulation_weak_evidence_anchors_to_drain_not_grace_expiry():
     event = no_repopulation_event()
 

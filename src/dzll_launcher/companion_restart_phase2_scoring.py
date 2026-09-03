@@ -1381,8 +1381,14 @@ def _event_at(event: PhysicalRestartEvent) -> float | None:
     return value
 
 
+def event_learning_eligible(event: PhysicalRestartEvent) -> bool:
+    """Whether an event may contribute positive or negative schedule learning."""
+
+    return event.coverage_complete and event.lifecycle_interruption is None
+
+
 def _event_weight(event: PhysicalRestartEvent) -> float:
-    if not event.coverage_complete:
+    if not event_learning_eligible(event):
         return 0.0
     weights = {
         EventOutcome.CORROBORATED_OFFLINE_RESTART: 1.0,
@@ -1394,6 +1400,8 @@ def _event_weight(event: PhysicalRestartEvent) -> float:
 
 
 def _hint_event_weight(event: PhysicalRestartEvent) -> float:
+    if not event_learning_eligible(event):
+        return 0.0
     direct = _event_weight(event)
     if direct > 0:
         return direct

@@ -271,6 +271,82 @@ def test_weak_episodes_are_hint_only_across_unmonitored_time(outcome):
 
 
 @pytest.mark.parametrize(
+    "marker",
+    [
+        detection.LifecycleMarker.PAUSE,
+        detection.LifecycleMarker.SHUTDOWN,
+        detection.LifecycleMarker.SERVER_SWITCH,
+        detection.LifecycleMarker.CLEAR,
+        detection.LifecycleMarker.SLEEP_GAP,
+        detection.LifecycleMarker.APP_RESTART,
+        detection.LifecycleMarker.RESUME,
+    ],
+)
+def test_lifecycle_interrupted_ambiguous_events_are_learning_neutral(marker):
+    physical = tuple(
+        replace_event(
+            event(hour, sequence, detection.EventOutcome.AMBIGUOUS_DRAIN),
+            authenticity=0.35,
+            schedule_weight_suggestion=0.15,
+            coverage_complete=False,
+            lifecycle_interruption=marker,
+            reason_codes=(f"lifecycle_{marker.value}",),
+        )
+        for sequence, hour in enumerate((0, 3), 1)
+    )
+    scorer = scoring.RestartScheduleScorer()
+    result = scorer.score(
+        physical, scoring.CoverageTimeline(), now=BASE + 3 * HOUR
+    )
+    empty = scorer.score((), scoring.CoverageTimeline(), now=BASE + 3 * HOUR)
+
+    assert all(not scoring.event_learning_eligible(item) for item in physical)
+    assert all(scoring._event_weight(item) == 0 for item in physical)
+    assert all(scoring._hint_event_weight(item) == 0 for item in physical)
+    assert result.schedule_existence_confidence == empty.schedule_existence_confidence
+    assert all(
+        candidate.direct_support == 0
+        and candidate.hints.event_count == 0
+        and candidate.hints.weighted_alignment == 0
+        and candidate.covered_miss_count == 0
+        and candidate.off_grid_event_count == 0
+        and candidate.off_grid_penalty == 0
+        and candidate.fundamental_period_confidence == 0
+        for candidate in result.candidates
+    )
+
+
+def test_coverage_incomplete_uncertain_a2s_event_is_learning_neutral():
+    value = replace_event(
+        event(0, 1, detection.EventOutcome.UNCERTAIN_A2S_INTERRUPTION),
+        coverage_complete=False,
+    )
+
+    assert not scoring.event_learning_eligible(value)
+    assert scoring._event_weight(value) == 0
+    assert scoring._hint_event_weight(value) == 0
+
+
+def test_lifecycle_ambiguous_event_still_blocks_covered_interval_inference():
+    interrupted = replace_event(
+        event(3, 2, detection.EventOutcome.AMBIGUOUS_DRAIN),
+        authenticity=0.35,
+        schedule_weight_suggestion=0.15,
+        coverage_complete=False,
+        lifecycle_interruption=detection.LifecycleMarker.SHUTDOWN,
+        reason_codes=("lifecycle_shutdown",),
+    )
+    result = scoring.RestartScheduleScorer().score(
+        (event(0, 1), interrupted, event(6, 3)),
+        full_coverage(0, 6),
+        now=BASE + 6 * HOUR,
+    )
+
+    assert result.candidate(6 * HOUR).direct_support == 0
+    assert result.candidate(3 * HOUR).covered_miss_count == 0
+
+
+@pytest.mark.parametrize(
     ("shorter", "longer"),
     [(2, 6), (3, 6), (3, 12), (4, 8), (4, 12), (6, 12)],
 )

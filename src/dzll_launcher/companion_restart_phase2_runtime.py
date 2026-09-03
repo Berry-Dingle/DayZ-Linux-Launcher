@@ -89,6 +89,7 @@ from .companion_restart_phase2_scoring import (
     RestartScheduleScorer,
     ScheduleScore,
     candidate_phase_tolerance,
+    event_learning_eligible,
 )
 from .companion_restart_phase2_storage import (
     PHASE2_SCHEMA_VERSION,
@@ -1723,7 +1724,8 @@ class Phase2RestartRuntime:
                 regime_generation=server.regime_generation,
                 now=now,
                 independent_authentic_event_count=sum(
-                    item.authenticity >= 0.50
+                    event_learning_eligible(item)
+                    and item.authenticity >= 0.50
                     and item.outcome not in {
                         EventOutcome.AMBIGUOUS_DRAIN,
                         EventOutcome.UNCERTAIN_A2S_INTERRUPTION,

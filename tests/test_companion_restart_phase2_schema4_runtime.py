@@ -1306,6 +1306,13 @@ def test_same_boot_recovering_resume_uses_observation_watermark_not_deadline(
     assert completed.finalized_events[0].outcome is (
         detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
     )
+    finalized = completed.finalized_events[0]
+    assert not finalized.coverage_complete
+    assert finalized.lifecycle_interruption is None
+    assert not scoring.event_learning_eligible(finalized)
+    assert scoring._event_weight(finalized) == 0
+    assert scoring._hint_event_weight(finalized) == 0
+    assert value._servers[SERVER].score.schedule_existence_confidence == 0
     value._authoritative_schema4_backend.close(flush=False)
 
 
