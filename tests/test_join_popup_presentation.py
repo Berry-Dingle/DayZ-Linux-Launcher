@@ -199,15 +199,11 @@ class JoinPopupPresentationTests(unittest.TestCase):
         self.assertNotIn('"Preparing required mods..."', JOIN_SOURCE)
         self.assertIn("_join_popup_show_launching(attempt_id)", JOIN_SOURCE)
 
-    def test_steamcmd_size_refresh_is_backend_owned(self):
-        function = STEAMCMD_UI_SOURCE.split("def _steamcmd_refresh_active_download_line2", 1)[1]
-        function = function.split("def _format_bytes_human", 1)[0]
-        self.assertIn('_mod_download_backend_active", "") != "steamcmd"', function)
-        self.assertIn("return False", function)
-
-    def test_steamcmd_auth_prompts_remain(self):
-        self.assertIn("SteamCMD Login", STEAMCMD_UI_SOURCE)
-        self.assertIn("Steam Guard", STEAMCMD_UI_SOURCE)
+    def test_shared_overlay_has_no_steamcmd_credentials_or_size_scanner(self):
+        self.assertNotIn("SteamCMD Login", STEAMCMD_UI_SOURCE)
+        self.assertNotIn("Steam Guard", STEAMCMD_UI_SOURCE)
+        self.assertNotIn("_steamcmd_refresh_active_download_line2", STEAMCMD_UI_SOURCE)
+        self.assertIn("steamcmd_cancel_btn", STEAMCMD_UI_SOURCE)
 
     def test_errors_bypass_pending_coalescing(self):
         harness = PresentationHarness()
@@ -281,7 +277,7 @@ class JoinPopupPresentationTests(unittest.TestCase):
 
     def test_backend_work_and_join_continuation_are_unchanged(self):
         self.assertIn("ok = win.run_steam_client_install(", JOIN_SOURCE)
-        self.assertIn("ok = win.run_steamcmd_install(", JOIN_SOURCE)
+        self.assertNotIn("run_steamcmd_install", JOIN_SOURCE)
         self.assertIn("win.GLib.idle_add(after)", JOIN_SOURCE)
         self.assertNotIn("sleep(", JOIN_SOURCE)
         shared = JOIN_SOURCE.split("def prepare_required_mods", 1)[1].split(

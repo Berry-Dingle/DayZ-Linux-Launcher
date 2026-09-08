@@ -1,9 +1,4 @@
-from pathlib import Path
-
 from dzll_launcher import server_companion_ui
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class Label:
@@ -141,11 +136,3 @@ def test_explicitly_persistent_join_status_has_no_clear_timer(monkeypatch):
     assert timers.scheduled == {}
     assert panel.join_status_label.text == "Waiting for user action"
     assert panel.join_status_label.visible is True
-
-
-def test_steamcmd_login_required_is_explicitly_persistent():
-    source = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
-    login_status = source.split('"SteamCMD Login Required"', 1)[1].split(
-        "return self._steamcmd_overlay_ui", 1,
-    )[0]
-    assert "transient=False" in login_status

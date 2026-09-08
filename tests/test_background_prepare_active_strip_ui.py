@@ -81,10 +81,7 @@ class Widget:
 
 
 def _runtime():
-    return BackgroundPreparationRuntime(
-        "/workshop", "", "", False, False, True,
-        "steam_client", True, False,
-    )
+    return BackgroundPreparationRuntime("/workshop", True, True)
 
 
 def _server(ip, name):

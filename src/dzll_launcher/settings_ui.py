@@ -13,7 +13,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Pango, GLib, Gio
 
 from .config import IMAGES_DIR, APP_VERSION, RELEASES_URL
-from .settings import save_settings, reset_settings, autodetect_steamcmd_path, autodetect_workshop_dir
+from .settings import save_settings, reset_settings, autodetect_workshop_dir
 from .storage import save_last_played
 from .ui_row import hr, attach_pointer_cursor
 from .mods_ui import ModsManagerOverlay
@@ -1326,48 +1326,6 @@ class SettingsUI:
         row.append(sw)
         return row
 
-    def _settings_row_backend_switch(self) -> Gtk.Widget:
-        key = "mod_download_backend"
-        tooltip = (
-            "Use SteamCMD instead of the recommended Steam client downloader. "
-            "Only needed for troubleshooting."
-        )
-
-        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        row.set_hexpand(True)
-        row.set_tooltip_text(tooltip)
-
-        label = Gtk.Label(label="Advanced SteamCMD Fallback")
-        label.set_xalign(0)
-        label.set_hexpand(True)
-
-        sw = Gtk.Switch()
-        sw.set_active(str(self._win.settings.get(key) or "steam_client") == "steamcmd")
-        sw.set_tooltip_text(tooltip)
-        attach_pointer_cursor(sw)
-
-        def on_toggled(_sw, _pspec):
-            if getattr(self._win, "_settings_update_guard", False):
-                return
-
-            self._win.settings[key] = "steamcmd" if sw.get_active() else "steam_client"
-            try:
-                save_settings(self._win.settings)
-            except Exception:
-                pass
-
-            try:
-                self._win._apply_setting_runtime_effects(key)
-            except Exception:
-                pass
-
-        sw.connect("notify::active", on_toggled)
-        self._win._settings_widgets[key] = sw
-
-        row.append(label)
-        row.append(sw)
-        return row
-
     def _settings_row_dropdown(self, title: str, key: str, options: list[tuple[str, str]], default_val: str) -> Gtk.Widget:
         row = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
 
@@ -1635,53 +1593,6 @@ class SettingsUI:
             default=True,
             tooltip="When joining a server, automatically download required mods that are missing.",
         ))
-
-        box.append(hr())
-        box.append(self._settings_section_header("Advanced / Fallback (Not Recommended)"))
-
-        box.append(self._settings_row_backend_switch())
-
-        steamcmd_warning = Gtk.Label(
-            label="SteamCMD fallback may close Steam during mod downloads to avoid login/session conflicts."
-        )
-        steamcmd_warning.set_xalign(0.0)
-        steamcmd_warning.set_wrap(True)
-        steamcmd_warning.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        steamcmd_warning.add_css_class("settings-warning-label")
-
-        steamcmd_rows = [
-            steamcmd_warning,
-            self._settings_row_entry(
-                "Steam Username",
-                "steamcmd_username",
-                "Username Only (No Password Stored)",
-            ),
-            self._settings_row_entry(
-                "SteamCMD Install Path",
-                "steamcmd_path",
-                "Auto Detect If Empty",
-                tooltip="If empty, DZLL attempts to autodetect SteamCMD.",
-                autodetect_fn=autodetect_steamcmd_path,
-                user_set_flag="steamcmd_path_user_set",
-                browse=True,
-                browse_select_folder=False,
-            ),
-            self._settings_row_switch(
-                "Verify Mod Files (Slower)",
-                "verify_mod_files",
-                default=False,
-                tooltip="SteamCMD only: validate and repair required workshop files.",
-            ),
-            self._settings_row_switch(
-                "Auto Update Required Mods",
-                "auto_update_required_mods",
-                default=False,
-                tooltip="SteamCMD fallback only: request all required mods again on join so SteamCMD can update them.",
-            ),
-        ]
-        self._steamcmd_advanced_rows = steamcmd_rows
-        for row in steamcmd_rows:
-            box.append(row)
 
         box.append(hr())
 
@@ -1953,7 +1864,7 @@ class SettingsUI:
 
                 if isinstance(w, Gtk.Entry):
                     # generic entries first; special autodetect entries handled below
-                    if key not in ("steamcmd_path", "workshop_dir"):
+                    if key != "workshop_dir":
                         w.set_text("" if val is None else str(val))
                         try:
                             w.remove_css_class("dimmed-entry")
@@ -1961,10 +1872,7 @@ class SettingsUI:
                             pass
 
                 elif isinstance(w, Gtk.Switch):
-                    if key == "mod_download_backend":
-                        w.set_active(str(val or "steam_client") == "steamcmd")
-                    else:
-                        w.set_active(bool(val))
+                    w.set_active(bool(val))
 
                 elif isinstance(w, Gtk.CheckButton):
                     w.set_active(bool(val))
@@ -1973,11 +1881,6 @@ class SettingsUI:
                     self._set_dropdown_to_value(w, val)
 
             # Rebuild autodetect suggestion entries WITHOUT committing them to settings
-            self._reset_entry_with_autodetect(
-                "steamcmd_path",
-                autodetect_fn=autodetect_steamcmd_path,
-                user_set_flag="steamcmd_path_user_set",
-            )
             self._reset_entry_value(
                 "workshop_dir",
                 autodetect_fn=autodetect_workshop_dir,
@@ -2002,7 +1905,6 @@ class SettingsUI:
         self._win._apply_setting_runtime_effects("show_counts_servers_loaded")
         self._win._apply_setting_runtime_effects("show_counts_global_players")
         self._win._apply_setting_runtime_effects("enable_steamcmd_mod_handling")
-        self._win._apply_setting_runtime_effects("mod_download_backend")
         self._win._apply_setting_runtime_effects("skip_dayz_launcher")
         self._win._apply_setting_runtime_effects("minimize_dayz_launcher")
         self._win._apply_setting_runtime_effects("force_fullscreen")
@@ -2138,17 +2040,8 @@ class SettingsUI:
             self._set_widget_sensitive("show_counts_global_players", master)
             self._win._apply_titlebar_counts()
 
-        if key in ("enable_steamcmd_mod_handling", "mod_download_backend", "settings_init"):
+        if key in ("enable_steamcmd_mod_handling", "settings_init"):
             enabled = bool(self._win.settings.get("enable_steamcmd_mod_handling", True))
-            backend = str(self._win.settings.get("mod_download_backend") or "steam_client")
-            steamcmd_selected = backend == "steamcmd"
-
-            for row in getattr(self, "_steamcmd_advanced_rows", []):
-                try:
-                    row.set_visible(steamcmd_selected)
-                    row.set_sensitive(enabled and steamcmd_selected)
-                except Exception:
-                    pass
 
             for dep in (
                     "auto_install_missing_mods",

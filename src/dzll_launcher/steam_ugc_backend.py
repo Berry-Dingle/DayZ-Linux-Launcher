@@ -2,8 +2,7 @@
 """
 Steam Client UGC backend for DayZ Workshop items.
 
-This is the default required-mod backend. SteamCMD remains the advanced
-fallback for troubleshooting.
+This is the required-mod preparation backend.
 """
 
 from __future__ import annotations

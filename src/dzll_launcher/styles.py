@@ -1951,7 +1951,7 @@ def get_app_css(
         
         .issues-emoji {{ font-size: 24px; }}
         
-        /* ---------- SteamCMD auth overlay ---------- */
+        /* ---------- Shared mod-preparation overlay (legacy class names) ---------- */
         .steamcmd-auth-card {{
           background: alpha(@dzll_surface_settings, 0.97);
           color: @dzll_text_primary;

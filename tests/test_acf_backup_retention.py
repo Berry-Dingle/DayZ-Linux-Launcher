@@ -8,9 +8,6 @@ import pytest
 
 from dzll_launcher import steam_ugc_backend, steamcmd_mods
 from dzll_launcher.steam_ugc_backend import UGCSubscriptionSnapshot
-from dzll_launcher.workshop_path_safety import (
-    safe_configured_workshop_mutation_path,
-)
 
 
 APPID = steam_ugc_backend.DAYZ_APPID
@@ -585,28 +582,6 @@ def test_mod_manager_bulk_cleanup_inherits_retention(monkeypatch, tmp_path):
 
     assert all(result["ok"] for result in results)
     assert all(f'"{mod_id}"' not in acf.read_text(encoding="utf-8") for mod_id in ids)
-    assert len(_eligible_backups(acf)) == 5
-
-
-def test_steamcmd_shared_writer_inherits_retention(monkeypatch, tmp_path):
-    workshop = tmp_path / "steamcmd-workshop"
-    acf = _acf_with_ids(tmp_path / "steamcmd-root", [101])
-    acf.parent.rename(workshop)
-    acf = workshop / acf.name
-    _seed_backups(acf, 5)
-    validator = lambda path: safe_configured_workshop_mutation_path(
-        workshop.resolve(),
-        path,
-        relative_parts=(acf.name,),
-        leaf_kind="file",
-    )
-    monkeypatch.setattr(
-        steam_ugc_backend.time, "strftime", lambda *_args: "20990101-010203",
-    )
-
-    assert steamcmd_mods.remove_mid_from_appworkshop_acf(
-        str(acf), 101, path_validator=validator,
-    ) is True
     assert len(_eligible_backups(acf)) == 5
 
 

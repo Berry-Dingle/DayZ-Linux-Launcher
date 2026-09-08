@@ -191,14 +191,8 @@ class ProductionStartHarness:
     def _resolve_join_runtime(self, _mods):
         return {
             "workshop_dir": "/workshop",
-            "steamcmd_path": "/steamcmd",
-            "steam_user": "",
-            "validate": False,
-            "dry": False,
             "use_steamcmd": True,
-            "mod_download_backend": "steam_client",
             "auto_install_missing": True,
-            "auto_update_required": False,
         }
 
     def _ensure_join_steam_start_consent(
@@ -222,14 +216,8 @@ def snapshot(name="Production Server"):
 def runtime():
     return BackgroundPreparationRuntime(
         workshop_dir="/workshop",
-        steamcmd_path="/steamcmd",
-        steam_user="",
-        validate=False,
-        dry_run=False,
         use_steamcmd=True,
-        mod_download_backend="steam_client",
         auto_install_missing=True,
-        auto_update_required=False,
     )
 
 
@@ -832,8 +820,7 @@ def test_background_ugc_readiness_receives_cancel_event_and_visible_progress(mon
 
     monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", readiness)
     outcome = join_prepare.prepare_required_mods(
-        host, [(101, "One")], "/workshop", "", "", False, False,
-        True, "steam_client", True, False,
+        host, [(101, "One")], "/workshop", True, True,
         presenter=presenter, server_name="Readiness Server",
         manage_join_presence=False, manage_join_presentation=False,
         allow_backend_steam_start=False,
@@ -863,8 +850,7 @@ def test_background_ugc_readiness_cancel_exits_promptly(monkeypatch):
     outcomes = []
     worker = threading.Thread(target=lambda: outcomes.append(
         join_prepare.prepare_required_mods(
-            host, [(101, "One")], "/workshop", "", "", False, False,
-            True, "steam_client", True, False,
+            host, [(101, "One")], "/workshop", True, True,
             presenter=presenter, server_name="Readiness Server",
             manage_join_presence=False, manage_join_presentation=False,
         )
@@ -893,8 +879,7 @@ def test_background_ugc_readiness_timeout_is_actionable_and_visible(monkeypatch)
 
     monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", readiness)
     outcome = join_prepare.prepare_required_mods(
-        host, [(101, "One")], "/workshop", "", "", False, False,
-        True, "steam_client", True, False,
+        host, [(101, "One")], "/workshop", True, True,
         presenter=presenter, server_name="Readiness Server",
         manage_join_presence=False, manage_join_presentation=False,
     )

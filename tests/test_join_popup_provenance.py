@@ -687,24 +687,24 @@ def test_activity_map_clears_only_matching_attempt():
     assert tracker.get(2, 1) is not None
 
 
-def test_steamcmd_guard_and_urgent_paths_remain_in_source():
+def test_ugc_only_overlay_and_urgent_paths_remain_in_source():
     steamcmd_source = (window_module.Path(__file__).resolve().parents[1]
                        / "src/dzll_launcher/steamcmd_overlay_ui.py").read_text()
     window_source = (window_module.Path(__file__).resolve().parents[1]
                      / "src/dzll_launcher/window.py").read_text()
-    assert '_mod_download_backend_active", "") != "steamcmd"' in steamcmd_source
-    assert "Steam Guard" in steamcmd_source
+    assert "Steam Guard" not in steamcmd_source
+    assert "steamcmd_cancel_btn" in steamcmd_source
     assert "PreparationPresentationReducer(" in window_source
     assert "JoinPopupPhase.ERROR" in window_source
     assert "_steam_ugc_render_cancelling()" in window_source
 
 
-def test_backend_control_calls_are_unchanged():
+def test_ugc_backend_control_calls_and_join_handoff_remain():
     root = window_module.Path(__file__).resolve().parents[1]
     backend = (root / "src/dzll_launcher/steam_ugc_backend.py").read_text()
     join = (root / "src/dzll_launcher/join_prepare.py").read_text()
     assert '"subscribe-download"' in backend
     assert "time.sleep(1.0)" not in backend  # helper, not backend, owns the existing cadence
     assert "ok = win.run_steam_client_install(" in join
-    assert "ok = win.run_steamcmd_install(" in join
+    assert "run_steamcmd_install" not in join
     assert "win.GLib.idle_add(after)" in join

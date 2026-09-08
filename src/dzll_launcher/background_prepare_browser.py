@@ -52,23 +52,6 @@ class BrowserPreparationPresenter:
     def on_cancelling(self, operation_id: int) -> None:
         self._dispatch(self._render_cancelling, int(operation_id))
 
-    def on_steamcmd_state(self, *, heading: str, line1: str, line2: str,
-                          spinning: bool) -> None:
-        """Receive semantic state from the existing SteamCMD overlay parser."""
-        generation = self.generation
-
-        def reduce_and_render():
-            if not self._is_current(generation) or self._reducer is None:
-                return False
-            reduction = self._reducer.apply_steamcmd_state(
-                heading=heading, line1=line1, line2=line2, spinning=spinning,
-            )
-            if reduction.snapshot is not None:
-                self._render_snapshot(reduction.snapshot)
-            return False
-
-        self._schedule(reduce_and_render)
-
     def on_terminal(self, outcome: PreparationOutcome) -> None:
         with self._lock:
             if self._terminal_scheduled:

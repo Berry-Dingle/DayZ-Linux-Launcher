@@ -606,7 +606,7 @@ class BackgroundPreparationQueue:
             PreparationStatus.FAILED,
             reason="worker_submission_failed",
             error=f"Could not start mod preparation: {error}",
-            backend=request.runtime.mod_download_backend,
+            backend="steam_client",
         ))
 
     def cancel_all(self) -> BackgroundQueueTransition:
@@ -630,7 +630,7 @@ class BackgroundPreparationQueue:
                     PreparationStatus.CANCELLED,
                     reason="batch_cancelled",
                     error="Background preparation cancelled before it started.",
-                    backend=active.runtime.mod_download_backend,
+                    backend="steam_client",
                 )
                 record = self._records[active.identity]
                 record = replace(

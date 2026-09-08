@@ -172,18 +172,3 @@ def test_join_and_browser_source_use_same_reducer_and_browser_does_not_render_ra
         'payload.get("index")', 'payload.get("total")', "download_bytes",
     ):
         assert forbidden not in BROWSER_SOURCE
-
-
-def test_steamcmd_uses_existing_semantic_parser_state_without_raw_line_parsing():
-    reducer = new_reducer()
-    snapshot = reducer.apply_steamcmd_state(
-        heading="Checking/Updating Required Mods…",
-        line1="Previous item complete",
-        line2="Checking/Updating: Mod 42 - 1/3...",
-        spinning=True,
-    ).snapshot
-    assert snapshot.backend == "steamcmd"
-    assert snapshot.stage_text == "Checking/Updating: Mod 42 - 1/3..."
-    assert snapshot.progress_mode is PreparationProgressMode.INDETERMINATE
-    assert "_steamcmd_line_to_overlay" not in BROWSER_SOURCE
-    assert "apply_steamcmd_state" in BROWSER_SOURCE

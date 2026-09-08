@@ -7,7 +7,6 @@ ROOT = Path(__file__).resolve().parents[1]
 WINDOW_SOURCE = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
 JOIN_SOURCE = (ROOT / "src/dzll_launcher/join_prepare.py").read_text(encoding="utf-8")
 STEAM_CLIENT_SOURCE = (ROOT / "src/dzll_launcher/steam_client_mods.py").read_text(encoding="utf-8")
-STEAMCMD_SOURCE = (ROOT / "src/dzll_launcher/steamcmd_overlay_ui.py").read_text(encoding="utf-8")
 
 
 def begin_counter(mod_ids):
@@ -163,12 +162,3 @@ def test_counter_initialized_from_work_queue_and_raw_event_index_not_formatted()
     assert 'event.get("total")' not in formatter
     assert 'f" ({int(current)}/{int(total)})"' in formatter
     assert '"index": index' in STEAM_CLIENT_SOURCE  # retained for backend diagnostics only
-
-
-def test_steamcmd_counter_is_already_fresh_ascending_and_left_unchanged():
-    counter = STEAMCMD_SOURCE.split("def _steamcmd_mark_started", 1)[1]
-    counter = counter.split("def _steamcmd_start_progress_timer", 1)[0]
-    assert "if mod_id not in seen:" in counter
-    assert "_steamcmd_started_missing" in counter
-    assert "+ 1" in counter
-    assert "remaining" not in counter.lower()

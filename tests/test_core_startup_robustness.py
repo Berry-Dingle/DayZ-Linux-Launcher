@@ -76,6 +76,34 @@ def test_invalid_string_and_boolean_settings_keep_exact_default_types(
     assert loaded["show_server_companion"] is False
 
 
+def test_removed_steamcmd_settings_are_tolerated_without_startup_rewrite(
+    tmp_path, monkeypatch
+):
+    path = tmp_path / "settings.json"
+    persisted = {
+        "enable_steamcmd_mod_handling": False,
+        "mod_download_backend": "steamcmd",
+        "steamcmd_username": "legacy-user",
+        "steamcmd_path": "/legacy/steamcmd",
+        "verify_mod_files": True,
+        "auto_update_required_mods": True,
+    }
+    original = json.dumps(persisted, sort_keys=True).encode()
+    path.write_bytes(original)
+    monkeypatch.setattr(settings, "SETTINGS_PATH", str(path))
+
+    loaded = settings.load_settings()
+
+    assert loaded["enable_steamcmd_mod_handling"] is False
+    for removed in (
+        "mod_download_backend", "steamcmd_username", "steamcmd_path",
+        "verify_mod_files", "auto_update_required_mods",
+    ):
+        assert removed not in loaded
+        assert removed not in settings.DEFAULTS
+    assert path.read_bytes() == original
+
+
 def test_last_played_prune_write_failure_is_best_effort(tmp_path, monkeypatch):
     path = tmp_path / "last_played.json"
     recent = int(time.time())

@@ -55,14 +55,8 @@ class BackgroundServerPreparationSnapshot:
 @dataclass(frozen=True)
 class BackgroundPreparationRuntime:
     workshop_dir: str
-    steamcmd_path: str
-    steam_user: str
-    validate: bool
-    dry_run: bool
     use_steamcmd: bool
-    mod_download_backend: str
     auto_install_missing: bool
-    auto_update_required: bool
 
 
 class BackgroundConsentStatus(Enum):
@@ -331,7 +325,7 @@ class SingleServerBackgroundPreparation:
                     PreparationStatus.CANCELLED,
                     reason="cancelled_before_start",
                     error="Background preparation was cancelled before it started.",
-                    backend=runtime.mod_download_backend,
+                    backend="steam_client",
                 )
                 presenter.on_terminal(outcome)
                 return outcome
@@ -370,7 +364,7 @@ class SingleServerBackgroundPreparation:
                         PreparationStatus.FAILED if failed else PreparationStatus.CANCELLED,
                         reason=reason,
                         error=str(consent_result.error or default_error),
-                        backend=runtime.mod_download_backend,
+                        backend="steam_client",
                     )
                     presenter.on_terminal(outcome)
                     return outcome
@@ -382,7 +376,7 @@ class SingleServerBackgroundPreparation:
                             "Steam start permission completed without confirming that "
                             "native Steam was running or that startup was submitted."
                         ),
-                        backend=runtime.mod_download_backend,
+                        backend="steam_client",
                     )
                     presenter.on_terminal(outcome)
                     return outcome
@@ -391,14 +385,8 @@ class SingleServerBackgroundPreparation:
                 self._win,
                 snapshot.required_mods,
                 runtime.workshop_dir,
-                runtime.steamcmd_path,
-                runtime.steam_user,
-                runtime.validate,
-                runtime.dry_run,
                 runtime.use_steamcmd,
-                runtime.mod_download_backend,
                 runtime.auto_install_missing,
-                runtime.auto_update_required,
                 operation_id=lease.generation,
                 presenter=presenter,
                 server_name=snapshot.name,

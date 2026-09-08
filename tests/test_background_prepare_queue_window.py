@@ -62,10 +62,7 @@ class Controller:
 
 
 def runtime():
-    return BackgroundPreparationRuntime(
-        "/workshop", "", "", False, False, True,
-        "steam_client", True, False,
-    )
+    return BackgroundPreparationRuntime("/workshop", True, True)
 
 
 def snap(obj, name=None):

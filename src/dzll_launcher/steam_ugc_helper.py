@@ -3,7 +3,7 @@
 Native Steamworks UGC helper for DayZ Workshop items.
 
 This subprocess-friendly JSON-lines CLI is used by the Steam Client backend,
-the default required-mod path. SteamCMD remains the advanced fallback.
+the required-mod preparation path.
 """
 
 from __future__ import annotations

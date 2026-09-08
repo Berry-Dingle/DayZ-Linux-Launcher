@@ -150,29 +150,6 @@ class PreparationPresentationReducer:
         reduction = self._accept(snapshot)
         return PreparationReduction(reduction.snapshot, outcome)
 
-    def apply_steamcmd_state(self, *, heading: str, line1: str, line2: str,
-                             spinning: bool) -> PreparationReduction:
-        """Reduce the established SteamCMD parser's semantic overlay state.
-
-        Parsing stays exclusively in ``SteamCMDOverlayUI``.  This adapter only
-        deduplicates the already reduced strings and mode that normal Join
-        renders, so another presenter never interprets SteamCMD output.
-        """
-        if not self._is_current(self.operation_id):
-            return PreparationReduction(None)
-        detail = str(line2 or line1 or heading or "").strip()
-        snapshot = PreparationPresentationSnapshot(
-            operation_id=self.operation_id,
-            backend="steamcmd",
-            phase=JoinPopupPhase.DOWNLOADING if spinning else JoinPopupPhase.CHECKING,
-            stage_text=detail,
-            progress_mode=(
-                PreparationProgressMode.INDETERMINATE
-                if spinning else PreparationProgressMode.HIDDEN
-            ),
-        )
-        return self._accept(snapshot)
-
     def _accept(self, snapshot: PreparationPresentationSnapshot, immediate=False):
         previous = self._snapshot
         if previous is not None and not immediate and snapshot.phase.rank < previous.phase.rank:

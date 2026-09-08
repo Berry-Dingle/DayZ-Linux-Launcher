@@ -635,59 +635,6 @@ def test_mod_manager_authority_cannot_bypass_descendant_confinement(
     assert patch.read_bytes() == b"preserve"
 
 
-def _disable_steamcmd_process_calls(monkeypatch):
-    monkeypatch.setattr(
-        steamcmd_mods.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
-    )
-
-
-def test_steamcmd_normal_cleanup_and_configured_root_symlink(monkeypatch, tmp_path):
-    physical_workshop = tmp_path / "SteamCMD-ゲーム" / "workshop"
-    content = physical_workshop / "content" / str(APPID) / str(MOD_ID)
-    content.mkdir(parents=True)
-    (content / "payload.bin").write_bytes(b"synthetic")
-    alias = tmp_path / "workshop-alias"
-    alias.symlink_to(physical_workshop, target_is_directory=True)
-    _disable_steamcmd_process_calls(monkeypatch)
-
-    assert steamcmd_mods.delete_single_mod(
-        MOD_ID, workshop_dir=str(alias), proton_prefix=str(tmp_path / "pfx"),
-    ) is True
-    assert not content.exists()
-
-
-@pytest.mark.parametrize("component", ["content", "downloads", "leaf"])
-def test_steamcmd_rejects_descendant_symlinks(monkeypatch, tmp_path, component):
-    workshop = tmp_path / "workshop"
-    external = tmp_path / f"external-{component}"
-    external.mkdir()
-    if component == "content":
-        link = workshop / "content"
-        item = external / str(APPID) / str(MOD_ID)
-    elif component == "downloads":
-        (workshop / "content" / str(APPID) / str(MOD_ID)).mkdir(parents=True)
-        link = workshop / "downloads"
-        item = external / str(APPID) / str(MOD_ID)
-    else:
-        link = workshop / "content" / str(APPID) / str(MOD_ID)
-        item = external
-    link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(external, target_is_directory=True)
-    item.mkdir(parents=True, exist_ok=True)
-    marker = item / "outside.bin"
-    marker.write_bytes(b"preserve")
-    _disable_steamcmd_process_calls(monkeypatch)
-
-    assert steamcmd_mods.delete_single_mod(
-        MOD_ID,
-        workshop_dir=str(workshop),
-        proton_prefix=str(tmp_path / "pfx"),
-    ) is False
-    assert marker.read_bytes() == b"preserve"
-
-
 def test_sink_revalidates_after_descendant_is_swapped(monkeypatch, tmp_path):
     root = tmp_path / "library"
     content = root / "steamapps/workshop/content"

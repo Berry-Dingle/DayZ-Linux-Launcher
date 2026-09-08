@@ -80,11 +80,10 @@ def test_join_cancel_sets_only_matching_active_attempt_event():
 
 
 class CharacterizationHarness:
-    def __init__(self, *, backend="steam_client", backend_ok=True,
+    def __init__(self, *, backend_ok=True,
                  cancelled=False, initial_missing=None, final_missing=None):
         self.GLib = ImmediateGLib()
         self.threading = threading
-        self.backend = backend
         self.backend_ok = backend_ok
         self.cancelled = cancelled
         self.initial_missing = list(initial_missing or [])
@@ -102,9 +101,7 @@ class CharacterizationHarness:
         self._steamcmd_install_in_progress = False
         self._mod_download_backend_active = ""
         self._discord = None
-        self._steamcmd_form_widgets = []
         self.steamcmd_spinner = Widget()
-        self.steamcmd_login_btn = Widget()
         self.steamcmd_cancel_btn = Widget()
         self._join_preparation_presenter = JoinPopupPreparationPresenter(
             consume_event=self._steam_ugc_progress_to_overlay,
@@ -127,9 +124,8 @@ class CharacterizationHarness:
 
     def compute_missing_mods(self, workshop_dir, _mods):
         self.events.append(("verify", workshop_dir))
-        result = self.initial_missing if self.missing_calls == 0 else self.final_missing
         self.missing_calls += 1
-        return list(result)
+        return list(self.final_missing)
 
     def _join_popup_initialize_download_counter(self, _attempt_id, mod_ids, *, backend):
         self.events.append(("counter", backend, tuple(mod_ids)))
@@ -141,34 +137,15 @@ class CharacterizationHarness:
     def _free_bytes_for_path(self, _path):
         return 20 * 1024 ** 3
 
-    def fetch_workshop_sizes_bytes(self, *_args, **_kwargs):
-        return {}
-
-    def _steamcmd_refresh_active_download_line2(self):
-        return None
-
-    def _request_steamcmd_credentials_blocking(self, **_kwargs):
-        self.events.append(("steamcmd_credentials",))
-        return {"ok": True, "username": "", "password": ""}
-
     def _show_steam_client_download_overlay(self, _status):
         self.events.append(("steam_client_overlay",))
 
     def _steam_ugc_progress_from_worker(self, event):
         self.events.append(("ugc_event", dict(event)))
 
-    def _steamcmd_install_line_from_worker(self, line):
-        self.events.append(("steamcmd_line", line))
-
     def run_steam_client_install(self, **kwargs):
         assert kwargs["stop_waiting_event"] is self._steam_client_stop_waiting_event
         self.events.append(("steam_client", tuple(kwargs["mod_ids"])))
-        if self.cancelled:
-            self._steamcmd_cancel_event.set()
-        return self.backend_ok
-
-    def run_steamcmd_install(self, **kwargs):
-        self.events.append(("steamcmd", tuple(kwargs["mod_ids"])))
         if self.cancelled:
             self._steamcmd_cancel_event.set()
         return self.backend_ok
@@ -180,9 +157,6 @@ class CharacterizationHarness:
         self.events.append(("hide_overlay",))
 
     def _show_join_progress_overlay(self, *_args):
-        return None
-
-    def _steamcmd_overlay_render(self, *_args):
         return None
 
     def ensure_watch_symlinks(self, **kwargs):
@@ -218,15 +192,17 @@ class CharacterizationHarness:
         return None
 
 
-def run_characterized(monkeypatch, *, backend="steam_client", backend_ok=True,
-                      cancelled=False, initially_ready=False, final_missing=False):
+def run_characterized(monkeypatch, *, backend_ok=True,
+                      cancelled=False, initially_ready=False, final_missing=False,
+                      free_bytes=20 * 1024 ** 3):
     mod = (101, "Mod 101")
     initial_missing = [] if initially_ready else [mod]
     missing_after = [mod] if final_missing else []
     win = CharacterizationHarness(
-        backend=backend, backend_ok=backend_ok, cancelled=cancelled,
+        backend_ok=backend_ok, cancelled=cancelled,
         initial_missing=initial_missing, final_missing=missing_after,
     )
+    win._free_bytes_for_path = lambda _path: free_bytes
     obj = SimpleNamespace(name="Synthetic", ip="127.0.0.1", gport=2302)
     monkeypatch.setattr(join_prepare, "_choose_initial_workshop_dir", lambda *_args: "/before")
     monkeypatch.setattr(
@@ -266,20 +242,19 @@ def run_characterized(monkeypatch, *, backend="steam_client", backend_ok=True,
         lambda **_kwargs: win.events.append(("validate_symlinks",)) or [],
     )
     join_prepare.join_prepare_and_launch(
-        win, obj, [mod], "/configured", "/steamcmd", "", False, False,
-        "/prefix", "/watch", True, backend, True, False, attempt_id=1,
+        win, obj, [mod], "/configured", "/prefix", "/watch", True, True,
+        attempt_id=1,
     )
     return win
 
 
-def prepare_characterized(monkeypatch, *, mods=None, backend="steam_client",
+def prepare_characterized(monkeypatch, *, mods=None,
                           backend_ok=True, cancelled=False, initially_ready=False,
-                          final_missing=False):
+                          final_missing=False, use_mod_management=True):
     mod_list = [(101, "Mod 101")] if mods is None else list(mods)
     initial_missing = [] if initially_ready else list(mod_list)
     missing_after = list(mod_list) if final_missing else []
     win = CharacterizationHarness(
-        backend=backend,
         backend_ok=backend_ok,
         cancelled=cancelled,
         initial_missing=initial_missing,
@@ -322,8 +297,7 @@ def prepare_characterized(monkeypatch, *, mods=None, backend="steam_client",
         lambda *_args, **_kwargs: next(state_results),
     )
     outcome = join_prepare.prepare_required_mods(
-        win, mod_list, "/configured", "/steamcmd", "", False, False,
-        True, backend, True, False, operation_id=1,
+        win, mod_list, "/configured", use_mod_management, True, operation_id=1,
         presenter=win._join_preparation_presenter,
         server_name="Synthetic",
     )
@@ -345,13 +319,11 @@ def test_all_required_mods_ready_skips_backend_and_continues(monkeypatch):
     assert win.launches == 1
 
 
-@pytest.mark.parametrize("backend", ["steam_client", "steamcmd"])
-def test_backend_success_reaches_symlink_preset_then_launch(monkeypatch, backend):
-    win = run_characterized(monkeypatch, backend=backend)
+def test_ugc_backend_success_reaches_symlink_preset_then_launch(monkeypatch):
+    win = run_characterized(monkeypatch)
     names = event_names(win)
-    backend_name = "steam_client" if backend == "steam_client" else "steamcmd"
-    assert backend_name in names
-    assert names.index(backend_name) < names.index("verify", 1)
+    assert "steam_client" in names
+    assert names.index("steam_client") < names.index("verify", 1)
     assert names.index("verify", 1) < names.index("symlinks")
     assert names.index("symlinks") < names.index("validate_symlinks")
     assert names.index("validate_symlinks") < names.index("preset")
@@ -360,12 +332,11 @@ def test_backend_success_reaches_symlink_preset_then_launch(monkeypatch, backend
     assert win.launches == 1
 
 
-@pytest.mark.parametrize("backend", ["steam_client", "steamcmd"])
 @pytest.mark.parametrize("cancelled", [False, True])
-def test_backend_failure_or_cancel_never_reaches_symlinks_or_launch(
-        monkeypatch, backend, cancelled):
+def test_ugc_backend_failure_or_cancel_never_reaches_symlinks_or_launch(
+        monkeypatch, cancelled):
     win = run_characterized(
-        monkeypatch, backend=backend, backend_ok=False, cancelled=cancelled,
+        monkeypatch, backend_ok=False, cancelled=cancelled,
     )
     assert "symlinks" not in event_names(win)
     assert "preset" not in event_names(win)
@@ -406,8 +377,7 @@ def test_foreground_preset_cancel_stops_before_steam_links_and_launch(monkeypatc
     )
 
     join_prepare.join_prepare_and_launch(
-        win, obj, [mod], "/workshop", "/steamcmd", "", False, False,
-        "/prefix", "/watch", True, "steam_client", True, False,
+        win, obj, [mod], "/workshop", "/prefix", "/watch", True, True,
         attempt_id=1,
     )
 
@@ -645,9 +615,8 @@ def test_late_ready_result_after_join_cancel_cannot_continue(monkeypatch):
 
     monkeypatch.setattr(join_prepare, "prepare_required_mods", late_ready)
     join_prepare.join_prepare_and_launch(
-        win, obj, [(101, "Required")], "/workshop", "/steamcmd", "",
-        False, False, "/prefix", "/watch", True, "steam_client",
-        True, False, attempt_id=1,
+        win, obj, [(101, "Required")], "/workshop", "/prefix", "/watch",
+        True, True, attempt_id=1,
     )
     assert "symlinks" not in event_names(win)
     assert "preset" not in event_names(win)
@@ -658,7 +627,6 @@ def test_late_ready_result_after_join_cancel_cannot_continue(monkeypatch):
 
 def test_final_filesystem_verification_failure_suppresses_continuation(monkeypatch):
     win = run_characterized(monkeypatch, final_missing=True)
-    assert win.events.count(("verify", "/before")) == 1
     assert win.events.count(("verify", "/after")) == 1
     assert "symlinks" not in event_names(win)
     assert "launch" not in event_names(win)
@@ -669,8 +637,8 @@ def test_no_required_mods_uses_shared_outcome_and_preserves_empty_preset(monkeyp
     win = CharacterizationHarness()
     obj = SimpleNamespace(name="No Mods", ip="127.0.0.1", gport=2302)
     join_prepare.join_prepare_and_launch(
-        win, obj, [], "/configured", "/steamcmd", "", False, False,
-        "/prefix", "/watch", True, "steam_client", True, False, attempt_id=1,
+        win, obj, [], "/configured", "/prefix", "/watch", True, True,
+        attempt_id=1,
     )
     names = event_names(win)
     assert "steam_client" not in names
@@ -755,11 +723,25 @@ def test_shared_preparation_all_ready_returns_verified_ready_without_backend(mon
     assert "steam_client" not in event_names(win)
 
 
-@pytest.mark.parametrize("backend", ["steam_client", "steamcmd"])
-def test_shared_preparation_backend_success_returns_ready(monkeypatch, backend):
-    win, outcome = prepare_characterized(monkeypatch, backend=backend)
+def test_master_toggle_still_disables_dzll_mod_preparation(monkeypatch):
+    win, outcome = prepare_characterized(
+        monkeypatch, use_mod_management=False,
+    )
     assert outcome.status is PreparationStatus.READY
-    assert outcome.backend == backend
+    assert "steam_client" not in event_names(win)
+    assert not any(event == "initial_query" for event, _fields in win.logs)
+
+
+def test_no_steamcmd_backend_selector_or_dispatch_remains():
+    assert 'backend = "steam_client"' in JOIN_SOURCE
+    assert '"mod_download_backend"' not in JOIN_SOURCE
+    assert "run_steamcmd_install" not in JOIN_SOURCE
+
+
+def test_shared_preparation_ugc_success_returns_ready(monkeypatch):
+    win, outcome = prepare_characterized(monkeypatch)
+    assert outcome.status is PreparationStatus.READY
+    assert outcome.backend == "steam_client"
     assert outcome.effective_workshop_path == "/after"
     assert outcome.verified_mods == ((101, "Mod 101"),)
     assert outcome.did_work is True
@@ -768,7 +750,6 @@ def test_shared_preparation_backend_success_returns_ready(monkeypatch, backend):
     assert "launch" not in event_names(win)
 
 
-@pytest.mark.parametrize("backend", ["steam_client", "steamcmd"])
 @pytest.mark.parametrize(
     ("cancelled", "status", "message"),
     [
@@ -776,10 +757,10 @@ def test_shared_preparation_backend_success_returns_ready(monkeypatch, backend):
         (True, PreparationStatus.CANCELLED, "Mod download cancelled"),
     ],
 )
-def test_shared_preparation_backend_non_success_maps_terminal_outcome(
-        monkeypatch, backend, cancelled, status, message):
+def test_shared_preparation_ugc_non_success_maps_terminal_outcome(
+        monkeypatch, cancelled, status, message):
     win, outcome = prepare_characterized(
-        monkeypatch, backend=backend, backend_ok=False, cancelled=cancelled,
+        monkeypatch, backend_ok=False, cancelled=cancelled,
     )
     assert outcome.status is status
     assert outcome.error == message
@@ -792,6 +773,37 @@ def test_shared_preparation_final_verification_failure_is_failed(monkeypatch):
     assert outcome.status is PreparationStatus.FAILED
     assert "Required mods still missing after install" in outcome.error
     assert "symlinks" not in event_names(win)
+
+
+def test_low_disk_foreground_ugc_failure_is_rendered_and_cannot_launch(monkeypatch):
+    terminal_outcomes = []
+
+    class RecordingPresenter:
+        def __init__(self, **_kwargs):
+            pass
+
+        def on_event(self, _event):
+            pass
+
+        def on_terminal(self, outcome):
+            terminal_outcomes.append(outcome)
+
+    monkeypatch.setattr(
+        join_prepare, "JoinPopupPreparationPresenter", RecordingPresenter,
+    )
+    win = run_characterized(
+        monkeypatch,
+        free_bytes=4 * 1024 ** 3,
+    )
+
+    message = "Not enough free disk space in workshop drive (4.0 GB free)."
+    assert terminal_outcomes[-1].status is PreparationStatus.FAILED
+    assert terminal_outcomes[-1].error == message
+    assert win.errors and set(win.errors) == {message}
+    assert ("steam_client_overlay",) in win.events
+    assert any(event[0] == "counter" for event in win.events)
+    assert "steam_client" not in event_names(win)
+    assert "launch" not in event_names(win)
 
 
 @pytest.mark.parametrize("backend_ok", [False, True], ids=["operation-failed", "ready"])
@@ -932,8 +944,7 @@ def run_terminal_validation_route(
     if background:
         presenter = JoinPopupPreparationPresenter(consume_event=win._steam_ugc_progress_to_overlay)
         outcome = join_prepare.prepare_required_mods(
-            win, mods, "/workshop", "/steamcmd", "", False, False,
-            True, "steam_client", True, False,
+            win, mods, "/workshop", True, True,
             presenter=presenter,
             server_name="Terminal Validation",
             manage_join_presence=False,
@@ -941,8 +952,7 @@ def run_terminal_validation_route(
         )
     else:
         join_prepare.join_prepare_and_launch(
-            win, obj, mods, "/workshop", "/steamcmd", "", False, False,
-            "/prefix", "/watch", True, "steam_client", True, False,
+            win, obj, mods, "/workshop", "/prefix", "/watch", True, True,
             attempt_id=1,
         )
         outcome = None

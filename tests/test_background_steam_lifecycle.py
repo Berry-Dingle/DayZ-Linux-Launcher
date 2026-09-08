@@ -162,10 +162,7 @@ def test_flagless_allowed_result_fails_before_helper_or_engine(monkeypatch):
         BackgroundServerPreparationSnapshot(
             "127.0.0.1", 2302, 27016, "Server", ((7, "Mod"),),
         ),
-        BackgroundPreparationRuntime(
-            "/workshop", "/steamcmd", "", False, False, True,
-            "steam_client", True, False,
-        ),
+        BackgroundPreparationRuntime("/workshop", True, True),
         ensure_steam_consent=lambda: BackgroundConsentResult(
             BackgroundConsentStatus.ALLOWED,
         ),
@@ -485,10 +482,7 @@ def test_background_cancel_before_shared_preflight_starts_no_steam(monkeypatch):
         BackgroundServerPreparationSnapshot(
             "127.0.0.1", 2302, 27016, "Server", ((7, "Mod"),),
         ),
-        BackgroundPreparationRuntime(
-            "/workshop", "/steamcmd", "", False, False, True,
-            "steam_client", True, False,
-        ),
+        BackgroundPreparationRuntime("/workshop", True, True),
         ensure_steam_consent=cancel_after_consent,
     )
 

@@ -190,16 +190,10 @@ class JoinHarness:
     def _free_bytes_for_path(self, _path):
         return 20 * 1024 ** 3
 
-    def fetch_workshop_sizes_bytes(self, *_args, **_kwargs):
-        return {}
-
     def _show_steam_client_download_overlay(self, _status):
         return None
 
     def _steam_ugc_progress_from_worker(self, _event):
-        return None
-
-    def _steamcmd_refresh_active_download_line2(self):
         return None
 
     def _set_updating(self, *_args):
@@ -284,8 +278,8 @@ def run_join_route(monkeypatch, states):
 
     win.run_steam_client_install = install
     join_prepare.join_prepare_and_launch(
-        win, obj, mods, "/workshop", "steamcmd", "", False, False,
-        "/prefix", "/watch", True, "steam_client", True, False, attempt_id=1,
+        win, obj, mods, "/workshop", "/prefix", "/watch", True, True,
+        attempt_id=1,
     )
     return win
 

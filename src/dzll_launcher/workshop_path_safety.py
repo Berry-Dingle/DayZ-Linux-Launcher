@@ -133,21 +133,3 @@ def safe_native_workshop_mutation_path(
         candidate=candidate,
         leaf_kind=leaf_kind,
     )
-
-
-def safe_configured_workshop_mutation_path(
-    workshop_root,
-    candidate,
-    *,
-    relative_parts: Iterable[object],
-    leaf_kind: WorkshopLeafKind,
-) -> Path | None:
-    """Validate a path below SteamCMD's configured/effective Workshop root."""
-
-    return _safe_workshop_descendant(
-        trusted_root=workshop_root,
-        workshop_prefix=(),
-        relative_parts=relative_parts,
-        candidate=candidate,
-        leaf_kind=leaf_kind,
-    )

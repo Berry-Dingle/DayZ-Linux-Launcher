@@ -30,10 +30,7 @@ def snap(identity, mods=((101, "One"),), name=None):
 
 
 def runtime():
-    return BackgroundPreparationRuntime(
-        "/workshop", "/steamcmd", "", False, False, True,
-        "steam_client", True, False,
-    )
+    return BackgroundPreparationRuntime("/workshop", True, True)
 
 
 class Controller:

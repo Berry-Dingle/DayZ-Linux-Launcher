@@ -124,7 +124,6 @@ from .settings import (
     load_settings,
     save_settings,
     reset_settings,
-    autodetect_steamcmd_path,
     autodetect_workshop_dir,
 )
 
@@ -141,12 +140,10 @@ from .startup_ui import build_startup_overlay
 from .steamcmd_mods import (
     parse_mods_from_db,
     compute_missing_mods,
-    run_steamcmd_install,
     parse_additional_mod_ids,
     merge_mod_lists_with_additional,
     ensure_watch_symlinks,
     scan_installed_mods_in_watch_folder,
-    fetch_workshop_sizes_bytes,
 )
 from .steam_client_mods import run_steam_client_install
 from .steam_ugc_backend import UGCHelperReapError
@@ -777,46 +774,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._settings_widgets = {}
         self._settings_update_guard = False
 
-        # SteamCMD calcs
+        # Shared Workshop preparation helpers (legacy member names remain below).
         self.compute_missing_mods = compute_missing_mods
         self.ensure_watch_symlinks = ensure_watch_symlinks
         self.scan_installed_mods_in_watch_folder = scan_installed_mods_in_watch_folder
         self.bootstrap_launcher_state = bootstrap_launcher_state
-        self.run_steamcmd_install = run_steamcmd_install
         self._run_steam_client_install_impl = run_steam_client_install
         self.run_steam_client_install = self._run_steam_client_install_with_stop_waiting
-        self.fetch_workshop_sizes_bytes = fetch_workshop_sizes_bytes
         self.GLib = GLib
         self.threading = threading
 
-        # SteamCMD auth overlay state (password is never saved)
-        self._steamcmd_auth_request = None
-        self._steamcmd_auth_event = None
-        self._steamcmd_auth_result = None
-
-        # Two-line overlay state (TOP + LN1 + LN2) = your 3-line model
-        self._steamcmd_l1 = ""
-        self._steamcmd_l2 = ""
-        self._steamcmd_heading = ""
-
-        self._steamcmd_auth_wait_count = 0
-
-        # Progress counters
+        # Shared UGC overlay state; legacy widget names are retained for now.
         self._steamcmd_total_missing = 0
-        self._steamcmd_done_missing = 0
-
-        # NEW: progress-by-detection (increment when NEW mod id is detected)
-        self._steamcmd_seen_mod_ids = set()
-        self._steamcmd_started_missing = 0
-
-        # Mod sizes cache (string id -> "12.3 GB")
-        self._steamcmd_mod_sizes = {}
-
-        # Progress Bar
-        self._steamcmd_active_mid = None
-        self._steamcmd_total_sizes = {}  # later: mid -> total bytes from API
-        self._steamcmd_progress_timer_id = 0
-        self._steamcmd_last_progress_bytes = 0
         self._steam_ugc_progress_timer_id = 0
         self._steam_ugc_active_event = None
         self._steam_ugc_percent_label = None
@@ -911,7 +880,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._dayz_watch_shutdown_event = threading.Event()
 
         # ----------------------------
-        # SteamCMD AUTH OVERLAY (3-line layout)
+        # Shared mod-preparation overlay (legacy module/widget names retained).
         # ----------------------------
         self._steamcmd_overlay_ui = SteamCMDOverlayUI(self)
         self._steamcmd_overlay_ui.build(overlay)
@@ -1470,36 +1439,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
     # ----------------------------
-    # SteamCMD overlay layout helpers (3-case layout)
+    # Shared mod-preparation overlay helpers (legacy names retained).
     # ----------------------------
-    def _on_steamcmd_show_password_toggled(self, btn):
-        return self._steamcmd_overlay_ui._on_steamcmd_show_password_toggled(btn)
-
-    def _steamcmd_overlay_render(self, heading: str, line1: str, line2: str, spinning: bool):
-        try:
-            self._join_popup_presentation.invalidate_pending()
-        except Exception:
-            pass
-        return self._steamcmd_overlay_ui._steamcmd_overlay_render(heading, line1, line2, spinning)
-
-    def _steamcmd_set_state(self, heading: str, line1: str, line2: str, spinning: bool):
-        try:
-            self._join_popup_presentation.invalidate_pending()
-        except Exception:
-            pass
-        result = self._steamcmd_overlay_ui._steamcmd_set_state(
-            heading, line1, line2, spinning,
-        )
-        presenter = getattr(self, "_background_prepare_presenter", None)
-        if self._background_prepare_active and presenter is not None:
-            presenter.on_steamcmd_state(
-                heading=heading, line1=line1, line2=line2, spinning=spinning,
-            )
-        return result
-
-    def _steamcmd_install_line_from_worker(self, line: str):
-        return self._steamcmd_overlay_ui._steamcmd_install_line_from_worker(line)
-
     def _set_server_companion_join_status(
         self,
         message: str | None,
@@ -1524,14 +1465,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
         refresh()
         return False
-
-    def _show_steamcmd_auth_overlay(self, username_prefill: str = "", status: str = ""):
-        self._set_server_companion_join_status(
-            "SteamCMD Login Required",
-            flash=True,
-            transient=False,
-        )
-        return self._steamcmd_overlay_ui._show_steamcmd_auth_overlay(username_prefill=username_prefill, status=status)
 
     def _show_steam_client_download_overlay(self, status: str = ""):
         self._mod_download_backend_active = "steam_client"
@@ -1755,12 +1688,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
-            for widget in getattr(self, "_steamcmd_form_widgets", []):
-                try:
-                    widget.set_visible(False)
-                except Exception:
-                    pass
-            self.steamcmd_login_btn.set_visible(False)
             self.steamcmd_cancel_btn.set_label("Cancel")
             self.steamcmd_cancel_btn.set_tooltip_text(
                 "Cancel this Join preparation."
@@ -1784,19 +1711,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         finally:
             self._set_server_companion_join_status(None)
 
-    def _steamcmd_auth_submit(self):
-        result = self._steamcmd_overlay_ui._steamcmd_auth_submit()
-        req = getattr(self, "_steamcmd_auth_request", None)
-        auth_result = getattr(self, "_steamcmd_auth_result", None)
-        if req is None and isinstance(auth_result, dict) and auth_result.get("ok"):
-            self._set_server_companion_join_status(None)
-        return result
-
     def _steamcmd_auth_cancel(self):
         active_join = getattr(getattr(self, "_join_attempts", None), "active", None)
         if (
-            getattr(self, "_mod_download_backend_active", "") == "steam_client"
-            or active_join is not None
+            active_join is not None
+            or bool(getattr(self, "_steamcmd_install_in_progress", False))
+            or bool(getattr(self, "_mod_download_backend_active", ""))
         ):
             return self._steam_client_download_cancel_clicked(
                 attempt_id=(
@@ -1804,48 +1724,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     if active_join is not None else None
                 )
             )
-        try:
-            return self._steamcmd_overlay_ui._steamcmd_auth_cancel()
-        finally:
-            self._set_server_companion_join_status(None)
-
-    def _request_steamcmd_credentials_blocking(self, username_prefill: str = "", status: str = ""):
-        try:
-            return self._steamcmd_overlay_ui._request_steamcmd_credentials_blocking(username_prefill=username_prefill, status=status)
-        finally:
-            req = getattr(self, "_steamcmd_auth_request", None)
-            if req is None:
-                GLib.idle_add(self._set_server_companion_join_status, None)
+        self._hide_steamcmd_auth_overlay()
+        return None
 
     # ----------------------------
-    # SteamCMD progress helpers
-    # ----------------------------
-    def _steamcmd_mark_started(self, *a, **kw):
-        return self._steamcmd_overlay_ui._steamcmd_mark_started(*a, **kw)
-
-    # ----------------------------
-    # SteamCMD Progress Bar Helpers
-    # ----------------------------
-    def _steamcmd_start_progress_timer(self, *a, **kw):
-        return self._steamcmd_overlay_ui._steamcmd_start_progress_timer(*a, **kw)
-
-    def _steamcmd_stop_progress_timer(self, *a, **kw):
-        return self._steamcmd_overlay_ui._steamcmd_stop_progress_timer(*a, **kw)
-
-    def _steamcmd_progress_tick(self, *a, **kw):
-        return self._steamcmd_overlay_ui._steamcmd_progress_tick(*a, **kw)
-
-    # ----------------------------
-    # SteamCMD output parsing -> 3-case layout
-    # ----------------------------
-    def _steamcmd_line_to_overlay(self, line: str):
-        return self._steamcmd_overlay_ui._steamcmd_line_to_overlay(line)
-
-    def _steamcmd_refresh_active_download_line2(self):
-        return self._steamcmd_overlay_ui._steamcmd_refresh_active_download_line2()
-
-    # ----------------------------
-    # SteamCMD New Run Reset
+    # Shared preparation run reset (legacy name retained)
     # ----------------------------
     def _steamcmd_reset_state_for_new_run(self):
         try:
@@ -1938,12 +1821,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _show_steam_ugc_download_overlay(self, status: str = ""):
         try:
-            for widget in getattr(self, "_steamcmd_form_widgets", []):
-                try:
-                    widget.set_visible(False)
-                except Exception:
-                    pass
-            self.steamcmd_login_btn.set_visible(False)
             self.steamcmd_cancel_btn.set_visible(True)
             self.steamcmd_auth_scrim.set_visible(True)
             self.steamcmd_auth_box.set_visible(True)
@@ -3174,30 +3051,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
-            self._steamcmd_stop_progress_timer()
-        except Exception:
-            try:
-                tid = int(getattr(self, "_steamcmd_progress_timer_id", 0) or 0)
-                if tid:
-                    GLib.source_remove(tid)
-            except Exception:
-                pass
-            self._steamcmd_progress_timer_id = 0
-
-        try:
             cancel_event = getattr(self, "_steamcmd_cancel_event", None)
             if isinstance(cancel_event, threading.Event):
                 cancel_event.set()
-        except Exception:
-            pass
-
-        try:
-            self._steamcmd_auth_result = {"ok": False, "cancelled": True, "shutdown": True}
-            self._steamcmd_auth_request = None
-            ev = getattr(self, "_steamcmd_auth_event", None)
-            if isinstance(ev, threading.Event):
-                ev.set()
-            self._steamcmd_auth_event = None
         except Exception:
             pass
 
@@ -7142,8 +6998,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return True
         if bool(getattr(self, "_mod_download_backend_active", "")):
             return True
-        if getattr(self, "_steamcmd_auth_request", None) is not None:
-            return True
         return False
 
     def _browser_live_candidate_groups(self):
@@ -10783,16 +10637,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         resolved = self._resolve_join_runtime(mods)
         runtime = BackgroundPreparationRuntime(
             workshop_dir=str(resolved["workshop_dir"] or ""),
-            steamcmd_path=str(resolved["steamcmd_path"] or ""),
-            steam_user=str(resolved["steam_user"] or ""),
-            validate=bool(resolved["validate"]),
-            dry_run=bool(resolved["dry"]),
             use_steamcmd=bool(resolved["use_steamcmd"]),
-            mod_download_backend=str(
-                resolved["mod_download_backend"] or "steam_client"
-            ),
             auto_install_missing=bool(resolved["auto_install_missing"]),
-            auto_update_required=bool(resolved["auto_update_required"]),
         )
         return snapshot, runtime
 
@@ -10971,7 +10817,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                             "Preparation remains blocked to prevent overlapping Steam "
                             f"API work: {exc}"
                         ),
-                        backend=request.runtime.mod_download_backend,
+                        backend="steam_client",
                     )
                     presenter.on_terminal(outcome)
                     if exc.helper_process_may_be_alive:
@@ -11011,7 +10857,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                             f"Background preparation failed for "
                             f"{request.display_name or request.identity}: {exc}"
                         ),
-                        backend=request.runtime.mod_download_backend,
+                        backend="steam_client",
                     )
                 elapsed = time.monotonic() - started
                 transition = queue.finish(request, outcome)
@@ -11606,43 +11452,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not workshop_dir:
             workshop_dir = autodetect_workshop_dir() or ""
 
-        steamcmd_path = str(self.settings.get("steamcmd_path") or "").strip()
-        if not steamcmd_path:
-            steamcmd_path = autodetect_steamcmd_path() or ""
-            logger.debug("Join Workshop path: %r", workshop_dir)
-            logger.debug("Join SteamCMD path: %r", steamcmd_path)
-
-        steam_user = str(self.settings.get("steamcmd_username") or "").strip()
-        validate = bool(self.settings.get("verify_mod_files", False))
-        dry = bool(self.settings.get("steamcmd_dry_run", False))  # kept for legacy; UI removed
+        logger.debug("Join Workshop path: %r", workshop_dir)
 
         proton_prefix = self._get_dayz_proton_prefix()
         watch_folder_linux = self._get_dzll_watch_folder_linux()
         self._log_join_resolved_dayz_paths(workshop_dir=workshop_dir, proton_prefix=proton_prefix)
 
         use_steamcmd = bool(self.settings.get("enable_steamcmd_mod_handling", True))
-        mod_download_backend = str(self.settings.get("mod_download_backend") or "steam_client")
 
-        # New split toggles (with backwards compatibility to old combined toggle)
+        # Preserve compatibility with the old combined install/update toggle.
         auto_install_missing = bool(self.settings.get("auto_install_missing_mods", True))
-        auto_update_required = bool(self.settings.get("auto_update_required_mods", False))
-        if ("auto_install_missing_mods" not in self.settings) and ("auto_update_required_mods" not in self.settings):
-            legacy = bool(self.settings.get("auto_install_update_mods", True))
-            auto_install_missing = legacy
-            auto_update_required = legacy
+        if "auto_install_missing_mods" not in self.settings:
+            auto_install_missing = bool(self.settings.get("auto_install_update_mods", True))
 
         return {
             "workshop_dir": workshop_dir,
-            "steamcmd_path": steamcmd_path,
-            "steam_user": steam_user,
-            "validate": validate,
-            "dry": dry,
             "proton_prefix": proton_prefix,
             "watch_folder_linux": watch_folder_linux,
             "use_steamcmd": use_steamcmd,
-            "mod_download_backend": mod_download_backend,
             "auto_install_missing": auto_install_missing,
-            "auto_update_required": auto_update_required,
         }
 
     def _join_server_for_obj(self, obj: ServerObject):
@@ -11766,16 +11594,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             runtime = self._resolve_join_runtime(mods)
             workshop_dir = runtime["workshop_dir"]
-            steamcmd_path = runtime["steamcmd_path"]
-            steam_user = runtime["steam_user"]
-            validate = runtime["validate"]
-            dry = runtime["dry"]
             proton_prefix = runtime["proton_prefix"]
             watch_folder_linux = runtime["watch_folder_linux"]
             use_steamcmd = runtime["use_steamcmd"]
-            mod_download_backend = runtime["mod_download_backend"]
             auto_install_missing = runtime["auto_install_missing"]
-            auto_update_required = runtime["auto_update_required"]
         except Exception as exc:
             self._show_join_preparation_error(
                 attempt_id, f"Could not resolve Join preparation settings: {exc}",
@@ -11791,16 +11613,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 obj,
                 mods,
                 workshop_dir,
-                steamcmd_path,
-                steam_user,
-                validate,
-                dry,
                 proton_prefix,
                 watch_folder_linux,
                 use_steamcmd,
-                mod_download_backend,
                 auto_install_missing,
-                auto_update_required,
                 attempt_id=attempt_id,
             )
 
