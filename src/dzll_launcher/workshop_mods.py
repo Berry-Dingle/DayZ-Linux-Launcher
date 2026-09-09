@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# steamcmd_mods.py
+# workshop_mods.py
 #
 # Shared DayZ Workshop mod helpers.
 

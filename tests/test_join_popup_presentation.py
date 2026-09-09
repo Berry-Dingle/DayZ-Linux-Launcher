@@ -14,7 +14,7 @@ from dzll_launcher.join_popup_presentation import (
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW_SOURCE = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
 JOIN_SOURCE = (ROOT / "src/dzll_launcher/join_prepare.py").read_text(encoding="utf-8")
-STEAMCMD_UI_SOURCE = (ROOT / "src/dzll_launcher/steamcmd_overlay_ui.py").read_text(encoding="utf-8")
+STEAMCMD_UI_SOURCE = (ROOT / "src/dzll_launcher/join_preparation_overlay_ui.py").read_text(encoding="utf-8")
 
 
 class TurnScheduler:

@@ -1113,8 +1113,8 @@ def test_backend_exact_offline_evidence_deletes_only_guarded_fake_tree(
         "_delete_file_if_present",
         lambda path, **_kwargs: path.unlink(missing_ok=True) or True,
     )
-    from dzll_launcher import steamcmd_mods
-    monkeypatch.setattr(steamcmd_mods, "remove_dzll_symlinks_for_mod", lambda *_args, **_kwargs: [])
+    from dzll_launcher import workshop_mods
+    monkeypatch.setattr(workshop_mods, "remove_dzll_symlinks_for_mod", lambda *_args, **_kwargs: [])
 
     result = steam_ugc_backend.delete_ugc_mod_local_files_after_unsubscribe(
         mod_id,

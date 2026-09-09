@@ -8,7 +8,7 @@ from pathlib import Path
 
 from .config import DB_LOCAL_PATH
 from .mod_metadata import clean_display_mod_name, upsert_many_names
-from .steamcmd_mods import parse_mods_from_db
+from .workshop_mods import parse_mods_from_db
 
 
 _CPP_NAME_RE = re.compile(r"\b(?:name|title)\s*=\s*(['\"])(?P<value>.*?)\1\s*;", re.IGNORECASE | re.DOTALL)

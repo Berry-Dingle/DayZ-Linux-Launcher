@@ -689,7 +689,7 @@ def test_activity_map_clears_only_matching_attempt():
 
 def test_ugc_only_overlay_and_urgent_paths_remain_in_source():
     steamcmd_source = (window_module.Path(__file__).resolve().parents[1]
-                       / "src/dzll_launcher/steamcmd_overlay_ui.py").read_text()
+                       / "src/dzll_launcher/join_preparation_overlay_ui.py").read_text()
     window_source = (window_module.Path(__file__).resolve().parents[1]
                      / "src/dzll_launcher/window.py").read_text()
     assert "Steam Guard" not in steamcmd_source

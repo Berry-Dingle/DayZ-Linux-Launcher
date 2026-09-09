@@ -3729,7 +3729,7 @@ def delete_ugc_mod(mod_id, *, appid=DAYZ_APPID, timeout=120, log_fn=None) -> dic
             _cache_ugc_state({mid: after})
 
         try:
-            from .steamcmd_mods import remove_dzll_symlinks_for_mod
+            from .workshop_mods import remove_dzll_symlinks_for_mod
 
             result["removed_symlinks"] = remove_dzll_symlinks_for_mod(mid, log_fn=log)
         except Exception as exc:
@@ -3887,7 +3887,7 @@ def delete_ugc_mod_local_files_after_unsubscribe(
         result["deleted_staging"] = bool(deleted_any_staging)
 
         try:
-            from .steamcmd_mods import remove_dzll_symlinks_for_mod
+            from .workshop_mods import remove_dzll_symlinks_for_mod
 
             result["removed_symlinks"] = remove_dzll_symlinks_for_mod(mid, log_fn=log)
         except Exception as exc:

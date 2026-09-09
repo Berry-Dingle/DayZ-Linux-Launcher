@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from dzll_launcher import steam_ugc_backend, steamcmd_mods
+from dzll_launcher import steam_ugc_backend, workshop_mods
 from dzll_launcher.steam_ugc_backend import UGCSubscriptionSnapshot
 
 
@@ -550,7 +550,7 @@ def test_mod_manager_bulk_cleanup_inherits_retention(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(steam_ugc_backend, "_mark_metadata_deleted", lambda _mid: None)
     monkeypatch.setattr(
-        steamcmd_mods,
+        workshop_mods,
         "remove_dzll_symlinks_for_mod",
         lambda *_args, **_kwargs: [],
     )

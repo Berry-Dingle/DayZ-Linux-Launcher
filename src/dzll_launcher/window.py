@@ -137,7 +137,7 @@ from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
 from .startup_ui import build_startup_overlay
 
-from .steamcmd_mods import (
+from .workshop_mods import (
     parse_mods_from_db,
     compute_missing_mods,
     parse_additional_mod_ids,
@@ -147,7 +147,7 @@ from .steamcmd_mods import (
 )
 from .steam_client_mods import run_steam_client_install
 from .steam_ugc_backend import UGCHelperReapError
-from .steamcmd_overlay_ui import SteamCMDOverlayUI
+from .join_preparation_overlay_ui import SteamCMDOverlayUI
 from .launcher_state import bootstrap_launcher_state
 from .join_prepare import join_prepare_and_launch
 from .background_prepare import (

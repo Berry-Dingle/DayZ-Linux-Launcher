@@ -6,7 +6,7 @@ import threading
 import time
 import traceback
 
-from . import steamcmd_mods
+from . import workshop_mods
 from .launcher_state import linux_to_win_path_under_prefix
 from .mod_metadata import clean_display_mod_name
 from .preparation_contracts import (
@@ -45,7 +45,7 @@ def _resolve_path(path):
 
 
 def _missing_ids_for(workshop_dir, mods):
-    return {int(mid) for mid, _name in (steamcmd_mods.compute_missing_mods(workshop_dir, mods) or [])}
+    return {int(mid) for mid, _name in (workshop_mods.compute_missing_mods(workshop_dir, mods) or [])}
 
 
 def _maybe_autodetect_workshop_dir():
@@ -1010,7 +1010,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, proton_prefix,
                     logger.warning("Join symlink warnings: %s", link_info.get("errors"))
 
             if ok and not continuation_cancelled():
-                validation_errors = steamcmd_mods.validate_selected_watch_symlinks(
+                validation_errors = workshop_mods.validate_selected_watch_symlinks(
                     selected_paths=(link_info or {}).get("selected_paths", []),
                     mods=mods_for_launch,
                 )

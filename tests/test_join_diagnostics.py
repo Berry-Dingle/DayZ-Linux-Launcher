@@ -266,7 +266,7 @@ def run_join_route(monkeypatch, states):
         join_prepare, "query_ugc_state_checked",
         lambda *_args, **_kwargs: next(state_results),
     )
-    monkeypatch.setattr(join_prepare.steamcmd_mods, "validate_selected_watch_symlinks", lambda **_kwargs: [])
+    monkeypatch.setattr(join_prepare.workshop_mods, "validate_selected_watch_symlinks", lambda **_kwargs: [])
 
     def install(**kwargs):
         kwargs["log_fn"]("helper synthetic start")

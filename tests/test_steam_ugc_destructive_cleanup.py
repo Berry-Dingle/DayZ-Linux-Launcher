@@ -3,7 +3,7 @@ import threading
 
 import pytest
 
-from dzll_launcher import mods_ui, steam_ugc_backend, steamcmd_mods
+from dzll_launcher import mods_ui, steam_ugc_backend, workshop_mods
 from dzll_launcher.mods_ui import ModsManagerOverlay
 from dzll_launcher.steam_native import SteamClientState
 
@@ -55,7 +55,7 @@ def _patch_local_delete_tree(monkeypatch, tmp_path, *, mod_id=MOD_ID):
         steam_ugc_backend, "_mark_metadata_deleted", lambda _mid: None,
     )
     monkeypatch.setattr(
-        steamcmd_mods, "remove_dzll_symlinks_for_mod", lambda *_args, **_kwargs: [],
+        workshop_mods, "remove_dzll_symlinks_for_mod", lambda *_args, **_kwargs: [],
     )
     return content
 

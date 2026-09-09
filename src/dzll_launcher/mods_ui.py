@@ -32,7 +32,7 @@ from .steam_native import (
     resolve_native_steam_cmd,
     resolve_steam_runtime_state,
 )
-from .steamcmd_mods import remove_dzll_symlinks_for_mod
+from .workshop_mods import remove_dzll_symlinks_for_mod
 from .mod_metadata import clean_display_mod_name, load_mod_metadata
 from .mod_name_resolver import resolve_best_mod_names
 

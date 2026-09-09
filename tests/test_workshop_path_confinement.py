@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from dzll_launcher import steam_ugc_backend, steamcmd_mods
+from dzll_launcher import steam_ugc_backend, workshop_mods
 from dzll_launcher.steam_ugc_backend import UGCSubscriptionSnapshot
 
 
@@ -79,7 +79,7 @@ def _patch_authorized_local_cleanup(monkeypatch, root: Path) -> None:
     )
     monkeypatch.setattr(steam_ugc_backend, "_mark_metadata_deleted", lambda _mid: None)
     monkeypatch.setattr(
-        steamcmd_mods,
+        workshop_mods,
         "remove_dzll_symlinks_for_mod",
         lambda *_args, **_kwargs: [],
     )
@@ -685,12 +685,12 @@ def test_normal_join_watch_symlink_creation_and_reuse_is_unchanged(tmp_path):
     (addons / "synthetic.pbo").write_bytes(b"pbo")
     watch = tmp_path / "watch"
 
-    created = steamcmd_mods.ensure_watch_symlinks(
+    created = workshop_mods.ensure_watch_symlinks(
         workshop_dir=str(workshop),
         mods=[(MOD_ID, "Synthetic Mod")],
         watch_folder=str(watch),
     )
-    reused = steamcmd_mods.ensure_watch_symlinks(
+    reused = workshop_mods.ensure_watch_symlinks(
         workshop_dir=str(workshop),
         mods=[(MOD_ID, "Synthetic Mod")],
         watch_folder=str(watch),

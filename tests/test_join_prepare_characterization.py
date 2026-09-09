@@ -12,7 +12,7 @@ from dzll_launcher import (
     steam_ugc_backend,
 )
 from dzll_launcher import window as window_module
-from dzll_launcher.steamcmd_overlay_ui import SteamCMDOverlayUI
+from dzll_launcher.join_preparation_overlay_ui import SteamCMDOverlayUI
 from dzll_launcher.preparation_contracts import (
     JoinPopupPreparationPresenter,
     PreparationStatus,
@@ -238,7 +238,7 @@ def run_characterized(monkeypatch, *, backend_ok=True,
         lambda *_args, **_kwargs: next(state_results),
     )
     monkeypatch.setattr(
-        join_prepare.steamcmd_mods, "validate_selected_watch_symlinks",
+        join_prepare.workshop_mods, "validate_selected_watch_symlinks",
         lambda **_kwargs: win.events.append(("validate_symlinks",)) or [],
     )
     join_prepare.join_prepare_and_launch(
@@ -916,7 +916,7 @@ def run_terminal_validation_route(
     )
     monkeypatch.setattr(join_prepare, "query_ugc_state_checked", checked_query)
     monkeypatch.setattr(
-        join_prepare.steamcmd_mods, "validate_selected_watch_symlinks",
+        join_prepare.workshop_mods, "validate_selected_watch_symlinks",
         lambda **_kwargs: trace.append(("validate_symlinks",)) or [],
     )
     win.run_steam_client_install = install

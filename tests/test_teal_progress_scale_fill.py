@@ -74,7 +74,7 @@ def test_scale_uses_accent_highlight_grey_trough_and_neutral_thumb():
 def test_alert_volume_and_all_current_ordinary_controls_use_common_rules():
     companion = (ROOT / "src/dzll_launcher/server_companion_ui.py").read_text(encoding="utf-8")
     sidebar = (ROOT / "src/dzll_launcher/sidebar_ui.py").read_text(encoding="utf-8")
-    steamcmd = (ROOT / "src/dzll_launcher/steamcmd_overlay_ui.py").read_text(encoding="utf-8")
+    steamcmd = (ROOT / "src/dzll_launcher/join_preparation_overlay_ui.py").read_text(encoding="utf-8")
 
     assert companion.count("Gtk.Scale.new_with_range") == 1
     assert "self.alert_volume_scale = Gtk.Scale.new_with_range" in companion

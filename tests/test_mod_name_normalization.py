@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from dzll_launcher import mod_metadata, mod_name_resolver, steamcmd_mods
+from dzll_launcher import mod_metadata, mod_name_resolver, workshop_mods
 from dzll_launcher.column_view import _required_mod_names_from_json
 from dzll_launcher.mod_metadata import (
     MOD_DISPLAY_NAME_MAX_CHARS,
@@ -25,7 +25,7 @@ from dzll_launcher.preparation_contracts import (
     PreparationStatus,
 )
 from dzll_launcher.preparation_presentation import PreparationPresentationReducer
-from dzll_launcher.steamcmd_mods import (
+from dzll_launcher.workshop_mods import (
     ensure_watch_symlinks,
     parse_mods_from_db,
     symlink_name_for_mod,
@@ -398,7 +398,7 @@ def test_watch_name_max_pathconf_failure_uses_255_fallback(tmp_path, monkeypatch
     workshop = _installed_workshop_fixture(tmp_path, mod_id)
     watch = tmp_path / "watch"
     monkeypatch.setattr(
-        steamcmd_mods.os, "pathconf",
+        workshop_mods.os, "pathconf",
         lambda *_args: (_ for _ in ()).throw(OSError("unsupported")),
     )
 
@@ -424,7 +424,7 @@ def test_impossible_name_max_creates_no_link_and_touches_no_existing_link(
     unrelated_target.mkdir()
     unrelated = watch / "@Unrelated__9999"
     unrelated.symlink_to(unrelated_target, target_is_directory=True)
-    monkeypatch.setattr(steamcmd_mods, "_watch_name_max", lambda _path: 1)
+    monkeypatch.setattr(workshop_mods, "_watch_name_max", lambda _path: 1)
 
     result = ensure_watch_symlinks(
         workshop_dir=str(workshop), mods=[(mod_id, "Name")],

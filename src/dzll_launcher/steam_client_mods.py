@@ -4,7 +4,7 @@
 import logging
 from typing import Callable, List
 
-from .steamcmd_mods import DAYZ_APPID
+from .workshop_mods import DAYZ_APPID
 from .steam_ugc_backend import (
     active_ugc_session,
     activate_ugc_session,
