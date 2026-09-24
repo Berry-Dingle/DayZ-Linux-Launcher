@@ -156,9 +156,9 @@ class JoinHarness:
         self.GLib = ImmediateGLib()
         self.threading = threading
         self._join_steam_start_allowed = False
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._steam_client_stop_waiting_event = threading.Event()
-        self._steamcmd_install_in_progress = False
+        self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
         self._discord = None
         self._steamcmd_form_widgets = []
@@ -185,7 +185,7 @@ class JoinHarness:
         return []
 
     def _steamcmd_reset_state_for_new_run(self):
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
 
     def _free_bytes_for_path(self, _path):
         return 20 * 1024 ** 3

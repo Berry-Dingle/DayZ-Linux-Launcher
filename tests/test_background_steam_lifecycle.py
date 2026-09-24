@@ -148,7 +148,7 @@ def test_already_running_returns_confirmed_state_without_launch(monkeypatch):
 
 def test_flagless_allowed_result_fails_before_helper_or_engine(monkeypatch):
     host = SimpleNamespace(
-        _steamcmd_cancel_event=threading.Event(),
+        _join_preparation_cancel_event=threading.Event(),
         _join_steam_start_allowed=False,
         _join_attempts=SimpleNamespace(active=None),
     )
@@ -442,8 +442,8 @@ def test_background_cancel_before_shared_preflight_starts_no_steam(monkeypatch):
         threading=threading,
         _join_attempts=SimpleNamespace(active=None),
         _join_steam_start_allowed=False,
-        _steamcmd_cancel_event=threading.Event(),
-        _steamcmd_install_in_progress=False,
+        _join_preparation_cancel_event=threading.Event(),
+        _steam_ugc_worker_in_progress=False,
         _mod_download_backend_active="",
         compute_missing_mods=lambda *_a, **_k: [],
         _join_log=lambda *_a, **_k: None,

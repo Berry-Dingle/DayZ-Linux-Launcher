@@ -38,10 +38,10 @@ class LifecycleHarness:
         self._pending_last_played_obj = None
         self._pending_join_mod_ids = []
         self._pending_join_mod_names_by_id = {}
-        self._steamcmd_cancel_event = None
+        self._join_preparation_cancel_event = None
         self._steam_client_stop_waiting_event = None
         self._steam_client_safe_cancel_requested = False
-        self._steamcmd_install_in_progress = False
+        self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
         self.attempt = self._join_attempts.begin(
             ip="127.0.0.1", game_port=2302, query_port=27016,
@@ -333,7 +333,7 @@ class SessionWatcherHarness(LifecycleHarness):
         self._discord_committed_watch_generation = None
         self._dayz_watch_shutdown_event = threading.Event()
         self._discord = None
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._steam_client_stop_waiting_event = threading.Event()
         self.launcher_results = list(launcher_results)
         self.game_results = list(game_results)

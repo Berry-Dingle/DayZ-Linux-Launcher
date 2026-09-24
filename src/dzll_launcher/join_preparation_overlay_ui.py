@@ -131,4 +131,4 @@ class JoinPreparationOverlayUI:
             self.steamcmd_line2.set_label("")
         except Exception:
             pass
-        self.win._steamcmd_install_in_progress = False
+        self.win._steam_ugc_worker_in_progress = False

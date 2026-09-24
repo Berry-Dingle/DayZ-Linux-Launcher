@@ -244,7 +244,7 @@ def test_foreground_join_cancel_ends_consent_and_preserves_cancel_state():
     host._start_steam_join_loop = loop
     host._join_attempts = SimpleNamespace(active=SimpleNamespace(attempt_id=7))
     host._steam_client_safe_cancel_requested = False
-    host._steamcmd_cancel_event = threading.Event()
+    host._join_preparation_cancel_event = threading.Event()
     events = []
     host._steam_client_set_cancel_buttons = (
         lambda safe_cancel: events.append(("buttons", safe_cancel))
@@ -253,7 +253,7 @@ def test_foreground_join_cancel_ends_consent_and_preserves_cancel_state():
 
     window_module.DZLLWindow._steam_client_download_cancel_clicked(host, 7)
 
-    assert host._steamcmd_cancel_event.is_set()
+    assert host._join_preparation_cancel_event.is_set()
     assert host._steam_client_safe_cancel_requested
     assert host._start_steam_join_decision == (False, False)
     assert loop.quit_calls == 1

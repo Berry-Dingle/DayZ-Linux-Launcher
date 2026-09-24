@@ -717,14 +717,14 @@ class SettingsUI:
             if self._recovery_callback_is_current(generation, cancel_event):
                 win = getattr(self, "_win", None)
                 if win is not None:
-                    old_cancel = getattr(win, "_steamcmd_cancel_event", None)
+                    old_cancel = getattr(win, "_join_preparation_cancel_event", None)
                     if old_cancel is not None:
                         try:
                             old_cancel.set()
                         except Exception:
                             pass
                     try:
-                        win._steamcmd_cancel_event = threading.Event()
+                        win._join_preparation_cancel_event = threading.Event()
                     except Exception:
                         pass
                     controller = getattr(

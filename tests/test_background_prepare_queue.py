@@ -178,7 +178,7 @@ def test_stale_progress_terminal_and_finish_cannot_mutate_retried_identity():
 def test_shared_mods_are_rechecked_by_existing_engine_and_not_cached_in_queue(monkeypatch):
     queue = BackgroundPreparationQueue()
     win = SimpleNamespace(
-        _steamcmd_cancel_event=threading.Event(),
+        _join_preparation_cancel_event=threading.Event(),
         _join_steam_start_allowed=False,
         _join_attempts=SimpleNamespace(active=None),
     )

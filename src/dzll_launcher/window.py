@@ -791,11 +791,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._steam_ugc_percent_label = None
 
         # NEW: Cancel support
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._steam_client_stop_waiting_event = threading.Event()
         self._steam_client_safe_cancel_requested = False
         self._steam_client_open_downloads_btn = None
-        self._steamcmd_install_in_progress = False
+        self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
         self._join_steam_start_allowed = False
         self._background_prepare_ui_generation = 0
@@ -1715,7 +1715,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         active_join = getattr(getattr(self, "_join_attempts", None), "active", None)
         if (
             active_join is not None
-            or bool(getattr(self, "_steamcmd_install_in_progress", False))
+            or bool(getattr(self, "_steam_ugc_worker_in_progress", False))
             or bool(getattr(self, "_mod_download_backend_active", ""))
         ):
             return self._steam_client_download_cancel_clicked(
@@ -1773,7 +1773,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._steam_client_safe_cancel_requested = True
         try:
-            self._steamcmd_cancel_event.set()
+            self._join_preparation_cancel_event.set()
         except Exception:
             pass
         DZLLWindow._finish_start_steam_join_consent(
@@ -1789,7 +1789,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self, False, always=False,
         )
         try:
-            self._steamcmd_cancel_event.set()
+            self._join_preparation_cancel_event.set()
         except Exception:
             pass
         try:
@@ -2033,7 +2033,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             if (
                 getattr(self, "_mod_download_backend_active", "") != "steam_client"
-                or not bool(getattr(self, "_steamcmd_install_in_progress", False))
+                or not bool(getattr(self, "_steam_ugc_worker_in_progress", False))
             ):
                 self._steam_ugc_progress_timer_id = 0
                 return False
@@ -3051,7 +3051,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
-            cancel_event = getattr(self, "_steamcmd_cancel_event", None)
+            cancel_event = getattr(self, "_join_preparation_cancel_event", None)
             if isinstance(cancel_event, threading.Event):
                 cancel_event.set()
         except Exception:
@@ -6994,7 +6994,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 return True
         except Exception:
             pass
-        if bool(getattr(self, "_steamcmd_install_in_progress", False)):
+        if bool(getattr(self, "_steam_ugc_worker_in_progress", False)):
             return True
         if bool(getattr(self, "_mod_download_backend_active", "")):
             return True
@@ -9515,10 +9515,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             reducer = getattr(self, "_join_preparation_reducer", None)
             if reducer is not None and reducer.operation_id == int(attempt_id):
                 self._join_preparation_reducer = None
-            self._steamcmd_cancel_event = threading.Event()
+            self._join_preparation_cancel_event = threading.Event()
             self._steam_client_stop_waiting_event = threading.Event()
             self._steam_client_safe_cancel_requested = False
-            self._steamcmd_install_in_progress = False
+            self._steam_ugc_worker_in_progress = False
             self._mod_download_backend_active = ""
             self._refresh_background_prepare_action_states()
         return cleaned
@@ -11125,7 +11125,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         operation_cancel_event = (
             cancel_event
             if cancel_event is not None
-            else self._steamcmd_cancel_event
+            else self._join_preparation_cancel_event
         )
         consent_started = time.monotonic()
         completed = threading.Event()
@@ -11536,7 +11536,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._remember_join_preparation_lease(attempt.attempt_id, join_lease)
         # Cancellation belongs to this Join attempt. Background preparation and
         # earlier Join attempts must never donate a set event to a new attempt.
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._refresh_background_prepare_action_states()
         attempt_id = attempt.attempt_id
         self._join_popup_enter_checking(attempt_id)

@@ -139,7 +139,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
     operation_cancel_event = (
         cancel_event
         if cancel_event is not None
-        else win._steamcmd_cancel_event
+        else win._join_preparation_cancel_event
     )
     stop_waiting_event = getattr(
         win, "_steam_client_stop_waiting_event", None,
@@ -583,7 +583,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                     progress_event = PreparationProgressEvent.from_authoritative_payload(event)
                     win.GLib.idle_add(deliver_event, progress_event)
 
-                win._steamcmd_install_in_progress = True
+                win._steam_ugc_worker_in_progress = True
                 win._mod_download_backend_active = "steam_client"
                 try:
                     if attempt_id:
@@ -605,7 +605,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                     if attempt_id:
                         win._join_log(attempt_id, "UGC helper returned", success=bool(ok))
                 finally:
-                    win._steamcmd_install_in_progress = False
+                    win._steam_ugc_worker_in_progress = False
                     win._mod_download_backend_active = ""
 
             if not ok and manage_join_presentation:
@@ -739,7 +739,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                         )
 
                     did_work = True
-                    win._steamcmd_install_in_progress = True
+                    win._steam_ugc_worker_in_progress = True
                     win._mod_download_backend_active = "steam_client"
                     try:
                         retry_ok = win.run_steam_client_install(
@@ -764,7 +764,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                             ) if attempt_id else None,
                         )
                     finally:
-                        win._steamcmd_install_in_progress = False
+                        win._steam_ugc_worker_in_progress = False
                         win._mod_download_backend_active = ""
 
                     if not retry_ok:
@@ -938,7 +938,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, proton_prefix,
     if consume_event is None:
         consume_event = win._steam_ugc_progress_from_worker
     join_presenter = JoinPopupPreparationPresenter(consume_event=consume_event)
-    operation_cancel_event = win._steamcmd_cancel_event
+    operation_cancel_event = win._join_preparation_cancel_event
 
     def continuation_cancelled() -> bool:
         if operation_cancel_event.is_set():

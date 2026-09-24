@@ -72,7 +72,7 @@ class RendererHarness:
         self._steam_client_safe_cancel_requested = False
         self._steam_ugc_active_event = None
         self._mod_download_backend_active = "steam_client"
-        self._steamcmd_install_in_progress = True
+        self._steam_ugc_worker_in_progress = True
         self.steamcmd_task_heading = FakeWidget("heading", self.writes)
         self.steamcmd_line1 = FakeWidget("line1", self.writes)
         self.steamcmd_line2 = FakeWidget("line2", self.writes)

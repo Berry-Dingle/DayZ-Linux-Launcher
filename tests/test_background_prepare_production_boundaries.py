@@ -158,7 +158,7 @@ class ProductionStartHarness:
     def __init__(self, executor):
         self._hi_executor = executor
         self._join_attempts = SimpleNamespace(active=None)
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._join_steam_start_allowed = False
         self._background_prepare_ui_generation = 0
         self._background_prepare_active = False
@@ -604,7 +604,7 @@ class ConsentHarness:
     def __init__(self, decision=True):
         self._background_prepare_ui_generation = 7
         self._shutdown_cleanup_done = False
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._background_prepare_consent_timeout_s = 0.2
         self.decision = decision
         self.calls = 0
@@ -690,7 +690,7 @@ def test_consent_cancel_interrupts_wait_promptly_and_late_callback_is_safe(monke
     deadline = time.monotonic() + 1.0
     while scheduler.callbacks.empty() and time.monotonic() < deadline:
         time.sleep(0.005)
-    host._steamcmd_cancel_event.set()
+    host._join_preparation_cancel_event.set()
     worker.join(timeout=0.5)
     elapsed = time.monotonic() - started
     assert not worker.is_alive()
@@ -753,7 +753,7 @@ def test_consent_timeout_is_not_reported_as_decline(monkeypatch):
 def test_controller_maps_explicit_consent_result_to_actionable_outcome(
         monkeypatch, consent_status, outcome_status, reason):
     host = SimpleNamespace(
-        _steamcmd_cancel_event=threading.Event(),
+        _join_preparation_cancel_event=threading.Event(),
         _join_steam_start_allowed=False,
         _join_attempts=SimpleNamespace(active=None),
     )
@@ -778,8 +778,8 @@ class ReadinessHarness:
         self.GLib = SimpleNamespace(idle_add=lambda callback, *args: callback(*args) or 1)
         self.threading = threading
         self._join_steam_start_allowed = False
-        self._steamcmd_cancel_event = threading.Event()
-        self._steamcmd_install_in_progress = False
+        self._join_preparation_cancel_event = threading.Event()
+        self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
 
     def compute_missing_mods(self, _path, _mods):
@@ -826,7 +826,7 @@ def test_background_ugc_readiness_receives_cancel_event_and_visible_progress(mon
         allow_backend_steam_start=False,
     )
     assert outcome.status is PreparationStatus.READY
-    assert seen["cancel_event"] is host._steamcmd_cancel_event
+    assert seen["cancel_event"] is host._join_preparation_cancel_event
     assert seen["allow_start_steam"] is False
     assert seen["launch_policy"] == "wait_only"
     assert callable(seen["progress_cb"])
@@ -857,7 +857,7 @@ def test_background_ugc_readiness_cancel_exits_promptly(monkeypatch):
     ))
     worker.start()
     assert entered.wait(timeout=0.5)
-    host._steamcmd_cancel_event.set()
+    host._join_preparation_cancel_event.set()
     worker.join(timeout=0.5)
     assert not worker.is_alive()
     assert outcomes[0].status is PreparationStatus.CANCELLED

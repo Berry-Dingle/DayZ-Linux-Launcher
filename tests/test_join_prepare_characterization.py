@@ -40,12 +40,12 @@ def test_overlay_reset_preserves_join_cancel_event_identity():
     cancel_event = threading.Event()
     cancel_event.set()
     win = SimpleNamespace(
-        _steamcmd_cancel_event=cancel_event,
+        _join_preparation_cancel_event=cancel_event,
         _steamcmd_form_widgets=[],
         _steamcmd_heading="old",
         _steamcmd_l1="old",
         _steamcmd_l2="old",
-        _steamcmd_install_in_progress=True,
+        _steam_ugc_worker_in_progress=True,
         steamcmd_spinner=Widget(),
         steamcmd_task_heading=Widget(),
         steamcmd_line1=Widget(),
@@ -55,7 +55,7 @@ def test_overlay_reset_preserves_join_cancel_event_identity():
     overlay = object.__new__(JoinPreparationOverlayUI)
     overlay.win = win
     overlay._steamcmd_reset_state_for_new_run()
-    assert win._steamcmd_cancel_event is cancel_event
+    assert win._join_preparation_cancel_event is cancel_event
     assert cancel_event.is_set() is True
 
 
@@ -64,7 +64,7 @@ def test_join_cancel_sets_only_matching_active_attempt_event():
     active = SimpleNamespace(attempt_id=9)
     win = SimpleNamespace(
         _join_attempts=SimpleNamespace(active=active),
-        _steamcmd_cancel_event=cancel_event,
+        _join_preparation_cancel_event=cancel_event,
         _steam_client_safe_cancel_requested=False,
         _steam_client_set_cancel_buttons=lambda **_kwargs: None,
         _steam_ugc_render_cancelling=lambda: None,
@@ -96,9 +96,9 @@ class CharacterizationHarness:
         self.launches = 0
         self.errors = []
         self._join_steam_start_allowed = False
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._steam_client_stop_waiting_event = threading.Event()
-        self._steamcmd_install_in_progress = False
+        self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
         self._discord = None
         self.steamcmd_spinner = Widget()
@@ -147,7 +147,7 @@ class CharacterizationHarness:
         assert kwargs["stop_waiting_event"] is self._steam_client_stop_waiting_event
         self.events.append(("steam_client", tuple(kwargs["mod_ids"])))
         if self.cancelled:
-            self._steamcmd_cancel_event.set()
+            self._join_preparation_cancel_event.set()
         return self.backend_ok
 
     def _set_updating(self, *_args):
@@ -349,7 +349,7 @@ def test_ugc_backend_failure_or_cancel_never_reaches_symlinks_or_launch(
 def test_foreground_preset_cancel_stops_before_steam_links_and_launch(monkeypatch):
     mod = (101, "Mod 101")
     win = CharacterizationHarness(initial_missing=[mod])
-    win._steamcmd_cancel_event.set()
+    win._join_preparation_cancel_event.set()
     obj = SimpleNamespace(name="Cancelled", ip="127.0.0.1", gport=2302)
     steam_calls = []
 
@@ -411,7 +411,7 @@ def test_cancel_closes_cooperative_context_before_fresh_cleanup(monkeypatch):
     def cancelled_install(self, **kwargs):
         order.append("cooperative_cancel_result")
         kwargs["handoff_cb"]({"cleanup_candidates": [101]})
-        self._steamcmd_cancel_event.set()
+        self._join_preparation_cancel_event.set()
         return False
 
     monkeypatch.setattr(
@@ -539,7 +539,7 @@ def test_cancel_skips_fresh_cleanup_without_confirmed_shutdown(monkeypatch):
 
     def cancelled_install(self, **kwargs):
         kwargs["handoff_cb"]({"cleanup_candidates": [101]})
-        self._steamcmd_cancel_event.set()
+        self._join_preparation_cancel_event.set()
         return False
 
     monkeypatch.setattr(
@@ -580,7 +580,7 @@ def test_cancel_handoff_collector_rejects_coercible_item_ids(monkeypatch):
                 101, 202.9, "303", True, CoercibleItemId(),
             ],
         })
-        self._steamcmd_cancel_event.set()
+        self._join_preparation_cancel_event.set()
         return False
 
     monkeypatch.setattr(
@@ -605,7 +605,7 @@ def test_late_ready_result_after_join_cancel_cannot_continue(monkeypatch):
     obj = SimpleNamespace(name="Cancelled", ip="127.0.0.1", gport=2302)
 
     def late_ready(_win, *_args, **_kwargs):
-        win._steamcmd_cancel_event.set()
+        win._join_preparation_cancel_event.set()
         return join_prepare.PreparationOutcome(
             PreparationStatus.READY,
             reason="ready",
@@ -702,7 +702,7 @@ def test_server_companion_and_joined_state_remain_post_launch_only():
 def test_join_popup_and_cancellation_paths_remain_textually_unchanged():
     assert '_show_join_progress_overlay("Checking & Preparing Mods for Join...")' in WINDOW_SOURCE
     assert "_steam_client_download_cancel_clicked" in WINDOW_SOURCE
-    assert "_steamcmd_cancel_event.set()" in WINDOW_SOURCE
+    assert "_join_preparation_cancel_event.set()" in WINDOW_SOURCE
     assert "_cleanup_subscriptions(sessions" not in JOIN_SOURCE  # remains backend-owned
 
 
@@ -907,7 +907,7 @@ def run_terminal_validation_route(
         assert backend_results
         result = backend_results.pop(0)
         if result == "cancel":
-            win._steamcmd_cancel_event.set()
+            win._join_preparation_cancel_event.set()
             return False
         return bool(result)
 

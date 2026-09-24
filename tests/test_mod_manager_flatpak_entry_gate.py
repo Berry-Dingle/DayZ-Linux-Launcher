@@ -201,7 +201,7 @@ def test_continue_orders_shutdown_reset_launch_readiness_and_open(monkeypatch):
     ui = _ui_gate()
     events = []
     old_cancel = threading.Event()
-    ui._win._steamcmd_cancel_event = old_cancel
+    ui._win._join_preparation_cancel_event = old_cancel
     ui._win._background_prepare_ui_generation = 3
     ui._win._background_prepare_controller = SimpleNamespace(
         cancel=lambda: events.append("background_cancel"),
@@ -224,8 +224,8 @@ def test_continue_orders_shutdown_reset_launch_readiness_and_open(monkeypatch):
         "launch", "ready", "authority", "inventory", "show",
     ]
     assert old_cancel.is_set()
-    assert ui._win._steamcmd_cancel_event is not old_cancel
-    assert not ui._win._steamcmd_cancel_event.is_set()
+    assert ui._win._join_preparation_cancel_event is not old_cancel
+    assert not ui._win._join_preparation_cancel_event.is_set()
     assert ui._win._background_prepare_ui_generation == 4
     assert ui.opened == []
     assert ui.hidden == 1
@@ -250,7 +250,7 @@ def test_recovery_blocks_native_start_for_owned_unconfirmed_helper(monkeypatch):
     ui = _ui_gate()
     failures = []
     old_cancel = threading.Event()
-    ui._win._steamcmd_cancel_event = old_cancel
+    ui._win._join_preparation_cancel_event = old_cancel
     ui._win._background_prepare_ui_generation = 0
     ui._win._background_prepare_controller = None
     ui._mods_mgr_overlay = None
@@ -308,7 +308,7 @@ def test_recovery_blocks_native_start_for_owned_unconfirmed_helper(monkeypatch):
 def test_recovery_may_start_native_after_owned_session_closes(monkeypatch):
     ui = _ui_gate()
     events = []
-    ui._win._steamcmd_cancel_event = threading.Event()
+    ui._win._join_preparation_cancel_event = threading.Event()
     ui._win._background_prepare_ui_generation = 0
     ui._win._background_prepare_controller = None
     ui._mods_mgr_overlay = None

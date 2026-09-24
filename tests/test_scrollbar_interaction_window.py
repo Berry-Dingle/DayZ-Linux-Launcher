@@ -149,7 +149,7 @@ def test_browser_live_is_paused_by_active_state_and_can_resume_after_settle(monk
     host.get_visible = lambda: True
     host.get_mapped = lambda: True
     host.get_surface = lambda: None
-    host._steamcmd_install_in_progress = False
+    host._steam_ugc_worker_in_progress = False
     host._mod_download_backend_active = ""
     host._steamcmd_auth_request = None
     assert not DZLLWindow._browser_live_should_pause(host)

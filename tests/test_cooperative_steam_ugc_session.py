@@ -1406,7 +1406,7 @@ def test_shutdown_cancels_active_wrapper_without_stop_event_swap_hang():
         _join_popup_item_activity=SimpleNamespace(
             clear_attempt=lambda _attempt_id: None,
         ),
-        _steamcmd_cancel_event=operation_cancel,
+        _join_preparation_cancel_event=operation_cancel,
         _steam_client_stop_waiting_event=e1,
         _run_steam_client_install_impl=install,
         _finish_start_steam_join_consent=lambda *_args, **_kwargs: False,

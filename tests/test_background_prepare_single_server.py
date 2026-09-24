@@ -28,7 +28,7 @@ WINDOW_SOURCE = (
 
 class FakeWindow:
     def __init__(self):
-        self._steamcmd_cancel_event = threading.Event()
+        self._join_preparation_cancel_event = threading.Event()
         self._join_steam_start_allowed = False
         self._join_attempts = SimpleNamespace(active=None)
         self.consent_calls = 0
@@ -283,9 +283,9 @@ def test_cancel_signals_existing_event_and_releases_owner(monkeypatch, snapshot,
     assert presenter.terminal is result[0]
     assert controller.active is False
     assert seen_cancel_events == [controller.cancel_event]
-    assert controller.cancel_event is not win._steamcmd_cancel_event
+    assert controller.cancel_event is not win._join_preparation_cancel_event
     assert controller.cancel_event.is_set() is False
-    assert win._steamcmd_cancel_event.is_set() is False
+    assert win._join_preparation_cancel_event.is_set() is False
 
 
 def test_old_operation_validity_guard_expires_after_release(monkeypatch, snapshot, runtime):
@@ -364,5 +364,5 @@ def test_normal_join_entry_rejects_background_gate_before_starting_attempt():
         "self._join_attempts.begin("
     )
     assert entry.index("self._join_attempts.begin(") < entry.index(
-        "self._steamcmd_cancel_event = threading.Event()"
+        "self._join_preparation_cancel_event = threading.Event()"
     )
