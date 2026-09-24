@@ -123,7 +123,7 @@ def _refresh_effective_workshop_dir_after_backend(current_workshop_dir, mods):
     return current
 
 
-def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
+def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                           auto_install_missing, *, operation_id=0, presenter=None,
                           server_name="", server_identity="", is_operation_current=None,
                           manage_join_presence=True, manage_join_presentation=True,
@@ -192,7 +192,7 @@ def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
             if mid_i > 0 and mid_i not in required_ids_seen:
                 required_ids.append(mid_i)
                 required_ids_seen.add(mid_i)
-        if use_steamcmd:
+        if mod_management_enabled:
             ugc_session = CooperativeUGCSession(
                 cancel_event=operation_cancel_event,
             )
@@ -224,7 +224,7 @@ def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
         download_ids = []
         status_msg = ""
 
-        if use_steamcmd:
+        if mod_management_enabled:
             report_readiness = bool(
                 not manage_join_presentation
                 or getattr(win, "_join_steam_start_allowed", False)
@@ -473,7 +473,7 @@ def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
         else:
             status_msg = "Mod download handling disabled."
 
-        if ok and use_steamcmd and download_ids:
+        if ok and mod_management_enabled and download_ids:
             did_work = True
             logger.debug("Join %s download ids: %s", backend, download_ids)
 
@@ -625,7 +625,7 @@ def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
                     pass
 
         else:
-            if use_steamcmd:
+            if mod_management_enabled:
                 logger.debug("Mod download not needed; proceeding with local mods")
             else:
                 logger.debug("Mod download handling disabled; proceeding with local mods")
@@ -639,7 +639,7 @@ def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
                 effective_workshop_dir,
             )
 
-            if use_steamcmd:
+            if mod_management_enabled:
                 terminal_failure_message = (
                     "Required mod updates could not be completed. Steam still reports "
                     "one or more required mods as outdated or unfinished. Open Steam "
@@ -932,7 +932,7 @@ def prepare_required_mods(win, mods, workshop_dir, use_steamcmd,
 
 
 def join_prepare_and_launch(win, obj, mods, workshop_dir, proton_prefix,
-                            watch_folder_linux, use_steamcmd,
+                            watch_folder_linux, mod_management_enabled,
                             auto_install_missing, *, attempt_id=0):
     consume_event = getattr(win, "_steam_ugc_progress_to_overlay", None)
     if consume_event is None:
@@ -948,7 +948,7 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, proton_prefix,
         )
 
     outcome = prepare_required_mods(
-        win, mods, workshop_dir, use_steamcmd, auto_install_missing,
+        win, mods, workshop_dir, mod_management_enabled, auto_install_missing,
         operation_id=attempt_id,
         presenter=join_presenter,
         server_name=str(getattr(obj, "name", "") or ""),

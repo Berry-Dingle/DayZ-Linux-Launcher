@@ -55,7 +55,7 @@ class BackgroundServerPreparationSnapshot:
 @dataclass(frozen=True)
 class BackgroundPreparationRuntime:
     workshop_dir: str
-    use_steamcmd: bool
+    mod_management_enabled: bool
     auto_install_missing: bool
 
 
@@ -385,7 +385,7 @@ class SingleServerBackgroundPreparation:
                 self._win,
                 snapshot.required_mods,
                 runtime.workshop_dir,
-                runtime.use_steamcmd,
+                runtime.mod_management_enabled,
                 runtime.auto_install_missing,
                 operation_id=lease.generation,
                 presenter=presenter,

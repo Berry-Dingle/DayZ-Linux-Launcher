@@ -191,7 +191,7 @@ class ProductionStartHarness:
     def _resolve_join_runtime(self, _mods):
         return {
             "workshop_dir": "/workshop",
-            "use_steamcmd": True,
+            "mod_management_enabled": True,
             "auto_install_missing": True,
         }
 
@@ -216,7 +216,7 @@ def snapshot(name="Production Server"):
 def runtime():
     return BackgroundPreparationRuntime(
         workshop_dir="/workshop",
-        use_steamcmd=True,
+        mod_management_enabled=True,
         auto_install_missing=True,
     )
 

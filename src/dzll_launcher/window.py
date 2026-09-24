@@ -10637,7 +10637,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         resolved = self._resolve_join_runtime(mods)
         runtime = BackgroundPreparationRuntime(
             workshop_dir=str(resolved["workshop_dir"] or ""),
-            use_steamcmd=bool(resolved["use_steamcmd"]),
+            mod_management_enabled=bool(resolved["mod_management_enabled"]),
             auto_install_missing=bool(resolved["auto_install_missing"]),
         )
         return snapshot, runtime
@@ -11458,7 +11458,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         watch_folder_linux = self._get_dzll_watch_folder_linux()
         self._log_join_resolved_dayz_paths(workshop_dir=workshop_dir, proton_prefix=proton_prefix)
 
-        use_steamcmd = bool(self.settings.get("enable_steamcmd_mod_handling", True))
+        mod_management_enabled = bool(
+            self.settings.get("enable_steamcmd_mod_handling", True)
+        )
 
         # Preserve compatibility with the old combined install/update toggle.
         auto_install_missing = bool(self.settings.get("auto_install_missing_mods", True))
@@ -11469,7 +11471,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "workshop_dir": workshop_dir,
             "proton_prefix": proton_prefix,
             "watch_folder_linux": watch_folder_linux,
-            "use_steamcmd": use_steamcmd,
+            "mod_management_enabled": mod_management_enabled,
             "auto_install_missing": auto_install_missing,
         }
 
@@ -11596,7 +11598,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             workshop_dir = runtime["workshop_dir"]
             proton_prefix = runtime["proton_prefix"]
             watch_folder_linux = runtime["watch_folder_linux"]
-            use_steamcmd = runtime["use_steamcmd"]
+            mod_management_enabled = runtime["mod_management_enabled"]
             auto_install_missing = runtime["auto_install_missing"]
         except Exception as exc:
             self._show_join_preparation_error(
@@ -11615,7 +11617,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 workshop_dir,
                 proton_prefix,
                 watch_folder_linux,
-                use_steamcmd,
+                mod_management_enabled,
                 auto_install_missing,
                 attempt_id=attempt_id,
             )

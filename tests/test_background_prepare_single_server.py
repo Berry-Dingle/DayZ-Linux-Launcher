@@ -54,7 +54,7 @@ def snapshot():
 def runtime():
     return BackgroundPreparationRuntime(
         workshop_dir="/workshop",
-        use_steamcmd=True,
+        mod_management_enabled=True,
         auto_install_missing=True,
     )
 
