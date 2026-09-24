@@ -17,6 +17,7 @@ import traceback
 import weakref
 from pathlib import Path
 import sys
+from datetime import datetime
 
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,7 @@ from .storage import (
     load_last_played,
     save_last_played,
     human_last_played,
+    local_days_ago,
     load_last_companion_server,
     save_last_companion_server,
     clear_last_companion_server,
@@ -594,6 +596,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.set_default_size(int(w), int(h))
 
         self.connect("close-request", self._on_close_request)
+        self.connect("map", self._on_last_played_map)
         self.connect("unmap", self._on_browser_scrollbar_unmap)
         self._perf_row_binds = 0
         self._perf_sort_calls = 0
@@ -670,6 +673,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self.favorites = load_favorites()
         self.last_played = load_last_played()
+        self._last_played_presentation_token = None
         self._last_server_companion_saved = load_last_companion_server()
         self._companion_import_startup_result = apply_pending_import_at_startup(
             config_dir=Path(COMPANION_RESTART_LEARNING_PHASE2_PATH).parent,
@@ -5797,18 +5801,71 @@ class DZLLWindow(Gtk.ApplicationWindow):
             now_ts = int(time.time())
         k = fav_key(obj.ip, obj.gport)
         ts = self.last_played.get(k)
-        if not ts:
-            played_days = 999999
-        else:
-            try:
-                played_days = max(0, int((int(now_ts) - int(ts)) // 86400))
-            except Exception:
-                played_days = 999999
+        days = local_days_ago(ts, now_ts=now_ts) if ts is not None else None
+        played_days = 999999 if days is None else days
         return self._set_int_property_if_changed(obj, "sort_played_days", played_days)
+
+    def _refresh_last_played_calendar(self) -> bool:
+        """Refresh history-backed rows when the local date or timezone changes."""
+        now_ts = int(time.time())
+        try:
+            localtime_stat = os.stat("/etc/localtime")
+            localtime_source = (
+                localtime_stat.st_dev, localtime_stat.st_ino,
+                localtime_stat.st_size, localtime_stat.st_mtime_ns,
+                localtime_stat.st_ctime_ns,
+            )
+        except OSError:
+            localtime_source = None
+        source = (os.environ.get("TZ"), localtime_source)
+        previous = getattr(self, "_last_played_presentation_token", None)
+        if (previous is None or source != previous[1]) and hasattr(time, "tzset"):
+            time.tzset()
+        try:
+            local_now = datetime.fromtimestamp(now_ts)
+            local_clock = time.localtime(now_ts)
+        except (ValueError, OverflowError, OSError):
+            return False
+        token = (
+            local_now.date(), source,
+            getattr(local_clock, "tm_zone", None),
+            getattr(local_clock, "tm_gmtoff", None),
+        )
+        if token == previous:
+            return False
+
+        changed = False
+        membership_changed = False
+        played_only = bool((getattr(self, "_filter_state", None) or {}).get("played_only", False))
+        current_rows = getattr(self, "_obj_by_key", {})
+        for key, ts in self.last_played.items():
+            obj = current_rows.get(key)
+            if not isinstance(obj, ServerObject):
+                continue
+            played = human_last_played(ts, now_ts=now_ts)
+            old_played = (obj.played or "").strip()
+            if old_played != played:
+                obj.played = played
+                changed = True
+                if played_only and bool(old_played) != bool(played):
+                    membership_changed = True
+            if self._update_row_sort_played_days(obj, now_ts):
+                changed = True
+        if membership_changed or (changed and getattr(self, "sort_key", None) == "played"):
+            self._rebuild_column_view_store(reorder_reason="last-played-calendar")
+        self._last_played_presentation_token = token
+        return changed
+
+    def _on_last_played_map(self, *_args):
+        self._refresh_last_played_calendar()
 
     def _snapshot_row_sort_keys(self, obj: ServerObject, now_ts: int):
         self._update_row_sort_ping(obj)
         self._update_row_sort_players(obj)
+        ts = self.last_played.get(fav_key(obj.ip, obj.gport))
+        played = human_last_played(ts, now_ts=now_ts) if ts is not None else ""
+        if obj.played != played:
+            obj.played = played
         self._update_row_sort_played_days(obj, now_ts)
 
     def _snapshot_all_sort_keys(self):
@@ -7064,6 +7121,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _browser_live_tick(self):
         if self._browser_live_should_pause():
             return True
+        self._refresh_last_played_calendar()
         if bool(getattr(self, "_browser_live_inflight", False)):
             return True
 
@@ -10106,12 +10164,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         try:
                             k = fav_key(played_obj.ip, played_obj.gport)
                             self.last_played[k] = played_ts
-                            played_obj.played = human_last_played(played_ts)
-                            self._update_row_sort_played_days(played_obj, played_ts)
+                            current_obj = getattr(self, "_obj_by_key", {}).get(k) or played_obj
+                            was_played = bool((current_obj.played or "").strip())
+                            now_ts = int(time.time())
+                            current_obj.played = human_last_played(played_ts, now_ts=now_ts)
+                            self._update_row_sort_played_days(current_obj, now_ts)
                             try:
                                 save_last_played(self.last_played)
                             except Exception:
                                 pass
+                            played_only = bool((getattr(self, "_filter_state", None) or {}).get("played_only", False))
+                            if getattr(self, "sort_key", None) == "played" or (
+                                played_only and not was_played and bool(current_obj.played)
+                            ):
+                                self._rebuild_column_view_store(reorder_reason="last-played-rejoin")
                         except Exception:
                             pass
                         return False

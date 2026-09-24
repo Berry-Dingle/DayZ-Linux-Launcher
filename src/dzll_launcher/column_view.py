@@ -2261,6 +2261,7 @@ def build_server_column_view(
             perf_metrics=perf_metrics,
             drag_light=drag_light,
             light_binder=_bind_played_light,
+            notify_props=("played",),
             max_chars=12,
             cell_css_classes=right_border,
         ),

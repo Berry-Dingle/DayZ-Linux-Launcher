@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime
 
 from .atomic_json import atomic_write_json
 from .config import (
@@ -102,18 +103,26 @@ def load_companion_restart_learning() -> dict:
 def save_companion_restart_learning(data: dict) -> None:
     save_json_dict(COMPANION_RESTART_LEARNING_PATH, data or {})
 
-def human_last_played(ts: int) -> str:
+def local_days_ago(ts: int, *, now_ts: int | None = None) -> int | None:
     try:
-        ts = int(ts)
-    except Exception:
+        joined_date = datetime.fromtimestamp(int(ts)).date()
+        current_date = datetime.fromtimestamp(
+            time.time() if now_ts is None else now_ts
+        ).date()
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return max(0, (current_date - joined_date).days)
+
+
+def human_last_played(ts: int, *, now_ts: int | None = None) -> str:
+    days = local_days_ago(ts, now_ts=now_ts)
+    if days is None:
         return ""
-    now = int(time.time())
-    days = max(0, int((now - ts) // 86400))
-    if days <= 0:
+    if days == 0:
         return "Today"
     if days == 1:
-        return "1 Day ago"
-    return f"{days} Days ago"
+        return "1 Day Ago"
+    return f"{days} Days Ago"
 
 def load_dead_cache() -> dict:
     raw = load_json_dict(DEAD_PATH)

@@ -64,6 +64,52 @@ def bound_time_factory(monkeypatch, obj):
     return factory, item, item.child
 
 
+def bound_played_factory(monkeypatch, obj):
+    fake_factory = FakeFactory()
+    monkeypatch.setattr(column_view.Gtk.SignalListItemFactory, "__new__", lambda cls: fake_factory)
+    monkeypatch.setattr(column_view, "_center_label", lambda **kwargs: FakeLabel())
+    monkeypatch.setattr(column_view, "_cell_label", lambda widget: widget)
+    monkeypatch.setattr(column_view, "_register_bound_cell", lambda *args, **kwargs: None)
+    monkeypatch.setattr(column_view, "_unregister_bound_cell", lambda *args, **kwargs: None)
+    factory = column_view._make_label_factory(
+        column_view._bind_played,
+        factory_name="played",
+        notify_props=("played",),
+    )
+    item = FakeListItem(obj)
+    factory.emit("setup", item)
+    factory.emit("bind", item)
+    return factory, item, item.child
+
+
+def test_bound_played_cell_updates_on_notify(monkeypatch):
+    obj = ServerObject(played="20 Days Ago")
+    factory, item, label = bound_played_factory(monkeypatch, obj)
+    assert label.text == "20 Days Ago"
+    obj.played = "Today"
+    assert label.text == "Today"
+    factory.emit("unbind", item)
+    obj.played = "1 Day Ago"
+    assert label.text == "Today"
+
+
+def test_recycled_played_cell_disconnects_old_object(monkeypatch):
+    old = ServerObject(played="20 Days Ago")
+    current = ServerObject(played="2 Days Ago")
+    factory, item, label = bound_played_factory(monkeypatch, old)
+    item.obj = current
+    factory.emit("bind", item)
+    assert label._dzll_notify_obj is current
+    assert len(label._dzll_notify_ids) == 1
+    assert label.text == "2 Days Ago"
+    writes = len(label.writes)
+    old.played = "Today"
+    assert label.text == "2 Days Ago"
+    assert len(label.writes) == writes
+    current.played = "1 Day Ago"
+    assert label.text == "1 Day Ago"
+
+
 def test_changing_live_time_refreshes_only_bound_time_cell(monkeypatch):
     obj = ServerObject(time="12:00", timewarp=12.0)
     _factory, _item, label = bound_time_factory(monkeypatch, obj)
