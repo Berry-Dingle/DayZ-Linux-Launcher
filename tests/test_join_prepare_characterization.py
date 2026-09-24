@@ -46,15 +46,15 @@ def test_overlay_reset_preserves_join_cancel_event_identity():
         _steamcmd_l1="old",
         _steamcmd_l2="old",
         _steam_ugc_worker_in_progress=True,
-        steamcmd_spinner=Widget(),
-        steamcmd_task_heading=Widget(),
-        steamcmd_line1=Widget(),
-        steamcmd_line2=Widget(),
+        join_preparation_spinner=Widget(),
+        join_preparation_heading=Widget(),
+        join_preparation_detail_label=Widget(),
+        join_preparation_status_label=Widget(),
         _set_steamcmd_busy=lambda _busy: None,
     )
     overlay = object.__new__(JoinPreparationOverlayUI)
     overlay.win = win
-    overlay._steamcmd_reset_state_for_new_run()
+    overlay._reset_join_preparation_overlay()
     assert win._join_preparation_cancel_event is cancel_event
     assert cancel_event.is_set() is True
 
@@ -101,8 +101,8 @@ class CharacterizationHarness:
         self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
         self._discord = None
-        self.steamcmd_spinner = Widget()
-        self.steamcmd_cancel_btn = Widget()
+        self.join_preparation_spinner = Widget()
+        self.join_preparation_cancel_button = Widget()
         self._join_preparation_presenter = JoinPopupPreparationPresenter(
             consume_event=self._steam_ugc_progress_to_overlay,
         )
@@ -131,7 +131,7 @@ class CharacterizationHarness:
         self.events.append(("counter", backend, tuple(mod_ids)))
         return True
 
-    def _steamcmd_reset_state_for_new_run(self):
+    def _reset_join_preparation_overlay(self):
         return None
 
     def _free_bytes_for_path(self, _path):
@@ -153,7 +153,7 @@ class CharacterizationHarness:
     def _set_updating(self, *_args):
         return None
 
-    def _hide_steamcmd_auth_overlay(self):
+    def _hide_join_preparation_overlay(self):
         self.events.append(("hide_overlay",))
 
     def _show_join_progress_overlay(self, *_args):

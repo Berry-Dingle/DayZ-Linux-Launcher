@@ -30,7 +30,7 @@ class LifecycleHarness:
         self.messages = []
         self.errors = []
         self.close_count = 0
-        self.steamcmd_cancel_btn = FakeButton()
+        self.join_preparation_cancel_button = FakeButton()
         self._join_attempts = JoinAttemptTracker(log_sink=self.logs.append)
         self._join_popup_item_activity = type("Activity", (), {"clear_attempt": lambda *_: None})()
         self._pending_join_attempt_id = 0
@@ -59,7 +59,7 @@ class LifecycleHarness:
         self.messages.append(str(message))
         return False
 
-    def _hide_steamcmd_auth_overlay(self):
+    def _hide_join_preparation_overlay(self):
         self.close_count += 1
         return False
 
@@ -199,8 +199,8 @@ def test_watcher_timeout_is_visible_and_cleans_matching_attempt():
     attempt_id = harness.attempt.attempt_id
     assert harness._join_popup_watcher_failure(attempt_id, "Synthetic launch timeout")
     assert harness.errors == ["Synthetic launch timeout"]
-    assert harness.steamcmd_cancel_btn.label == "Close"
-    assert harness.steamcmd_cancel_btn.visible is True
+    assert harness.join_preparation_cancel_button.label == "Close"
+    assert harness.join_preparation_cancel_button.visible is True
     assert not harness._join_attempts.matches(attempt_id)
     assert harness.close_count == 0
 
@@ -212,8 +212,8 @@ def test_immediate_launch_submission_error_remains_visible():
     assert harness.errors == [
         "DZLL could not submit the launch request to Steam. Synthetic Popen failure"
     ]
-    assert harness.steamcmd_cancel_btn.label == "Close"
-    assert harness.steamcmd_cancel_btn.visible is True
+    assert harness.join_preparation_cancel_button.label == "Close"
+    assert harness.join_preparation_cancel_button.visible is True
 
 
 def test_launch_mode_is_immutable_attempt_state():
@@ -228,11 +228,11 @@ def test_launch_mode_is_immutable_attempt_state():
 def test_popen_success_path_does_not_hide_popup():
     after = JOIN_SOURCE.split("def after():", 1)[1].split("win.GLib.idle_add(after)", 1)[0]
     assert "result = win._launch_direct_steam_url" in after
-    assert "_hide_steamcmd_auth_overlay" not in after
+    assert "_hide_join_preparation_overlay" not in after
     launch = WINDOW_SOURCE.split("def _launch_direct_steam_url", 1)[1]
     launch = launch.split("def _start_native_steam_for_join", 1)[0]
     assert "_start_dayz_session_watch" in launch
-    assert "_hide_steamcmd_auth_overlay" not in launch
+    assert "_hide_join_preparation_overlay" not in launch
 
 
 def test_watcher_process_matchers_use_shared_strict_snapshot():

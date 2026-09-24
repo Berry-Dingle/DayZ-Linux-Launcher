@@ -203,7 +203,7 @@ class JoinPopupPresentationTests(unittest.TestCase):
         self.assertNotIn("SteamCMD Login", STEAMCMD_UI_SOURCE)
         self.assertNotIn("Steam Guard", STEAMCMD_UI_SOURCE)
         self.assertNotIn("_steamcmd_refresh_active_download_line2", STEAMCMD_UI_SOURCE)
-        self.assertIn("steamcmd_cancel_btn", STEAMCMD_UI_SOURCE)
+        self.assertIn("join_preparation_cancel_button", STEAMCMD_UI_SOURCE)
 
     def test_errors_bypass_pending_coalescing(self):
         harness = PresentationHarness()
@@ -237,9 +237,9 @@ class JoinPopupPresentationTests(unittest.TestCase):
 
     def test_popup_labels_are_not_backend_control_state(self):
         control_reads = [
-            "steamcmd_line1.get_text",
-            "steamcmd_line2.get_text",
-            "steamcmd_task_heading.get_text",
+            "join_preparation_detail_label.get_text",
+            "join_preparation_status_label.get_text",
+            "join_preparation_heading.get_text",
         ]
         for read in control_reads:
             self.assertNotIn(read, WINDOW_SOURCE)
@@ -272,7 +272,7 @@ class JoinPopupPresentationTests(unittest.TestCase):
         renderer = WINDOW_SOURCE.split("def _render_join_preparation_snapshot", 1)[1]
         renderer = renderer.split("def _open_steam_downloads", 1)[0]
         self.assertIn("float(download_bytes) / float(total_bytes)", reducer)
-        self.assertIn("steamcmd_prog_bar.set_fraction(fraction)", renderer)
+        self.assertIn("join_preparation_progress_bar.set_fraction(fraction)", renderer)
         self.assertIn('percent_label.set_text(f"{int(fraction * 100)}%")', renderer)
 
     def test_backend_work_and_join_continuation_are_unchanged(self):

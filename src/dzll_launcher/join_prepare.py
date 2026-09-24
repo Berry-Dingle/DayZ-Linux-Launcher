@@ -294,7 +294,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                         win._steam_ugc_render_status(err_msg, error=True)
                         win._mod_download_backend_active = ""
                         try:
-                            win.steamcmd_cancel_btn.set_label("Close")
+                            win.join_preparation_cancel_button.set_label("Close")
                         except Exception:
                             pass
                         return False
@@ -497,19 +497,19 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
 
             reset_done = win.threading.Event()
 
-            def _ui_reset_steamcmd_state():
+            def _ui_reset_join_preparation_overlay():
                 try:
-                    win._steamcmd_reset_state_for_new_run()
+                    win._reset_join_preparation_overlay()
                 finally:
                     reset_done.set()
                 return False
 
-            win.GLib.idle_add(_ui_reset_steamcmd_state)
+            win.GLib.idle_add(_ui_reset_join_preparation_overlay)
             reset_done.wait(timeout=2.0)
 
             if manage_join_presentation:
                 try:
-                    win.GLib.idle_add(win.steamcmd_spinner.set_spinning, False)
+                    win.GLib.idle_add(win.join_preparation_spinner.set_spinning, False)
                 except Exception:
                     pass
 
@@ -609,7 +609,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                     win._mod_download_backend_active = ""
 
             if not ok and manage_join_presentation:
-                win.GLib.idle_add(win._hide_steamcmd_auth_overlay)
+                win.GLib.idle_add(win._hide_join_preparation_overlay)
             win._mod_download_backend_active = ""
 
             if not ok:
@@ -1089,8 +1089,8 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, proton_prefix,
                     err_msg or "Join cancelled.", error=True,
                 )
                 win._mod_download_backend_active = ""
-                win.steamcmd_cancel_btn.set_label("Close")
-                win.steamcmd_cancel_btn.set_visible(True)
+                win.join_preparation_cancel_button.set_label("Close")
+                win.join_preparation_cancel_button.set_visible(True)
             except Exception:
                 pass
             if attempt_id:
@@ -1113,8 +1113,8 @@ def join_prepare_and_launch(win, obj, mods, workshop_dir, proton_prefix,
             try:
                 win._steam_ugc_render_status(err_msg or "Join aborted.", error=True)
                 win._mod_download_backend_active = ""
-                win.steamcmd_cancel_btn.set_label("Close")
-                win.steamcmd_cancel_btn.set_visible(True)
+                win.join_preparation_cancel_button.set_label("Close")
+                win.join_preparation_cancel_button.set_visible(True)
             except Exception:
                 pass
             logger.error("Aborting Join launch: %s", err_msg or "unknown error")

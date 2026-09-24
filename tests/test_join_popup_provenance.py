@@ -73,11 +73,11 @@ class RendererHarness:
         self._steam_ugc_active_event = None
         self._mod_download_backend_active = "steam_client"
         self._steam_ugc_worker_in_progress = True
-        self.steamcmd_task_heading = FakeWidget("heading", self.writes)
-        self.steamcmd_line1 = FakeWidget("line1", self.writes)
-        self.steamcmd_line2 = FakeWidget("line2", self.writes)
-        self.steamcmd_spinner = FakeWidget("spinner", self.writes)
-        self.steamcmd_prog_bar = FakeWidget("progress", self.writes)
+        self.join_preparation_heading = FakeWidget("heading", self.writes)
+        self.join_preparation_detail_label = FakeWidget("line1", self.writes)
+        self.join_preparation_status_label = FakeWidget("line2", self.writes)
+        self.join_preparation_spinner = FakeWidget("spinner", self.writes)
+        self.join_preparation_progress_bar = FakeWidget("progress", self.writes)
         self.percent_label = FakeWidget("percent", self.writes)
         self._join_popup_item_activity = JoinPopupActivityTracker()
         self._join_popup_presentation = JoinPopupPresentationController(
@@ -276,7 +276,7 @@ def test_byte_increase_after_request_keeps_correct_action_and_advances_progress(
                         total_bytes=1000, attempted=True, accepted=True,
                         was_installed=installed))
     assert harness.item_lines == [expected]
-    assert 0.25 in harness.steamcmd_prog_bar.fractions
+    assert 0.25 in harness.join_preparation_progress_bar.fractions
     assert any(fields.get("bytes_advanced") is True
                for _attempt, message, fields in harness.logs
                if message == "popup item presentation authorised")
@@ -296,7 +296,7 @@ def test_genuine_active_download_display_format_size_and_progress_are_preserved(
     assert harness.item_lines == [
         "Downloading Mod: Example Mod - 500 MB (1/15)"
     ]
-    assert harness.steamcmd_prog_bar.fractions[-1] == pytest.approx(0.5)
+    assert harness.join_preparation_progress_bar.fractions[-1] == pytest.approx(0.5)
     assert harness.percent_label.text == "50%"
 
 
@@ -645,10 +645,10 @@ def test_final_and_refresh_snapshots_do_not_replace_visible_item():
     send(harness, event(1, source="poll", installed=False, ready=False,
                         downloaded=250, total_bytes=1000, was_installed=False,
                         attempted=True, accepted=True))
-    original = harness.steamcmd_line2.text
+    original = harness.join_preparation_status_label.text
     send(harness, event(2, source="refresh", pending=True, ready=False))
     send(harness, event(1, source="final", ready=True))
-    assert harness.steamcmd_line2.text == original == "Downloading Mod: Mod 1 - 0 MB (1/15)"
+    assert harness.join_preparation_status_label.text == original == "Downloading Mod: Mod 1 - 0 MB (1/15)"
 
 
 def test_old_attempt_event_is_rejected_after_new_attempt_starts():
@@ -693,7 +693,7 @@ def test_ugc_only_overlay_and_urgent_paths_remain_in_source():
     window_source = (window_module.Path(__file__).resolve().parents[1]
                      / "src/dzll_launcher/window.py").read_text()
     assert "Steam Guard" not in steamcmd_source
-    assert "steamcmd_cancel_btn" in steamcmd_source
+    assert "join_preparation_cancel_button" in steamcmd_source
     assert "PreparationPresentationReducer(" in window_source
     assert "JoinPopupPhase.ERROR" in window_source
     assert "_steam_ugc_render_cancelling()" in window_source

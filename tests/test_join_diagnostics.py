@@ -162,9 +162,9 @@ class JoinHarness:
         self._mod_download_backend_active = ""
         self._discord = None
         self._steamcmd_form_widgets = []
-        self.steamcmd_spinner = FakeWidget()
+        self.join_preparation_spinner = FakeWidget()
         self.steamcmd_login_btn = FakeWidget()
-        self.steamcmd_cancel_btn = FakeWidget()
+        self.join_preparation_cancel_button = FakeWidget()
         self._pending_server_companion_obj = object()
         self.attempt_id = attempt_id
         self.launching_messages = 0
@@ -184,7 +184,7 @@ class JoinHarness:
     def compute_missing_mods(self, _workshop, _mods):
         return []
 
-    def _steamcmd_reset_state_for_new_run(self):
+    def _reset_join_preparation_overlay(self):
         self._join_preparation_cancel_event = threading.Event()
 
     def _free_bytes_for_path(self, _path):
@@ -199,7 +199,7 @@ class JoinHarness:
     def _set_updating(self, *_args):
         return None
 
-    def _hide_steamcmd_auth_overlay(self):
+    def _hide_join_preparation_overlay(self):
         return None
 
     def _show_join_progress_overlay(self, *_args):

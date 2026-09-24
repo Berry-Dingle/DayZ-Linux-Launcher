@@ -1620,7 +1620,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not self._join_attempts.close_popup(attempt_id, process):
             return False
         self._join_log(attempt_id, "popup closed with process reason", process=process)
-        self._hide_steamcmd_auth_overlay()
+        self._hide_join_preparation_overlay()
         return True
 
     def _join_popup_watcher_failure(self, attempt_id: int, reason: str) -> bool:
@@ -1636,8 +1636,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._join_log(attempt_id, "watcher terminal failure", reason=detail)
         self._steam_ugc_render_status(detail, error=True)
         try:
-            self.steamcmd_cancel_btn.set_label("Close")
-            self.steamcmd_cancel_btn.set_visible(True)
+            self.join_preparation_cancel_button.set_label("Close")
+            self.join_preparation_cancel_button.set_visible(True)
         except Exception:
             pass
         self._cleanup_join_attempt(attempt_id, "watcher terminal failure")
@@ -1692,13 +1692,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
-            self.steamcmd_cancel_btn.set_label("Cancel")
-            self.steamcmd_cancel_btn.set_tooltip_text(
+            self.join_preparation_cancel_button.set_label("Cancel")
+            self.join_preparation_cancel_button.set_tooltip_text(
                 "Cancel this Join preparation."
             )
-            self.steamcmd_cancel_btn.set_visible(True)
-            self.steamcmd_auth_scrim.set_visible(True)
-            self.steamcmd_auth_box.set_visible(True)
+            self.join_preparation_cancel_button.set_visible(True)
+            self.join_preparation_scrim.set_visible(True)
+            self.join_preparation_card.set_visible(True)
         except Exception:
             pass
         try:
@@ -1707,15 +1707,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         return False
 
-    def _hide_steamcmd_auth_overlay(self):
+    def _hide_join_preparation_overlay(self):
         try:
             self._steam_ugc_stop_progress_timer()
             self._steam_ugc_set_layout_active(False)
-            return self._join_preparation_overlay_ui._hide_steamcmd_auth_overlay()
+            return self._join_preparation_overlay_ui._hide_join_preparation_overlay()
         finally:
             self._set_server_companion_join_status(None)
 
-    def _steamcmd_auth_cancel(self):
+    def _join_preparation_cancel_clicked(self):
         active_join = getattr(getattr(self, "_join_attempts", None), "active", None)
         if (
             active_join is not None
@@ -1728,13 +1728,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     if active_join is not None else None
                 )
             )
-        self._hide_steamcmd_auth_overlay()
+        self._hide_join_preparation_overlay()
         return None
 
     # ----------------------------
     # Shared preparation run reset (legacy name retained)
     # ----------------------------
-    def _steamcmd_reset_state_for_new_run(self):
+    def _reset_join_preparation_overlay(self):
         try:
             self._steam_ugc_stop_progress_timer()
             self._steam_ugc_set_layout_active(False)
@@ -1747,12 +1747,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steam_client_set_cancel_buttons(safe_cancel=False)
         except Exception:
             pass
-        return self._join_preparation_overlay_ui._steamcmd_reset_state_for_new_run()
+        return self._join_preparation_overlay_ui._reset_join_preparation_overlay()
 
     def _steam_client_set_cancel_buttons(self, safe_cancel: bool):
         try:
-            self.steamcmd_cancel_btn.set_label("Cancel")
-            self.steamcmd_cancel_btn.set_tooltip_text("Cancel download and unsubscribe unfinished mods.")
+            self.join_preparation_cancel_button.set_label("Cancel")
+            self.join_preparation_cancel_button.set_tooltip_text("Cancel download and unsubscribe unfinished mods.")
         except Exception:
             pass
         try:
@@ -1801,7 +1801,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
-            self._hide_steamcmd_auth_overlay()
+            self._hide_join_preparation_overlay()
         except Exception:
             pass
         self._cleanup_active_join_attempt("stop waiting/cancel")
@@ -1825,9 +1825,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _show_steam_ugc_download_overlay(self, status: str = ""):
         try:
-            self.steamcmd_cancel_btn.set_visible(True)
-            self.steamcmd_auth_scrim.set_visible(True)
-            self.steamcmd_auth_box.set_visible(True)
+            self.join_preparation_cancel_button.set_visible(True)
+            self.join_preparation_scrim.set_visible(True)
+            self.join_preparation_card.set_visible(True)
         except Exception:
             pass
         return self._steam_ugc_render_preparing(status)
@@ -1844,7 +1844,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             attrs.insert(Pango.attr_foreground_new(0xC8C8, 0xC8C8, 0xC8C8))
             label.set_attributes(attrs)
             label.set_visible(False)
-            parent = self.steamcmd_prog_bar.get_parent()
+            parent = self.join_preparation_progress_bar.get_parent()
             if parent is not None:
                 parent.append(label)
             self._steam_ugc_percent_label = label
@@ -1855,15 +1855,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _steam_ugc_set_layout_active(self, active: bool):
         try:
-            self.steamcmd_line1.set_visible(not active)
+            self.join_preparation_detail_label.set_visible(not active)
         except Exception:
             pass
         try:
-            self.steamcmd_prog_bar.set_margin_top(10 if active else 0)
+            self.join_preparation_progress_bar.set_margin_top(10 if active else 0)
         except Exception:
             pass
         try:
-            btn_parent = self.steamcmd_cancel_btn.get_parent()
+            btn_parent = self.join_preparation_cancel_button.get_parent()
             if btn_parent is not None:
                 btn_parent.set_margin_top(10 if active else 0)
         except Exception:
@@ -1883,19 +1883,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _steam_ugc_render_preparing(self, status: str = ""):
         try:
             self._steam_ugc_set_layout_active(True)
-            self.steamcmd_task_heading.set_text(self._steam_ugc_title())
-            self.steamcmd_line1.set_text("")
+            self.join_preparation_heading.set_text(self._steam_ugc_title())
+            self.join_preparation_detail_label.set_text("")
         except Exception:
             pass
         try:
-            self.steamcmd_spinner.set_visible(True)
-            self.steamcmd_spinner.set_spinning(True)
+            self.join_preparation_spinner.set_visible(True)
+            self.join_preparation_spinner.set_spinning(True)
         except Exception:
             pass
         try:
-            self.steamcmd_prog_bar.set_visible(True)
-            self.steamcmd_prog_bar.set_show_text(False)
-            self.steamcmd_prog_bar.set_fraction(0.0)
+            self.join_preparation_progress_bar.set_visible(True)
+            self.join_preparation_progress_bar.set_show_text(False)
+            self.join_preparation_progress_bar.set_fraction(0.0)
         except Exception:
             pass
         label = self._steam_ugc_get_percent_label()
@@ -1930,19 +1930,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         try:
             self._steam_ugc_set_layout_active(True)
-            self.steamcmd_task_heading.set_text(self._steam_ugc_title())
-            self.steamcmd_line1.set_text("")
-            self.steamcmd_line2.set_text("Cancelling download and cleaning up...")
+            self.join_preparation_heading.set_text(self._steam_ugc_title())
+            self.join_preparation_detail_label.set_text("")
+            self.join_preparation_status_label.set_text("Cancelling download and cleaning up...")
         except Exception:
             pass
         try:
-            self.steamcmd_spinner.set_visible(True)
-            self.steamcmd_spinner.set_spinning(True)
+            self.join_preparation_spinner.set_visible(True)
+            self.join_preparation_spinner.set_spinning(True)
         except Exception:
             pass
         try:
-            self.steamcmd_prog_bar.set_visible(True)
-            self.steamcmd_prog_bar.set_show_text(False)
+            self.join_preparation_progress_bar.set_visible(True)
+            self.join_preparation_progress_bar.set_show_text(False)
         except Exception:
             pass
         return False
@@ -1964,20 +1964,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
         try:
             self._steam_ugc_set_layout_active(True)
-            self.steamcmd_task_heading.set_text(self._steam_ugc_title())
-            self.steamcmd_line1.set_text("")
-            self.steamcmd_line2.set_text(text)
+            self.join_preparation_heading.set_text(self._steam_ugc_title())
+            self.join_preparation_detail_label.set_text("")
+            self.join_preparation_status_label.set_text(text)
         except Exception:
             pass
         try:
-            self.steamcmd_spinner.set_visible(not bool(error))
-            self.steamcmd_spinner.set_spinning(not bool(error))
+            self.join_preparation_spinner.set_visible(not bool(error))
+            self.join_preparation_spinner.set_spinning(not bool(error))
         except Exception:
             pass
         try:
-            self.steamcmd_prog_bar.set_visible(True)
-            self.steamcmd_prog_bar.set_show_text(False)
-            self.steamcmd_prog_bar.set_fraction(0.0)
+            self.join_preparation_progress_bar.set_visible(True)
+            self.join_preparation_progress_bar.set_show_text(False)
+            self.join_preparation_progress_bar.set_fraction(0.0)
             if not error:
                 self._steam_ugc_start_progress_timer()
             else:
@@ -2001,14 +2001,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         """Update only the established active-transfer text, never its progress."""
         try:
             self._steam_ugc_set_layout_active(True)
-            self.steamcmd_task_heading.set_text(self._steam_ugc_title())
-            self.steamcmd_line1.set_text("")
-            self.steamcmd_line2.set_text(str(text or ""))
+            self.join_preparation_heading.set_text(self._steam_ugc_title())
+            self.join_preparation_detail_label.set_text("")
+            self.join_preparation_status_label.set_text(str(text or ""))
         except Exception:
             pass
         try:
-            self.steamcmd_spinner.set_visible(True)
-            self.steamcmd_spinner.set_spinning(True)
+            self.join_preparation_spinner.set_visible(True)
+            self.join_preparation_spinner.set_spinning(True)
         except Exception:
             pass
         return False
@@ -2045,9 +2045,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             total_bytes = int(active.get("total_bytes") or 0) if isinstance(active, dict) else 0
             if total_bytes <= 0:
                 try:
-                    self.steamcmd_prog_bar.set_visible(True)
-                    self.steamcmd_prog_bar.set_show_text(False)
-                    self.steamcmd_prog_bar.pulse()
+                    self.join_preparation_progress_bar.set_visible(True)
+                    self.join_preparation_progress_bar.set_show_text(False)
+                    self.join_preparation_progress_bar.pulse()
                 except Exception:
                     pass
             return True
@@ -2148,8 +2148,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 attempt_id=snapshot.operation_id,
             )
         try:
-            self.steamcmd_spinner.set_visible(True)
-            self.steamcmd_spinner.set_spinning(True)
+            self.join_preparation_spinner.set_visible(True)
+            self.join_preparation_spinner.set_spinning(True)
         except Exception:
             pass
         percent_label = self._steam_ugc_get_percent_label()
@@ -2157,9 +2157,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steam_ugc_stop_progress_timer()
             fraction = float(snapshot.fraction or 0.0)
             try:
-                self.steamcmd_prog_bar.set_visible(True)
-                self.steamcmd_prog_bar.set_show_text(False)
-                self.steamcmd_prog_bar.set_fraction(fraction)
+                self.join_preparation_progress_bar.set_visible(True)
+                self.join_preparation_progress_bar.set_show_text(False)
+                self.join_preparation_progress_bar.set_fraction(fraction)
             except Exception:
                 pass
             if percent_label is not None:
@@ -2167,9 +2167,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 percent_label.set_visible(True)
         elif snapshot.progress_mode is PreparationProgressMode.INDETERMINATE:
             try:
-                self.steamcmd_prog_bar.set_visible(True)
-                self.steamcmd_prog_bar.set_show_text(False)
-                self.steamcmd_prog_bar.set_fraction(0.0)
+                self.join_preparation_progress_bar.set_visible(True)
+                self.join_preparation_progress_bar.set_show_text(False)
+                self.join_preparation_progress_bar.set_fraction(0.0)
             except Exception:
                 pass
             self._steam_ugc_start_progress_timer()
@@ -9596,8 +9596,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._show_join_progress_overlay(message)
             self._steam_ugc_render_status(f"{message} {detail}", error=True)
             self._mod_download_backend_active = ""
-            self.steamcmd_cancel_btn.set_label("Close")
-            self.steamcmd_cancel_btn.set_visible(True)
+            self.join_preparation_cancel_button.set_label("Close")
+            self.join_preparation_cancel_button.set_visible(True)
         except Exception:
             self._set_updating(False, message)
 
@@ -9608,8 +9608,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             self._show_join_progress_overlay(detail)
             self._steam_ugc_render_status(detail, error=True)
-            self.steamcmd_cancel_btn.set_label("Close")
-            self.steamcmd_cancel_btn.set_visible(True)
+            self.join_preparation_cancel_button.set_label("Close")
+            self.join_preparation_cancel_button.set_visible(True)
         except Exception:
             self._set_updating(False, detail)
 
@@ -11618,7 +11618,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._release_join_preparation_lease(attempt_id)
             return
         if not consent_ready:
-            self._hide_steamcmd_auth_overlay()
+            self._hide_join_preparation_overlay()
             self._cleanup_join_attempt(attempt_id, "Steam start declined or failed")
             self._release_join_preparation_lease(attempt_id)
             self._on_filter_changed(reason="join")

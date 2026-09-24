@@ -324,7 +324,7 @@ class _WatcherHost:
         self._discord = SimpleNamespace(events=[], set_menu=lambda: None)
         self.settings = {"discord_detail_level": "ingame"}
         self._discord_last_join = None
-        self.steamcmd_cancel_btn = _Button()
+        self.join_preparation_cancel_button = _Button()
         self.process_presentations = []
         self.errors = []
         self.cleanups = []
