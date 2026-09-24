@@ -7,10 +7,12 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .companion_restart_phase2_authority import (
+    AuthorityCandidate,
     AuthorityDecision,
     AuthorityGate,
     AuthorityOrigin,
     RegimeRecord,
+    RegimeRecordStatus,
     RegimeState,
 )
 from .companion_restart_phase2_consumers import ConsumerDecision
@@ -283,7 +285,18 @@ def evaluate_authority_consumers(
         and regime.phase_authority >= 0.85
         and not (candidate and candidate.harmonic_blockers)
     )
-    presentation, visible, suspended, suspension_reason = _presentation(decision, gate, policy)
+    safe_established_continuity_h2 = _safe_established_continuity_h2(
+        decision,
+        regime,
+        candidate,
+        gate,
+    )
+    presentation, visible, suspended, suspension_reason = _presentation(
+        decision,
+        gate,
+        policy,
+        safe_established_continuity_h2=safe_established_continuity_h2,
+    )
     period = regime.candidate_period_seconds if regime is not None and visible else None
     label = _cycle_label(period) if period is not None else None
     safe_h3 = bool(
@@ -339,13 +352,17 @@ def evaluate_authority_consumers(
             phase_offset=regime.phase_offset,
             now=policy.now,
         )
-        if safe_h3 and regime is not None
+        if (safe_h3 or safe_established_continuity_h2) and regime is not None
         else normal.raw_predicted_occurrence_at
         if safe_established_normal_schedule and normal is not None
         else None
     )
     countdown_visible = prediction is not None
-    safe_schedule = safe_h3 or safe_established_normal_schedule
+    safe_schedule = (
+        safe_h3
+        or safe_established_continuity_h2
+        or safe_established_normal_schedule
+    )
 
     warning_key = None
     warning_at = None
@@ -355,6 +372,10 @@ def evaluate_authority_consumers(
         and policy.restart_alert_enabled
         and policy.server_online_healthy
         and prediction is not None
+        and (
+            not safe_established_continuity_h2
+            or decision.combined_confidence >= 0.80
+        )
     )
     warning_due = False
     if warning_model_eligible and regime is not None and prediction is not None:
@@ -433,6 +454,8 @@ def evaluate_authority_consumers(
         reasons.add("safe_h3_prediction_available")
     if safe_established_normal_schedule and countdown_visible:
         reasons.add("safe_established_normal_schedule_available")
+    if safe_established_continuity_h2 and countdown_visible:
+        reasons.add("safe_established_continuity_h2_prediction_available")
     elif gate is AuthorityGate.H2:
         reasons.add("h2_countdown_withheld")
     if suspended:
@@ -463,7 +486,11 @@ def evaluate_authority_consumers(
         cycle_label=label,
         cycle_period_seconds=period,
         confidence_display_value=max(0.0, min(1.0, confidence)),
-        phase_available=phase_available or safe_established_normal_schedule,
+        phase_available=(
+            phase_available
+            or safe_established_continuity_h2
+            or safe_established_normal_schedule
+        ),
         next_expected_restart_at=prediction,
         countdown_visible=countdown_visible,
         countdown_safe=safe_schedule,
@@ -652,6 +679,8 @@ def _presentation(
     decision: AuthorityDecision,
     gate: AuthorityGate,
     policy: AuthorityConsumerPolicyInput,
+    *,
+    safe_established_continuity_h2: bool,
 ) -> tuple[AuthorityPresentationKey, bool, bool, str | None]:
     state = decision.state
     if state is RegimeState.UNKNOWN:
@@ -662,6 +691,8 @@ def _presentation(
         return AuthorityPresentationKey.NONE, False, False, None
     if state is RegimeState.LIKELY and gate is AuthorityGate.H2:
         return AuthorityPresentationKey.LIKELY_CYCLE, True, False, None
+    if safe_established_continuity_h2:
+        return AuthorityPresentationKey.CONFIRMED_CYCLE, True, False, None
     if (
         state in {RegimeState.LIKELY, RegimeState.ESTABLISHED}
         and gate is AuthorityGate.NORMAL
@@ -696,6 +727,33 @@ def _presentation(
             "authority_decision_countdown_unsafe",
         )
     return AuthorityPresentationKey.NONE, False, False, None
+
+
+def _safe_established_continuity_h2(
+    decision: AuthorityDecision,
+    regime: RegimeRecord | None,
+    candidate: AuthorityCandidate | None,
+    gate: AuthorityGate,
+) -> bool:
+    """Accept a durable incumbent at H2 only under the authority safety contract."""
+
+    incumbent = decision.incumbent_shadow_regime
+    return bool(
+        gate is AuthorityGate.H2
+        and regime is not None
+        and regime.origin is AuthorityOrigin.CONTINUITY
+        and regime.status is RegimeRecordStatus.ESTABLISHED
+        and decision.state is RegimeState.ESTABLISHED
+        and incumbent is not None
+        and regime.regime_id == incumbent.regime_id
+        and decision.suspicion_level == 0
+        and decision.cycle_visible
+        and decision.prediction_usable
+        and decision.countdown_safe
+        and regime.candidate_period_seconds > 0
+        and math.isfinite(regime.phase_offset)
+        and not (candidate and candidate.harmonic_blockers)
+    )
 
 
 def _candidate_for_regime(

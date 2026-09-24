@@ -113,6 +113,35 @@ def _authority(event_count, period=3 * HOUR, *, server=SERVER, start=BASE):
     )
 
 
+def _established_continuity_h2():
+    source = _authority(4)
+    regime = source.selected_shadow_regime
+    assert regime is not None
+    durable = replace(
+        regime,
+        regime_id="durable-established-h2",
+        authority_gate=authority.AuthorityGate.H2,
+        phase_authority=0.767018,
+        combined_confidence=0.972369,
+        status=authority.RegimeRecordStatus.ESTABLISHED,
+        origin=authority.AuthorityOrigin.CONTINUITY,
+    )
+    return replace(
+        source,
+        decision_id="established-continuity-h2",
+        selected_shadow_regime=durable,
+        incumbent_shadow_regime=durable,
+        regimes=(durable,),
+        state=authority.RegimeState.ESTABLISHED,
+        cycle_visible=True,
+        prediction_usable=True,
+        countdown_safe=True,
+        suspicion_level=0,
+        active_suspicion_evidence_ids=(),
+        combined_confidence=0.972369,
+    )
+
+
 def _policy(decision, *, now=BASE + 100, **kwargs):
     return consumers4.AuthorityConsumerPolicyInput(
         authority_decision=decision,
@@ -637,6 +666,167 @@ def test_h2_is_likely_at_seventy_nine_percent_without_countdown():
     assert value.confidence_display_value == 0.79
     assert value.visible_cycle and not value.countdown_visible
     assert not value.scheduled_warning_eligible
+    assert "h2_countdown_withheld" in value.reason_codes
+
+
+def test_established_continuity_h2_retains_confirmed_cycle_eta_and_warning():
+    decision = _established_continuity_h2()
+    regime = decision.selected_shadow_regime
+    assert regime is not None
+    occurrence = consumers4.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE + 100,
+    )
+    due = occurrence - 300
+
+    first = consumers4.evaluate_authority_consumers(
+        _policy(decision, now=due, restart_alert_enabled=True)
+    )
+    resolution = consumers4.resolve_authority_consumer_cutover(
+        schema3_decision=_schema3_decision(),
+        schema4_decision=first,
+        production_cutover_enabled=True,
+        authoritative_schema4_runtime_enabled=True,
+        schema4_server_valid=True,
+    )
+    assert resolution.source is consumers4.CutoverSource.SCHEMA4
+    assert resolution.selected_output is first
+    summary = consumers4.authority_consumer_summary(
+        resolution.selected_output,
+        now=due,
+    )
+    presentation = restart_learning_presentation(summary)
+    again = consumers4.evaluate_authority_consumers(
+        _policy(
+            decision,
+            now=due,
+            restart_alert_enabled=True,
+            fired_keys=frozenset({first.scheduled_warning_suppression_key}),
+        )
+    )
+
+    assert first.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert first.cycle_period_seconds == 3 * HOUR
+    assert first.next_expected_restart_at == occurrence
+    assert first.phase_available
+    assert first.countdown_visible and first.countdown_safe
+    assert first.scheduled_warning_eligible
+    assert first.scheduled_pre_restart_alert_eligible
+    assert not again.scheduled_pre_restart_alert_eligible
+    assert again.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
+    assert summary["cycle_text"] == "Confirmed: Every 3 hours"
+    assert summary["presentation_key"] == "confirmed_cycle"
+    assert summary["prediction_usable"]
+    assert presentation["cycle_text"] == "Every 3 Hours"
+    assert presentation["cycle_text"] != "--"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"cycle_visible": False},
+        {"prediction_usable": False},
+        {"countdown_safe": False},
+        {"suspicion_level": 1},
+    ],
+)
+def test_unsafe_established_continuity_h2_does_not_gain_countdown_or_warning(
+    override,
+):
+    decision = replace(_established_continuity_h2(), **override)
+    value = consumers4.evaluate_authority_consumers(
+        _policy(decision, restart_alert_enabled=True)
+    )
+
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.NONE
+    assert not value.visible_cycle
+    assert value.next_expected_restart_at is None
+    assert not value.countdown_visible
+    assert not value.countdown_safe
+    assert not value.scheduled_warning_eligible
+    assert not value.scheduled_pre_restart_alert_eligible
+
+
+def test_established_continuity_h2_requires_selected_incumbent_identity():
+    decision = _established_continuity_h2()
+    incumbent = decision.incumbent_shadow_regime
+    assert incumbent is not None
+    mismatched = replace(
+        decision,
+        incumbent_shadow_regime=replace(incumbent, regime_id="different-incumbent"),
+    )
+
+    value = consumers4.evaluate_authority_consumers(_policy(mismatched))
+
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.NONE
+    assert value.next_expected_restart_at is None
+    assert not value.countdown_safe
+    assert not value.scheduled_warning_eligible
+
+
+def test_established_continuity_h2_warning_keeps_eighty_percent_threshold():
+    decision = replace(_established_continuity_h2(), combined_confidence=0.79)
+    regime = decision.selected_shadow_regime
+    assert regime is not None
+    occurrence = consumers4.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE + 100,
+    )
+    value = consumers4.evaluate_authority_consumers(
+        _policy(decision, now=occurrence - 300, restart_alert_enabled=True)
+    )
+
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert value.countdown_visible and value.countdown_safe
+    assert not value.scheduled_warning_eligible
+    assert not value.scheduled_pre_restart_alert_eligible
+
+
+def test_established_cycle_stays_usable_when_structural_gate_moves_h4_to_h2():
+    h4 = consumers4.evaluate_authority_consumers(_policy(_authority(4)))
+    h2 = consumers4.evaluate_authority_consumers(
+        _policy(_established_continuity_h2())
+    )
+
+    assert h4.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert h2.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert h4.cycle_period_seconds == h2.cycle_period_seconds == 3 * HOUR
+    assert h4.next_expected_restart_at is not None
+    assert h2.next_expected_restart_at is not None
+    assert h4.countdown_safe and h2.countdown_safe
+
+
+def test_established_continuity_h2_consumer_survives_authority_payload_reload():
+    decision = _established_continuity_h2()
+    record = {
+        "authority_candidates": [
+            schema4._primitive(item) for item in decision.candidates
+        ],
+        "challenger_contexts": [
+            schema4._primitive(item) for item in decision.challenger_contexts
+        ],
+        "regimes": [schema4._primitive(item) for item in decision.regimes],
+        "normal_evidence_ledger": schema4._ledger_wrapper(
+            "normal", decision.normal_ledger, decision.decision_id
+        ),
+        "high_evidence_ledger": schema4._ledger_wrapper(
+            "high", decision.high_ledger, decision.decision_id
+        ),
+    }
+    reloaded = schema4._decision_from_payload(
+        schema4._decision_payload(decision),
+        record,
+    )
+
+    before = consumers4.evaluate_authority_consumers(_policy(decision))
+    after = consumers4.evaluate_authority_consumers(_policy(reloaded))
+
+    assert reloaded == decision
+    assert after == before
+    assert after.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert after.countdown_safe and after.countdown_visible
 
 
 def test_h3_is_confirmed_with_safe_countdown():
