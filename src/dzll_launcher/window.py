@@ -147,7 +147,7 @@ from .workshop_mods import (
 )
 from .steam_client_mods import run_steam_client_install
 from .steam_ugc_backend import UGCHelperReapError
-from .join_preparation_overlay_ui import SteamCMDOverlayUI
+from .join_preparation_overlay_ui import JoinPreparationOverlayUI
 from .launcher_state import bootstrap_launcher_state
 from .join_prepare import join_prepare_and_launch
 from .background_prepare import (
@@ -882,8 +882,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # ----------------------------
         # Shared mod-preparation overlay (legacy module/widget names retained).
         # ----------------------------
-        self._steamcmd_overlay_ui = SteamCMDOverlayUI(self)
-        self._steamcmd_overlay_ui.build(overlay)
+        self._join_preparation_overlay_ui = JoinPreparationOverlayUI(self)
+        self._join_preparation_overlay_ui.build(overlay)
 
         # ----------------------------
         # START STEAM ON JOIN CONSENT OVERLAY
@@ -1707,7 +1707,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             self._steam_ugc_stop_progress_timer()
             self._steam_ugc_set_layout_active(False)
-            return self._steamcmd_overlay_ui._hide_steamcmd_auth_overlay()
+            return self._join_preparation_overlay_ui._hide_steamcmd_auth_overlay()
         finally:
             self._set_server_companion_join_status(None)
 
@@ -1743,7 +1743,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steam_client_set_cancel_buttons(safe_cancel=False)
         except Exception:
             pass
-        return self._steamcmd_overlay_ui._steamcmd_reset_state_for_new_run()
+        return self._join_preparation_overlay_ui._steamcmd_reset_state_for_new_run()
 
     def _steam_client_set_cancel_buttons(self, safe_cancel: bool):
         try:
@@ -5207,8 +5207,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             getattr(self, "settings_revealer", None),
             getattr(self, "start_steam_join_scrim", None),
             getattr(self, "start_steam_join_box", None),
-            getattr(getattr(self, "_steamcmd_overlay_ui", None), "scrim", None),
-            getattr(getattr(self, "_steamcmd_overlay_ui", None), "revealer", None),
+            getattr(getattr(self, "_join_preparation_overlay_ui", None), "scrim", None),
+            getattr(getattr(self, "_join_preparation_overlay_ui", None), "revealer", None),
         )
         for widget in widgets:
             if widget is None:
@@ -5234,8 +5234,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             getattr(self, "settings_revealer", None),
             getattr(self, "start_steam_join_scrim", None),
             getattr(self, "start_steam_join_box", None),
-            getattr(getattr(self, "_steamcmd_overlay_ui", None), "scrim", None),
-            getattr(getattr(self, "_steamcmd_overlay_ui", None), "revealer", None),
+            getattr(getattr(self, "_join_preparation_overlay_ui", None), "scrim", None),
+            getattr(getattr(self, "_join_preparation_overlay_ui", None), "revealer", None),
         )
         for widget in widgets:
             if widget is None:

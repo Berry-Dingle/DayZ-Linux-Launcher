@@ -12,7 +12,7 @@ from dzll_launcher import (
     steam_ugc_backend,
 )
 from dzll_launcher import window as window_module
-from dzll_launcher.join_preparation_overlay_ui import SteamCMDOverlayUI
+from dzll_launcher.join_preparation_overlay_ui import JoinPreparationOverlayUI
 from dzll_launcher.preparation_contracts import (
     JoinPopupPreparationPresenter,
     PreparationStatus,
@@ -52,7 +52,7 @@ def test_overlay_reset_preserves_join_cancel_event_identity():
         steamcmd_line2=Widget(),
         _set_steamcmd_busy=lambda _busy: None,
     )
-    overlay = object.__new__(SteamCMDOverlayUI)
+    overlay = object.__new__(JoinPreparationOverlayUI)
     overlay.win = win
     overlay._steamcmd_reset_state_for_new_run()
     assert win._steamcmd_cancel_event is cancel_event

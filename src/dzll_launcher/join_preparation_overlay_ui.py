@@ -5,7 +5,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, Pango
 
 
-class SteamCMDOverlayUI:
+class JoinPreparationOverlayUI:
     """Build the shared Join preparation overlay used by Steam Client UGC."""
 
     def __init__(self, win):
