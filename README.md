@@ -1,6 +1,6 @@
 # 🧠 DZLL (DayZ Linux Launcher) — Python Version
 
-A native Linux launcher for DayZ with Steam Client Workshop mod handling. SteamCMD is available as an advanced fallback.
+A native Linux launcher for DayZ. Required mods are prepared through the native Steam Client Workshop/UGC integration; SteamCMD fallback support has been removed.
 
 🌐 Website: https://dzllauncher.uk/
 
@@ -15,8 +15,8 @@ A native Linux launcher for DayZ with Steam Client Workshop mod handling. SteamC
 - Native Steam (with DayZ installed)
 - Flatpak Steam is unsupported — use native Steam
 - DayZ must have been launched at least once to create the files DZLL needs
-- Steam Client Workshop backend is the default/recommended mod handler
-- SteamCMD is optional and only needed for Advanced SteamCMD Fallback troubleshooting
+- Steam Client Workshop/UGC is the supported path for preparing and downloading required mods
+- DZLL does not store your Steam password
 
 ---
 
@@ -153,62 +153,7 @@ Launch Steam once and install **DayZ**, then launch DayZ at least once before co
 
 ---
 
-## ⚙️ 8. Optional: Install SteamCMD fallback
-
-Most users should skip this section. DZLL uses the native Steam Client Workshop backend by default.
-
-Install SteamCMD only if you need the Advanced SteamCMD Fallback for troubleshooting.
-
-If you do need it, make sure `wget` is installed:
-
-```bash
-sudo apt install wget      # Ubuntu/Debian
-sudo dnf install wget      # Fedora
-sudo pacman -S wget        # Arch
-sudo zypper install wget   # openSUSE
-```
-
-### Install SteamCMD fallback
-
-```bash
-mkdir -p ~/.local/share/steamcmd
-cd ~/.local/share/steamcmd
-
-wget https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz
-tar -xzf steamcmd_linux.tar.gz
-chmod +x steamcmd.sh
-```
-
-Use the path above if possible so DZLL can auto-detect the fallback.
-
-### Test it
-
-```bash
-~/.local/share/steamcmd/steamcmd.sh +quit
-```
-
-If it prints SteamCMD info and exits without errors, the fallback is available.
-
----
-
-### 🧠 Important Notes
-
-- This installs SteamCMD locally for the advanced fallback
-- DZLL will auto-detect this fallback path:
-
-```bash
-~/.local/share/steamcmd/steamcmd.sh
-```
-
-- You do **NOT** need to manually enter it unless detection fails
-- Normal Steam Client backend users should not need SteamCMD credentials
-
-**IMPORTANT:**  
-DZLL does **not** store your Steam password at all.
-
----
-
-## 🚀 9. Launch DZLL
+## 🚀 8. Launch DZLL
 
 ```bash
 source .venv/bin/activate
@@ -262,18 +207,6 @@ Try:
 
 ---
 
-### ❌ Advanced SteamCMD fallback not found
-
-Only use this if you enabled Advanced SteamCMD Fallback in Settings.
-
-```bash
-ls ~/.local/share/steamcmd/steamcmd.sh
-```
-
-If missing, reinstall SteamCMD fallback.
-
----
-
 ### ❌ GTK / gi import errors
 
 You likely missed system packages.
@@ -305,7 +238,7 @@ This creates required launcher files DZLL depends on.
 DZLL Reset button:
 
 - resets settings only ✅
-- does **NOT** delete mods / SteamCMD / files ❌
+- does **NOT** delete mods or files ❌
 
 To fully wipe DZLL state manually:
 
@@ -330,7 +263,6 @@ dzll-launcher-v0.4.0-beta/
 
 ## 💬 Final Notes
 
-- Leave SteamCMD fallback settings empty unless troubleshooting
 - Autodetect is preferred and safer
 - Reset is non-destructive and safe to use
 
