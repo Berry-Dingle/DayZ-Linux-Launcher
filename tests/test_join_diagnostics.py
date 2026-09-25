@@ -343,6 +343,22 @@ def test_popen_success_means_handoff_submitted_not_confirmed_launch(monkeypatch)
     assert not hasattr(result, "launch_confirmed")
 
 
+def test_dispatch_guard_runs_immediately_before_and_can_prevent_popen(monkeypatch):
+    monkeypatch.setattr(launch_utils, "set_launcher_shutdown_mode", lambda *_args: None)
+    order = []
+
+    result = launch_utils.launch_direct_steam_url(
+        LaunchWin(),
+        OBJ,
+        before_dispatch=lambda: order.append("guard") or False,
+        popen_factory=lambda _cmd: order.append("popen") or SimpleNamespace(pid=4321),
+    )
+
+    assert not result.submitted
+    assert result.error_kind == "dispatch_guard"
+    assert order == ["guard"]
+
+
 def test_captured_launch_mode_overrides_later_setting_change(monkeypatch):
     monkeypatch.setattr(launch_utils, "set_launcher_shutdown_mode", lambda *_args: None)
     win = LaunchWin()

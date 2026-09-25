@@ -1695,6 +1695,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self.join_preparation_cancel_button.set_tooltip_text(
                 "Cancel this Join preparation."
             )
+            self.join_preparation_cancel_button.set_sensitive(True)
             self.join_preparation_cancel_button.set_visible(True)
             self.join_preparation_scrim.set_visible(True)
             self.join_preparation_card.set_visible(True)
@@ -1716,6 +1717,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _join_preparation_cancel_clicked(self):
         active_join = getattr(getattr(self, "_join_attempts", None), "active", None)
+        if active_join is not None and str(active_join.phase) in {"launching", "watching"}:
+            self._join_log(
+                active_join.attempt_id,
+                "post-handoff Cancel callback ignored",
+                phase=str(active_join.phase),
+            )
+            return None
         if (
             active_join is not None
             or bool(getattr(self, "_steam_ugc_worker_in_progress", False))
@@ -1752,6 +1760,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             self.join_preparation_cancel_button.set_label("Cancel")
             self.join_preparation_cancel_button.set_tooltip_text("Cancel download and unsubscribe unfinished mods.")
+            self.join_preparation_cancel_button.set_sensitive(True)
         except Exception:
             pass
         try:
@@ -9592,6 +9601,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steam_ugc_render_status(f"{message} {detail}", error=True)
             self._mod_download_backend_active = ""
             self.join_preparation_cancel_button.set_label("Close")
+            self.join_preparation_cancel_button.set_sensitive(True)
             self.join_preparation_cancel_button.set_visible(True)
         except Exception:
             self._set_updating(False, message)
@@ -9681,6 +9691,40 @@ class DZLLWindow(Gtk.ApplicationWindow):
             ensure_recovery()
         return False
 
+    def _enter_join_launch_boundary(self, attempt_id: int) -> bool:
+        """Seal the UI and revalidate an attempt immediately before Steam dispatch."""
+        active = self._join_attempts.active
+        cancel_event = getattr(self, "_join_preparation_cancel_event", None)
+        if (
+            active is None
+            or active.attempt_id != int(attempt_id)
+            or isinstance(cancel_event, threading.Event) and cancel_event.is_set()
+        ):
+            return False
+
+        self._join_attempts.set_phase(attempt_id, "launching")
+        try:
+            self.join_preparation_cancel_button.set_sensitive(False)
+            self.join_preparation_cancel_button.set_tooltip_text(
+                "DayZ launch can no longer be cancelled."
+            )
+        except Exception:
+            pass
+        self._join_log(attempt_id, "non-cancellable Steam launch boundary entered")
+
+        # Keep this as the last operation before the caller invokes Popen.  It
+        # closes the small window for non-GTK cancellation sources as well as
+        # rejecting an attempt invalidated during the UI transition above.
+        active = self._join_attempts.active
+        return bool(
+            active is not None
+            and active.attempt_id == int(attempt_id)
+            and not (
+                isinstance(cancel_event, threading.Event)
+                and cancel_event.is_set()
+            )
+        )
+
     def _launch_direct_steam_url(self, obj: ServerObject, mod_win_paths=None, *, attempt_id: int = 0):
         active = self._join_attempts.active
         captured_skip_launcher = (
@@ -9693,8 +9737,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
             obj,
             mod_win_paths=mod_win_paths,
             skip_dayz_launcher=captured_skip_launcher,
+            before_dispatch=(
+                lambda: self._enter_join_launch_boundary(attempt_id)
+            ) if attempt_id else None,
         )
         if not result.submitted:
+            if result.error_kind == "dispatch_guard":
+                if attempt_id and self._join_attempt_is_active(attempt_id):
+                    try:
+                        self._steam_ugc_render_status("Join cancelled.", error=True)
+                        self._mod_download_backend_active = ""
+                        self.join_preparation_cancel_button.set_label("Close")
+                        self.join_preparation_cancel_button.set_sensitive(True)
+                        self.join_preparation_cancel_button.set_visible(True)
+                    except Exception:
+                        pass
+                    self._cleanup_join_attempt(
+                        attempt_id, "cancelled or stale at Steam launch boundary",
+                    )
+                return result
             if attempt_id:
                 self._show_join_launch_error(attempt_id, result.error)
                 self._cleanup_join_attempt(attempt_id, f"launch {result.error_kind or 'construction'} failure")

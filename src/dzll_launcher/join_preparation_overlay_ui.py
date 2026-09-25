@@ -89,6 +89,11 @@ class JoinPreparationOverlayUI:
         buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         buttons.set_halign(Gtk.Align.END)
         self.join_preparation_cancel_button = Gtk.Button(label="Cancel")
+        # Reuse the application's standard action width and accent/disabled
+        # action-button styling.  Sensitivity changes then remain visually
+        # obvious without changing the button's footprint.
+        self.join_preparation_cancel_button.add_css_class("warning-btn")
+        self.join_preparation_cancel_button.add_css_class("suggested-action")
         self.join_preparation_cancel_button.connect(
             "clicked",
             lambda *_: self.win._join_preparation_cancel_clicked(),

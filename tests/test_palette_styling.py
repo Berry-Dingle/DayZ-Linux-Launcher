@@ -42,6 +42,23 @@ def test_dzll_owned_css_has_no_gtk_theme_colour_dependency():
     assert "@theme_text_color" not in css
 
 
+def test_join_preparation_cancel_reuses_action_width_and_sensitivity_styles():
+    overlay = (ROOT / "src/dzll_launcher/join_preparation_overlay_ui.py").read_text(
+        encoding="utf-8"
+    )
+    css = app_css()
+    assert 'add_css_class("warning-btn")' in overlay
+    assert 'add_css_class("suggested-action")' in overlay
+    assert ".warning-btn" in css
+    assert "min-width: 160px;" in css
+    enabled = css.split("button.suggested-action,", 1)[1].split("}", 1)[0]
+    disabled = css.split("button.suggested-action:disabled,", 1)[1].split("}", 1)[0]
+    assert "background: @dzll_accent;" in enabled
+    assert "color: @dzll_text_on_accent;" in enabled
+    assert "background: @dzll_control_disabled;" in disabled
+    assert "color: @dzll_text_disabled;" in disabled
+
+
 def test_root_scope_and_major_surface_rules_are_present():
     css = app_css()
     for selector_or_rule in (

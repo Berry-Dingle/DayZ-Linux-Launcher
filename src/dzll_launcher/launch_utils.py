@@ -44,7 +44,7 @@ def _sanitize_launch_command(cmd) -> tuple[str, ...]:
 
 
 def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
-                            skip_dayz_launcher=None):
+                            skip_dayz_launcher=None, before_dispatch=None):
     popen = popen_factory or subprocess.Popen
     try:
         try:
@@ -116,6 +116,22 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
 
         # Launch DayZ via Steam
         sanitized = _sanitize_launch_command(cmd)
+        if callable(before_dispatch) and not bool(before_dispatch()):
+            try:
+                if getattr(win, "_discord", None):
+                    win._discord.set_menu()
+            except Exception:
+                pass
+            try:
+                win._discord_last_join = None
+            except Exception:
+                pass
+            return SteamLaunchResult(
+                False,
+                error_kind="dispatch_guard",
+                error="Join was cancelled or became stale before Steam dispatch.",
+                sanitized_command=sanitized,
+            )
         try:
             proc = popen(cmd)
         except Exception as e:

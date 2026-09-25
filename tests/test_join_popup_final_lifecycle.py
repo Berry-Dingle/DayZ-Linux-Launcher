@@ -16,12 +16,16 @@ class FakeButton:
     def __init__(self):
         self.label = "Cancel"
         self.visible = False
+        self.sensitive = True
 
     def set_label(self, value):
         self.label = str(value)
 
     def set_visible(self, value):
         self.visible = bool(value)
+
+    def set_sensitive(self, value):
+        self.sensitive = bool(value)
 
 
 class LifecycleHarness:
