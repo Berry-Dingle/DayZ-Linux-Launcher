@@ -2979,6 +2979,79 @@ class _ACFBackupCandidate:
     mtime_ns: int
     collision_counter: int
     identity: tuple[int, int]
+    snapshot: tuple[int, int, int, int, int, int]
+    fd: int
+
+
+def _acf_backup_stat_snapshot(info) -> tuple[int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+    )
+
+
+def _restore_claimed_acf_backup(claimed: Path, original: Path) -> bool:
+    """Restore a wrongly claimed regular file without replacing another path."""
+
+    try:
+        os.link(claimed, original, follow_symlinks=False)
+    except OSError:
+        return False
+    try:
+        claimed.unlink()
+    except OSError:
+        # The file is safe through the restored hard link.  Leaving the
+        # quarantine link behind is preferable to risking the restored path.
+        return False
+    return True
+
+
+def _prune_claimed_acf_backup(candidate: _ACFBackupCandidate) -> tuple[bool, str | None]:
+    """Atomically claim and remove only the candidate held open at discovery."""
+
+    quarantine_dir = Path(tempfile.mkdtemp(
+        prefix=f".{candidate.path.name}.dzll-prune-",
+        dir=candidate.path.parent,
+    ))
+    claimed = quarantine_dir / candidate.path.name
+    try:
+        os.rename(candidate.path, claimed)
+        try:
+            current = os.lstat(claimed)
+            anchored = os.fstat(candidate.fd)
+        except OSError as exc:
+            if _restore_claimed_acf_backup(claimed, candidate.path):
+                return False, str(exc)
+            return False, f"{exc}; candidate retained at {claimed}"
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or _acf_backup_stat_snapshot(current)
+            != _acf_backup_stat_snapshot(anchored)
+            or _acf_backup_stat_snapshot(anchored) != candidate.snapshot
+        ):
+            if _restore_claimed_acf_backup(claimed, candidate.path):
+                return False, "candidate changed before atomic prune claim"
+            return False, (
+                "candidate changed before atomic prune claim and was retained at "
+                f"{claimed}"
+            )
+        try:
+            claimed.unlink()
+        except OSError as exc:
+            restored = _restore_claimed_acf_backup(claimed, candidate.path)
+            if restored or candidate.path.exists():
+                return False, str(exc)
+            return False, f"{exc}; candidate retained at {claimed}"
+        return True, None
+    finally:
+        try:
+            quarantine_dir.rmdir()
+        except OSError:
+            pass
 
 
 def _acf_backup_name_match(source_name: str, candidate_name: str):
@@ -3056,14 +3129,33 @@ def _prune_old_acf_backups(
         parsed = _acf_backup_name_match(path.name, entry.name)
         if parsed is None:
             continue
+        candidate_fd = -1
         try:
-            info = entry.stat(follow_symlinks=False)
+            flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags |= getattr(os, "O_NONBLOCK", 0)
+            candidate_fd = os.open(path.parent / entry.name, flags)
+            info = os.fstat(candidate_fd)
+            current_path = os.lstat(path.parent / entry.name)
         except OSError as exc:
+            if candidate_fd >= 0:
+                try:
+                    os.close(candidate_fd)
+                except OSError:
+                    pass
             _log_acf_backup_prune_warning(
                 log_fn, path, path.parent / entry.name, exc,
             )
             continue
-        if not stat.S_ISREG(info.st_mode):
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or _acf_backup_stat_snapshot(current_path)
+            != _acf_backup_stat_snapshot(info)
+        ):
+            try:
+                os.close(candidate_fd)
+            except OSError:
+                pass
             continue
         timestamp, collision_counter = parsed
         candidate = _ACFBackupCandidate(
@@ -3072,11 +3164,17 @@ def _prune_old_acf_backups(
             mtime_ns=info.st_mtime_ns,
             collision_counter=collision_counter,
             identity=(info.st_dev, info.st_ino),
+            snapshot=_acf_backup_stat_snapshot(info),
+            fd=candidate_fd,
         )
         if protected_path is not None and candidate.path == protected_path:
             if candidate.identity == protected_backup_identity:
                 protected_candidate = candidate
             else:
+                try:
+                    os.close(candidate.fd)
+                except OSError:
+                    pass
                 _log_acf_backup_prune_warning(
                     log_fn,
                     path,
@@ -3086,52 +3184,49 @@ def _prune_old_acf_backups(
             continue
         candidates.append(candidate)
 
-    candidates.sort(
-        key=lambda candidate: (
-            candidate.timestamp,
-            candidate.mtime_ns,
-            candidate.collision_counter,
-            candidate.path.name,
-        ),
-        reverse=True,
+    opened_candidates = candidates + (
+        [] if protected_candidate is None else [protected_candidate]
     )
-    historical_keep_count = ACF_BACKUP_RETENTION_COUNT
-    if protected_candidate is not None:
-        historical_keep_count -= 1
-    for candidate in candidates[historical_keep_count:]:
-        try:
-            validate_authoritative_path()
-        except Exception as exc:
-            _log_acf_backup_prune_warning(
-                log_fn, path, candidate.path, exc,
-            )
-            return
-        try:
-            current = os.lstat(candidate.path)
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            _log_acf_backup_prune_warning(
-                log_fn, path, candidate.path, exc,
-            )
-            continue
-        if (
-            not stat.S_ISREG(current.st_mode)
-            or (current.st_dev, current.st_ino) != candidate.identity
-        ):
-            _log_acf_backup_prune_warning(
-                log_fn,
-                path,
-                candidate.path,
-                "candidate identity or file type changed",
-            )
-            continue
-        try:
-            candidate.path.unlink()
-        except OSError as exc:
-            _log_acf_backup_prune_warning(
-                log_fn, path, candidate.path, exc,
-            )
+    try:
+        candidates.sort(
+            key=lambda candidate: (
+                candidate.timestamp,
+                candidate.mtime_ns,
+                candidate.collision_counter,
+                candidate.path.name,
+            ),
+            reverse=True,
+        )
+        historical_keep_count = ACF_BACKUP_RETENTION_COUNT
+        if protected_candidate is not None:
+            historical_keep_count -= 1
+        for candidate in candidates[historical_keep_count:]:
+            try:
+                validate_authoritative_path()
+            except Exception as exc:
+                _log_acf_backup_prune_warning(
+                    log_fn, path, candidate.path, exc,
+                )
+                return
+            try:
+                removed, reason = _prune_claimed_acf_backup(candidate)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                removed, reason = False, str(exc)
+            if not removed:
+                _log_acf_backup_prune_warning(
+                    log_fn,
+                    path,
+                    candidate.path,
+                    reason or "candidate could not be safely pruned",
+                )
+    finally:
+        for candidate in opened_candidates:
+            try:
+                os.close(candidate.fd)
+            except OSError:
+                pass
 
 
 def _open_unique_acf_backup(path: Path, suffix: str) -> tuple[int, Path, tuple[int, int]]:
@@ -3589,7 +3684,7 @@ def delete_ugc_mod(mod_id, *, appid=DAYZ_APPID, timeout=120, log_fn=None) -> dic
             if callable(log_fn):
                 log_fn(message)
             else:
-                print(message)
+                logger.debug("%s", message)
         except Exception:
             pass
 
@@ -3770,7 +3865,7 @@ def delete_ugc_mod_local_files_after_unsubscribe(
             if callable(log_fn):
                 log_fn(message)
             else:
-                print(message)
+                logger.debug("%s", message)
         except Exception:
             pass
 

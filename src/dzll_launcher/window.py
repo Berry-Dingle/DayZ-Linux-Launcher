@@ -1636,6 +1636,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._steam_ugc_render_status(detail, error=True)
         try:
             self.join_preparation_cancel_button.set_label("Close")
+            self.join_preparation_cancel_button.set_tooltip_text(
+                "Close this Join status."
+            )
+            self.join_preparation_cancel_button.set_sensitive(True)
             self.join_preparation_cancel_button.set_visible(True)
         except Exception:
             pass

@@ -288,12 +288,12 @@ def remove_dzll_symlinks_for_mod(mod_id, *, proton_prefix: str = "", log_fn=None
     Remove only DZLL-owned watch-folder symlinks whose name encodes mod_id.
     This intentionally does not remove arbitrary symlinks or non-symlink paths.
     """
-    def log(msg: str):
+    def log(msg: str, *, level: int = logging.DEBUG):
         try:
             if callable(log_fn):
                 log_fn(msg)
             else:
-                print(msg)
+                logger.log(level, "%s", msg)
         except Exception:
             pass
 
@@ -342,9 +342,15 @@ def remove_dzll_symlinks_for_mod(mod_id, *, proton_prefix: str = "", log_fn=None
                     removed.append(path)
                     log(f"[MOD DELETE] removed DZLL symlink: {path}")
                 except Exception as exc:
-                    log(f"[MOD DELETE] failed to remove DZLL symlink {path}: {exc}")
+                    log(
+                        f"[MOD DELETE] failed to remove DZLL symlink {path}: {exc}",
+                        level=logging.WARNING,
+                    )
         except Exception as exc:
-            log(f"[MOD DELETE] failed to scan DZLL symlinks in {watch_folder}: {exc}")
+            log(
+                f"[MOD DELETE] failed to scan DZLL symlinks in {watch_folder}: {exc}",
+                level=logging.WARNING,
+            )
 
     return removed
 

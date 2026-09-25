@@ -133,7 +133,12 @@ def launch_direct_steam_url(win, obj, mod_win_paths=None, *, popen_factory=None,
                 sanitized_command=sanitized,
             )
         try:
-            proc = popen(cmd)
+            proc = popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception as e:
             logger.error("Failed to submit Steam launch request: %s", e)
             try:

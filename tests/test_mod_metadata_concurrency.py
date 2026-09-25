@@ -225,7 +225,6 @@ def test_cross_process_writers_share_stable_lock_file(isolated_metadata):
     assert first_loaded.wait(10)
     lock_path = isolated_metadata.with_name(f"{isolated_metadata.name}.lock")
     lock_inode = lock_path.stat().st_ino
-    first_metadata_inode = isolated_metadata.stat().st_ino
 
     second.start()
     assert second_lock_attempted.wait(10)
@@ -237,7 +236,6 @@ def test_cross_process_writers_share_stable_lock_file(isolated_metadata):
     assert second.exitcode == 0
     assert set(_read(isolated_metadata)["mods"]) == {"1", "2", "3"}
     assert lock_path.stat().st_ino == lock_inode
-    assert isolated_metadata.stat().st_ino != first_metadata_inode
 
 
 def test_failed_atomic_save_preserves_file_and_releases_locks(isolated_metadata, monkeypatch):

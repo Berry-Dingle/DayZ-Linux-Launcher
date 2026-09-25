@@ -152,7 +152,8 @@ def test_launch_rejects_invalid_endpoint_before_process_dispatch(monkeypatch):
     obj = SimpleNamespace(ip="example.com", gport=2302, name="Bad", map_name="")
 
     result = launch_utils.launch_direct_steam_url(
-        _LaunchWindow(), obj, popen_factory=lambda cmd: launches.append(cmd)
+        _LaunchWindow(), obj,
+        popen_factory=lambda cmd, **_kwargs: launches.append(cmd),
     )
 
     assert result.submitted is False
@@ -168,7 +169,8 @@ def test_launch_uses_canonical_valid_endpoint(monkeypatch):
     process = SimpleNamespace(pid=42)
 
     result = launch_utils.launch_direct_steam_url(
-        _LaunchWindow(), obj, popen_factory=lambda cmd: launches.append(cmd) or process
+        _LaunchWindow(), obj,
+        popen_factory=lambda cmd, **_kwargs: launches.append(cmd) or process,
     )
 
     assert result.submitted is True

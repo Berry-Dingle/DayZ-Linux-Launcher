@@ -4,6 +4,7 @@ import gi
 import pytest
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 
 from dzll_launcher import settings as settings_module
@@ -13,11 +14,38 @@ from dzll_launcher.ui_row import ServerObject
 from dzll_launcher.window import DZLLWindow
 
 
-def _settle_layout():
+def _settle_layout(widget):
     context = GLib.MainContext.default()
-    for _ in range(100):
-        if not context.pending():
-            break
+    while context.pending():
+        context.iteration(False)
+
+    frame_clock = widget.get_frame_clock()
+    assert frame_clock is not None
+    loop = GLib.MainLoop()
+    completed_frames = 0
+
+    def after_paint(*_args):
+        nonlocal completed_frames
+        completed_frames += 1
+        if completed_frames >= 2:
+            loop.quit()
+        else:
+            frame_clock.request_phase(Gdk.FrameClockPhase.PAINT)
+
+    def timeout():
+        loop.quit()
+        return GLib.SOURCE_REMOVE
+
+    handler = frame_clock.connect("after-paint", after_paint)
+    timeout_id = GLib.timeout_add(1000, timeout)
+    widget.queue_allocate()
+    frame_clock.request_phase(Gdk.FrameClockPhase.PAINT)
+    loop.run()
+    frame_clock.disconnect(handler)
+    if completed_frames >= 2:
+        GLib.source_remove(timeout_id)
+    assert completed_frames >= 2, "GTK did not complete two layout frames"
+    while context.pending():
         context.iteration(False)
 
 
@@ -96,7 +124,7 @@ def test_real_column_visibility_collapses_header_rows_and_reclaims_width():
     window.set_child(view)
     window.present()
     try:
-        _settle_layout()
+        _settle_layout(window)
         column = view.background_download_column
         columns = view.get_columns()
         count = columns.get_n_items()
@@ -112,23 +140,51 @@ def test_real_column_visibility_collapses_header_rows_and_reclaims_width():
         ]
         assert len(download_buttons) == 1
         assert len(join_buttons) == 1
-        shown_join_x = join_buttons[0].get_allocation().x
+        name_labels = [
+            widget for widget in _walk(view)
+            if isinstance(widget, Gtk.Label)
+            and widget.has_css_class("server-name")
+        ]
+        assert len(name_labels) == 1
+        name_cell = name_labels[0].get_parent().get_parent().get_parent()
+        shown_name_ok, shown_name_bounds = name_cell.compute_bounds(view)
+        shown_download_ok, _shown_download_bounds = (
+            download_buttons[0].compute_bounds(view)
+        )
+        assert shown_name_ok
+        assert shown_download_ok
+        shown_name_width = shown_name_bounds.get_width()
 
         column.set_visible(False)
-        _settle_layout()
+        _settle_layout(window)
         assert not column.get_visible()
         assert columns.get_n_items() == count
-        assert not download_buttons[0].should_layout()
-        assert download_buttons[0].get_allocated_width() == 0
-        hidden_join_x = join_buttons[0].get_allocation().x
-        assert hidden_join_x < shown_join_x
+        assert not download_buttons[0].get_mapped()
+        hidden_download_ok, _hidden_download_bounds = (
+            download_buttons[0].compute_bounds(view)
+        )
+        assert not hidden_download_ok
+        hidden_name_ok, hidden_name_bounds = name_cell.compute_bounds(view)
+        assert hidden_name_ok
+        assert hidden_name_bounds.get_width() > shown_name_width
 
         column.set_visible(True)
-        _settle_layout()
+        _settle_layout(window)
         assert column.get_visible()
         assert columns.get_n_items() == count
-        assert download_buttons[0].should_layout()
-        assert download_buttons[0].get_allocated_width() > 0
-        assert join_buttons[0].get_allocation().x == shown_join_x
+        restored_download_buttons = [
+            widget for widget in _walk(view)
+            if isinstance(widget, Gtk.Button)
+            and widget.has_css_class("dzll-download-mods-button")
+        ]
+        assert len(restored_download_buttons) == 1
+        assert restored_download_buttons[0].get_mapped()
+        restored_download_ok, _restored_download_bounds = (
+            restored_download_buttons[0].compute_bounds(view)
+        )
+        restored_name_ok, restored_name_bounds = name_cell.compute_bounds(view)
+        assert restored_download_ok
+        assert restored_name_ok
+        assert restored_name_bounds.get_width() == pytest.approx(shown_name_width)
     finally:
         window.destroy()

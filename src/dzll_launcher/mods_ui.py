@@ -1,4 +1,5 @@
 # mods_ui.py
+import logging
 import os
 import subprocess
 import threading
@@ -35,6 +36,8 @@ from .steam_native import (
 from .workshop_mods import remove_dzll_symlinks_for_mod
 from .mod_metadata import clean_display_mod_name, load_mod_metadata
 from .mod_name_resolver import resolve_best_mod_names
+
+logger = logging.getLogger(__name__)
 
 APPID = "221100"
 MOD_WORKSHOP_COLUMN_CHARS = 18
@@ -2567,7 +2570,12 @@ class ModsManagerOverlay:
             return
         url = f"steam://url/CommunityFilePage/{int(mod_id)}"
         try:
-            subprocess.Popen([steam_cmd, url])
+            subprocess.Popen(
+                [steam_cmd, url],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         except Exception as exc:
             self._confirm_show(
                 "Could not open Steam Workshop",
@@ -3445,7 +3453,7 @@ class ModsManagerOverlay:
                         result = delete_ugc_mod_local_files_after_unsubscribe(
                             int(mid),
                             appid=int(APPID),
-                            log_fn=print,
+                            log_fn=logger.debug,
                             steam_absence_verified=steam_absence_verified,
                             subscription_snapshot=authoritative_snapshot,
                         )
@@ -4063,13 +4071,18 @@ class ModsManagerOverlay:
         if not _supported_native_steam_running():
             return False
         try:
-            remove_dzll_symlinks_for_mod(int(mod_id), proton_prefix=self._proton_prefix(), log_fn=print)
+            remove_dzll_symlinks_for_mod(
+                int(mod_id),
+                proton_prefix=self._proton_prefix(),
+                log_fn=logger.debug,
+            )
             return True
         except Exception as exc:
-            try:
-                print(f"[MOD MANAGER] DZLL symlink cleanup after unsubscribe failed for {int(mod_id)}: {exc}", flush=True)
-            except Exception:
-                pass
+            logger.warning(
+                "DZLL symlink cleanup after unsubscribe failed for %d: %s",
+                int(mod_id),
+                exc,
+            )
             return False
 
     def _run_batch_unsubscribe(self, workshop_ids: list[int], skip_count: int) -> None:

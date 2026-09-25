@@ -119,6 +119,9 @@ def test_native_launch_sanitizes_flatpak_environment_and_records_pid(monkeypatch
     assert result.executable == "/native/steam"
     assert result.pid == 8080
     assert calls[0][0] == ["/native/steam", "-silent"]
+    assert calls[0][1]["stdin"] is steam_native.subprocess.DEVNULL
+    assert calls[0][1]["stdout"] is steam_native.subprocess.DEVNULL
+    assert calls[0][1]["stderr"] is steam_native.subprocess.DEVNULL
     environment = calls[0][1]["env"]
     assert "FLATPAK_ID" not in environment
     assert "XDG_DATA_HOME" not in environment

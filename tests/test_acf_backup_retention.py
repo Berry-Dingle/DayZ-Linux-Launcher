@@ -338,18 +338,20 @@ def test_candidate_inode_replacement_is_not_deleted(monkeypatch, tmp_path):
     acf = _acf_with_ids(root, [101])
     oldest = _seed_backups(acf, 6)[0]
     replacement = b"replacement inode"
-    real_lstat = steam_ugc_backend.os.lstat
+    real_rename = steam_ugc_backend.os.rename
     replaced = False
 
-    def replace_before_revalidation(path):
+    def replace_before_atomic_claim(source, destination):
         nonlocal replaced
-        if Path(path) == oldest and not replaced:
+        if Path(source) == oldest and not replaced:
             replaced = True
             oldest.unlink()
             oldest.write_bytes(replacement)
-        return real_lstat(path)
+        return real_rename(source, destination)
 
-    monkeypatch.setattr(steam_ugc_backend.os, "lstat", replace_before_revalidation)
+    monkeypatch.setattr(
+        steam_ugc_backend.os, "rename", replace_before_atomic_claim,
+    )
 
     steam_ugc_backend._prune_old_acf_backups(
         acf,
@@ -358,6 +360,7 @@ def test_candidate_inode_replacement_is_not_deleted(monkeypatch, tmp_path):
 
     assert replaced is True
     assert oldest.read_bytes() == replacement
+    assert not list(oldest.parent.glob(f".{oldest.name}.dzll-prune-*"))
 
 
 @pytest.mark.parametrize("error", [PermissionError("denied"), OSError("transient")])
@@ -372,7 +375,7 @@ def test_prune_failure_is_nonfatal_and_continues(
     messages = []
 
     def fail_one(path, *args, **kwargs):
-        if Path(path) == blocked:
+        if Path(path).name == blocked.name:
             raise error
         return real_unlink(path, *args, **kwargs)
 
@@ -411,7 +414,7 @@ def test_prune_diagnostic_failures_never_break_successful_rewrite(
     module_messages = []
 
     def fail_one(path, *args, **kwargs):
-        if Path(path) == blocked:
+        if Path(path).name == blocked.name:
             raise PermissionError("blocked prune")
         return real_unlink(path, *args, **kwargs)
 

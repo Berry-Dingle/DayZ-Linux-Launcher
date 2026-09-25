@@ -335,12 +335,22 @@ OBJ = SimpleNamespace(ip="127.0.0.1", gport=2302, name="Synthetic", map_name="Ch
 
 def test_popen_success_means_handoff_submitted_not_confirmed_launch(monkeypatch):
     monkeypatch.setattr(launch_utils, "set_launcher_shutdown_mode", lambda *_args: None)
+    calls = []
     result = launch_utils.launch_direct_steam_url(
-        LaunchWin(), OBJ, popen_factory=lambda _cmd: SimpleNamespace(pid=4321)
+        LaunchWin(), OBJ,
+        popen_factory=lambda command, **kwargs: (
+            calls.append((list(command), dict(kwargs)))
+            or SimpleNamespace(pid=4321)
+        ),
     )
     assert result.submitted is True
     assert result.pid == 4321
     assert not hasattr(result, "launch_confirmed")
+    assert calls[0][1] == {
+        "stdin": launch_utils.subprocess.DEVNULL,
+        "stdout": launch_utils.subprocess.DEVNULL,
+        "stderr": launch_utils.subprocess.DEVNULL,
+    }
 
 
 def test_dispatch_guard_runs_immediately_before_and_can_prevent_popen(monkeypatch):
@@ -351,7 +361,7 @@ def test_dispatch_guard_runs_immediately_before_and_can_prevent_popen(monkeypatc
         LaunchWin(),
         OBJ,
         before_dispatch=lambda: order.append("guard") or False,
-        popen_factory=lambda _cmd: order.append("popen") or SimpleNamespace(pid=4321),
+        popen_factory=lambda _cmd, **_kwargs: order.append("popen") or SimpleNamespace(pid=4321),
     )
 
     assert not result.submitted
@@ -367,7 +377,7 @@ def test_captured_launch_mode_overrides_later_setting_change(monkeypatch):
     result = launch_utils.launch_direct_steam_url(
         win,
         OBJ,
-        popen_factory=lambda command: commands.append(list(command)) or SimpleNamespace(pid=4321),
+        popen_factory=lambda command, **_kwargs: commands.append(list(command)) or SimpleNamespace(pid=4321),
         skip_dayz_launcher=True,
     )
     assert result.submitted
@@ -383,7 +393,7 @@ def test_command_construction_failure_is_structured(monkeypatch):
 
 def test_popen_exception_is_structured(monkeypatch):
     monkeypatch.setattr(launch_utils, "set_launcher_shutdown_mode", lambda *_args: None)
-    def fail(_cmd):
+    def fail(_cmd, **_kwargs):
         raise OSError("synthetic failure")
     result = launch_utils.launch_direct_steam_url(LaunchWin(), OBJ, popen_factory=fail)
     assert not result.submitted
@@ -442,7 +452,7 @@ def test_application_shutdown_invalidates_pending_callbacks():
 def test_no_automatic_retry_delay_or_second_handoff_added():
     launch_source = Path("src/dzll_launcher/launch_utils.py").read_text(encoding="utf-8")
     window_source = Path("src/dzll_launcher/window.py").read_text(encoding="utf-8")
-    assert launch_source.count("popen(cmd)") == 1
+    assert launch_source.count("proc = popen(") == 1
     assert "retry" not in launch_source.lower()
     join_section = window_source.split("def _join_server_for_obj", 1)[1]
     assert "Join already in progress" in join_section

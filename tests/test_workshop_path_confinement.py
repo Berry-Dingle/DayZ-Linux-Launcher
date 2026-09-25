@@ -85,6 +85,52 @@ def _patch_authorized_local_cleanup(monkeypatch, root: Path) -> None:
     )
 
 
+def test_successful_dzll_symlink_removal_is_quiet_by_default(tmp_path, capsys):
+    proton_prefix = tmp_path / "pfx"
+    watch_folder = proton_prefix / "drive_c/users/steamuser/DZLLMods"
+    watch_folder.mkdir(parents=True)
+    target = tmp_path / "target"
+    target.mkdir()
+    link = watch_folder / f"@DZLL__{MOD_ID}"
+    link.symlink_to(target, target_is_directory=True)
+
+    removed = workshop_mods.remove_dzll_symlinks_for_mod(
+        MOD_ID, proton_prefix=str(proton_prefix),
+    )
+
+    assert removed == [str(link)]
+    assert not link.exists()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
+def test_dzll_symlink_removal_failure_remains_logged(
+    monkeypatch, tmp_path, caplog,
+):
+    proton_prefix = tmp_path / "pfx"
+    watch_folder = proton_prefix / "drive_c/users/steamuser/DZLLMods"
+    watch_folder.mkdir(parents=True)
+    target = tmp_path / "target"
+    target.mkdir()
+    link = watch_folder / f"@DZLL__{MOD_ID}"
+    link.symlink_to(target, target_is_directory=True)
+
+    def fail_unlink(_path):
+        raise OSError("synthetic failure")
+
+    monkeypatch.setattr(workshop_mods.os, "unlink", fail_unlink)
+
+    with caplog.at_level("WARNING", logger=workshop_mods.__name__):
+        removed = workshop_mods.remove_dzll_symlinks_for_mod(
+            MOD_ID, proton_prefix=str(proton_prefix),
+        )
+
+    assert removed == []
+    assert "failed to remove DZLL symlink" in caplog.text
+    assert "synthetic failure" in caplog.text
+
+
 def test_native_real_content_directory_is_accepted_and_deleted(monkeypatch, tmp_path):
     root = tmp_path / "library"
     item = _item(root)

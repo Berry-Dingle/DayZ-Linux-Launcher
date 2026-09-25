@@ -17,6 +17,7 @@ class FakeButton:
         self.label = "Cancel"
         self.visible = False
         self.sensitive = True
+        self.tooltip = ""
 
     def set_label(self, value):
         self.label = str(value)
@@ -26,6 +27,9 @@ class FakeButton:
 
     def set_sensitive(self, value):
         self.sensitive = bool(value)
+
+    def set_tooltip_text(self, value):
+        self.tooltip = str(value)
 
 
 class LifecycleHarness:
@@ -47,6 +51,7 @@ class LifecycleHarness:
         self._steam_client_safe_cancel_requested = False
         self._steam_ugc_worker_in_progress = False
         self._mod_download_backend_active = ""
+        self.background_refreshes = 0
         self.attempt = self._join_attempts.begin(
             ip="127.0.0.1", game_port=2302, query_port=27016,
             name="Synthetic", skip_dayz_launcher=skip_launcher,
@@ -77,14 +82,20 @@ class LifecycleHarness:
     def _clear_join_pending_state(self, attempt_id):
         if self._pending_join_attempt_id != int(attempt_id):
             return False
+        self._pending_server_companion_obj = None
+        self._pending_last_played_obj = None
+        self._pending_join_mod_ids = []
+        self._pending_join_mod_names_by_id = {}
         self._pending_join_attempt_id = 0
         return True
 
     def _cleanup_join_attempt(self, attempt_id, reason, *, clear_pending=True):
-        cleaned = self._join_attempts.cleanup(attempt_id, reason)
-        if cleaned and clear_pending:
-            self._clear_join_pending_state(attempt_id)
-        return cleaned
+        return window_module.DZLLWindow._cleanup_join_attempt(
+            self, attempt_id, reason, clear_pending=clear_pending,
+        )
+
+    def _refresh_background_prepare_action_states(self):
+        self.background_refreshes += 1
 
 
 for method_name in (
@@ -95,6 +106,7 @@ for method_name in (
     "_join_popup_process_detected",
     "_join_popup_watcher_failure",
     "_show_join_launch_error",
+    "_join_preparation_cancel_clicked",
 ):
     setattr(LifecycleHarness, method_name, getattr(window_module.DZLLWindow, method_name))
 
@@ -201,12 +213,68 @@ def test_genuine_download_sequence_uses_downloaded_launch_message():
 def test_watcher_timeout_is_visible_and_cleans_matching_attempt():
     harness = LifecycleHarness()
     attempt_id = harness.attempt.attempt_id
+    old_cancel_event = threading.Event()
+    old_cancel_event.set()
+    old_stop_event = threading.Event()
+    old_stop_event.set()
+    harness._join_preparation_cancel_event = old_cancel_event
+    harness._steam_client_stop_waiting_event = old_stop_event
+    harness._steam_client_safe_cancel_requested = True
+    harness._steam_ugc_worker_in_progress = True
+    harness._mod_download_backend_active = "steam_client"
+    harness._pending_server_companion_obj = object()
+    harness._pending_last_played_obj = object()
+    harness._pending_join_mod_ids = [101]
+    harness._pending_join_mod_names_by_id = {101: "Synthetic"}
+    harness.join_preparation_cancel_button.set_sensitive(False)
     assert harness._join_popup_watcher_failure(attempt_id, "Synthetic launch timeout")
     assert harness.errors == ["Synthetic launch timeout"]
     assert harness.join_preparation_cancel_button.label == "Close"
     assert harness.join_preparation_cancel_button.visible is True
+    assert harness.join_preparation_cancel_button.sensitive is True
     assert not harness._join_attempts.matches(attempt_id)
+    assert harness._pending_join_attempt_id == 0
+    assert harness._pending_server_companion_obj is None
+    assert harness._pending_last_played_obj is None
+    assert harness._pending_join_mod_ids == []
+    assert harness._pending_join_mod_names_by_id == {}
+    assert harness._join_preparation_cancel_event is not old_cancel_event
+    assert not harness._join_preparation_cancel_event.is_set()
+    assert harness._steam_client_stop_waiting_event is not old_stop_event
+    assert not harness._steam_client_stop_waiting_event.is_set()
+    assert harness._steam_client_safe_cancel_requested is False
+    assert harness._steam_ugc_worker_in_progress is False
+    assert harness._mod_download_backend_active == ""
     assert harness.close_count == 0
+
+    harness._join_preparation_cancel_clicked()
+    assert harness.close_count == 1
+
+
+def test_fresh_join_after_timeout_gets_fresh_cancel_state():
+    harness = LifecycleHarness()
+    old_attempt_id = harness.attempt.attempt_id
+    old_cancel_event = harness._join_preparation_cancel_event
+    harness.join_preparation_cancel_button.set_sensitive(False)
+
+    assert harness._join_popup_watcher_failure(old_attempt_id, "Synthetic timeout")
+    harness._join_preparation_cancel_clicked()
+
+    new_attempt = harness._join_attempts.begin(
+        ip="127.0.0.2", game_port=2402, query_port=27017,
+        name="Fresh", skip_dayz_launcher=True,
+    )
+    harness._pending_join_attempt_id = new_attempt.attempt_id
+    harness._join_preparation_cancel_event = threading.Event()
+    window_module.DZLLWindow._show_join_progress_overlay(
+        harness, "Checking & Preparing Mods for Join...",
+    )
+
+    assert new_attempt.attempt_id != old_attempt_id
+    assert harness._join_preparation_cancel_event is not old_cancel_event
+    assert not harness._join_preparation_cancel_event.is_set()
+    assert harness.join_preparation_cancel_button.label == "Cancel"
+    assert harness.join_preparation_cancel_button.sensitive is True
 
 
 def test_immediate_launch_submission_error_remains_visible():
