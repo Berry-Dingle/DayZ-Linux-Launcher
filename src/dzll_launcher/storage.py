@@ -121,7 +121,7 @@ def human_last_played(ts: int, *, now_ts: int | None = None) -> str:
     if days == 0:
         return "Today"
     if days == 1:
-        return "1 Day Ago"
+        return "Yesterday"
     return f"{days} Days Ago"
 
 def load_dead_cache() -> dict:

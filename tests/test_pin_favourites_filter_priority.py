@@ -32,7 +32,7 @@ def server(name, *, fav=False, ping=40, third_person=False, map_name="Chernarus"
         "map_name": map_name,
         "max_players": 60,
         "password": False,
-        "played": "1 Day Ago",
+        "played": "Yesterday",
         "name": name,
         "sort_ping": ping if ping >= 0 else 999999,
     }

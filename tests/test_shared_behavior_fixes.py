@@ -164,7 +164,7 @@ def test_pin_favorites_and_favorites_only_filter_keep_intentional_refresh(monkey
 @pytest.mark.parametrize(
     ("key", "a_kwargs", "b_kwargs"),
     [
-        ("played", {"played": "1 Day Ago", "sort_played_days": 1}, {"played": "2 Days Ago", "sort_played_days": 2}),
+        ("played", {"played": "Yesterday", "sort_played_days": 1}, {"played": "2 Days Ago", "sort_played_days": 2}),
         ("players", {"sort_players": 10}, {"sort_players": 20}),
         ("ping", {"sort_ping": 20}, {"sort_ping": 40}),
     ],

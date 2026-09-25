@@ -89,7 +89,7 @@ def test_bound_played_cell_updates_on_notify(monkeypatch):
     obj.played = "Today"
     assert label.text == "Today"
     factory.emit("unbind", item)
-    obj.played = "1 Day Ago"
+    obj.played = "Yesterday"
     assert label.text == "Today"
 
 
@@ -106,8 +106,8 @@ def test_recycled_played_cell_disconnects_old_object(monkeypatch):
     old.played = "Today"
     assert label.text == "2 Days Ago"
     assert len(label.writes) == writes
-    current.played = "1 Day Ago"
-    assert label.text == "1 Day Ago"
+    current.played = "Yesterday"
+    assert label.text == "Yesterday"
 
 
 def test_changing_live_time_refreshes_only_bound_time_cell(monkeypatch):

@@ -37,7 +37,7 @@ def epoch(year, month, day, hour=0, minute=0, zone="UTC"):
 
 @pytest.mark.parametrize(
     "age, expected",
-    [(0, "Today"), (1, "1 Day Ago"), (2, "2 Days Ago"),
+    [(0, "Today"), (1, "Yesterday"), (2, "2 Days Ago"),
      (5, "5 Days Ago"), (20, "20 Days Ago")],
 )
 def test_local_calendar_day_labels(local_zone, age, expected):
@@ -52,7 +52,7 @@ def test_two_minutes_across_midnight_changes_today_to_one_day(local_zone):
     local_zone("UTC")
     joined = epoch(2026, 9, 21, 23, 59)
     assert storage.human_last_played(joined, now_ts=epoch(2026, 9, 21, 23, 59)) == "Today"
-    assert storage.human_last_played(joined, now_ts=epoch(2026, 9, 22, 0, 1)) == "1 Day Ago"
+    assert storage.human_last_played(joined, now_ts=epoch(2026, 9, 22, 0, 1)) == "Yesterday"
 
 
 @pytest.mark.parametrize(
@@ -62,10 +62,10 @@ def test_two_minutes_across_midnight_changes_today_to_one_day(local_zone):
 )
 def test_dst_overnight_uses_local_dates(local_zone, joined, viewed):
     local_zone("Europe/London")
-    assert storage.local_days_ago(
-        epoch(*joined, zone="Europe/London"),
-        now_ts=epoch(*viewed, zone="Europe/London"),
-    ) == 1
+    joined_ts = epoch(*joined, zone="Europe/London")
+    viewed_ts = epoch(*viewed, zone="Europe/London")
+    assert storage.local_days_ago(joined_ts, now_ts=viewed_ts) == 1
+    assert storage.human_last_played(joined_ts, now_ts=viewed_ts) == "Yesterday"
 
 
 def test_future_and_invalid_timestamps(local_zone):
@@ -97,7 +97,7 @@ def test_timezone_change_and_persisted_epoch_recalculation(local_zone, monkeypat
     loaded = storage.load_last_played()
     assert loaded == {"server": joined}
     local_zone("UTC")
-    assert storage.human_last_played(loaded["server"], now_ts=now) == "1 Day Ago"
+    assert storage.human_last_played(loaded["server"], now_ts=now) == "Yesterday"
     local_zone("Pacific/Honolulu")
     assert storage.human_last_played(loaded["server"], now_ts=now) == "Today"
 
@@ -157,11 +157,11 @@ def test_rollover_refreshes_all_history_and_rebuilds_active_sort_once(local_zone
     original = host._rebuild_column_view_store
     host._rebuild_column_view_store = lambda **kw: (rebuilds.append(kw), original(**kw))
     assert DZLLWindow._refresh_last_played_calendar(host)
-    assert [a.played, b.played] == ["Today", "1 Day Ago"]
+    assert [a.played, b.played] == ["Today", "Yesterday"]
     assert [a.sort_played_days, b.sort_played_days] == [0, 1]
     clock[0] = epoch(2026, 9, 22, 0, 1)
     assert DZLLWindow._refresh_last_played_calendar(host)
-    assert [a.played, b.played] == ["1 Day Ago", "2 Days Ago"]
+    assert [a.played, b.played] == ["Yesterday", "2 Days Ago"]
     assert [a.sort_played_days, b.sort_played_days] == [1, 2]
     assert len(rebuilds) == 2
     assert visible.rows == [a, b]
@@ -178,7 +178,7 @@ def test_rollover_without_played_sort_updates_models_without_rebuild(local_zone,
     host, _visible = browser_host([row], {fav_key(row.ip, row.gport): now - 120})
     host._rebuild_column_view_store = lambda **_kw: pytest.fail("unneeded rebuild")
     assert DZLLWindow._refresh_last_played_calendar(host)
-    assert row.played == "1 Day Ago"
+    assert row.played == "Yesterday"
     assert row.sort_played_days == 1
 
 
@@ -194,7 +194,7 @@ def test_timezone_change_same_local_date_refreshes_history(local_zone, monkeypat
     assert row.played == "Today"
     local_zone("Pacific/Honolulu")
     DZLLWindow._refresh_last_played_calendar(host)
-    assert row.played == "1 Day Ago"
+    assert row.played == "Yesterday"
 
 
 def test_timezone_source_change_with_same_current_offset_recalculates_history(local_zone, monkeypatch):
@@ -224,7 +224,7 @@ def test_map_after_sleep_catches_up_across_midnight(local_zone, monkeypatch):
     assert row.played == "Today"
     clock[0] = epoch(2026, 9, 22, 8)
     DZLLWindow._on_last_played_map(host)
-    assert row.played == "1 Day Ago"
+    assert row.played == "Yesterday"
     assert row.sort_played_days == 1
 
 
