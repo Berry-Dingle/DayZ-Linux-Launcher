@@ -789,7 +789,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.threading = threading
 
         # Shared UGC overlay state; legacy widget names are retained for now.
-        self._steamcmd_total_missing = 0
         self._steam_ugc_progress_timer_id = 0
         self._steam_ugc_active_event = None
         self._steam_ugc_percent_label = None
@@ -1906,10 +1905,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
         self._steam_ugc_start_progress_timer()
-        total = int(getattr(self, "_steamcmd_total_missing", 0) or 0)
-        match = re.search(r"\b(\d+)\b", str(status or ""))
-        if match:
-            total = int(match.group(1))
         self._join_popup_request(
             JoinPopupPhase.CHECKING,
             "Checking & Preparing Mods for Join...",

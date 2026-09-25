@@ -493,8 +493,6 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                     backend=backend,
                 )
 
-            win._steamcmd_total_missing = int(len(download_ids))
-
             reset_done = win.threading.Event()
 
             def _ui_reset_join_preparation_overlay():
