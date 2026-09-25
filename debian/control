@@ -26,8 +26,8 @@ Depends:
  gir1.2-gdkpixbuf-2.0,
  gir1.2-graphene-1.0
 Description: native Linux launcher for DayZ
- DZLL is a native Linux launcher for DayZ with Steam Client Workshop mod
- handling and SteamCMD as an advanced fallback. Native Steam is required;
+ DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod
+ preparation. Native Steam is required;
  Flatpak Steam is unsupported. Discord Rich Presence is supported through
  the bundled pypresence fallback.
  .

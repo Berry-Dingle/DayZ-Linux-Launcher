@@ -1,7 +1,7 @@
 Name:           dzll_launcher
 Version:        0.4.0
 Release:        0.beta%{?dist}
-Summary:        DZLL is a native Linux launcher for DayZ with Steam Client Workshop mod handling and SteamCMD as an advanced fallback
+Summary:        DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation
 
 License:        LicenseRef-DZLL-Community-Source-1.0
 URL:            https://dzllauncher.uk/
@@ -24,8 +24,8 @@ Requires:       graphene
 # END AUTO-DEPS
 
 %description
-DZLL is a native Linux launcher for DayZ with Steam Client Workshop mod
-handling and SteamCMD as an advanced fallback. Native Steam is required;
+DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod
+preparation. Native Steam is required;
 Flatpak Steam is unsupported.
 
 %prep
