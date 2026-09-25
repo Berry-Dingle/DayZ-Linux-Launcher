@@ -445,7 +445,7 @@ class ModsManagerOverlay:
         self.card.set_can_target(True)
 
         # Keep existing card layout/padding styling
-        self.card.add_css_class("steamcmd-auth-card")
+        self.card.add_css_class("dzll-overlay-card")
         # Add mods-specific styling hook (bg/border/radius)
         self.card.add_css_class("mods-card")
 
@@ -482,7 +482,7 @@ class ModsManagerOverlay:
         self.confirm_title.set_xalign(0.0)
         self.confirm_title.set_wrap(True)
         self.confirm_title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.confirm_title.add_css_class("steamcmd-heading")
+        self.confirm_title.add_css_class("dzll-overlay-heading")
         self.confirm_title.add_css_class("confirmation-title")
         self.confirm_box.append(self.confirm_title)
 
@@ -1277,7 +1277,7 @@ class ModsManagerOverlay:
 
         heading = Gtk.Label(label="Manage Installed Mods")
         heading.set_xalign(0.0)
-        heading.add_css_class("steamcmd-heading")
+        heading.add_css_class("dzll-overlay-heading")
         heading.set_hexpand(True)
         header.append(heading)
 

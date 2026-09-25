@@ -103,7 +103,7 @@ def get_app_css(
         @define-color dzll_restart_confidence_learning #9ad43a;
         @define-color dzll_startup_overlay rgba(0, 0, 0, 0.55);
         @define-color dzll_startup_band rgba(0, 0, 0, 0.75);
-        @define-color dzll_steamcmd_log #33ff66;
+        @define-color dzll_join_preparation_status #33ff66;
 
         /* ---------- Explicit application-owned surfaces ---------- */
         .dzll-app-root,
@@ -1952,22 +1952,22 @@ def get_app_css(
         .issues-emoji {{ font-size: 24px; }}
         
         /* ---------- Shared mod-preparation overlay (legacy class names) ---------- */
-        .steamcmd-auth-card {{
+        .dzll-overlay-card {{
           background: alpha(@dzll_surface_settings, 0.97);
           color: @dzll_text_primary;
           border: 1px solid @dzll_border;
           border-radius: 14px;
           padding: 80px;
         }}
-        .steamcmd-heading {{
+        .dzll-overlay-heading {{
           font-size: 18px;
           font-weight: 700;
         }}
-        .steamcmd-log {{
+        .join-preparation-status {{
           font-size: 12px;
-          color: @dzll_steamcmd_log;
+          color: @dzll_join_preparation_status;
         }}
-        .steamcmd-hr {{
+        .join-preparation-separator {{
           margin-top: 6px;
           margin-bottom: 10px;
           opacity: 0.9;

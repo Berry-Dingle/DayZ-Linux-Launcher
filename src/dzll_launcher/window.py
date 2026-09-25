@@ -912,7 +912,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.start_steam_join_title.set_xalign(0.0)
         self.start_steam_join_title.set_wrap(True)
         self.start_steam_join_title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.start_steam_join_title.add_css_class("steamcmd-heading")
+        self.start_steam_join_title.add_css_class("dzll-overlay-heading")
         self.start_steam_join_box.append(self.start_steam_join_title)
 
         self.start_steam_join_text = Gtk.Label(

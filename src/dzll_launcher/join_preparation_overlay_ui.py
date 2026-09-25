@@ -41,15 +41,15 @@ class JoinPreparationOverlayUI:
         self.join_preparation_card.set_margin_top(40)
         self.join_preparation_card.set_margin_bottom(40)
         self.join_preparation_card.set_size_request(520, -1)
-        self.join_preparation_card.add_css_class("steamcmd-auth-card")
+        self.join_preparation_card.add_css_class("dzll-overlay-card")
 
         self.join_preparation_heading = Gtk.Label(label="")
         self.join_preparation_heading.set_xalign(0.0)
-        self.join_preparation_heading.add_css_class("steamcmd-heading")
+        self.join_preparation_heading.add_css_class("dzll-overlay-heading")
         self.join_preparation_card.append(self.join_preparation_heading)
 
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        separator.add_css_class("steamcmd-hr")
+        separator.add_css_class("join-preparation-separator")
         self.join_preparation_card.append(separator)
 
         log_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -60,7 +60,7 @@ class JoinPreparationOverlayUI:
         self.join_preparation_detail_label.set_xalign(0.0)
         self.join_preparation_detail_label.set_wrap(True)
         self.join_preparation_detail_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.join_preparation_detail_label.add_css_class("steamcmd-log")
+        self.join_preparation_detail_label.add_css_class("join-preparation-status")
         log_box.append(self.join_preparation_detail_label)
 
         line2_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -73,12 +73,12 @@ class JoinPreparationOverlayUI:
         self.join_preparation_status_label.set_xalign(0.0)
         self.join_preparation_status_label.set_wrap(True)
         self.join_preparation_status_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.join_preparation_status_label.add_css_class("steamcmd-log")
+        self.join_preparation_status_label.add_css_class("join-preparation-status")
         line2_row.append(self.join_preparation_status_label)
         log_box.append(line2_row)
 
         self.join_preparation_progress_bar = Gtk.ProgressBar()
-        self.join_preparation_progress_bar.add_css_class("steamcmd-progress")
+        self.join_preparation_progress_bar.add_css_class("join-preparation-progress")
         self.join_preparation_progress_bar.set_fraction(0.0)
         self.join_preparation_progress_bar.set_show_text(False)
         self.join_preparation_progress_bar.set_pulse_step(0.05)

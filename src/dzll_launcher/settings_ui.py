@@ -183,7 +183,7 @@ class SettingsUI:
         title = Gtk.Label(label="Flatpak Steam detected")
         title.set_xalign(0.0)
         title.set_wrap(True)
-        title.add_css_class("steamcmd-heading")
+        title.add_css_class("dzll-overlay-heading")
         title.add_css_class("confirmation-title")
         card.append(title)
 
