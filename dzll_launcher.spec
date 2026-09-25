@@ -16,7 +16,6 @@ BuildRequires:  python3-wheel
 BuildRequires:  python3-build
 
 # BEGIN AUTO-DEPS
-Requires:       python3-requests
 Requires:       python3-gobject
 Requires:       gtk4
 Requires:       gdk-pixbuf2
@@ -38,7 +37,7 @@ Flatpak Steam is unsupported.
 %pyproject_install
 
 install -Dm644 com.bdingle.dzll.desktop %{buildroot}%{_datadir}/applications/com.bdingle.dzll.desktop
-install -Dm644 src/dzll_launcher/images/com.bdingle.dzll.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/com.bdingle.dzll.png
+install -Dm644 src/dzll_launcher/images/com.bdingle.dzll.png %{buildroot}%{_datadir}/icons/hicolor/512x512/apps/com.bdingle.dzll.png
 install -Dm644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -Dm644 src/dzll_launcher/a2s/LICENSE %{buildroot}%{_licensedir}/%{name}/python-a2s-LICENSE
 install -Dm644 src/dzll_launcher/vendor/pypresence/LICENSE %{buildroot}%{_licensedir}/%{name}/pypresence-LICENSE
@@ -49,7 +48,7 @@ install -Dm644 src/dzll_launcher/vendor/pypresence/LICENSE %{buildroot}%{_licens
 %license %{_licensedir}/%{name}/pypresence-LICENSE
 %{_bindir}/dzll_launcher
 %{_datadir}/applications/com.bdingle.dzll.desktop
-%{_datadir}/icons/hicolor/256x256/apps/com.bdingle.dzll.png
+%{_datadir}/icons/hicolor/512x512/apps/com.bdingle.dzll.png
 %{python3_sitelib}/dzll_launcher
 %{python3_sitelib}/dzll_launcher-*.dist-info
 

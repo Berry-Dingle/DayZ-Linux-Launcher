@@ -304,7 +304,7 @@ def ensure_user_desktop_integration(
     Best-effort desktop integration for source/venv usage via: python -m dzll_launcher
 
     Behavior:
-      - installs icon to ~/.local/share/icons/hicolor/256x256/apps/com.bdingle.dzll.png
+      - installs icon to ~/.local/share/icons/hicolor/512x512/apps/com.bdingle.dzll.png
       - creates ~/.local/share/applications/<app_id>.desktop
       - launches via project venv python if available
       - supports src-layout projects
@@ -317,7 +317,7 @@ def ensure_user_desktop_integration(
     try:
         home = Path.home()
         user_apps = home / ".local/share/applications"
-        user_icons = home / ".local/share/icons/hicolor/256x256/apps"
+        user_icons = home / ".local/share/icons/hicolor/512x512/apps"
         desktop_path = user_apps / f"{app_id}.desktop"
         marker = "X-DZLL-AutoCreated=true"
         system_desktop_path = Path("/usr/share/applications") / f"{app_id}.desktop"
