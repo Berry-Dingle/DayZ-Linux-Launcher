@@ -29,6 +29,7 @@ class SteamRuntimeEvidence:
     native_helper_running: bool = False
     flatpak_process_running: bool = False
     flatpak_client_running: bool = False
+    native_client_executables: tuple[str, ...] = ()
 
 
 _FLATPAK_STEAM_APP_ID = "com.valvesoftware.steam"
@@ -40,6 +41,10 @@ _FLATPAK_STEAM_PROCESS_NAMES = {
     "pressure-vessel-wrap",
     "reaper",
 }
+_NATIVE_STEAM_SYSTEM_CANDIDATES = (
+    Path("/usr/bin/steam"),
+    Path("/usr/games/steam"),
+)
 
 
 def _vdf_unescape(value: str) -> str:
@@ -133,50 +138,146 @@ def _libraryfolders_sort_key(item) -> tuple[int, object]:
         return (1, key)
 
 
-def resolve_native_steam_cmd() -> str | None:
-    def valid_native_steam_cmd(raw_path) -> str | None:
-        raw = str(raw_path or "").strip()
-        if not raw:
-            return None
+def _path_has_flatpak_identity(path: Path) -> bool:
+    low = str(path).casefold()
+    return "flatpak" in low or "com.valvesoftware.steam" in low
+
+
+def _script_invokes_xdg_open(snippet: str) -> bool:
+    lines = str(snippet or "").splitlines()
+    if lines and "xdg-open" in lines[0].casefold() and lines[0].startswith("#!"):
+        return True
+    command_re = re.compile(
+        r"^(?:exec\s+)?(?:(?:/usr/bin/)?env\s+)?"
+        r"(?:/[^\s]+/)?xdg-open(?:\s|$)",
+        re.IGNORECASE,
+    )
+    return any(
+        command_re.match(line.strip())
+        for line in lines
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+
+
+def _valid_native_steam_cmd(raw_path, *, trusted_root: Path | None = None) -> str | None:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None
+    try:
+        candidate = Path(raw).expanduser()
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    low_name = resolved.name.casefold()
+    if (
+        low_name == "flatpak"
+        or low_name.startswith("steamcmd")
+        or _path_has_flatpak_identity(resolved)
+    ):
+        return None
+    if trusted_root is not None:
         try:
-            candidate = Path(raw).expanduser()
-            resolved = candidate.resolve()
-        except Exception:
-            return None
-        low_path = str(resolved).lower()
-        if resolved.name.lower() == "flatpak" or "flatpak" in low_path or "com.valvesoftware.steam" in low_path:
-            return None
-        try:
-            if not resolved.is_file() or not os.access(str(resolved), os.X_OK):
+            canonical_root = Path(trusted_root).expanduser().resolve()
+            if resolved.parent != canonical_root or not resolved.is_relative_to(canonical_root):
                 return None
         except Exception:
             return None
-        try:
-            snippet = resolved.read_bytes()[:8192].decode("utf-8", "ignore").lower()
-        except Exception:
-            snippet = ""
-        forbidden_launcher_markers = (
-            "flatpak",
-            "com.valvesoftware.steam",
-            "xdg-open",
-            "gtk-launch",
-            "steam://",
-        )
-        if any(marker in snippet for marker in forbidden_launcher_markers):
+    try:
+        if not resolved.is_file() or not os.access(str(resolved), os.X_OK):
             return None
-        return str(resolved)
+    except Exception:
+        return None
+    try:
+        snippet = resolved.read_bytes()[:8192].decode("utf-8", "ignore")
+    except Exception:
+        return None
+    low_snippet = snippet.casefold()
+    forbidden_launcher_markers = (
+        "flatpak",
+        "com.valvesoftware.steam",
+        "gtk-launch",
+        "steam://",
+        "steamcmd",
+    )
+    if any(marker in low_snippet for marker in forbidden_launcher_markers):
+        return None
+    # Ubuntu's native package launcher embeds the text ``xdg-open`` while
+    # generating a desktop file. Reject xdg-open only when the candidate is
+    # itself an xdg-open script/forwarder, not for an unrelated occurrence.
+    if _script_invokes_xdg_open(snippet):
+        return None
+    return str(resolved)
+
+
+def _valid_native_steam_root(raw_path) -> Path | None:
+    root = _normalize_native_library_path(raw_path)
+    if root is None or _path_has_flatpak_identity(root):
+        return None
+    try:
+        if not root.is_dir() or not (root / "steamapps").is_dir():
+            return None
+        plausible_runtime = any((
+            (root / "steam.sh").is_file(),
+            (root / "ubuntu12_32/steam").is_file(),
+            (root / "steamrt64/libsteam_api.so").is_file(),
+        ))
+    except Exception:
+        return None
+    return root if plausible_runtime else None
+
+
+def _runtime_corroborates_native_root(
+    runtime: SteamRuntimeEvidence, root: Path,
+) -> bool:
+    if not (
+        runtime.state is SteamClientState.NATIVE
+        and runtime.native_client_running
+        and not runtime.flatpak_process_running
+    ):
+        return False
+    try:
+        canonical_root = Path(root).resolve()
+    except Exception:
+        return False
+    for executable in runtime.native_client_executables:
+        try:
+            if Path(executable).resolve().is_relative_to(canonical_root):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def resolve_native_steam_cmd() -> str | None:
 
     seen: set[str] = set()
     # Never use PATH here: a user-level `steam` command can be a Flatpak,
     # desktop-handler, or URI wrapper.  Only supported system-native entries
     # are eligible, and each is resolved and inspected above.
-    candidates = [Path("/usr/bin/steam"), Path("/usr/games/steam")]
-    for candidate in candidates:
+    for candidate in _NATIVE_STEAM_SYSTEM_CANDIDATES:
         raw = str(candidate or "").strip()
         if not raw or raw in seen:
             continue
         seen.add(raw)
-        steam = valid_native_steam_cmd(raw)
+        steam = _valid_native_steam_cmd(raw)
+        if steam:
+            return steam
+
+    # A per-user steam.sh is accepted only while a native-only Steam client is
+    # live from that same canonical installation root. Merely finding a Steam
+    # directory is not launch authority.
+    try:
+        runtime = resolve_steam_runtime_state()
+        root = resolve_native_steam_root()
+    except Exception:
+        runtime = None
+        root = None
+    if (
+        runtime is not None
+        and root is not None
+        and _runtime_corroborates_native_root(runtime, root)
+    ):
+        steam = _valid_native_steam_cmd(root / "steam.sh", trusted_root=root)
         if steam:
             return steam
     return None
@@ -247,14 +348,20 @@ def launch_native_steam_silent() -> tuple[bool, str]:
     result = launch_native_steam_silent_tracked()
     return result.ok, result.error
 
-def resolve_native_steam_root() -> Path | None:
-    for path in (
+
+def _native_steam_root_candidates() -> tuple[Path, ...]:
+    return (
         Path.home() / ".local/share/Steam",
         Path.home() / ".steam/steam",
-    ):
+    )
+
+
+def resolve_native_steam_root() -> Path | None:
+    for path in _native_steam_root_candidates():
         try:
-            if path.exists():
-                return path
+            root = _valid_native_steam_root(path)
+            if root is not None:
+                return root
         except Exception:
             continue
     return None
@@ -537,6 +644,7 @@ def resolve_steam_runtime_state(proc_root: Path | None = None) -> SteamRuntimeEv
     native_helper_seen = False
     flatpak_seen = False
     flatpak_client_seen = False
+    native_client_executables: list[str] = []
     try:
         entries = list(root.iterdir())
     except Exception:
@@ -584,6 +692,12 @@ def resolve_steam_runtime_state(proc_root: Path | None = None) -> SteamRuntimeEv
                 flatpak_client_seen = True
         elif _is_native_steam_client_cmdline(text):
             native_client_seen = True
+            try:
+                executable = os.readlink(entry / "exe")
+                if executable and executable not in native_client_executables:
+                    native_client_executables.append(executable)
+            except Exception:
+                pass
         elif _is_native_steam_process_cmdline(text):
             native_helper_seen = True
 
@@ -606,6 +720,7 @@ def resolve_steam_runtime_state(proc_root: Path | None = None) -> SteamRuntimeEv
         native_helper_running=native_helper_seen,
         flatpak_process_running=flatpak_seen,
         flatpak_client_running=flatpak_client_seen,
+        native_client_executables=tuple(native_client_executables),
     )
 
 
@@ -626,7 +741,7 @@ def native_steam_ready_for_mod_manager(
 
 
 def is_flatpak_steam_running() -> bool:
-    return detect_steam_client_state() is SteamClientState.FLATPAK
+    return resolve_steam_runtime_state().flatpak_process_running
 
 
 def is_native_steam_client_running() -> bool:

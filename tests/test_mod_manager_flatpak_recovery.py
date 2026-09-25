@@ -85,11 +85,15 @@ def test_flatpak_wait_timeout_is_actionable(monkeypatch):
 
 
 def test_native_launch_uses_absolute_system_candidate_without_path_lookup():
-    source = inspect.getsource(steam_native.resolve_native_steam_cmd)
-    assert 'Path("/usr/bin/steam")' in source
-    assert 'Path("/usr/games/steam")' in source
+    source = "\n".join((
+        inspect.getsource(steam_native.resolve_native_steam_cmd),
+        inspect.getsource(steam_native._valid_native_steam_cmd),
+    ))
+    assert steam_native._NATIVE_STEAM_SYSTEM_CANDIDATES == (
+        steam_native.Path("/usr/bin/steam"),
+        steam_native.Path("/usr/games/steam"),
+    )
     assert "shutil.which" not in source
-    assert "xdg-open" in source
     assert "steam://" in source
 
 

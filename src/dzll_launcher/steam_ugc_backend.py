@@ -1581,13 +1581,6 @@ def _run_ugc_native_steam_preflight(
         eprint(f"[Steam UGC] {message}")
         return False
 
-    steam_cmd = resolve_native_steam_cmd()
-    if not steam_cmd:
-        message = "Native Steam executable was not found. DZLL UGC install cannot continue."
-        _ugc_preflight_event(progress_cb, message, ok=False, reason="native_steam_not_found", error=True)
-        eprint(f"[Steam UGC] {message}")
-        return False
-
     try:
         native_running = is_native_steam_running()
     except Exception:
@@ -1601,6 +1594,12 @@ def _run_ugc_native_steam_preflight(
             eprint(f"[Steam UGC] {message}")
             return False
         if policy is SteamLaunchPolicy.BACKEND_ALLOWED:
+            steam_cmd = resolve_native_steam_cmd()
+            if not steam_cmd:
+                message = "Native Steam executable was not found. DZLL UGC install cannot continue."
+                _ugc_preflight_event(progress_cb, message, ok=False, reason="native_steam_not_found", error=True)
+                eprint(f"[Steam UGC] {message}")
+                return False
             _ugc_preflight_event(progress_cb, "Starting Steam...")
             if cancel_event is not None and cancel_event.is_set():
                 _ugc_preflight_event(
