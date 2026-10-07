@@ -14,7 +14,9 @@ from .ui_row import (
     PING_MARKUP_COLORS,
     ServerObject,
     attach_pointer_cursor,
+    country_tooltip_for,
     flag_for,
+    new_official_badge,
     row_ping_display,
     row_players_display,
     row_stable_display,
@@ -1565,8 +1567,23 @@ def _bind_required_mods_popover_target(
         _popdown_required_mods_popover(widget)
 
 
-def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) -> None:
+def _bind_name_status(cell, obj: ServerObject | None, perf_metrics=None, *, light=False) -> None:
+    official = isinstance(obj, ServerObject) and bool(obj.official)
+    locked = isinstance(obj, ServerObject) and bool(obj.password) and not official
     lock_label = cell._dzll_lock_label
+    lock_text = "🔒" if locked else ""
+    if light:
+        _set_text_if_changed(lock_label, lock_text, perf_metrics)
+    else:
+        lock_label.set_text(lock_text)
+    lock_label.set_tooltip_text("Password Protected" if locked else None)
+    badge = getattr(cell, "_dzll_official_badge", None)
+    if badge is not None:
+        badge.set_visible(official)
+        badge.set_tooltip_text("Official Server" if official else None)
+
+
+def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) -> None:
     name_label = cell._dzll_name_label
     perspective_label = cell._dzll_perspective_label
     flag_label = cell._dzll_flag_label
@@ -1579,11 +1596,12 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) 
     cell._dzll_drag_tooltips_cleared = False
 
     if not isinstance(obj, ServerObject):
-        lock_label.set_text("")
+        _bind_name_status(cell, None)
         name_label.set_text("")
         name_label.set_tooltip_text(None)
         perspective_label.set_text("")
         flag_label.set_text("")
+        flag_label.set_tooltip_text(None)
         ipport_label.set_text("")
         ipport_label.set_tooltip_text(None)
         ipport_label._dzll_ipport_plain = ""
@@ -1598,7 +1616,7 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) 
             perf_metrics.count("name_visibility_changes", 2)
         return
 
-    lock_label.set_text("🔒" if bool(getattr(obj, "password", False)) else "")
+    _bind_name_status(cell, obj)
     server_name = (getattr(obj, "name", "") or "").strip()
     name_label.set_text(server_name)
     name_label.set_tooltip_text(server_name or None)
@@ -1613,6 +1631,7 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) 
 
     country = (getattr(obj, "country", "") or "").strip().upper()
     flag_label.set_text(flag_for(country) if len(country) == 2 else "")
+    flag_label.set_tooltip_text(country_tooltip_for(country))
 
     _flag, _country_name, ipport, _meta = row_stable_display(obj)
     mod_count = int(getattr(obj, "mod_count", 0) or 0)
@@ -1641,7 +1660,6 @@ def _bind_name_cell_light(
     obj: ServerObject | None,
     perf_metrics=None,
 ) -> None:
-    lock_label = cell._dzll_lock_label
     name_label = cell._dzll_name_label
     perspective_label = cell._dzll_perspective_label
     flag_label = cell._dzll_flag_label
@@ -1651,6 +1669,7 @@ def _bind_name_cell_light(
     mods_button_label = cell._dzll_mods_button_label
 
     current_obj = obj if isinstance(obj, ServerObject) else None
+    _bind_name_status(cell, current_obj, perf_metrics, light=True)
     cell._dzll_bound_obj = current_obj
     mods_button._dzll_bound_obj = current_obj
     # Never retain popup data from a recycled server while presentation is
@@ -1667,14 +1686,16 @@ def _bind_name_cell_light(
         cell._dzll_drag_tooltips_cleared = True
 
     if current_obj is None:
-        values = ("", "", "", "", "", "", "")
+        values = ("", "", "", "", "", "")
         has_mods = False
         ipport = ""
+        country_tooltip = None
     else:
         mod_count = int(getattr(current_obj, "mod_count", 0) or 0)
         mods_text = f"Mods: {mod_count}"
         raw_country = getattr(current_obj, "country", "") or ""
         country = raw_country.strip().upper()
+        country_tooltip = country_tooltip_for(country)
         flag_text = ""
         if len(country) == 2:
             stable_key = getattr(current_obj, "_row_stable_cache_key", None)
@@ -1693,7 +1714,6 @@ def _bind_name_cell_light(
             if len(country) == 2 and raw_country.upper() == country:
                 flag_text = stable_flag
         values = (
-            "🔒" if bool(getattr(current_obj, "password", False)) else "",
             (getattr(current_obj, "name", "") or "").strip(),
             "3P" if bool(getattr(current_obj, "third_person", False)) else "1P",
             flag_text,
@@ -1705,7 +1725,6 @@ def _bind_name_cell_light(
 
     for index, (widget, value) in enumerate(zip(
         (
-            lock_label,
             name_label,
             perspective_label,
             flag_label,
@@ -1716,9 +1735,10 @@ def _bind_name_cell_light(
         values,
     )):
         changed = _set_text_if_changed(widget, value, perf_metrics)
-        if changed and index == 3 and perf_metrics is not None:
+        if changed and index == 2 and perf_metrics is not None:
             perf_metrics.count("light_flag_updates")
     ipport_label._dzll_ipport_plain = ipport
+    flag_label.set_tooltip_text(country_tooltip)
     _set_visible_if_changed(mods_label, not has_mods, perf_metrics)
     _set_visible_if_changed(mods_button, has_mods, perf_metrics)
     if perf_metrics is not None:
@@ -1755,6 +1775,11 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         lock_label.set_valign(Gtk.Align.CENTER)
         lock_label.set_halign(Gtk.Align.CENTER)
         lock_label.set_size_request(18, -1)
+        status_slot = Gtk.Overlay()
+        status_slot.set_size_request(18, -1)
+        status_slot.set_child(lock_label)
+        official_badge = new_official_badge()
+        status_slot.add_overlay(official_badge)
         name_label = Gtk.Label(xalign=0.0)
         name_label.set_hexpand(True)
         name_label.set_halign(Gtk.Align.FILL)
@@ -1766,7 +1791,7 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         except Exception:
             pass
         name_label.add_css_class("server-name")
-        top.append(lock_label)
+        top.append(status_slot)
         top.append(name_label)
 
         bottom = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -1833,6 +1858,7 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         content.append(bottom)
         outer.append(content)
         outer._dzll_lock_label = lock_label
+        outer._dzll_official_badge = official_badge
         outer._dzll_name_label = name_label
         outer._dzll_perspective_label = perspective_label
         outer._dzll_flag_label = flag_label

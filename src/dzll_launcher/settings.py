@@ -17,6 +17,7 @@ DEFAULTS: Dict[str, Any] = {
     "hide_below_max_players": 0,
     "hide_test_servers": True,
     "prioritise_trusted_servers": False,
+    "hide_official_servers": False,
     "pin_favorite_servers": False,
     # Title bar counts
     "show_counts_in_title_bar": False,

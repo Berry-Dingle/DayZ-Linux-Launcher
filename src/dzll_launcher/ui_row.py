@@ -1,6 +1,8 @@
 # ui_row.py
 import os
 import time
+from functools import lru_cache
+from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "4.0")
@@ -30,6 +32,23 @@ PING_MARKUP_COLORS = {
     "ping-bad": "#e04b4b",
     "ping-offline": "#e04b4b",
 }
+
+
+@lru_cache(maxsize=1)
+def official_badge_texture():
+    """Load the package SVG once; recycled rows share the resulting texture."""
+    path = Path(__file__).resolve().parent / "images" / "official-badge.svg"
+    return Gdk.Texture.new_from_filename(str(path))
+
+
+def new_official_badge() -> Gtk.Picture:
+    badge = Gtk.Picture.new_for_paintable(official_badge_texture())
+    badge.set_size_request(18, 18)
+    badge.set_halign(Gtk.Align.CENTER)
+    badge.set_valign(Gtk.Align.CENTER)
+    badge.set_tooltip_text("Official Server")
+    badge.set_visible(False)
+    return badge
 
 
 def _monitor_icon_name() -> str:
@@ -241,6 +260,14 @@ def flag_for(cc: str) -> str:
     )
 
 
+def country_tooltip_for(cc: str) -> str | None:
+    country = (cc or "").strip().upper()
+    if len(country) != 2 or not country.isalpha():
+        return None
+    name = country_name_for(country)
+    return name if name != "Unknown" else None
+
+
 def fmt_timewarp(x: float) -> str:
     """
     Display as (x12) with NO decimals.
@@ -255,7 +282,7 @@ def fmt_timewarp(x: float) -> str:
         return "(x?)"
 
 
-def row_stable_display(obj) -> tuple[str, str, str, str]:
+def row_stable_display(obj) -> tuple[str, str | None, str, str]:
     key = (
         getattr(obj, "country", ""),
         getattr(obj, "ip", ""),
@@ -282,7 +309,7 @@ def row_stable_display(obj) -> tuple[str, str, str, str]:
 
     obj._row_stable_cache_key = key
     obj._row_flag_text = flag_for(country)
-    obj._row_country_tooltip = country_name_for(country)
+    obj._row_country_tooltip = country_tooltip_for(country)
     obj._row_ipport_plain = ipport
     obj._row_meta_text = f"{ipport}   {mods_txt}"
     return obj._row_flag_text, obj._row_country_tooltip, obj._row_ipport_plain, obj._row_meta_text
@@ -383,6 +410,7 @@ class ServerObject(GObject.Object):
     # Core display fields
     fav = GObject.Property(type=bool, default=False)
     password = GObject.Property(type=bool, default=False)
+    official = GObject.Property(type=bool, default=False)
     third_person = GObject.Property(type=bool, default=False)
 
     name = GObject.Property(type=str, default="")
@@ -497,6 +525,10 @@ class ServerRowWidget(Gtk.Box):
             self.light_lock_label.set_ellipsize(Pango.EllipsizeMode.NONE)
             self.light_lock_label.set_width_chars(2)
             self.light_lock_label.set_size_request(-1, 16)
+            light_status_slot = Gtk.Overlay()
+            light_status_slot.set_child(self.light_lock_label)
+            self.light_official_badge = new_official_badge()
+            light_status_slot.add_overlay(self.light_official_badge)
             self.light_perspective_label = Gtk.Label(xalign=0.5)
             self.light_perspective_label.set_single_line_mode(True)
             self.light_perspective_label.set_ellipsize(Pango.EllipsizeMode.NONE)
@@ -504,7 +536,7 @@ class ServerRowWidget(Gtk.Box):
             self.light_perspective_label.set_size_request(-1, 16)
             self.light_perspective_label.add_css_class("perspective-badge")
             self._light_perspective_css_class = None
-            status_box.append(self.light_lock_label)
+            status_box.append(light_status_slot)
             status_box.append(self.light_perspective_label)
 
             name_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
@@ -586,7 +618,11 @@ class ServerRowWidget(Gtk.Box):
         self.lock_wrap.set_margin_start(6)
         self.lock_lbl = Gtk.Label(label="🔒")
         self.lock_lbl.set_tooltip_text("Password Protected")
-        self.lock_wrap.append(self.lock_lbl)
+        lock_slot = Gtk.Overlay()
+        lock_slot.set_child(self.lock_lbl)
+        self.official_badge = new_official_badge()
+        lock_slot.add_overlay(self.official_badge)
+        self.lock_wrap.append(lock_slot)
         line1.append(self.lock_wrap)
 
         self.name_label = Gtk.Label(xalign=0)
@@ -872,7 +908,7 @@ class ServerRowWidget(Gtk.Box):
             self._render_from_obj(obj)
 
         props = [
-            "fav", "password", "third_person", "name", "country", "ip", "gport",
+            "fav", "password", "official", "third_person", "name", "country", "ip", "gport",
             "mod_count", "mods_preview", "time", "timewarp", "played",
             "map_name", "players", "max_players", "queue", "ping",
         ]
@@ -946,6 +982,20 @@ class ServerRowWidget(Gtk.Box):
         except Exception:
             pass
 
+    def _render_status_slot(self, obj: ServerObject, *, light: bool = False):
+        official = bool(obj.official)
+        locked = bool(obj.password) and not official
+        if light:
+            self.light_lock_label.set_text("🔒" if locked else "")
+            self.light_lock_label.set_tooltip_text("Password Protected" if locked else None)
+            self.light_official_badge.set_visible(official)
+            self.light_official_badge.set_tooltip_text("Official Server" if official else None)
+        else:
+            self._set_opacity_if_changed(self.lock_lbl, 1.0 if locked else 0.0)
+            self._set_tooltip_if_changed(self.lock_lbl, "Password Protected" if locked else None)
+            self.official_badge.set_visible(official)
+            self._set_tooltip_if_changed(self.official_badge, "Official Server" if official else None)
+
     def _render_from_obj(self, obj: ServerObject):
         start = time.perf_counter() if PERF_LOG_ENABLED else None
         last = start
@@ -969,7 +1019,7 @@ class ServerRowWidget(Gtk.Box):
             self._fav_state = fav
             mark("fav")
 
-            self._set_opacity_if_changed(self.lock_lbl, 1.0 if obj.password else 0.0)
+            self._render_status_slot(obj)
             mark("other")
             if bool(obj.third_person):
                 self._set_label_text_if_changed(self.tp_lbl, "3P")
@@ -1043,7 +1093,7 @@ class ServerRowWidget(Gtk.Box):
         self._set_single_css_class(self.star_btn, "_fav_css_class", "fav-on" if fav else "fav-off", ("fav-on", "fav-off"))
         self._fav_state = fav
 
-        self._set_opacity_if_changed(self.lock_lbl, 1.0 if obj.password else 0.0)
+        self._render_status_slot(obj)
         if bool(obj.third_person):
             self._set_label_text_if_changed(self.tp_lbl, "3P")
             self._set_single_css_class(
@@ -1065,9 +1115,10 @@ class ServerRowWidget(Gtk.Box):
         full_name = obj.name or ""
         self._set_label_text_if_changed(self.name_label, full_name)
 
-        flag, _country_tooltip, ipport_plain, _meta_text = row_stable_display(obj)
+        flag, country_tooltip, ipport_plain, _meta_text = row_stable_display(obj)
         self._ipport_plain = ipport_plain
         self._set_label_text_if_changed(self.flag_label, flag)
+        self._set_tooltip_if_changed(self.flag_label, country_tooltip)
         self._set_label_text_if_changed(self.meta_label, ipport_plain)
 
         self._set_label_text_if_changed(self.time_main, "")
@@ -1156,12 +1207,13 @@ class ServerRowWidget(Gtk.Box):
         self.light_map_label.set_text((getattr(obj, "map_name", "") or "").strip())
 
     def _render_light_password(self, obj: ServerObject):
-        self.light_lock_label.set_text("🔒" if bool(getattr(obj, "password", False)) else "")
+        self._render_status_slot(obj, light=True)
 
     def _render_light_address(self, obj: ServerObject):
         country = (getattr(obj, "country", "") or "").strip().upper()
         flag_text = flag_for(country) if len(country) == 2 else ""
         self.light_flag_label.set_text(flag_text)
+        self.light_flag_label.set_tooltip_text(country_tooltip_for(country))
         ip = (getattr(obj, "ip", "") or "").strip()
         try:
             gport = int(getattr(obj, "gport", 0) or 0)
@@ -1201,9 +1253,11 @@ class ServerRowWidget(Gtk.Box):
             self._render_light_map(obj)
         elif name == "fav":
             self._render_light_fav(obj)
+        elif name in ("password", "official"):
+            self._render_light_password(obj)
 
     def _connect_light_notifies(self, obj: ServerObject):
-        props = ["players", "max_players", "queue", "ping", "time", "timewarp", "played", "map_name"]
+        props = ["players", "max_players", "queue", "ping", "time", "timewarp", "played", "map_name", "password", "official"]
         if LIGHT_ROW_FAV_ENABLED:
             props.append("fav")
         for prop in props:

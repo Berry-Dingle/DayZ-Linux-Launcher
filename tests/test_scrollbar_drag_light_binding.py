@@ -3,10 +3,16 @@ from types import SimpleNamespace
 import weakref
 from pathlib import Path
 
+import gi
 import pytest
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+from gi.repository import Gdk, Gtk
 
 from dzll_launcher import column_view
 from dzll_launcher import scrollbar_interaction as interaction_module
+from dzll_launcher import ui_row
 from dzll_launcher.scrollbar_interaction import (
     BoundCellRegistry,
     ScrollbarDragLightController,
@@ -64,10 +70,17 @@ class FakeWidget:
     def set_cursor(self, value):
         self.cursor = value
 
+    def add_css_class(self, _value):
+        pass
+
+    def remove_css_class(self, _value):
+        pass
+
 
 def make_name_cell():
     return SimpleNamespace(
         _dzll_lock_label=FakeWidget("stale"),
+        _dzll_official_badge=FakeWidget(visible=False),
         _dzll_name_label=FakeWidget("stale"),
         _dzll_perspective_label=FakeWidget("stale"),
         _dzll_flag_label=FakeWidget("stale"),
@@ -76,6 +89,80 @@ def make_name_cell():
         _dzll_mods_button=FakeWidget("", True),
         _dzll_mods_button_label=FakeWidget("stale"),
     )
+
+
+@pytest.mark.parametrize("light", [False, True])
+def test_country_flag_tooltip_and_recycled_name_cell(monkeypatch, light):
+    monkeypatch.setattr(column_view, "_set_required_mods_pointer_cursor", lambda *_args: None)
+    bind = column_view._bind_name_cell_light if light else column_view._bind_name_cell
+    cell = make_name_cell()
+
+    for country, expected in (
+        ("GB", "United Kingdom"),
+        ("DE", "Germany"),
+        ("FR", "France"),
+        ("ZZ", None),
+        ("", None),
+        ("USA", None),
+        ("1!", None),
+    ):
+        bind(cell, column_view.ServerObject(country=country))
+        assert cell._dzll_flag_label.tooltip == expected
+
+    bind(cell, column_view.ServerObject(country="GB"))
+    bind(cell, None)
+    assert cell._dzll_flag_label.tooltip is None
+
+
+@pytest.mark.parametrize("light", [False, True])
+def test_legacy_country_flag_tooltip_rebind(monkeypatch, light):
+    Gtk.init_check()
+    if Gdk.Display.get_default() is None:
+        pytest.skip("usable GTK display is unavailable")
+    monkeypatch.setattr(ui_row, "LIGHT_ROWS_ENABLED", light)
+    row = ui_row.ServerRowWidget(None, lambda *_: None, lambda *_: None, lambda *_: None)
+    flag = row.light_flag_label if light else row.flag_label
+    for country, expected in (
+        ("GB", "United Kingdom"),
+        ("DE", "Germany"),
+        ("FR", "France"),
+        ("ZZ", None),
+        ("", None),
+        ("USA", None),
+    ):
+        row.bind(column_view.ServerObject(country=country))
+        assert flag.get_tooltip_text() == expected
+
+
+@pytest.mark.parametrize("light", [False, True])
+def test_official_badge_precedence_and_recycled_name_cell(monkeypatch, light):
+    monkeypatch.setattr(column_view, "_set_required_mods_pointer_cursor", lambda *_args: None)
+    cell = make_name_cell()
+    bind = column_view._bind_name_cell_light if light else column_view._bind_name_cell
+
+    official = column_view.ServerObject(name="Official", official=True, password=True)
+    bind(cell, official)
+    assert cell._dzll_official_badge.visible
+    assert cell._dzll_official_badge.tooltip == "Official Server"
+    assert cell._dzll_lock_label.text == ""
+    assert cell._dzll_lock_label.tooltip is None
+
+    passworded = column_view.ServerObject(name="Community", password=True)
+    bind(cell, passworded)
+    assert not cell._dzll_official_badge.visible
+    assert cell._dzll_official_badge.tooltip is None
+    assert cell._dzll_lock_label.text == "🔒"
+    assert cell._dzll_lock_label.tooltip == "Password Protected"
+
+    bind(cell, column_view.ServerObject(name="Open"))
+    assert not cell._dzll_official_badge.visible
+    assert cell._dzll_official_badge.tooltip is None
+    assert cell._dzll_lock_label.text == ""
+    assert cell._dzll_lock_label.tooltip is None
+
+    bind(cell, None)
+    assert not cell._dzll_official_badge.visible
+    assert cell._dzll_official_badge.tooltip is None
 
 
 def test_controller_feature_gate_is_active_only_between_begin_and_settle():

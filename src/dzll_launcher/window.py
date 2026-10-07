@@ -5678,6 +5678,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
             password = _db_advisory_flag(dbrow.get("password"))
             third_person = _db_advisory_flag(dbrow.get("third_person"))
+            official = type(dbrow.get("official")) is int and dbrow.get("official") == 1
 
             raw_mods_json = dbrow.get("mods")
             mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
@@ -5717,6 +5718,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 fav=fav,
                 password=password,
                 third_person=third_person,
+                official=official,
                 name=name,
                 country=country,
                 ip=ip,
@@ -7828,6 +7830,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._filter_state = state
         k = getattr(obj, "filter_key", None) or fav_key(obj.ip, obj.gport)
         is_fav = bool(getattr(self, "favorites", {}).get(k, False))
+        if bool(state.get("hide_official_servers", False)) and bool(getattr(obj, "official", False)) and not is_fav:
+            return False
 
         live = state.get("live", {}).get(k)
         if not is_fav and live and bool(live.get("hide_high_ping", False)):
@@ -7933,6 +7937,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "played_only": active("cb_played_only"),
             "selected_map": selected_map,
             "hide_test_servers": bool(self.settings.get("hide_test_servers", True)),
+            "hide_official_servers": bool(self.settings.get("hide_official_servers", False)),
             "max_players_cutoff": max_players_cutoff,
         }
 

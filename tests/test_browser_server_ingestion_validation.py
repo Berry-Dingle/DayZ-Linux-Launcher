@@ -103,20 +103,71 @@ def _load(host, rows):
     return window.DZLLWindow._load_rows_into_store(host, rows)
 
 
-def _write_server_database(path, rows):
+def _write_server_database(path, rows, *, include_official=False):
     connection = sqlite3.connect(path)
-    connection.execute(
-        """CREATE TABLE servers (
-            ip, gport, qport, name, map, players, maxPlayers, password,
-            mods, modCount, third_person, timeWarp, time, country, ping, bm_rank
-        )"""
+    columns = (
+        "ip", "gport", "qport", "name", "map", "players", "maxPlayers",
+        "password", "mods", "modCount", "third_person", "timeWarp", "time",
+        "country", "ping", "bm_rank",
     )
+    connection.execute(
+        "CREATE TABLE servers (" + ", ".join(columns) +
+        (", official" if include_official else "") + ")"
+    )
+    placeholders = ",".join("?" for _ in range(len(columns) + int(include_official)))
     connection.executemany(
-        "INSERT INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [tuple(row.values()) for row in rows],
+        f"INSERT INTO servers VALUES ({placeholders})",
+        [
+            tuple(row.get(column) for column in columns) +
+            ((row.get("official"),) if include_official else ())
+            for row in rows
+        ],
     )
     connection.commit()
     connection.close()
+
+
+@pytest.mark.parametrize("include_official", [False, True])
+def test_optional_official_column_reads_and_old_database_remains_usable(
+    tmp_path, monkeypatch, include_official,
+):
+    local_path = tmp_path / "local.db"
+    published_path = tmp_path / "published.db"
+    rows = [_row("1.1.1.1"), _row("2.2.2.2"), _row("3.3.3.3")]
+    for row, value in zip(rows, (1, 0, None)):
+        row["official"] = value
+    _write_server_database(published_path, rows, include_official=include_official)
+    monkeypatch.setattr(db, "_fetch_db_bytes_with_retries", published_path.read_bytes)
+    monkeypatch.setattr(db, "DB_LOCAL_DIR", str(tmp_path))
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(local_path))
+
+    assert db.fetch_db_overwrite_local() is True
+    read = db.read_servers_from_db()
+    by_ip = {row["ip"]: row["official"] for row in read}
+    assert by_ip == (
+        {"1.1.1.1": 1, "2.2.2.2": 0, "3.3.3.3": None}
+        if include_official else
+        {"1.1.1.1": None, "2.2.2.2": None, "3.3.3.3": None}
+    )
+    host = _BrowserHost()
+    assert _load(host, read) is True
+    assert {obj.ip: obj.official for obj in host.store.items} == (
+        {"1.1.1.1": True, "2.2.2.2": False, "3.3.3.3": False}
+        if include_official else
+        {"1.1.1.1": False, "2.2.2.2": False, "3.3.3.3": False}
+    )
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1, True), (0, False), (None, False), ("1", False), (2, False), (True, False), ("official", False)],
+)
+def test_official_mapping_accepts_only_integer_one(value, expected):
+    host = _BrowserHost()
+    row = _row("1.2.3.4")
+    row["official"] = value
+    assert _load(host, [row]) is True
+    assert host.store.items[0].official is expected
 
 
 def test_read_servers_uses_safe_read_only_uri_for_unusual_path(tmp_path, monkeypatch):

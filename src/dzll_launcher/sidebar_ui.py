@@ -1347,6 +1347,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
         "Trusted First",
         tooltip="Prioritise trusted servers:\nTop 100 first\nTop 1,000 next\nTop 2,000 next\nAll others after",
     ))
+    default_filters.append(sidebar_setting_checkbutton("hide_official_servers", "Hide Official Servers"))
     default_filters.append(compact_int_setting_entry("high_ping_cutoff_ms", "Max Ping Cutoff (ms)"))
     default_filters.append(compact_int_setting_entry(
         "hide_below_max_players",

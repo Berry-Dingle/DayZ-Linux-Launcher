@@ -233,6 +233,31 @@ def test_real_window_constructs_from_fresh_isolated_state(isolated_window_state)
         _close_window(app, window)
 
 
+def test_official_sidebar_toggle_restores_saves_and_refreshes_real_window(
+    isolated_window_state, monkeypatch,
+):
+    path = isolated_window_state["config"] / "settings.json"
+    path.write_text(
+        '{"discord_rich_presence":false,"hide_official_servers":true}',
+        encoding="utf-8",
+    )
+    app = _new_app()
+    window = window_module.DZLLWindow(app)
+    try:
+        toggle = window._sidebar_settings_widgets["hide_official_servers"]
+        assert toggle.get_active()
+        assert window._build_filter_state()["hide_official_servers"] is True
+        refreshes = []
+        monkeypatch.setattr(window, "_on_filter_changed", lambda **kw: refreshes.append(kw))
+        toggle.set_active(False)
+        assert window.settings["hide_official_servers"] is False
+        assert settings.load_settings()["hide_official_servers"] is False
+        assert window._build_filter_state()["hide_official_servers"] is False
+        assert refreshes == [{"reason": "settings"}]
+    finally:
+        _close_window(app, window)
+
+
 def test_real_window_accepts_invalid_persisted_numeric_setting(
     isolated_window_state,
 ):
