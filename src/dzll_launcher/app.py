@@ -6,7 +6,7 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import Gtk
+from gi.repository import GLib, Gtk
 
 from .config import APP_ID
 from .window import DZLLWindow
@@ -209,6 +209,7 @@ class DZLLApp(Gtk.Application):
 
 
 def main():
+    GLib.set_application_name("DayZ Linux Launcher")
     app = DZLLApp()
     original_argv = list(sys.argv)
     status = app.run(original_argv)
