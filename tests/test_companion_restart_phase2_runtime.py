@@ -5,6 +5,7 @@ import json
 import textwrap
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -24,6 +25,54 @@ DAY = 24 * scoring.HOUR
 
 def paths(tmp_path):
     return tmp_path / storage.PHASE2_ACTIVE_FILENAME, tmp_path / storage.LEGACY_PHASE1_FILENAME
+
+
+def test_presentation_candidate_ranking_and_evidence_boundary():
+    def candidate(period, confidence, direct=0.0, compatible=0.0, hints=0):
+        return SimpleNamespace(
+            period_seconds=period,
+            fundamental_period_confidence=confidence,
+            direct_support=direct,
+            compatible_multiple_support=compatible,
+            fundamental_relationship_count=0,
+            hints=SimpleNamespace(event_count=hints),
+        )
+
+    empty = SimpleNamespace(candidates=(candidate(2 * scoring.HOUR, 0.0),))
+    assert runtime.presentation_period_candidate(None) is None
+    assert runtime.presentation_period_candidate(empty) is None
+    score = SimpleNamespace(candidates=(
+        candidate(2 * scoring.HOUR, 0.12, direct=1),
+        candidate(3 * scoring.HOUR, 0.27, direct=1),
+        candidate(4 * scoring.HOUR, 0.532, direct=1),
+    ))
+    assert runtime.presentation_period_candidate(score) == (4 * scoring.HOUR, 0.532)
+    assert runtime.presentation_period_candidate(score, period_seconds=2 * scoring.HOUR) == (2 * scoring.HOUR, 0.12)
+    assert runtime.presentation_period_candidate(score, period_seconds=6 * scoring.HOUR) is None
+
+    tied = SimpleNamespace(candidates=(
+        candidate(2 * scoring.HOUR, 0.27, direct=1),
+        candidate(3 * scoring.HOUR, 0.27, direct=2),
+        candidate(4 * scoring.HOUR, 0.27, direct=2),
+    ))
+    assert runtime.presentation_period_candidate(tied) == (3 * scoring.HOUR, 0.27)
+    unsupported = SimpleNamespace(candidates=(candidate(4 * scoring.HOUR, 0.53),))
+    assert runtime.presentation_period_candidate(unsupported) is None
+
+
+def test_runtime_presentation_projection_does_not_change_score(tmp_path):
+    value, _, _ = make_runtime(tmp_path)
+    score = SimpleNamespace(candidates=(SimpleNamespace(
+        period_seconds=4 * scoring.HOUR,
+        fundamental_period_confidence=0.532,
+        direct_support=2.0,
+        compatible_multiple_support=0.26,
+        fundamental_relationship_count=3,
+        hints=SimpleNamespace(event_count=0),
+    ),))
+    value._servers[SERVER] = SimpleNamespace(score=score)
+    assert value.presentation_period_candidate(SERVER) == (4 * scoring.HOUR, 0.532)
+    assert value._servers[SERVER].score is score
 
 
 def make_runtime(tmp_path, *, legacy=None):

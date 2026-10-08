@@ -14,6 +14,7 @@ from dzll_launcher.server_companion_ui import (
     format_restart_local_time,
     restart_learning_presentation,
 )
+from dzll_launcher.window import companion_display_confidence_summary
 
 
 NOW = 1_800_000_000.0
@@ -106,7 +107,7 @@ def test_pattern_observed_uses_schedule_confidence_and_learning_wording():
         decision(ConsumerModelStatus.PATTERN_OBSERVED, schedule=0.65),
         now=NOW,
     )
-    assert summary["cycle_text"] == "Recurring timing observed"
+    assert summary["cycle_text"] == "Learning Restart Pattern"
     assert summary["confidence_kind"] == "pattern"
     assert summary["confidence_percent"] == 65
     assert summary["confidence_label"] == "Pattern Confidence:"
@@ -117,7 +118,7 @@ def test_pattern_observed_uses_schedule_confidence_and_learning_wording():
 
     panel = apply_to_fake_panel(summary)
     assert panel.restart_cycle_label.text == "Restart Cycle:"
-    assert panel.restart_cycle_value_label.text == "Recurring timing observed"
+    assert panel.restart_cycle_value_label.text == "Learning Restart Pattern"
     assert panel.restart_confidence_label.text == "Pattern Confidence:"
     assert panel.restart_confidence_value_label.text == "65%"
     assert "0%" not in panel.restart_confidence_value_label.text
@@ -138,6 +139,72 @@ def test_low_pattern_confidence_near_display_threshold_is_never_green():
     assert presentation["confidence_style_class"] not in {"ping-greeny", "ping-good"}
 
 
+def test_pattern_only_exact_candidate_reaches_final_panel_without_safety_changes():
+    original = {
+        "confidence_percent": 95,
+        "confidence_kind": "pattern",
+        "confidence_label": "Confidence:",
+        "confidence_visible": True,
+        "cycle_text": "Still Learning",
+        "presentation_key": "pattern_only",
+        "next_visible": False,
+        "countdown_visible": False,
+        "countdown_safe": False,
+        "prediction_usable": False,
+        "reason_codes": ("presentation:pattern_only",),
+    }
+    summary = companion_display_confidence_summary(
+        original, (4 * 3600, 0.532), period_seconds=None
+    )
+    panel = apply_to_fake_panel(summary)
+    assert panel.restart_cycle_value_label.text == "Learning Restart Pattern"
+    assert panel.restart_confidence_label.text == "Learning Confidence:"
+    assert panel.restart_confidence_value_label.text == "53%"
+    assert panel.restart_confidence_value_label.classes == {"ping-yellow"}
+    assert not panel.restart_countdown_row.visible
+    assert not panel.restart_next_row.visible
+    assert summary["reason_codes"] == original["reason_codes"]
+    assert original["confidence_percent"] == 95
+
+
+@pytest.mark.parametrize(("internal_percent", "visible_percent", "colour"), (
+    (97, 95, "ping-good"),
+    (95, 95, "ping-good"),
+    (88, 88, "ping-greeny"),
+))
+def test_selected_consumer_confidence_reaches_final_panel_unchanged(
+    internal_percent, visible_percent, colour
+):
+    original = {
+        "confidence_percent": internal_percent,
+        "confidence_visible": True,
+        "confidence_label": "Confidence:",
+        "cycle_text": "Confirmed: Every 3 hours",
+        "presentation_key": "confirmed_cycle",
+        "next_text": "1900010800",
+        "next_restart_at": 1900010800.0,
+        "next_visible": True,
+        "countdown_text": "01:23",
+        "countdown_visible": True,
+        "countdown_safe": True,
+        "prediction_usable": True,
+        "reason_codes": ("safe_h3_prediction_available",),
+    }
+    summary = companion_display_confidence_summary(
+        original, (3 * 3600, 0.122839), period_seconds=3 * 3600
+    )
+    panel = apply_to_fake_panel(summary)
+    assert panel.restart_cycle_value_label.text == "Every 3 Hours"
+    assert panel.restart_confidence_label.text == "Cycle Confidence:"
+    assert panel.restart_confidence_value_label.text == f"{visible_percent}%"
+    assert panel.restart_confidence_value_label.classes == {colour}
+    assert panel.restart_next_row.visible
+    assert panel.restart_countdown_row.visible
+    assert summary["confidence_percent"] == internal_percent
+    assert summary["reason_codes"] == original["reason_codes"]
+    assert summary["countdown_safe"] == original["countdown_safe"]
+
+
 def test_live_normal_four_hour_schedule_confidence_reaches_final_widget_as_95_percent():
     summary = {
         "authority_consumer": True,
@@ -156,18 +223,21 @@ def test_live_normal_four_hour_schedule_confidence_reaches_final_widget_as_95_pe
         "presentation_key": "confirmed_cycle",
         "reason_codes": ("normal_schedule_confidence_display",),
     }
+    summary = companion_display_confidence_summary(
+        summary, (4 * 3600, 0.797908), period_seconds=4 * 3600
+    )
 
     presentation = restart_learning_presentation(summary)
     panel = apply_to_fake_panel(summary)
 
     assert presentation["confidence_percent"] == 95
     assert panel.restart_cycle_value_label.text == "Every 4 Hours"
-    assert panel.restart_confidence_label.text == "Confidence:"
+    assert panel.restart_confidence_label.text == "Cycle Confidence:"
     assert panel.restart_confidence_value_label.text == "95%"
     assert (
         f"{panel.restart_confidence_label.text} "
         f"{panel.restart_confidence_value_label.text}"
-        == "Confidence: 95%"
+        == "Cycle Confidence: 95%"
     )
     assert not panel.restart_next_row.visible
     assert not panel.restart_countdown_row.visible

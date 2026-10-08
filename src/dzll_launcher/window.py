@@ -229,6 +229,48 @@ from .companion_restart_phase2_runtime import (
     phase2_learning_summary,
 )
 
+
+def companion_display_confidence_summary(
+    summary: dict | None, candidate: tuple[int, float] | None, *, period_seconds: int | None
+) -> dict | None:
+    """Label selected confidence or show a learning candidate in the UI only."""
+
+    learning = summary is None or (
+        period_seconds is None
+        and (
+            summary.get("presentation_key") in {"none", "pattern_only"}
+            or summary.get("cycle_text") in {"Still Learning", "Learning Restart Pattern"}
+        )
+    )
+    if summary is None and candidate is None:
+        return None
+    result = dict(summary or {})
+    named_cycle = period_seconds is not None and (
+        result.get("presentation_key")
+        in {"likely_cycle", "confirmed_cycle", "likely_new_cycle", "confirmed_new_cycle"}
+        or str(result.get("cycle_text") or "").startswith("Every ")
+    )
+    if named_cycle:
+        result["confidence_label"] = "Cycle Confidence:"
+        return result
+    if not learning:
+        return result
+    result["cycle_text"] = "Learning Restart Pattern"
+    result.setdefault("next_visible", False)
+    result.setdefault("countdown_visible", False)
+    result.setdefault("prediction_usable", False)
+    if candidate is None:
+        result["confidence_visible"] = False
+        return result
+    result.update(
+        confidence_percent=int(round(candidate[1] * 100)),
+        confidence_kind="period",
+        confidence_label="Learning Confidence:",
+        confidence_visible=True,
+    )
+    result.pop("confidence_severity", None)
+    return result
+
 BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET = 10
 BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING = 8
 
@@ -3787,6 +3829,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         else (*reason_codes, hold_reason)
                     ),
                 }
+            if summary_source == "schema4":
+                period_seconds = summary.get("cycle_period_seconds")
+            else:
+                period_seconds = getattr(decision, "selected_period_seconds", None)
+            projection = getattr(
+                self._companion_restart_phase2, "presentation_period_candidate", None
+            )
+            learning = period_seconds is None and (
+                summary is None
+                or summary.get("presentation_key") in {"none", "pattern_only"}
+                or summary.get("cycle_text") in {"Still Learning", "Learning Restart Pattern"}
+            )
+            candidate = (
+                projection(key, period_seconds=None)
+                if learning and callable(projection)
+                else None
+            )
+            summary = companion_display_confidence_summary(
+                summary, candidate, period_seconds=period_seconds
+            )
             return summary
         except Exception as exc:
             debug = getattr(self, "_debug_server_companion_alert", None)

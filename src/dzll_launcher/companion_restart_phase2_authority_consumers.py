@@ -777,7 +777,7 @@ def _presentation_text(decision: AuthorityConsumerDecision) -> str:
     label = decision.cycle_label or ""
     return {
         AuthorityPresentationKey.NONE: "--",
-        AuthorityPresentationKey.PATTERN_ONLY: "Recurring timing observed",
+        AuthorityPresentationKey.PATTERN_ONLY: "Learning Restart Pattern",
         AuthorityPresentationKey.LIKELY_CYCLE: f"Likely: {label}",
         AuthorityPresentationKey.CONFIRMED_CYCLE: f"Confirmed: {label}",
         AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED: "Schedule change suspected",
