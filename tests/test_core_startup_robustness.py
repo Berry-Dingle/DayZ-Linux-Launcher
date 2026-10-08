@@ -167,7 +167,7 @@ def isolated_window_state(tmp_path, monkeypatch):
 
     monkeypatch.setattr(settings, "SETTINGS_PATH", str(config_dir / "settings.json"))
     (config_dir / "settings.json").write_text(
-        '{"discord_rich_presence":false}', encoding="utf-8"
+        '{"discord_rich_presence":false,"auto_check_updates":false}', encoding="utf-8"
     )
     for name, filename in (
         ("FAV_PATH", "favorites.json"),
@@ -190,6 +190,9 @@ def isolated_window_state(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(window_module, "ensure_user_desktop_integration", lambda **_kw: None)
     monkeypatch.setattr(window_module, "PERF_LOG_ENABLED", False)
+    # These tests exercise window construction and cleanup, not the network
+    # startup updater. Prevent its idle callback from starting an executor job.
+    monkeypatch.setattr(window_module.DZLLWindow, "_begin_startup_update", lambda self: False)
     return {"config": config_dir, "cache": cache_dir}
 
 
