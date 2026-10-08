@@ -81,7 +81,8 @@ def test_legacy_light_row_badge_and_lock_precedence():
     if not ui_row.LIGHT_ROWS_ENABLED:
         pytest.skip("legacy light row mode is disabled")
 
-    row = ServerRowWidget(None, lambda *_: None, lambda *_: None, lambda *_: None)
+    col_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(7)]
+    row = ServerRowWidget(col_groups, lambda *_: None, lambda *_: None, lambda *_: None)
     row.bind(ServerObject(official=True, password=True))
     assert row.light_official_badge.get_visible()
     assert row.light_official_badge.get_tooltip_text() == "Official Server"

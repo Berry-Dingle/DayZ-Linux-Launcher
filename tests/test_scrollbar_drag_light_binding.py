@@ -120,7 +120,8 @@ def test_legacy_country_flag_tooltip_rebind(monkeypatch, light):
     if Gdk.Display.get_default() is None:
         pytest.skip("usable GTK display is unavailable")
     monkeypatch.setattr(ui_row, "LIGHT_ROWS_ENABLED", light)
-    row = ui_row.ServerRowWidget(None, lambda *_: None, lambda *_: None, lambda *_: None)
+    col_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(7)]
+    row = ui_row.ServerRowWidget(col_groups, lambda *_: None, lambda *_: None, lambda *_: None)
     flag = row.light_flag_label if light else row.flag_label
     for country, expected in (
         ("GB", "United Kingdom"),
