@@ -3570,8 +3570,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _on_server_companion_undocked_close_request(self, *_args):
         if bool(getattr(self, "_server_companion_reparenting", False)):
             return False
-        self._debug_server_companion_dock("undocked window close requested")
-        self._dock_server_companion()
+        self._debug_server_companion_dock("undocked window close requested; turning off companion")
+        self.set_server_companion_enabled(False)
         return True
 
     def _update_server_companion_undocked_size(self) -> None:

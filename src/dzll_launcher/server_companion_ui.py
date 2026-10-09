@@ -516,10 +516,12 @@ class ServerCompanionPanel(Gtk.Box):
             self.add_css_class("server-companion-panel-docked")
             self.dock_toggle_btn.set_label("↗")
             self.dock_toggle_btn.set_tooltip_text("Undock Companion")
+            self.power_off_btn.set_visible(True)
         else:
             self.remove_css_class("server-companion-panel-docked")
             self.dock_toggle_btn.set_label("↙")
             self.dock_toggle_btn.set_tooltip_text("Dock Companion")
+            self.power_off_btn.set_visible(False)
 
     def restart_learning_visible(self) -> bool:
         return bool(self.restart_learning_box.get_visible())
