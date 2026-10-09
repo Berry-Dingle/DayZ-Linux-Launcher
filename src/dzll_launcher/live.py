@@ -319,21 +319,27 @@ def _reassemble_dayz_rules_chunks(rules: dict) -> bytes | None:
         return None
 
 
-def _unescape_dayz_rules_payload(buf: bytes) -> bytes:
-    """Undo DayZ's escaping of low bytes (0x00-0x03) within a rules payload.
+# DayZ escapes exactly 4 bytes that can't appear raw in a rules payload -
+# 0x00 (would truncate the null-terminated A2S_RULES value), 0x01 (the
+# escape marker itself), and two others (0x02, 0xFF) that presumably collide
+# with other protocol-level markers. Each is written as 0x01 followed by its
+# index in this table, *not* its literal value - verified against a real
+# server's confirmed Workshop IDs, where index 3 decodes to 0xFF, not 0x03.
+_DAYZ_RULES_ESCAPE_TABLE = (0x00, 0x01, 0x02, 0xFF)
 
-    The payload is embedded in a null-terminated A2S_RULES value, so any
-    occurrence of byte 0x00-0x03 in the original data is escaped as the
-    two-byte sequence 0x01 <byte> to avoid a premature null terminator
-    (and to keep 0x01 itself unambiguous).
+
+def _unescape_dayz_rules_payload(buf: bytes) -> bytes:
+    """Undo DayZ's escaping of forbidden bytes within a rules payload.
+
+    See _DAYZ_RULES_ESCAPE_TABLE for which 4 bytes are escaped and how.
     """
     out = bytearray()
     i = 0
     n = len(buf)
     while i < n:
         b = buf[i]
-        if b == 0x01 and i + 1 < n:
-            out.append(buf[i + 1])
+        if b == 0x01 and i + 1 < n and buf[i + 1] < len(_DAYZ_RULES_ESCAPE_TABLE):
+            out.append(_DAYZ_RULES_ESCAPE_TABLE[buf[i + 1]])
             i += 2
         else:
             out.append(b)
