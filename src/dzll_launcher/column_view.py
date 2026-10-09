@@ -38,6 +38,7 @@ _DUMP_COLUMNVIEW_TREE = os.environ.get("DZLL_DUMP_COLUMNVIEW_TREE") == "1"
 _DEBUG_COLUMN_SORT = os.environ.get("DZLL_DEBUG_COLUMN_SORT") == "1"
 _SORT_DEBUG_BIND_HOOK = None
 _SORTABLE_HEADER_KEYS = {
+    "FAV": "fav",
     "PLAYED": "played",
     "PLAYERS": "players",
     "PING": "ping",

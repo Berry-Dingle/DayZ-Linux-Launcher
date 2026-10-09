@@ -1080,7 +1080,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     Builds the entire sidebar and assigns the same widget refs onto `window`:
       - window.map_model
       - window.map_dropdown
-      - window.cb_show_fav / cb_1pp_only / cb_no_password / cb_online_only / cb_played_only
+      - window.cb_1pp_only / cb_3pp_only / cb_no_password / cb_online_only
       - window.reset_btn
     """
     sidebar_frame = Gtk.Overlay()
@@ -1184,10 +1184,6 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     window.map_dropdown.connect("notify::selected", lambda *_: timed_filter_callback("map", "map"))
     sidebar.append(window.map_dropdown)
 
-    row, window.cb_show_fav = sidebar_mini_toggle_row("Show Favourites")
-    window.cb_show_fav.connect("toggled", lambda *_: timed_filter_callback("show-favorites", "favourites"))
-    sidebar.append(row)
-
     row, window.cb_1pp_only = sidebar_mini_toggle_row("1st Person Only")
     sidebar.append(row)
 
@@ -1206,10 +1202,6 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     row, window.cb_online_only = sidebar_mini_toggle_row("Online Only")
     window.cb_online_only.connect("toggled", lambda *_: timed_filter_callback("online-only", "online"))
-    sidebar.append(row)
-
-    row, window.cb_played_only = sidebar_mini_toggle_row("Previously Joined", tooltip="Show servers you have joined before")
-    window.cb_played_only.connect("toggled", lambda *_: timed_filter_callback("played-only", "played"))
     sidebar.append(row)
 
     sidebar.append(hr())

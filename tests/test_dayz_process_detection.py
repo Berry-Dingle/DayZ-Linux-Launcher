@@ -449,7 +449,6 @@ def test_detected_rejoin_updates_replaced_row_persistence_and_active_order(monke
     host.column_view_store = Store([other, current])
     host.sort_key = "played"
     host.sort_asc = True
-    host._filter_state = {"played_only": False}
     host.settings.update({"pin_favorite_servers": False, "prioritise_trusted_servers": False})
     host._combined_filter_func = lambda _obj: True
     host._set_int_property_if_changed = MethodType(DZLLWindow._set_int_property_if_changed, host)
@@ -482,14 +481,13 @@ def test_detected_rejoin_updates_replaced_row_persistence_and_active_order(monke
     assert len(rebuilds) == 1
 
 
-def test_detected_join_rebuilds_played_only_membership(monkeypatch):
+def test_detected_join_without_played_sort_does_not_rebuild(monkeypatch):
     selected = ServerObject(ip="10.0.0.3", gport=2302)
     snapshots = [DayZProcessSnapshot(dayz_running=True), DayZProcessSnapshot()]
     host = _WatcherHost(lambda: snapshots.pop(0))
     host._pending_last_played_obj = selected
     host.last_played = {}
     host._obj_by_key = {fav_key(selected.ip, selected.gport): selected}
-    host._filter_state = {"played_only": True}
     host.sort_key = "ping"
     host._set_int_property_if_changed = MethodType(DZLLWindow._set_int_property_if_changed, host)
     host._update_row_sort_played_days = MethodType(DZLLWindow._update_row_sort_played_days, host)
@@ -501,7 +499,7 @@ def test_detected_join_rebuilds_played_only_membership(monkeypatch):
 
     assert selected.played == "Today"
     assert selected.sort_played_days == 0
-    assert rebuilds == [{"reorder_reason": "last-played-rejoin"}]
+    assert rebuilds == []
 
 
 @pytest.mark.parametrize("argument", ["DayZLauncher.exe", "DayZ Launcher"])

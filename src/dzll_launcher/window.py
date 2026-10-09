@@ -674,7 +674,7 @@ def _pending_import_startup_error_kind(result) -> str:
 
 
 class DZLLWindow(Gtk.ApplicationWindow):
-    SORT_KEYS = ("ping", "players", "played")  # (list sorting keys only)
+    SORT_KEYS = ("ping", "players", "played", "fav")  # (list sorting keys only)
     _ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
     def __init__(self, app: Gtk.Application):
@@ -5952,8 +5952,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
 
         changed = False
-        membership_changed = False
-        played_only = bool((getattr(self, "_filter_state", None) or {}).get("played_only", False))
         current_rows = getattr(self, "_obj_by_key", {})
         for key, ts in self.last_played.items():
             obj = current_rows.get(key)
@@ -5964,11 +5962,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if old_played != played:
                 obj.played = played
                 changed = True
-                if played_only and bool(old_played) != bool(played):
-                    membership_changed = True
             if self._update_row_sort_played_days(obj, now_ts):
                 changed = True
-        if membership_changed or (changed and getattr(self, "sort_key", None) == "played"):
+        if changed and getattr(self, "sort_key", None) == "played":
             self._rebuild_column_view_store(reorder_reason="last-played-calendar")
         self._last_played_presentation_token = token
         return changed
@@ -6116,6 +6112,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         str(getattr(obj, "ip", "") or "").lower(),
                         gport,
                     )
+                elif self.sort_key == "fav":
+                    active_value = 0 if bool(getattr(obj, "fav", False)) else 1
                 else:
                     active_value = 0
                 if not self.sort_asc:
@@ -7822,9 +7820,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not is_fav and max_players_cutoff > 0 and int(obj.max_players) < max_players_cutoff:
             return False
 
-        if bool(state.get("show_fav", False)) and not is_fav:
-            return False
-
         # 1PP Only: reject servers that allow 3PP
         if bool(state.get("one_pp_only", False)) and bool(obj.third_person):
             return False
@@ -7840,9 +7835,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if int(obj.ping) < 0:
                     return False
             except Exception:
-                return False
-        if bool(state.get("played_only", False)):
-            if not (obj.played or "").strip():
                 return False
 
         selected_map = str(state.get("selected_map") or "All Maps")
@@ -7900,12 +7892,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "mod_query": mod_query,
             "now": int(time.time()),
             "live": self.live,
-            "show_fav": active("cb_show_fav"),
             "one_pp_only": active("cb_1pp_only"),
             "three_pp_only": active("cb_3pp_only"),
             "no_password": active("cb_no_password"),
             "online_only": active("cb_online_only"),
-            "played_only": active("cb_played_only"),
             "selected_map": selected_map,
             "max_players_cutoff": max_players_cutoff,
         }
@@ -8967,7 +8957,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self.map_dropdown.set_selected(0)
             except Exception:
                 pass
-            for cb in (self.cb_show_fav, self.cb_1pp_only, self.cb_3pp_only, self.cb_no_password, self.cb_online_only, self.cb_played_only):
+            for cb in (self.cb_1pp_only, self.cb_3pp_only, self.cb_no_password, self.cb_online_only):
                 try:
                     cb.set_active(False)
                 except Exception:
@@ -9337,9 +9327,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "played": "played",
             "players": "players",
             "ping": "ping",
+            "fav": "fav",
         }
         key = title_to_key.get(key, key)
-        if key in {"players", "ping", "played"}:
+        if key in {"players", "ping", "played", "fav"}:
             if DEBUG_FILTER_TIMING and isinstance(ctx, dict):
                 ctx["action"] = f"sort:{key}"
             self._set_sort(key, timing_ctx=ctx)
@@ -10400,7 +10391,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                             k = fav_key(played_obj.ip, played_obj.gport)
                             self.last_played[k] = played_ts
                             current_obj = getattr(self, "_obj_by_key", {}).get(k) or played_obj
-                            was_played = bool((current_obj.played or "").strip())
                             now_ts = int(time.time())
                             current_obj.played = human_last_played(played_ts, now_ts=now_ts)
                             self._update_row_sort_played_days(current_obj, now_ts)
@@ -10408,10 +10398,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                                 save_last_played(self.last_played)
                             except Exception:
                                 pass
-                            played_only = bool((getattr(self, "_filter_state", None) or {}).get("played_only", False))
-                            if getattr(self, "sort_key", None) == "played" or (
-                                played_only and not was_played and bool(current_obj.played)
-                            ):
+                            if getattr(self, "sort_key", None) == "played":
                                 self._rebuild_column_view_store(reorder_reason="last-played-rejoin")
                         except Exception:
                             pass
