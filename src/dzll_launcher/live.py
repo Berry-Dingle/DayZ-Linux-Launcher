@@ -288,3 +288,61 @@ def query_server_live(
         if STATUS_DIAGNOSTICS.enabled:
             result["_a2s_diag"] = {"classification": classification, "cycle_id": cycle_id, "generation": generation}
         return result
+
+
+def parse_dayz_rules_mods(rules: dict) -> list[dict]:
+    """Parse DayZ's A2S_RULES mod convention into [{"steamWorkshopId", "name"}, ...].
+
+    DayZ servers advertise their required Workshop mods as a "modCount" rule
+    plus "mod0".."mod{N-1}" rules, each formatted "<steamWorkshopId>;<modName>".
+    """
+    if not isinstance(rules, dict):
+        return []
+    try:
+        mod_count = int(rules.get("modCount") or 0)
+    except Exception:
+        mod_count = 0
+    if mod_count <= 0:
+        return []
+
+    mods = []
+    seen = set()
+    for i in range(mod_count):
+        entry = rules.get(f"mod{i}")
+        if not entry:
+            continue
+        workshop_id_text, _, name = str(entry).partition(";")
+        try:
+            workshop_id = int(workshop_id_text.strip())
+        except (TypeError, ValueError):
+            continue
+        if workshop_id <= 0 or workshop_id in seen:
+            continue
+        seen.add(workshop_id)
+        mods.append({"steamWorkshopId": workshop_id, "name": name.strip()})
+    return mods
+
+
+def query_server_mods(ip: str, qport: int, timeout: float = 3.0) -> dict:
+    """Query A2S_RULES for a server's required-mod list.
+
+    Unlike query_server_live() (A2S_INFO), this hits A2S_RULES - the query
+    DayZ servers actually use to advertise their Workshop mod list. Nothing
+    else in this app calls A2S_RULES: the normal server list gets its mod
+    data from the prebuilt database instead, so this only matters for
+    servers added without that database entry (Direct Connect).
+    """
+    try:
+        ip = str(ip).strip()
+        qport = int(qport)
+    except Exception:
+        return {"ok": False, "err": "invalid server endpoint"}
+    try:
+        from . import a2s
+    except Exception as e:
+        return {"ok": False, "err": f"vendored a2s unavailable: {e}"}
+    try:
+        raw_rules = a2s.rules((ip, qport), timeout=float(timeout))
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
+    return {"ok": True, "mods": parse_dayz_rules_mods(raw_rules)}

@@ -98,7 +98,7 @@ from .storage import (
 )
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
-from .live import query_server_live, is_valid_hhmm
+from .live import query_server_live, query_server_mods, is_valid_hhmm
 from .server_endpoint import (
     ServerEndpointValidationError,
     normalize_server_endpoint,
@@ -7175,21 +7175,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
             k, ip, qport = item
             obj = self._obj_by_key.get(k)
             try:
-                return (
-                    k,
-                    query_server_live(
-                        ip,
-                        qport,
-                        timeout=BROWSER_LIVE_TIMEOUT_SECS,
-                        gport=(obj.gport if obj is not None else qport),
-                        cycle_id=f"browser:{token}:{k}",
-                        generation=token,
-                        row_id=(id(obj) if obj is not None else "missing"),
-                        model_id=id(getattr(self, "column_view_store", None)),
-                    ),
+                result = query_server_live(
+                    ip,
+                    qport,
+                    timeout=BROWSER_LIVE_TIMEOUT_SECS,
+                    gport=(obj.gport if obj is not None else qport),
+                    cycle_id=f"browser:{token}:{k}",
+                    generation=token,
+                    row_id=(id(obj) if obj is not None else "missing"),
+                    model_id=id(getattr(self, "column_view_store", None)),
                 )
             except Exception as e:
                 return (k, {"ok": False, "err": str(e)})
+            if result.get("ok") and bool(self.retained_servers.get(k, {}).get("manual")):
+                try:
+                    result["mods"] = query_server_mods(ip, qport, timeout=BROWSER_LIVE_TIMEOUT_SECS)
+                except Exception:
+                    pass
+            return (k, result)
 
         def worker():
             results = []
@@ -7637,6 +7640,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if reason == "browser-live":
                 obj.refresh_pulse = int(obj.refresh_pulse) + 1
             self.live.setdefault(k, {})["offline"] = False
+            if reason == "browser-live":
+                mods_result = info.get("mods")
+                if isinstance(mods_result, dict) and mods_result.get("ok"):
+                    mod_list = mods_result.get("mods") or []
+                    mods_json = json.dumps(mod_list)
+                    if mods_json != obj.mods_json:
+                        obj.mods_json = mods_json
+                        obj.mod_count = len(mod_list)
+                        _mod_cnt, preview = parse_mods_preview(mods_json, max_names=8)
+                        obj.mods_preview = preview
+                        obj.mod_search_index = build_server_mod_index(mods_json)
             if debug_success:
                 for notify_id in notify_ids:
                     try:
@@ -9529,11 +9543,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 row_id=id(obj),
                 model_id=id(getattr(self, "column_view_store", None)),
             )
-            GLib.idle_add(self._apply_direct_connect_info, key, info)
+            mods = query_server_mods(ip, qport)
+            GLib.idle_add(self._apply_direct_connect_info, key, info, mods)
 
         self._executor.submit(worker)
 
-    def _apply_direct_connect_info(self, key: str, info: dict) -> bool:
+    def _apply_direct_connect_info(self, key: str, info: dict, mods: dict | None = None) -> bool:
         obj = self._obj_by_key.get(key)
         if obj is None:
             return False
@@ -9565,6 +9580,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._update_row_sort_ping(obj)
         self._update_row_sort_players(obj)
         self.live.setdefault(key, {})["offline"] = False
+
+        if isinstance(mods, dict) and mods.get("ok"):
+            mod_list = mods.get("mods") or []
+            mods_json = json.dumps(mod_list)
+            obj.mods_json = mods_json
+            obj.mod_count = len(mod_list)
+            _cnt, preview = parse_mods_preview(mods_json, max_names=8)
+            obj.mods_preview = preview
+            obj.mod_search_index = build_server_mod_index(mods_json)
 
         self._update_retained_cache_for_obj(obj, manual=True)
         self._on_filter_changed(reason="direct-connect")

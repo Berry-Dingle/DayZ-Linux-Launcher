@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -112,6 +113,14 @@ def test_adding_new_server_creates_row_and_manual_retained_entry(monkeypatch):
             "map": "chernarusplus",
         },
     )
+    monkeypatch.setattr(
+        window_module,
+        "query_server_mods",
+        lambda *_args, **_kwargs: {
+            "ok": True,
+            "mods": [{"steamWorkshopId": 1559212036, "name": "DayZ-Expansion-Core"}],
+        },
+    )
 
     host._add_direct_connect_server("1.2.3.4", 2302, 2303, add_favorite=False)
 
@@ -124,6 +133,10 @@ def test_adding_new_server_creates_row_and_manual_retained_entry(monkeypatch):
     assert obj.map_name == "Chernarus"
     assert obj.players == 5
     assert obj.ping == 42
+    assert obj.mod_count == 1
+    assert json.loads(obj.mods_json) == [
+        {"steamWorkshopId": 1559212036, "name": "DayZ-Expansion-Core"}
+    ]
 
     retained = host.retained_servers[key]
     assert retained["manual"] is True
@@ -138,6 +151,11 @@ def test_adding_new_server_with_favourite_checked_persists_favourite(monkeypatch
         window_module,
         "query_server_live",
         lambda *_args, **_kwargs: {"ok": False},
+    )
+    monkeypatch.setattr(
+        window_module,
+        "query_server_mods",
+        lambda *_args, **_kwargs: {"ok": False, "mods": []},
     )
 
     host._add_direct_connect_server("1.2.3.4", 2302, 2303, add_favorite=True)
@@ -170,6 +188,11 @@ def test_failed_a2s_query_marks_new_row_offline(monkeypatch):
     host = direct_connect_host()
     monkeypatch.setattr(window_module.GLib, "idle_add", lambda fn, *args, **kwargs: fn(*args, **kwargs))
     monkeypatch.setattr(window_module, "query_server_live", lambda *_args, **_kwargs: {"ok": False})
+    monkeypatch.setattr(
+        window_module,
+        "query_server_mods",
+        lambda *_args, **_kwargs: {"ok": False, "mods": []},
+    )
 
     host._add_direct_connect_server("1.2.3.4", 2302, 2303, add_favorite=False)
 
