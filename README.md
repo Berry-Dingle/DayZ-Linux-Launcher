@@ -4,6 +4,8 @@ A native Linux launcher for DayZ. Required mods are prepared through the native 
 
 🌐 Website: https://dzllauncher.uk/
 
+Join the DZLL Discord for help, feedback, testing, and community discussion: https://discord.gg/vhd6SbvAqS
+
 ![DZLL main launcher screen](src/dzll_launcher/images/dzll_main_screen.png)
 
 ---
@@ -66,9 +68,9 @@ mkdir -p ~/DayZLinuxLauncher
 cd ~/DayZLinuxLauncher
 
 # Replace with your actual file path
-tar -xzf ~/Downloads/dzll-launcher-v0.4.0-beta.tar.gz
+tar -xzf ~/Downloads/dzll-launcher-v0.4.1-beta.tar.gz
 
-cd dzll-launcher-v0.4.0-beta
+cd dzll-launcher-v0.4.1-beta
 ```
 
 ---
@@ -250,7 +252,7 @@ rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
 ## 🧠 Recommended Project Layout
 
 ```text
-dzll-launcher-v0.4.0-beta/
+dzll-launcher-v0.4.1-beta/
 ├── src/dzll_launcher/
 ├── pyproject.toml
 ├── README.md
@@ -268,8 +270,6 @@ dzll-launcher-v0.4.0-beta/
 ---
 
 ## Community / Support
-
-Join the DZLL Discord for help, feedback, testing, and community discussion: https://discord.gg/vhd6SbvAqS
 
 ## Licence
 

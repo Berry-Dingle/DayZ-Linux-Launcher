@@ -1,11 +1,11 @@
 Name:           dzll_launcher
-Version:        0.4.0
+Version:        0.4.1
 Release:        0.beta%{?dist}
 Summary:        DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation
 
 License:        LicenseRef-DZLL-Community-Source-1.0
 URL:            https://dzllauncher.uk/
-Source0:        %{name}-0.4.0b0.tar.gz
+Source0:        %{name}-0.4.1b0.tar.gz
 
 BuildArch:      noarch
 
@@ -28,7 +28,7 @@ preparation. Native Steam is required;
 Flatpak Steam is unsupported.
 
 %prep
-%autosetup -n %{name}-0.4.0b0
+%autosetup -n %{name}-0.4.1b0
 
 %build
 %pyproject_wheel
@@ -56,6 +56,9 @@ install -Dm644 src/dzll_launcher/vendor/pypresence/LICENSE %{buildroot}%{_licens
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "import dzll_launcher"
 
 %changelog
+* Fri Oct 09 2026 Gareth Brown - 0.4.1-0.beta
+- Improve browser ordering, Companion presentation, and official-server UI
+
 * Sat Aug 15 2026 Gareth Brown - 0.4.0-0.beta
 - v0.4.0 beta metadata refresh
 

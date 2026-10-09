@@ -6,7 +6,7 @@ APP_ID = "com.bdingle.dzll"
 # ----------------------------
 # VERSION / UPDATES
 # ----------------------------
-APP_VERSION = "v0.4.0-beta"
+APP_VERSION = "v0.4.1-beta"
 RELEASES_URL = "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
 GITHUB_LATEST_API = "https://api.github.com/repos/Berry-Dingle/DayZ-Linux-Launcher/releases/latest"
 
