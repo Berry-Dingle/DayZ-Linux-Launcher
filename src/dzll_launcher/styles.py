@@ -780,7 +780,7 @@ def get_app_css(
 
         .dzll-app-root columnview.dzll-column-view > listview > row.dzll-live-refresh-flash {{
           transition: none;
-          box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.28);
+          box-shadow: inset 0 0 0 1px alpha(@dzll_ping_yellow, 0.45);
         }}
 
         /* ---------- Favorites star ---------- */

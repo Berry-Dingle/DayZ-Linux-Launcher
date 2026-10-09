@@ -1768,6 +1768,34 @@ def _bind_name_cell_light(
         perf_metrics.count("drag_skipped_popup_preparation")
 
 
+# Properties the name cell actually renders (name, flag, lock, mod count)
+# that can change after the initial bind - e.g. a Direct Connect row whose
+# a2s query resolves after the row is already on screen.
+_NAME_CELL_NOTIFY_PROPS = ("name", "country", "third_person", "password", "mod_count")
+
+
+def _connect_name_cell_notify_handlers(cell, obj, perf_metrics=None) -> None:
+    if not isinstance(obj, ServerObject):
+        return
+
+    def notify(changed_obj, _pspec, cell=cell):
+        if not _notify_is_current(cell, changed_obj):
+            return
+        _bind_name_cell(cell, changed_obj, perf_metrics)
+
+    hids = []
+    for prop in _NAME_CELL_NOTIFY_PROPS:
+        try:
+            hids.append(obj.connect(f"notify::{prop}", notify))
+            if perf_metrics is not None:
+                perf_metrics.count("notify_connects")
+                perf_metrics.count("name_notify_connects")
+        except Exception:
+            pass
+    cell._dzll_notify_obj = obj
+    cell._dzll_notify_ids = hids
+
+
 def _make_name_factory(perf_metrics=None, drag_light=None):
     factory = Gtk.SignalListItemFactory()
 
@@ -1890,7 +1918,10 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         cell = list_item.get_child()
         if cell is None or (known_cell is not None and cell is not known_cell):
             return
-        _bind_name_cell(cell, list_item.get_item(), perf_metrics)
+        _disconnect_notify_handlers(cell, perf_metrics, "name")
+        obj = list_item.get_item()
+        _bind_name_cell(cell, obj, perf_metrics)
+        _connect_name_cell_notify_handlers(cell, obj, perf_metrics)
 
     def render_light(list_item, known_cell=None):
         cell = list_item.get_child()
@@ -1934,6 +1965,7 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         try:
             cell = list_item.get_child()
             _unregister_bound_cell(drag_light, cell, list_item)
+            _disconnect_notify_handlers(cell, perf_metrics, "name")
             if _drag_light_active(drag_light):
                 _bind_name_cell_light(cell, None, perf_metrics)
             else:

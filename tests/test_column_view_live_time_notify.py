@@ -172,4 +172,29 @@ def test_players_and_ping_factory_bindings_are_unchanged():
     assert 'factory_name="ping",' in source
     assert 'notify_props=("ping",),' in source
     assert 'factory_name="time",' in source
-    assert 'notify_props=("time",),' in source
+    # TIME also refreshes on timewarp changes alone (stale-TIME-column fix),
+    # not just when the time string itself changes.
+    assert 'notify_props=("time", "timewarp"),' in source
+
+
+def test_timewarp_only_change_refreshes_bound_time_cell(monkeypatch):
+    obj = ServerObject(time="12:00", timewarp=1.0)
+    fake_factory = FakeFactory()
+    monkeypatch.setattr(column_view.Gtk.SignalListItemFactory, "__new__", lambda cls: fake_factory)
+    monkeypatch.setattr(column_view, "_center_label", lambda **kwargs: FakeLabel())
+    monkeypatch.setattr(column_view, "_cell_label", lambda widget: widget)
+    monkeypatch.setattr(column_view, "_register_bound_cell", lambda *args, **kwargs: None)
+    monkeypatch.setattr(column_view, "_unregister_bound_cell", lambda *args, **kwargs: None)
+    factory = column_view._make_label_factory(
+        column_view._bind_time,
+        factory_name="time",
+        notify_props=("time", "timewarp"),
+    )
+    item = FakeListItem(obj)
+    factory.emit("setup", item)
+    factory.emit("bind", item)
+    label = item.child
+
+    assert label.text == "12:00 (x1)"
+    obj.timewarp = 4.0
+    assert label.text == "12:00 (x4)"
