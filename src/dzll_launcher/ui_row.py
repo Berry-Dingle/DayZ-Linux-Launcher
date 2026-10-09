@@ -1,13 +1,14 @@
 # ui_row.py
 import os
 import time
+import math
 from functools import lru_cache
 from pathlib import Path
 
 import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("GObject", "2.0")
-from gi.repository import Gtk, Pango, Gdk, GObject
+from gi.repository import Gtk, Pango, Gdk, GObject, GdkPixbuf, GLib
 from .country_codes import country_name_for
 from .config import (
     FAV_STAR_WIDTH,
@@ -49,6 +50,35 @@ def new_official_badge() -> Gtk.Picture:
     badge.set_tooltip_text("Official Server")
     badge.set_visible(False)
     return badge
+
+
+@lru_cache(maxsize=2)
+def time_speed_texture(filename: str):
+    path = Path(__file__).resolve().parent / "images" / filename
+    source = Gdk.Texture.new_from_filename(str(path))
+    downloader = Gdk.TextureDownloader.new(source)
+    downloader.set_format(Gdk.MemoryFormat.R8G8B8A8)
+    pixels, stride = downloader.download_bytes()
+    pixbuf = GdkPixbuf.Pixbuf.new_from_bytes(
+        pixels, GdkPixbuf.Colorspace.RGB, True, 8,
+        source.get_width(), source.get_height(), stride,
+    )
+    small = pixbuf.scale_simple(14, 14, GdkPixbuf.InterpType.BILINEAR)
+    return Gdk.MemoryTexture.new(
+        14, 14, Gdk.MemoryFormat.R8G8B8A8,
+        GLib.Bytes.new(small.get_pixels()), small.get_rowstride(),
+    )
+
+
+def fmt_time_speed(value) -> str:
+    """Render a positive acceleration with conventional half-up rounding."""
+    try:
+        number = float(value)
+        if not math.isfinite(number) or number <= 0:
+            return "x?"
+        return f"x{math.floor(number + 0.5)}"
+    except (TypeError, ValueError, OverflowError):
+        return "x?"
 
 
 def _monitor_icon_name() -> str:
@@ -424,7 +454,8 @@ class ServerObject(GObject.Object):
     mods_json = GObject.Property(type=str, default="")  # raw DB JSON for workshop IDs
 
     time = GObject.Property(type=str, default="")
-    timewarp = GObject.Property(type=float, default=1.0)
+    timewarp = GObject.Property(type=object, default=None)
+    night_timewarp = GObject.Property(type=object, default=None)
 
     played = GObject.Property(type=str, default="")
     map_name = GObject.Property(type=str, default="")

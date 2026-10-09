@@ -16,17 +16,18 @@ from .ui_row import (
     attach_pointer_cursor,
     country_tooltip_for,
     flag_for,
+    fmt_time_speed,
     new_official_badge,
     row_ping_display,
     row_players_display,
     row_stable_display,
-    row_time_display,
+    time_speed_texture,
 )
 
 
 _META_WIDTHS = {
     "fav": 44,
-    "time": 98,
+    "time": 116,
     "played": 112,
     "map": 170,
     "players": 132,
@@ -770,14 +771,132 @@ def _make_label_factory(
     return factory
 
 
-def _bind_time(label: Gtk.Label, obj: ServerObject) -> None:
-    time_text, timewarp_text = row_time_display(obj)
-    _set_text_if_changed(label, f"{time_text} {timewarp_text}".strip())
+def _bind_time_cell(cell, obj: ServerObject | None, perf_metrics=None) -> None:
+    if isinstance(obj, ServerObject):
+        main = (obj.time or "").strip() or "--:--"
+        day = fmt_time_speed(obj.timewarp)
+        night = fmt_time_speed(obj.night_timewarp)
+    else:
+        main = day = night = ""
+    _set_text_if_changed(cell._dzll_time_main, main, perf_metrics)
+    _set_text_if_changed(cell._dzll_time_day, day, perf_metrics)
+    _set_text_if_changed(cell._dzll_time_night, night, perf_metrics)
 
 
-def _bind_time_light(label: Gtk.Label, obj: ServerObject, perf_metrics=None) -> None:
-    time_text, timewarp_text = row_time_display(obj)
-    _set_text_if_changed(label, f"{time_text} {timewarp_text}".strip(), perf_metrics)
+def _make_time_factory(perf_metrics=None, drag_light=None):
+    factory = Gtk.SignalListItemFactory()
+    factory_name = "time"
+    notify_props = ("time", "timewarp", "night-timewarp")
+
+    def setup(_factory, list_item):
+        if perf_metrics is not None:
+            perf_metrics.record_setup(factory_name)
+        cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        cell.set_hexpand(True)
+        cell.set_vexpand(True)
+        cell.add_css_class("dzll-column-cell-right-border")
+        left_space = Gtk.Box()
+        left_space.set_size_request(4, -1)
+        left_space.set_hexpand(True)
+        cell.append(left_space)
+        group = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+        group.set_valign(Gtk.Align.CENTER)
+        cell.append(group)
+        main = Gtk.Label(xalign=0.5)
+        main.set_valign(Gtk.Align.CENTER)
+        main.set_width_chars(5)
+        main.set_single_line_mode(True)
+        group.append(main)
+        stack = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        stack.set_valign(Gtk.Align.CENTER)
+        stack.set_margin_start(2)
+        stack.set_margin_end(2)
+        for filename, attribute in (("sunIcon.png", "_dzll_time_day"), ("moonIcon.png", "_dzll_time_night")):
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=2)
+            picture = Gtk.Picture.new_for_paintable(time_speed_texture(filename))
+            picture.set_size_request(14, 14)
+            picture.set_can_shrink(True)
+            row.append(picture)
+            speed = Gtk.Label(xalign=0.0)
+            speed.set_width_chars(4)
+            speed.set_halign(Gtk.Align.START)
+            speed.add_css_class("dzll-time-speed")
+            speed.set_single_line_mode(True)
+            row.append(speed)
+            setattr(cell, attribute, speed)
+            stack.append(row)
+        cell._dzll_time_main = main
+        cell._dzll_time_stack = stack
+        cell._dzll_time_group = group
+        group.append(stack)
+        right_space = Gtk.Box()
+        right_space.set_hexpand(True)
+        cell.append(right_space)
+        list_item.set_child(cell)
+
+    def render_full(list_item, known_cell=None):
+        cell = list_item.get_child()
+        if cell is None or (known_cell is not None and cell is not known_cell):
+            return
+        _disconnect_notify_handlers(cell, perf_metrics, factory_name)
+        obj = list_item.get_item()
+        cell._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+        _bind_time_cell(cell, obj)
+        if not isinstance(obj, ServerObject):
+            return
+
+        def notify(changed_obj, _pspec):
+            if not _notify_is_current(cell, changed_obj):
+                return
+            _bind_time_cell(cell, changed_obj)
+            tracker = getattr(changed_obj, "_a2s_status_apply_tracker", None)
+            if isinstance(tracker, dict):
+                tracker.setdefault("refreshed_cells", []).append(factory_name)
+
+        cell._dzll_notify_obj = obj
+        cell._dzll_notify_ids = [obj.connect(f"notify::{prop}", notify) for prop in notify_props]
+
+    def render_light(list_item, known_cell=None):
+        cell = list_item.get_child()
+        if cell is None or (known_cell is not None and cell is not known_cell):
+            return
+        _disconnect_notify_handlers(cell, perf_metrics, factory_name)
+        obj = list_item.get_item()
+        cell._dzll_bound_obj = obj if isinstance(obj, ServerObject) else None
+        _bind_time_cell(cell, obj, perf_metrics)
+        if perf_metrics is not None:
+            perf_metrics.count("drag_skipped_notify_connects", len(notify_props))
+
+    def bind(_factory, list_item):
+        light = _drag_light_active(drag_light)
+        token = (perf_metrics.start(factory_name, "bind", bind_mode="light" if light else "full")
+                 if perf_metrics is not None else None)
+        try:
+            cell = list_item.get_child()
+            if cell is None:
+                return
+            if light:
+                render_light(list_item, cell)
+            else:
+                render_full(list_item, cell)
+            _register_bound_cell(drag_light, factory_name, cell, list_item, render_full)
+        finally:
+            if perf_metrics is not None:
+                perf_metrics.finish(token)
+
+    def unbind(_factory, list_item):
+        cell = list_item.get_child()
+        if cell is None:
+            return
+        _unregister_bound_cell(drag_light, cell, list_item)
+        _disconnect_notify_handlers(cell, perf_metrics, factory_name)
+        cell._dzll_bound_obj = None
+        _bind_time_cell(cell, None)
+
+    factory.connect("setup", setup)
+    factory.connect("bind", bind)
+    factory.connect("unbind", unbind)
+    return factory
 
 
 def _bind_played(label: Gtk.Label, obj: ServerObject) -> None:
@@ -2268,15 +2387,7 @@ def build_server_column_view(
     _append_column(
         view,
         "TIME",
-        _make_label_factory(_bind_time,
-            factory_name="time",
-            perf_metrics=perf_metrics,
-            drag_light=drag_light,
-            light_binder=_bind_time_light,
-            notify_props=("time",),
-            max_chars=11,
-            cell_css_classes=right_border,
-        ),
+        _make_time_factory(perf_metrics, drag_light),
         _META_WIDTHS["time"],
     )
     _append_column(

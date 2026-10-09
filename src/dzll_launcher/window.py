@@ -5753,9 +5753,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     pass
 
             try:
-                timewarp = float(dbrow.get("timeWarp")) if dbrow.get("timeWarp") is not None else 1.0
-            except Exception:
-                timewarp = 1.0
+                timewarp = float(dbrow["timeWarp"]) if dbrow.get("timeWarp") is not None else None
+            except (TypeError, ValueError, OverflowError):
+                timewarp = None
+            try:
+                night_timewarp = float(dbrow["nightTimeWarp"]) if dbrow.get("nightTimeWarp") is not None else None
+            except (TypeError, ValueError, OverflowError):
+                night_timewarp = None
             time_str = _db_advisory_text(dbrow.get("time"))
             if not is_valid_hhmm(time_str):
                 time_str = "--:--"
@@ -5791,6 +5795,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 mods_json=mods_json,
                 time=time_str,
                 timewarp=timewarp,
+                night_timewarp=night_timewarp,
                 played=played_disp,
                 map_name=map_name,
                 players=players,

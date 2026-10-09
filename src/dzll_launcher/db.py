@@ -133,6 +133,7 @@ def read_servers_from_db() -> list:
         cur.execute("PRAGMA table_info(servers)")
         columns = {row[1] for row in cur.fetchall()}
         official_column = "official" if "official" in columns else "NULL AS official"
+        night_column = "nightTimeWarp" if "nightTimeWarp" in columns else "NULL AS nightTimeWarp"
         cur.execute(f"""
             SELECT
                 ip, gport, qport,
@@ -140,7 +141,7 @@ def read_servers_from_db() -> list:
                 players, maxPlayers,
                 password, mods, modCount,
                 third_person,
-                timeWarp, time,
+                timeWarp, {night_column}, time,
                 country, ping, bm_rank,
                 {official_column}
             FROM servers
