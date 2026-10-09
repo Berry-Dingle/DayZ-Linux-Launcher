@@ -1348,11 +1348,23 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
         tooltip="Prioritise trusted servers:\nTop 100 first\nTop 1,000 next\nTop 2,000 next\nAll others after",
     ))
     default_filters.append(sidebar_setting_checkbutton("hide_official_servers", "Hide Official Servers"))
-    default_filters.append(compact_int_setting_entry("high_ping_cutoff_ms", "Max Ping Cutoff (ms)"))
+    default_filters.append(compact_int_setting_entry("high_ping_cutoff_ms", "Max Ping Cutoff (ms)",
+        tooltip=(
+            "Applied when the server list is\n"
+            "built or refreshed. Live ping\n"
+            "updates do not move or remove\n"
+            "servers from the current list."
+        ),
+    ))
     default_filters.append(compact_int_setting_entry(
         "hide_below_max_players",
         "Min Player Slots",
-        tooltip="Hide servers with fewer player slots than this.\nExample: 10 hides servers with max players below 10.",
+        tooltip=(
+            "Applied when the server list is\n"
+            "built or refreshed. Live player-count\n"
+            "updates do not move or remove\n"
+            "servers from the current list."
+        ),
     ))
     sidebar.append(default_filters)
 

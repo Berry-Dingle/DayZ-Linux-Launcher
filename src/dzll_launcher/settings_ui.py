@@ -1996,6 +1996,8 @@ class SettingsUI:
                 sorter = getattr(self._win, "sorter", None)
                 if sorter is not None:
                     sorter.changed(Gtk.SorterChange.DIFFERENT)
+                if bool(self._win.settings.get("prioritise_trusted_servers", False)):
+                    self._win._rebuild_column_view_store(reorder_reason="settings:trusted-first")
                 GLib.idle_add(self._win._scroll_to_top)
             except Exception:
                 pass

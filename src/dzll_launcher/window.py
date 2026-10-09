@@ -45,7 +45,8 @@ from .config import (
     DISCLAIMER_GAP_ABOVE,
     DISCLAIMER_COLOR,
     PING_MAX,
-    STARTUP_PING_FIRST_N,
+    STARTUP_WARMUP_READY_PERCENT,
+    STARTUP_WARMUP_MAX_WAIT_SECS,
     STARTUP_LIVE_REST_WORKERS,
     STARTUP_LIVE_REST_TIMEOUT_SECS,
     STARTUP_LIVE_FLUSH_MAX,
@@ -801,6 +802,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._startup_live_rest_completed = 0
         self._startup_live_rest_started_at = 0.0
         self._startup_live_rest_last_log_completed = 0
+        self._startup_warmup_keys = set()
+        self._startup_warmup_completed = 0
+        self._startup_warmup_target = 0
+        self._startup_warmup_timeout_id = 0
+        self._startup_warmup_revealed = False
         self._status_refresh_generation = 0
         self._status_refresh_running = False
         self._status_refresh_queue = deque()
@@ -3078,6 +3084,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         try:
             self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
+        except Exception:
+            pass
+        try:
+            timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+            if timeout_id:
+                GLib.source_remove(timeout_id)
+            self._startup_warmup_timeout_id = 0
         except Exception:
             pass
         try:
@@ -5682,19 +5695,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._restore_server_companion_if_enabled()
         self._set_updating(True, "Updating The Server Database, Please Wait…")
         if not fetched_ok:
+            self._auto_sort_lowest_ping_after_startup()
             self._complete_startup_presentation()
             return False
         keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
-        first_n = min(int(STARTUP_PING_FIRST_N), len(keys))
-        first_keys = keys[:first_n]
-        rest_keys = keys[first_n:]
+        warmup_count = sum(self._bm_live_group(k) <= 1 for k in keys)
         if DEBUG_STARTUP_LIVE:
             print(
-                f"[STARTUP-LIVE] first_n={first_n} rest={len(rest_keys)} "
-                f"rest_workers={STARTUP_LIVE_REST_WORKERS}",
+                f"[STARTUP-LIVE] warmup={warmup_count} total={len(keys)} "
+                f"workers={STARTUP_LIVE_REST_WORKERS}",
                 flush=True,
             )
-        self._submit_live_first_n_then_hide_band(first_n, first_keys, rest_keys)
+        self._submit_startup_rest_batches(keys, warmup_count=warmup_count)
 
         GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
         self._apply_titlebar_counts()
@@ -5827,8 +5839,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         self._apply_titlebar_counts()
-
-        GLib.timeout_add_seconds(1, self._auto_sort_lowest_ping_after_startup)
 
         # ---- Init Discord Status ----
         try:
@@ -6401,7 +6411,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return 3
         return 0 if rank <= 100 else (1 if rank <= 1000 else (2 if rank <= 2000 else 3))
 
-    def _submit_startup_rest_batches(self, keys):
+    def _submit_startup_rest_batches(self, keys, warmup_count=0):
         keys = list(keys or [])
         self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
         generation = self._startup_live_generation
@@ -6412,6 +6422,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._startup_live_rest_completed = 0
         self._startup_live_rest_started_at = time.monotonic()
         self._startup_live_rest_last_log_completed = 0
+        self._startup_warmup_keys = set(keys[:warmup_count])
+        self._startup_warmup_completed = 0
+        self._startup_warmup_target = max(
+            1, (warmup_count * int(STARTUP_WARMUP_READY_PERCENT) + 99) // 100
+        ) if warmup_count else 0
+        self._startup_warmup_revealed = False
+        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+        if timeout_id:
+            GLib.source_remove(timeout_id)
+        self._startup_warmup_timeout_id = 0
         tid = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
         if tid:
             try:
@@ -6427,8 +6447,43 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 flush=True,
             )
         if not keys:
+            self._complete_startup_warmup(generation)
             return False
+        if warmup_count:
+            self._startup_warmup_timeout_id = GLib.timeout_add_seconds(
+                STARTUP_WARMUP_MAX_WAIT_SECS, self._on_startup_warmup_timeout, generation
+            )
+        else:
+            self._complete_startup_warmup(generation)
         self._pump_startup_rest_sweep(generation)
+        return False
+
+    def _on_startup_warmup_timeout(self, generation: int):
+        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
+            return False
+        self._startup_warmup_timeout_id = 0
+        return self._complete_startup_warmup(generation)
+
+    def _complete_startup_warmup(self, generation: int):
+        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
+            return False
+        if self._startup_warmup_revealed:
+            return False
+        self._startup_warmup_revealed = True
+        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+        self._startup_warmup_timeout_id = 0
+        if timeout_id:
+            GLib.source_remove(timeout_id)
+        flush_id = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
+        if flush_id:
+            GLib.source_remove(flush_id)
+            self._startup_live_rest_flush_id = 0
+        self._flush_startup_rest_results(generation)
+        self._auto_sort_lowest_ping_after_startup()
+        was_completed = bool(getattr(getattr(self, "_startup_presentation", None), "startup_completed", False))
+        self._complete_startup_presentation()
+        if was_completed:
+            self._set_updating(False)
         return False
 
     def _query_startup_rest_one(self, generation: int, k, ip: str, qport: int):
@@ -6475,10 +6530,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             try:
                 fut = self._startup_live_executor.submit(self._query_startup_rest_one, generation, k, ip, qport)
                 fut.add_done_callback(
-                    lambda done_fut, gen=generation: GLib.idle_add(
+                    lambda done_fut, gen=generation, key=k: GLib.idle_add(
                         self._on_startup_rest_future_done,
                         gen,
                         done_fut,
+                        key,
                     )
                 )
             except Exception:
@@ -6488,11 +6544,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._maybe_finish_startup_rest_sweep(generation)
         return False
 
-    def _on_startup_rest_future_done(self, generation: int, fut):
+    def _on_startup_rest_future_done(self, generation: int, fut, key=None):
         if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
             return False
         self._startup_live_rest_inflight = max(0, int(getattr(self, "_startup_live_rest_inflight", 0) or 0) - 1)
         self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
+        if key in self._startup_warmup_keys:
+            self._startup_warmup_completed += 1
         try:
             result_generation, result = fut.result()
         except Exception:
@@ -6510,6 +6568,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     )
                 except Exception:
                     self._startup_live_rest_flush_id = 0
+
+        if (
+            not self._startup_warmup_revealed
+            and self._startup_warmup_completed >= self._startup_warmup_target
+        ):
+            self._complete_startup_warmup(generation)
 
         if DEBUG_STARTUP_LIVE:
             completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
@@ -6558,6 +6622,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._startup_live_rest_flush_id = 0
             self._flush_startup_rest_results(generation)
             return False
+        if not self._startup_warmup_revealed:
+            self._complete_startup_warmup(generation)
         if DEBUG_STARTUP_LIVE:
             total = int(getattr(self, "_startup_live_rest_total", 0) or 0)
             completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
@@ -6972,72 +7038,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
         return False
 
-    def _submit_live_first_n_then_hide_band(self, n: int, ordered_keys=None, rest_keys=None):
-        keys = list(ordered_keys or self._obj_by_key.keys())[:max(0, int(n))]
-        if not keys:
-            self._complete_startup_presentation()
-            GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
-            return
-
-        def query_one(k):
-            try:
-                obj = self._obj_by_key.get(k)
-                if not obj:
-                    return None
-                generation = int(getattr(self, "_startup_live_generation", 0) or 0)
-                return (
-                    k,
-                    query_server_live(
-                        obj.ip,
-                        obj.qport,
-                        gport=obj.gport,
-                        cycle_id=f"startup-first:{generation}:{k}",
-                        generation=generation,
-                        row_id=id(obj),
-                        model_id=id(getattr(self, "column_view_store", None)),
-                    ),
-                )
-            except Exception as e:
-                return (k, {"ok": False, "err": str(e)})
-
-        def apply_late_result(fut):
-            try:
-                result = fut.result()
-                if result:
-                    GLib.idle_add(self._apply_live_results, [result], "startup-first")
-            except Exception:
-                pass
-
-        def worker():
-            futures = [self._executor.submit(query_one, k) for k in keys]
-            target = max(1, (len(futures) * 65 + 99) // 100)
-            deadline = time.monotonic() + 6.0
-            done = set()
-            pending = set(futures)
-            while pending and len(done) < target:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                newly_done, pending = wait(pending, timeout=min(0.2, remaining))
-                done.update(newly_done)
-            results = []
-            for fut in done:
-                try:
-                    result = fut.result()
-                    if result:
-                        results.append(result)
-                except Exception:
-                    pass
-            for fut in pending:
-                fut.add_done_callback(apply_late_result)
-            GLib.idle_add(self._apply_live_results_and_hide_band, results)
-            GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
-
-        try:
-            self._executor.submit(worker)
-        except Exception:
-            self._complete_startup_presentation()
-
     def _submit_live_batch(self, keys, reason="batch"):
         if not keys:
             return
@@ -7441,17 +7441,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._submit_live_batch(batch, reason="offline-recheck")
         return True
 
-    def _apply_live_results_and_hide_band(self, results):
-        self._apply_live_results(results, reason="startup-first")
-        self._complete_startup_presentation()
-        return False
-
     def _apply_live_results(self, results, reason="batch"):
         now = int(time.time())
         changed_any = False
         background_live_update = reason in ("batch", "browser-live", "offline-recheck")
         trigger_filter = reason not in ("manual-refresh", "batch", "browser-live", "offline-recheck")
-        live_filter_active = background_live_update and self._active_filter_depends_on_live_values()
+        live_filter_active = False
         live_filter_membership_changed = False
         live_filter_membership_changed_rows = 0
         manual_success = False
@@ -7587,8 +7582,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     reason=f"failure-streak-{streak}",
                     row_lifecycle="retained",
                 )
-                if live_filter_active:
-                    self.live.setdefault(k, {})["hide_high_ping"] = False
+                self.live.setdefault(k, {})["hide_high_ping"] = False
 
                 d = self.dead.get(k, {"fail_count": 0, "dead_until": 0, "last_fail": 0})
                 d["last_fail"] = now
@@ -7778,9 +7772,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 row_lifecycle="retained",
             )
 
-            if trigger_filter or live_filter_active:
-                cut = int(getattr(self, "_ping_cutoff_ms", 250) or 250)
-                self.live.setdefault(k, {})["hide_high_ping"] = (ping_ms > cut)
+            cut = int(getattr(self, "_ping_cutoff_ms", 250) or 250)
+            self.live.setdefault(k, {})["hide_high_ping"] = (ping_ms > cut)
 
             if k in self.dead:
                 self.dead.pop(k, None)
@@ -7806,11 +7799,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         called_membership_reconcile = False
         skipped_stable_order = False
         if changed_any and background_live_update:
-            if live_filter_active and live_filter_membership_changed:
-                called_membership_reconcile = True
-                self._reconcile_visible_store_membership_preserve_order(reason=reason)
-            else:
-                skipped_stable_order = True
+            skipped_stable_order = True
             if DEBUG_FILTER_TIMING and skipped_stable_order:
                 print(
                     f"[filter-timing] action={reason} live_rebuild=skipped stable_order "
