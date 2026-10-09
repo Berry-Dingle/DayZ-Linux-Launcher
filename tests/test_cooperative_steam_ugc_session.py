@@ -757,6 +757,116 @@ def test_cancel_between_subscribe_and_download_hands_off_subscription(monkeypatc
     assert caught.value.cancel_handoff["cleanup_candidates"] == [7]
 
 
+class _FakeMonotonicClock:
+    def __init__(self, start=0.0):
+        self.value = float(start)
+
+    def __call__(self):
+        return self.value
+
+    def advance(self, seconds):
+        self.value += float(seconds)
+
+
+def test_subscribe_download_fails_fast_as_stalled_with_zero_progress(monkeypatch):
+    commands = queue.Queue()
+    clock = _FakeMonotonicClock()
+    emitted = []
+
+    class NeverProgressesSteam:
+        def snapshot(self, item_id):
+            return _cancel_cleanup_snapshot(
+                item_id, subscribed=True, installed=False, downloading=False,
+            )
+
+        def subscribe(self, item_id):
+            return 0
+
+        def download(self, item_id, _high_priority):
+            return True
+
+        def run_callbacks(self):
+            return None
+
+    monkeypatch.setattr(steam_ugc_helper, "emit", lambda _event: None)
+    monkeypatch.setattr(
+        steam_ugc_helper, "_session_emit",
+        lambda *_a, **kwargs: emitted.append(kwargs),
+    )
+    monkeypatch.setattr(steam_ugc_helper.time, "monotonic", clock)
+    monkeypatch.setattr(steam_ugc_helper.time, "sleep", lambda _s: clock.advance(0.1))
+
+    # Absolute timeout (3600s) is far longer than the stall window (90s), so
+    # this must resolve via the stall path, not the absolute deadline.
+    steam_ugc_helper._session_subscribe_download(
+        NeverProgressesSteam(), commands, "d-1", [2116092810], 3600.0,
+    )
+
+    assert emitted
+    result = emitted[-1]
+    assert result["command"] == "subscribe_download"
+    assert result["ok"] is False
+    assert result["reason"] == "stalled"
+    assert result["failed"] == [2116092810]
+    assert clock.value < 3600.0
+
+
+def test_subscribe_download_does_not_stall_while_bytes_keep_advancing(monkeypatch):
+    commands = queue.Queue()
+    clock = _FakeMonotonicClock()
+    emitted = []
+    progress = {"downloaded": 0}
+
+    class SlowButProgressingSteam:
+        def snapshot(self, item_id):
+            progress["downloaded"] += 1
+            done = progress["downloaded"] >= 5
+            state_names = ["Subscribed"] + (["Installed"] if done else ["Downloading"])
+            return steam_ugc_helper.ItemSnapshot(
+                item_id=int(item_id),
+                state=0,
+                state_names=state_names,
+                subscribed=True,
+                installed=done,
+                needs_update=False,
+                downloading=not done,
+                download_pending=False,
+                download_bytes=progress["downloaded"],
+                total_bytes=10,
+                size_on_disk=progress["downloaded"] if done else 0,
+                install_folder=f"/workshop/{item_id}" if done else None,
+            )
+
+        def subscribe(self, item_id):
+            return 0
+
+        def download(self, item_id, _high_priority):
+            return True
+
+        def run_callbacks(self):
+            # Each poll takes longer than the stall window, but state keeps
+            # changing (download_bytes increments via the snapshot call),
+            # so this must never be classified as stalled.
+            clock.advance(120.0)
+
+    monkeypatch.setattr(steam_ugc_helper, "emit", lambda _event: None)
+    monkeypatch.setattr(
+        steam_ugc_helper, "_session_emit",
+        lambda *_a, **kwargs: emitted.append(kwargs),
+    )
+    monkeypatch.setattr(steam_ugc_helper.time, "monotonic", clock)
+    monkeypatch.setattr(steam_ugc_helper.time, "sleep", lambda _s: None)
+
+    steam_ugc_helper._session_subscribe_download(
+        SlowButProgressingSteam(), commands, "d-1", [42], 3600.0,
+    )
+
+    assert emitted
+    result = emitted[-1]
+    assert result["ok"] is True
+    assert result["command"] == "subscribe_download"
+
+
 def test_protocol_request_id_mismatch_fails_closed(monkeypatch):
     appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_bad_protocol_"))
 

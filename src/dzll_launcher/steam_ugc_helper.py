@@ -35,6 +35,12 @@ DAYZ_APPID = 221100
 SESSION_INIT_RETRY_S = 0.25
 SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S = 2.0
 CANCEL_CLEANUP_BATCH_TIMEOUT_S = 2.0
+# How long subscribe/download may go with zero Steam-reported state change
+# before giving up early. The overall `timeout` (often ~1h) stays as the
+# absolute ceiling for genuinely slow/large downloads that are actively
+# making progress; this catches items that never start at all (e.g. a bad
+# or unresolvable Workshop ID) long before that.
+SUBSCRIBE_DOWNLOAD_STALL_TIMEOUT_S = 90.0
 REMOTE_STORAGE_SUBSCRIBE_RESULT_CALLBACK_ID = 1313
 ERESULT_OK = 1
 
@@ -1095,16 +1101,19 @@ def _session_subscribe_download(
             emit(event)
 
         deadline = time.monotonic() + max(0.0, float(timeout))
+        last_progress_monotonic = time.monotonic()
         while True:
             _session_check_control(commands, active_request_id=request_id)
             steam.run_callbacks()
             ready = []
             installed = []
+            progressed = False
             for item_id in item_ids:
                 snap = steam.snapshot(item_id)
                 key = snap.progress_key()
                 if last_seen.get(item_id) != key:
                     last_seen[item_id] = key
+                    progressed = True
                     _session_item_event(request_id, snap)
                 if snap.installed:
                     installed.append(item_id)
@@ -1117,7 +1126,17 @@ def _session_subscribe_download(
                     command="subscribe_download", installed=installed, ready=ready, failed=[],
                 )
                 return
-            if time.monotonic() >= deadline:
+            now = time.monotonic()
+            if progressed:
+                last_progress_monotonic = now
+            elif now - last_progress_monotonic >= SUBSCRIBE_DOWNLOAD_STALL_TIMEOUT_S:
+                _session_emit(
+                    request_id, "command_result", ok=False,
+                    command="subscribe_download", installed=installed, ready=ready,
+                    failed=failed, reason="stalled",
+                )
+                return
+            if now >= deadline:
                 _session_emit(
                     request_id, "command_result", ok=False,
                     command="subscribe_download", installed=installed, ready=ready,
