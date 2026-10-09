@@ -508,6 +508,128 @@ def _db_advisory_flag(value) -> bool:
     return bool(value) if type(value) is int and value in (0, 1) else False
 
 
+def _build_server_rows(rows: list, favorites: dict, last_played: dict) -> list:
+    """Validate and construct ServerObjects from raw DB rows.
+
+    Pure computation only (no store/widget access) so it is safe to run on a
+    background thread; callers apply the returned (key, obj) pairs on the
+    main thread.
+    """
+    built = []
+    for dbrow in rows:
+        try:
+            ip, gport, qport = normalize_server_endpoint(
+                dbrow.get("ip"),
+                dbrow.get("gport"),
+                dbrow.get("qport"),
+                allow_missing_query_port=True,
+            )
+        except (AttributeError, ServerEndpointValidationError):
+            continue
+
+        name = _db_advisory_text(dbrow.get("name"))
+        raw_map = _db_advisory_text(dbrow.get("map"))
+        map_name = standardize_map(raw_map)
+
+        try:
+            players = int(dbrow.get("players") or 0)
+        except Exception:
+            players = 0
+        try:
+            maxp = int(dbrow.get("maxPlayers") or 0)
+        except Exception:
+            maxp = 0
+
+        password = _db_advisory_flag(dbrow.get("password"))
+        third_person = _db_advisory_flag(dbrow.get("third_person"))
+
+        raw_mods_json = dbrow.get("mods")
+        mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
+        mod_count_db = dbrow.get("modCount")
+        cnt, preview = parse_mods_preview(mods_json, max_names=8)
+        if mod_count_db is not None:
+            try:
+                cnt = int(mod_count_db)
+            except Exception:
+                pass
+
+        try:
+            timewarp = float(dbrow.get("timeWarp")) if dbrow.get("timeWarp") is not None else 1.0
+        except Exception:
+            timewarp = 1.0
+        time_str = _db_advisory_text(dbrow.get("time"))
+        if not is_valid_hhmm(time_str):
+            time_str = "--:--"
+
+        country = _db_advisory_text(dbrow.get("country"))
+        try:
+            ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
+        except Exception:
+            ping_db = -1
+        try:
+            bm_rank = int(dbrow.get("bm_rank")) if dbrow.get("bm_rank") is not None else 999999999
+        except Exception:
+            bm_rank = 999999999
+
+        k = fav_key(ip, gport)
+        fav = bool(favorites.get(k, False))
+
+        lp_ts = last_played.get(k)
+        played_disp = human_last_played(lp_ts) if lp_ts else ""
+
+        obj = ServerObject(
+            fav=fav,
+            password=password,
+            third_person=third_person,
+            name=name,
+            country=country,
+            ip=ip,
+            gport=gport,
+            qport=qport,
+            mod_count=cnt,
+            mods_preview=preview,
+            mods_json=mods_json,
+            time=time_str,
+            timewarp=timewarp,
+            played=played_disp,
+            map_name=map_name,
+            players=players,
+            max_players=maxp,
+            ping=ping_db,
+            bm_rank=bm_rank,
+        )
+        obj.name_lc = name.strip().lower()
+        obj.ipport_lc = f"{ip}:{gport}".lower()
+        obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
+        obj.filter_key = k
+        obj.mod_search_index = build_server_mod_index(mods_json)
+        built.append((k, obj))
+    return built
+
+
+def _parse_direct_connect_address(text: str):
+    """Parse a user-typed "IP:Port" string into (ip, gport, qport).
+
+    Returns None if the text isn't a strict dotted-decimal IPv4 address with
+    a valid port - Direct Connect follows the same endpoint contract as every
+    other server source in the app.
+    """
+    text = (text or "").strip()
+    if ":" not in text:
+        return None
+    ip_part, _, port_part = text.rpartition(":")
+    ip_part = ip_part.strip()
+    port_part = port_part.strip()
+    try:
+        port = int(port_part)
+    except ValueError:
+        return None
+    try:
+        return normalize_server_endpoint(ip_part, port, None, allow_missing_query_port=True)
+    except (AttributeError, ServerEndpointValidationError):
+        return None
+
+
 def _initialize_companion_restart_runtime_for_window(
     *,
     active_path: str | Path,
@@ -750,14 +872,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._browser_live_filter_cooldown_logged_until = 0.0
         self._browser_live_apply_skip_logged_until = 0.0
         self._startup_live_generation = 0
-        self._startup_live_rest_queue = deque()
-        self._startup_live_rest_inflight = 0
-        self._startup_live_rest_buffer = []
-        self._startup_live_rest_flush_id = 0
-        self._startup_live_rest_total = 0
-        self._startup_live_rest_completed = 0
-        self._startup_live_rest_started_at = 0.0
-        self._startup_live_rest_last_log_completed = 0
+        self._row_load_generation = 0
         self._status_refresh_generation = 0
         self._status_refresh_running = False
         self._status_refresh_queue = deque()
@@ -770,6 +885,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._status_refresh_last_log_completed = 0
         self._status_refresh_progress_update_id = 0
         self._status_refresh_progress_last_rendered = 0
+        self._status_refresh_last_completed_at = 0.0
+        self._status_refresh_last_completed_total = 0
+        self._status_refresh_last_label_tick_id = 0
 
         self._col_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(7)]
 
@@ -3026,6 +3144,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._status_refresh_inflight = 0
             self._set_status_refresh_slot_running(False, generation=generation)
             self._status_refresh_generation = int(getattr(self, "_status_refresh_generation", 0) or 0) + 1
+            tick_id = int(getattr(self, "_status_refresh_last_label_tick_id", 0) or 0)
+            if tick_id:
+                try:
+                    GLib.source_remove(tick_id)
+                except Exception:
+                    pass
+            self._status_refresh_last_label_tick_id = 0
         except Exception:
             pass
 
@@ -5576,146 +5701,80 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             self._set_map_choices(["All Maps"])
 
-        loaded = self._load_rows_into_store(endpoint_valid_rows)
-        if not loaded:
-            self._server_companion_rows_loaded = False
-            msg = "No Servers Found."
+        def on_loaded(loaded):
+            if not loaded:
+                self._server_companion_rows_loaded = False
+                msg = "No Servers Found."
+                if not fetched_ok:
+                    msg = "No Servers Found (DB Fetch Failed And No Usable Local DB)."
+                self.empty_label.set_text(msg)
+                self.empty_label.set_visible(True)
+                self._complete_startup_presentation()
+                return
+
+            self._server_companion_rows_loaded = True
+            self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
+            self._restore_server_companion_if_enabled()
+            self._set_updating(True, "Updating The Server Database, Please Wait…")
             if not fetched_ok:
-                msg = "No Servers Found (DB Fetch Failed And No Usable Local DB)."
-            self.empty_label.set_text(msg)
-            self.empty_label.set_visible(True)
-            self._complete_startup_presentation()
-            return False
+                self._complete_startup_presentation()
+                return
+            keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
+            first_n = min(int(STARTUP_PING_FIRST_N), len(keys))
+            first_keys = keys[:first_n]
+            rest_keys = keys[first_n:]
+            if DEBUG_STARTUP_LIVE:
+                print(
+                    f"[STARTUP-LIVE] first_n={first_n} rest={len(rest_keys)} "
+                    f"rest_workers={STARTUP_LIVE_REST_WORKERS}",
+                    flush=True,
+                )
+            self._submit_live_first_n_then_hide_band(first_n, first_keys, rest_keys)
 
-        self._server_companion_rows_loaded = True
-        self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
-        self._restore_server_companion_if_enabled()
-        self._set_updating(True, "Updating The Server Database, Please Wait…")
-        if not fetched_ok:
-            self._complete_startup_presentation()
-            return False
-        keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
-        first_n = min(int(STARTUP_PING_FIRST_N), len(keys))
-        first_keys = keys[:first_n]
-        rest_keys = keys[first_n:]
-        if DEBUG_STARTUP_LIVE:
-            print(
-                f"[STARTUP-LIVE] first_n={first_n} rest={len(rest_keys)} "
-                f"rest_workers={STARTUP_LIVE_REST_WORKERS}",
-                flush=True,
-            )
-        self._submit_live_first_n_then_hide_band(first_n, first_keys, rest_keys)
+            GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
+            self._apply_titlebar_counts()
 
-        GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
-        self._apply_titlebar_counts()
+        self._load_rows_into_store(endpoint_valid_rows, on_loaded=on_loaded)
         return False
 
     # ----------------------------
     # Load rows
     # ----------------------------
-    def _load_rows_into_store(self, rows: list) -> bool:
+    def _load_rows_into_store(self, rows: list, on_loaded=None) -> None:
         n = self.store.get_n_items()
         if n:
             self.store.splice(0, n, [])
         self._obj_by_key.clear()
         self._browser_live_offline_streaks.clear()
 
+        self._row_load_generation = int(getattr(self, "_row_load_generation", 0) or 0) + 1
+        generation = self._row_load_generation
+
         if not rows:
             self._rebuild_mod_suggestion_index()
+            if on_loaded is not None:
+                on_loaded(False)
+            return
+
+        favorites = dict(self.favorites)
+        last_played = dict(self.last_played)
+
+        def worker():
+            built = _build_server_rows(rows, favorites, last_played)
+            GLib.idle_add(self._finish_loading_rows, generation, built, on_loaded)
+
+        self._db_executor.submit(worker)
+
+    def _finish_loading_rows(self, generation: int, built: list, on_loaded) -> bool:
+        if generation != int(getattr(self, "_row_load_generation", 0) or 0):
             return False
 
-        for dbrow in rows:
-            try:
-                ip, gport, qport = normalize_server_endpoint(
-                    dbrow.get("ip"),
-                    dbrow.get("gport"),
-                    dbrow.get("qport"),
-                    allow_missing_query_port=True,
-                )
-            except (AttributeError, ServerEndpointValidationError):
-                continue
-
-            name = _db_advisory_text(dbrow.get("name"))
-            raw_map = _db_advisory_text(dbrow.get("map"))
-            map_name = standardize_map(raw_map)
-
-            try:
-                players = int(dbrow.get("players") or 0)
-            except Exception:
-                players = 0
-            try:
-                maxp = int(dbrow.get("maxPlayers") or 0)
-            except Exception:
-                maxp = 0
-
-            password = _db_advisory_flag(dbrow.get("password"))
-            third_person = _db_advisory_flag(dbrow.get("third_person"))
-
-            raw_mods_json = dbrow.get("mods")
-            mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
-            mod_count_db = dbrow.get("modCount")
-            cnt, preview = parse_mods_preview(mods_json, max_names=8)
-            if mod_count_db is not None:
-                try:
-                    cnt = int(mod_count_db)
-                except Exception:
-                    pass
-
-            try:
-                timewarp = float(dbrow.get("timeWarp")) if dbrow.get("timeWarp") is not None else 1.0
-            except Exception:
-                timewarp = 1.0
-            time_str = _db_advisory_text(dbrow.get("time"))
-            if not is_valid_hhmm(time_str):
-                time_str = "--:--"
-
-            country = _db_advisory_text(dbrow.get("country"))
-            try:
-                ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
-            except Exception:
-                ping_db = -1
-            try:
-                bm_rank = int(dbrow.get("bm_rank")) if dbrow.get("bm_rank") is not None else 999999999
-            except Exception:
-                bm_rank = 999999999
-
-            k = fav_key(ip, gport)
-            fav = bool(self.favorites.get(k, False))
-
-            lp_ts = self.last_played.get(k)
-            played_disp = human_last_played(lp_ts) if lp_ts else ""
-
-            obj = ServerObject(
-                fav=fav,
-                password=password,
-                third_person=third_person,
-                name=name,
-                country=country,
-                ip=ip,
-                gport=gport,
-                qport=qport,
-                mod_count=cnt,
-                mods_preview=preview,
-                mods_json=mods_json,
-                time=time_str,
-                timewarp=timewarp,
-                played=played_disp,
-                map_name=map_name,
-                players=players,
-                max_players=maxp,
-                ping=ping_db,
-                bm_rank=bm_rank,
-            )
-            obj.name_lc = name.strip().lower()
-            obj.ipport_lc = f"{ip}:{gport}".lower()
-            obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
-            obj.filter_key = k
-            obj.mod_search_index = build_server_mod_index(mods_json)
+        n = self.store.get_n_items()
+        self.store.splice(n, 0, [obj for _k, obj in built])
+        for k, obj in built:
             self._debug_sort_attach_notify_probe(obj)
-
-            self.store.append(obj)
             self._obj_by_key[k] = obj
-            self.live.setdefault(k, {"hide_high_ping": False, "offline": (ping_db < 0)})
+            self.live.setdefault(k, {"hide_high_ping": False, "offline": (int(getattr(obj, "ping", -1)) < 0)})
 
         self._rebuild_mod_suggestion_index()
         self._snapshot_all_sort_keys()
@@ -5740,7 +5799,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         # -----------------------------
 
-        return self.store.get_n_items() > 0
+        if on_loaded is not None:
+            on_loaded(self.store.get_n_items() > 0)
+        return False
 
     # ----------------------------
     # Snapshot sort keys
@@ -6303,175 +6364,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return 3
         return 0 if rank <= 100 else (1 if rank <= 1000 else (2 if rank <= 2000 else 3))
 
-    def _submit_startup_rest_batches(self, keys):
-        keys = list(keys or [])
-        self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
-        generation = self._startup_live_generation
-        self._startup_live_rest_queue = deque(keys)
-        self._startup_live_rest_inflight = 0
-        self._startup_live_rest_buffer = []
-        self._startup_live_rest_total = len(keys)
-        self._startup_live_rest_completed = 0
-        self._startup_live_rest_started_at = time.monotonic()
-        self._startup_live_rest_last_log_completed = 0
-        tid = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
-        if tid:
-            try:
-                GLib.source_remove(tid)
-            except Exception:
-                pass
-        self._startup_live_rest_flush_id = 0
-        if DEBUG_STARTUP_LIVE:
-            print(
-                f"[STARTUP-LIVE] rest start queued={len(keys)} workers={STARTUP_LIVE_REST_WORKERS} "
-                f"timeout={STARTUP_LIVE_REST_TIMEOUT_SECS:.2f}s "
-                f"flush_max={STARTUP_LIVE_FLUSH_MAX} flush_ms={STARTUP_LIVE_FLUSH_MS}",
-                flush=True,
-            )
-        if not keys:
-            return False
-        self._pump_startup_rest_sweep(generation)
-        return False
-
-    def _query_startup_rest_one(self, generation: int, k, ip: str, qport: int):
-        obj = self._obj_by_key.get(k)
-        try:
-            info = query_server_live(
-                ip,
-                qport,
-                timeout=STARTUP_LIVE_REST_TIMEOUT_SECS,
-                gport=(obj.gport if obj is not None else qport),
-                cycle_id=f"startup-rest:{generation}:{k}",
-                generation=generation,
-                row_id=(id(obj) if obj is not None else "missing"),
-                model_id=id(getattr(self, "column_view_store", None)),
-            )
-        except Exception as e:
-            info = {"ok": False, "err": str(e)}
-        return generation, (k, info)
-
-    def _pump_startup_rest_sweep(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-
-        cap = int(STARTUP_LIVE_REST_WORKERS)
-        while int(getattr(self, "_startup_live_rest_inflight", 0) or 0) < cap:
-            try:
-                k = self._startup_live_rest_queue.popleft()
-            except Exception:
-                break
-            obj = self._obj_by_key.get(k)
-            if not obj:
-                self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-                continue
-            try:
-                ip = str(obj.ip)
-                qport = int(obj.qport)
-            except Exception:
-                self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-                continue
-
-            self._startup_live_rest_inflight = int(getattr(self, "_startup_live_rest_inflight", 0) or 0) + 1
-            try:
-                fut = self._startup_live_executor.submit(self._query_startup_rest_one, generation, k, ip, qport)
-                fut.add_done_callback(
-                    lambda done_fut, gen=generation: GLib.idle_add(
-                        self._on_startup_rest_future_done,
-                        gen,
-                        done_fut,
-                    )
-                )
-            except Exception:
-                self._startup_live_rest_inflight = max(0, int(getattr(self, "_startup_live_rest_inflight", 0) or 0) - 1)
-                self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-
-        self._maybe_finish_startup_rest_sweep(generation)
-        return False
-
-    def _on_startup_rest_future_done(self, generation: int, fut):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        self._startup_live_rest_inflight = max(0, int(getattr(self, "_startup_live_rest_inflight", 0) or 0) - 1)
-        self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-        try:
-            result_generation, result = fut.result()
-        except Exception:
-            result_generation, result = generation, None
-        if result_generation == generation and result:
-            self._startup_live_rest_buffer.append(result)
-            if len(self._startup_live_rest_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
-                self._flush_startup_rest_results(generation)
-            elif not int(getattr(self, "_startup_live_rest_flush_id", 0) or 0):
-                try:
-                    self._startup_live_rest_flush_id = GLib.timeout_add(
-                        int(STARTUP_LIVE_FLUSH_MS),
-                        self._flush_startup_rest_results,
-                        generation,
-                    )
-                except Exception:
-                    self._startup_live_rest_flush_id = 0
-
-        if DEBUG_STARTUP_LIVE:
-            completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
-            total = int(getattr(self, "_startup_live_rest_total", 0) or 0)
-            last_logged = int(getattr(self, "_startup_live_rest_last_log_completed", 0) or 0)
-            if completed == total or completed - last_logged >= 250:
-                self._startup_live_rest_last_log_completed = completed
-                elapsed = time.monotonic() - float(getattr(self, "_startup_live_rest_started_at", time.monotonic()) or time.monotonic())
-                rate = (completed / elapsed) if elapsed > 0 else 0.0
-                print(
-                    f"[STARTUP-LIVE] rest progress completed={completed}/{total} "
-                    f"elapsed={elapsed:.1f}s rate={rate:.1f}/s",
-                    flush=True,
-                )
-
-        self._pump_startup_rest_sweep(generation)
-        return False
-
-    def _flush_startup_rest_results(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        self._startup_live_rest_flush_id = 0
-        results = list(getattr(self, "_startup_live_rest_buffer", ()) or ())
-        self._startup_live_rest_buffer = []
-        if results:
-            if DEBUG_STARTUP_LIVE:
-                print(f"[STARTUP-LIVE] rest flush size={len(results)}", flush=True)
-            self._apply_live_results(results, reason="startup-batch")
-        self._maybe_finish_startup_rest_sweep(generation)
-        return False
-
-    def _maybe_finish_startup_rest_sweep(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        if int(getattr(self, "_startup_live_rest_inflight", 0) or 0) > 0:
-            return False
-        if len(getattr(self, "_startup_live_rest_queue", ()) or ()) > 0:
-            return False
-        if getattr(self, "_startup_live_rest_buffer", None):
-            tid = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
-            if tid:
-                try:
-                    GLib.source_remove(tid)
-                except Exception:
-                    pass
-                self._startup_live_rest_flush_id = 0
-            self._flush_startup_rest_results(generation)
-            return False
-        if DEBUG_STARTUP_LIVE:
-            total = int(getattr(self, "_startup_live_rest_total", 0) or 0)
-            completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
-            elapsed = time.monotonic() - float(getattr(self, "_startup_live_rest_started_at", time.monotonic()) or time.monotonic())
-            rate = (completed / elapsed) if elapsed > 0 else 0.0
-            print(
-                f"[STARTUP-LIVE] rest complete completed={completed}/{total} "
-                f"elapsed={elapsed:.2f}s rate={rate:.1f}/s",
-                flush=True,
-            )
-        return False
-
     def _apply_status_refresh_cursor_for_state(self, btn=None):
         btn = btn or getattr(self, "refresh_status_btn", None)
         if btn is None:
@@ -6530,7 +6422,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         count_label = getattr(self, "status_refresh_progress_count_label", None)
         bar = getattr(self, "status_refresh_progress_bar", None)
         slot = getattr(self, "status_refresh_slot", None)
-        refresh_btn = getattr(self, "refresh_status_btn", None)
+        idle_row = getattr(self, "status_refresh_idle_row", None)
         if not visible:
             self._status_refresh_progress_last_rendered = 0
             try:
@@ -6541,8 +6433,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     bar.set_fraction(0.0)
                 if box is not None:
                     box.set_visible(False)
-                if slot is not None and refresh_btn is not None:
-                    slot.set_visible_child(refresh_btn)
+                if slot is not None and idle_row is not None:
+                    slot.set_visible_child(idle_row)
             except Exception:
                 pass
             return False
@@ -6642,9 +6534,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if generation is not None and generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         btn = getattr(self, "refresh_status_btn", None)
+        idle_row = getattr(self, "status_refresh_idle_row", None)
         progress = getattr(self, "status_refresh_progress_box", None)
         slot = getattr(self, "status_refresh_slot", None)
-        if btn is None or progress is None or slot is None:
+        if btn is None or idle_row is None or progress is None or slot is None:
             return False
         self._ensure_status_refresh_cursor_controller(btn)
         try:
@@ -6653,7 +6546,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 slot.set_visible_child(progress)
                 self._apply_status_refresh_cursor_for_state(btn)
             else:
-                slot.set_visible_child(btn)
+                slot.set_visible_child(idle_row)
                 self._apply_status_refresh_cursor_for_state(btn)
         except Exception:
             return False
@@ -6666,6 +6559,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not keys:
             self._clear_status_refresh_progress()
             return
+        self._begin_status_refresh_sweep(keys)
+
+    def _begin_status_refresh_sweep(self, keys):
+        if bool(getattr(self, "_status_refresh_running", False)):
+            return False
+        keys = list(keys or [])
+        if not keys:
+            return False
 
         self._status_refresh_generation = int(getattr(self, "_status_refresh_generation", 0) or 0) + 1
         generation = self._status_refresh_generation
@@ -6704,6 +6605,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 flush=True,
             )
         self._pump_status_refresh(generation)
+        return False
 
     def _query_status_refresh_one(self, generation: int, k, ip: str, qport: int):
         obj = self._obj_by_key.get(k)
@@ -6862,6 +6764,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             GLib.idle_add(restore_status_refresh_scroll)
         self._set_status_refresh_slot_running(False, generation=generation)
         self._clear_status_refresh_progress(generation)
+        self._status_refresh_last_completed_at = time.monotonic()
+        self._status_refresh_last_completed_total = int(getattr(self, "_status_refresh_total", 0) or 0)
+        self._update_status_refresh_last_label()
+        self._schedule_status_refresh_last_label_tick()
         if DEBUG_STARTUP_LIVE:
             total = int(getattr(self, "_status_refresh_total", 0) or 0)
             completed = int(getattr(self, "_status_refresh_completed", 0) or 0)
@@ -6874,11 +6780,54 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
         return False
 
+    def _format_elapsed_ago(self, seconds: float) -> str:
+        total_minutes = max(0, int(seconds)) // 60
+        if total_minutes < 1:
+            return "just now"
+        hours, minutes = divmod(total_minutes, 60)
+        if hours <= 0:
+            return f"{minutes}m ago"
+        return f"{hours}h {minutes}m ago"
+
+    def _update_status_refresh_last_label(self):
+        label = getattr(self, "status_refresh_last_label", None)
+        if label is None:
+            return False
+        completed_at = float(getattr(self, "_status_refresh_last_completed_at", 0.0) or 0.0)
+        if completed_at <= 0.0:
+            label.set_visible(False)
+            return False
+        total = int(getattr(self, "_status_refresh_last_completed_total", 0) or 0)
+        ago_text = self._format_elapsed_ago(time.monotonic() - completed_at)
+        text = f"Refreshed {total:,} - {ago_text}"
+        label.set_text(text)
+        label.set_tooltip_text(text)
+        label.set_visible(True)
+        return False
+
+    def _schedule_status_refresh_last_label_tick(self):
+        if int(getattr(self, "_status_refresh_last_label_tick_id", 0) or 0):
+            return False
+        try:
+            self._status_refresh_last_label_tick_id = GLib.timeout_add_seconds(
+                30, self._on_status_refresh_last_label_tick
+            )
+        except Exception:
+            self._status_refresh_last_label_tick_id = 0
+        return False
+
+    def _on_status_refresh_last_label_tick(self):
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            self._status_refresh_last_label_tick_id = 0
+            return False
+        self._update_status_refresh_last_label()
+        return True
+
     def _submit_live_first_n_then_hide_band(self, n: int, ordered_keys=None, rest_keys=None):
         keys = list(ordered_keys or self._obj_by_key.keys())[:max(0, int(n))]
         if not keys:
             self._complete_startup_presentation()
-            GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
+            GLib.idle_add(self._begin_status_refresh_sweep, rest_keys)
             return
 
         def query_one(k):
@@ -6933,7 +6882,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             for fut in pending:
                 fut.add_done_callback(apply_late_result)
             GLib.idle_add(self._apply_live_results_and_hide_band, results)
-            GLib.idle_add(self._submit_startup_rest_batches, rest_keys)
+            GLib.idle_add(self._begin_status_refresh_sweep, rest_keys)
 
         try:
             self._executor.submit(worker)

@@ -679,6 +679,12 @@ def get_app_css(
           font-size: 10px;
         }}
 
+        .dzll-app-root .status-refresh-last-label {{
+          min-width: 0;
+          font-size: 12px;
+          color: @dzll_text_secondary;
+        }}
+
         .dzll-app-root .status-refresh-progress-bar trough,
         .dzll-app-root .status-refresh-progress-bar progress {{
           min-height: 3px;
