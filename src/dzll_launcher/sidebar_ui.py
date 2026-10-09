@@ -1373,6 +1373,14 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     sidebar.append(hr())
 
+    direct_connect_btn = Gtk.Button(label="Add by IP")
+    direct_connect_btn.set_hexpand(True)
+    direct_connect_btn.set_halign(Gtk.Align.FILL)
+    direct_connect_btn.set_tooltip_text("Add a server by IP:Port and fetch its current status.")
+    attach_pointer_cursor(direct_connect_btn)
+    direct_connect_btn.connect("clicked", lambda *_: window._open_direct_connect_dialog())
+    sidebar.append(direct_connect_btn)
+
     bottom_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     bottom_section.set_hexpand(True)
     bottom_section.set_vexpand(False)

@@ -51,6 +51,8 @@ def test_non_debug_query_result_contract_is_unchanged(monkeypatch):
         "max_players": 60,
         "queue": 2,
         "time": "12:34",
+        "name": "",
+        "map": "",
         "password": False,
     }
 
@@ -89,6 +91,7 @@ def _host(ping=42, streak=0):
         password=False,
         time="--:--",
         queue=-1,
+        refresh_pulse=0,
     )
     key = fav_key(IP, GPORT)
     host = SimpleNamespace(

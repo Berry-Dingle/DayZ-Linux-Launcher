@@ -210,6 +210,8 @@ def query_server_live(
             "queue": queue,
             "time": t,
             "password": pw,
+            "name": str(getattr(info, "server_name", "") or ""),
+            "map": str(getattr(info, "map_name", "") or ""),
         }
         emit_unrelated("success")
         STATUS_DIAGNOSTICS.observe_result(

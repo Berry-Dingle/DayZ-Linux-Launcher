@@ -57,6 +57,11 @@ LAST_PLAYED_PRUNE_DAYS = 90
 
 # Last Companion server (local app state)
 LAST_COMPANION_SERVER_PATH = os.path.join(CFG_DIR, "last_companion_server.json")
+
+# Servers retained even when absent from the latest server-database snapshot:
+# favourites (so they don't vanish when the DB drops them) and Direct Connect
+# entries (added manually, independent of favourite status).
+RETAINED_SERVERS_PATH = os.path.join(CFG_DIR, "retained_servers.json")
 COMPANION_RESTART_LEARNING_PATH = os.path.join(CFG_DIR, "companion_restart_learning.json")
 # Active Phase 2 restart-learning state. The Phase 1 path above is retained only
 # as the one-time verified migration input and for rollback compatibility.

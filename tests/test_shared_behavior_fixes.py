@@ -37,23 +37,16 @@ class FakeScroller:
         return self.adjustment
 
 
-class FakeToggle:
-    def __init__(self, active=False):
-        self.active = active
-
-    def get_active(self):
-        return self.active
-
-
-def favorite_host(*, pin=False, favorites_only=False):
+def favorite_host(*, pin=False):
     adjustment = FakeAdjustment()
     calls = []
     host = SimpleNamespace(
         scroller=FakeScroller(adjustment),
         favorites={},
+        retained_servers={},
         settings={"pin_favorite_servers": pin},
-        cb_show_fav=FakeToggle(favorites_only),
         _on_filter_changed=lambda **kwargs: calls.append(kwargs),
+        _update_retained_cache_for_obj=lambda *_args, **_kwargs: None,
     )
     return host, adjustment, calls
 
@@ -150,11 +143,11 @@ def test_favorite_toggle_without_pin_or_favorites_filter_refreshes_visibility_an
     assert len(saved) == 1
 
 
-def test_pin_favorites_and_favorites_only_filter_keep_intentional_refresh(monkeypatch):
+def test_pin_favorites_setting_keeps_intentional_refresh(monkeypatch):
     monkeypatch.setattr(window_module, "save_favorites", lambda _value: None)
     monkeypatch.setattr(window_module.GLib, "idle_add", lambda callback: callback() or 1)
-    for pin, filtered in ((True, False), (False, True)):
-        host, adjustment, calls = favorite_host(pin=pin, favorites_only=filtered)
+    for pin in (True, False):
+        host, adjustment, calls = favorite_host(pin=pin)
         obj = ServerObject(ip="127.0.0.1", gport=2302)
         DZLLWindow._toggle_favorite_for_obj(host, obj)
         assert calls == [{"reason": "favourites"}]

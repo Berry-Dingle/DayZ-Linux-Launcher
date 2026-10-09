@@ -93,6 +93,8 @@ from .storage import (
     clear_last_companion_server,
     load_dead_cache,
     save_dead_cache,
+    load_retained_servers,
+    save_retained_servers,
 )
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
@@ -794,6 +796,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self.favorites = load_favorites()
         self.last_played = load_last_played()
+        self.retained_servers = load_retained_servers()
         self._last_played_presentation_token = None
         self._last_server_companion_saved = load_last_companion_server()
         self._companion_import_startup_result = apply_pending_import_at_startup(
@@ -984,6 +987,71 @@ class DZLLWindow(Gtk.ApplicationWindow):
         panel = self._settings_ui.build_panel()
         self.settings_revealer.set_child(panel)
         overlay.add_overlay(self.settings_revealer)
+
+        # DIRECT CONNECT DIALOG
+        self.direct_connect_scrim = Gtk.Box()
+        self.direct_connect_scrim.set_hexpand(True)
+        self.direct_connect_scrim.set_vexpand(True)
+        self.direct_connect_scrim.set_visible(False)
+        self.direct_connect_scrim.set_can_target(True)
+        self.direct_connect_scrim.add_css_class("settings-scrim")
+        direct_connect_scrim_click = Gtk.GestureClick.new()
+        direct_connect_scrim_click.set_button(0)
+        direct_connect_scrim_click.connect("pressed", lambda *_: self._close_direct_connect_dialog())
+        self.direct_connect_scrim.add_controller(direct_connect_scrim_click)
+        overlay.add_overlay(self.direct_connect_scrim)
+
+        self.direct_connect_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.direct_connect_box.set_halign(Gtk.Align.CENTER)
+        self.direct_connect_box.set_valign(Gtk.Align.CENTER)
+        self.direct_connect_box.set_visible(False)
+        self.direct_connect_box.set_can_target(True)
+        self.direct_connect_box.add_css_class("warning-card")
+        overlay.add_overlay(self.direct_connect_box)
+
+        direct_connect_title = Gtk.Label(label="Add by IP")
+        direct_connect_title.set_xalign(0.0)
+        direct_connect_title.add_css_class("dzll-overlay-heading")
+        direct_connect_title.add_css_class("confirmation-title")
+        self.direct_connect_box.append(direct_connect_title)
+
+        direct_connect_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        direct_connect_row.set_halign(Gtk.Align.FILL)
+        direct_connect_label = Gtk.Label(label="IP:Port")
+        direct_connect_label.set_xalign(0.0)
+        direct_connect_row.append(direct_connect_label)
+        self.direct_connect_entry = Gtk.Entry()
+        self.direct_connect_entry.set_hexpand(True)
+        self.direct_connect_entry.set_placeholder_text("203.0.113.10:2302")
+        self.direct_connect_entry.connect("activate", lambda *_: self._on_direct_connect_ok_clicked())
+        direct_connect_row.append(self.direct_connect_entry)
+        self.direct_connect_box.append(direct_connect_row)
+
+        self.direct_connect_error_label = Gtk.Label(label="")
+        self.direct_connect_error_label.add_css_class("confirmation-body")
+        self.direct_connect_error_label.set_xalign(0.0)
+        self.direct_connect_error_label.set_visible(False)
+        self.direct_connect_box.append(self.direct_connect_error_label)
+
+        self.direct_connect_fav_check = Gtk.CheckButton(label="Add to Favourites")
+        self.direct_connect_fav_check.set_active(True)
+        self.direct_connect_fav_check.set_halign(Gtk.Align.START)
+        self.direct_connect_box.append(self.direct_connect_fav_check)
+
+        direct_connect_btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        direct_connect_btn_row.set_halign(Gtk.Align.CENTER)
+        direct_connect_cancel_btn = Gtk.Button(label="Cancel")
+        direct_connect_cancel_btn.add_css_class("warning-btn")
+        attach_pointer_cursor(direct_connect_cancel_btn)
+        direct_connect_cancel_btn.connect("clicked", lambda *_: self._close_direct_connect_dialog())
+        direct_connect_btn_row.append(direct_connect_cancel_btn)
+        direct_connect_ok_btn = Gtk.Button(label="OK")
+        direct_connect_ok_btn.add_css_class("suggested-action")
+        direct_connect_ok_btn.add_css_class("warning-btn")
+        attach_pointer_cursor(direct_connect_ok_btn)
+        direct_connect_ok_btn.connect("clicked", lambda *_: self._on_direct_connect_ok_clicked())
+        direct_connect_btn_row.append(direct_connect_ok_btn)
+        self.direct_connect_box.append(direct_connect_btn_row)
 
         # DISCORD RICH FEATURES
         self._discord_last_join = None
@@ -5683,9 +5751,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _apply_db_rows(self, rows: list, fetched_ok: bool):
         endpoint_valid_rows = []
+        known_keys = set()
         for dbrow in rows or []:
             try:
-                normalize_server_endpoint(
+                ip, gport, _qport = normalize_server_endpoint(
                     dbrow.get("ip"),
                     dbrow.get("gport"),
                     dbrow.get("qport"),
@@ -5694,6 +5763,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except (AttributeError, ServerEndpointValidationError):
                 continue
             endpoint_valid_rows.append(dbrow)
+            known_keys.add(fav_key(ip, gport))
+
+        # Favourites and Direct Connect entries are retained even when the
+        # latest database snapshot drops them, so they don't silently vanish.
+        for key, retained_row in (self.retained_servers or {}).items():
+            if key in known_keys or not isinstance(retained_row, dict):
+                continue
+            endpoint_valid_rows.append(retained_row)
 
         try:
             choices = map_choices_from_db_rows(endpoint_valid_rows)
@@ -9289,6 +9366,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             save_favorites(self.favorites)
         except Exception:
             pass
+        if obj.fav:
+            self._update_retained_cache_for_obj(obj)
+        else:
+            entry = self.retained_servers.get(k)
+            if isinstance(entry, dict) and not bool(entry.get("manual", False)):
+                del self.retained_servers[k]
+                try:
+                    save_retained_servers(self.retained_servers)
+                except Exception:
+                    pass
         # Favourite membership is part of the visibility predicate: refresh so
         # the three ordinary-filter exemptions take effect (or are removed)
         # immediately. The existing row object and sort semantics are retained.
@@ -9304,6 +9391,184 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 return False
 
             GLib.idle_add(restore_favourite_scroll)
+
+    def _retained_snapshot_from_obj(self, obj: ServerObject) -> dict:
+        return {
+            "ip": obj.ip,
+            "gport": int(obj.gport),
+            "qport": int(obj.qport),
+            "name": obj.name,
+            "map": obj.map_name,
+            "players": int(obj.players),
+            "maxPlayers": int(obj.max_players),
+            "password": int(bool(obj.password)),
+            "mods": obj.mods_json,
+            "modCount": int(obj.mod_count),
+            "third_person": int(bool(obj.third_person)),
+            "timeWarp": float(obj.timewarp),
+            "time": obj.time,
+            "country": obj.country,
+            "ping": int(obj.ping),
+            "bm_rank": int(obj.bm_rank),
+        }
+
+    def _update_retained_cache_for_obj(self, obj: ServerObject, *, manual: bool | None = None) -> None:
+        key = fav_key(obj.ip, obj.gport)
+        snapshot = self._retained_snapshot_from_obj(obj)
+        existing = self.retained_servers.get(key)
+        if manual is None:
+            manual = bool(existing.get("manual", False)) if isinstance(existing, dict) else False
+        snapshot["manual"] = bool(manual)
+        self.retained_servers[key] = snapshot
+        try:
+            save_retained_servers(self.retained_servers)
+        except Exception:
+            pass
+
+    # ----------------------------
+    # Direct Connect
+    # ----------------------------
+    def _open_direct_connect_dialog(self, *_args):
+        self.direct_connect_entry.set_text("")
+        self.direct_connect_fav_check.set_active(True)
+        self.direct_connect_error_label.set_visible(False)
+        self.direct_connect_scrim.set_visible(True)
+        self.direct_connect_box.set_visible(True)
+        self.direct_connect_entry.grab_focus()
+        return False
+
+    def _close_direct_connect_dialog(self, *_args):
+        self.direct_connect_scrim.set_visible(False)
+        self.direct_connect_box.set_visible(False)
+        return False
+
+    def _on_direct_connect_ok_clicked(self, *_args):
+        parsed = _parse_direct_connect_address(self.direct_connect_entry.get_text())
+        if parsed is None:
+            self.direct_connect_error_label.set_text("Enter a valid address as IP:Port.")
+            self.direct_connect_error_label.set_visible(True)
+            return False
+        ip, gport, qport = parsed
+        add_favorite = bool(self.direct_connect_fav_check.get_active())
+        self._close_direct_connect_dialog()
+        self._add_direct_connect_server(ip, gport, qport, add_favorite)
+        return False
+
+    def _add_direct_connect_server(self, ip: str, gport: int, qport: int, add_favorite: bool) -> None:
+        key = fav_key(ip, gport)
+        existing = self._obj_by_key.get(key)
+        if existing is not None:
+            if add_favorite and not bool(existing.fav):
+                self._toggle_favorite_for_obj(existing)
+            self._update_retained_cache_for_obj(existing, manual=True)
+            self._submit_live_batch([key], reason="direct-connect")
+            return
+
+        if add_favorite:
+            self.favorites[key] = True
+            try:
+                save_favorites(self.favorites)
+            except Exception:
+                pass
+
+        row = {
+            "ip": ip,
+            "gport": gport,
+            "qport": qport,
+            "name": "",
+            "map": "",
+            "players": 0,
+            "maxPlayers": 0,
+            "password": 0,
+            "mods": "[]",
+            "modCount": 0,
+            "third_person": 0,
+            "timeWarp": 1.0,
+            "time": "--:--",
+            "country": "",
+            "ping": -1,
+            "bm_rank": 999999999,
+        }
+        built = _build_server_rows([row], self.favorites, self.last_played)
+        if not built:
+            return
+        k, obj = built[0]
+        n = self.store.get_n_items()
+        self.store.splice(n, 0, [obj])
+        self._obj_by_key[k] = obj
+        self.live.setdefault(k, {"hide_high_ping": False, "offline": True})
+        self._snapshot_row_sort_keys(obj, int(time.time()))
+        self._update_retained_cache_for_obj(obj, manual=True)
+
+        self._rebuild_mod_suggestion_index()
+        self._on_filter_changed(reason="direct-connect")
+        try:
+            sorter = getattr(self, "sorter", None)
+            if sorter is not None:
+                self._debug_sort_note_model_event("direct_connect_sorter_changed")
+                sorter.changed(Gtk.SorterChange.DIFFERENT)
+        except Exception:
+            pass
+        self._apply_titlebar_counts()
+
+        self._query_direct_connect_info(k)
+
+    def _query_direct_connect_info(self, key: str) -> None:
+        obj = self._obj_by_key.get(key)
+        if obj is None:
+            return
+        ip, qport, gport = obj.ip, obj.qport, obj.gport
+
+        def worker():
+            info = query_server_live(
+                ip,
+                qport,
+                gport=gport,
+                cycle_id=f"direct-connect:{key}",
+                generation="untokened",
+                row_id=id(obj),
+                model_id=id(getattr(self, "column_view_store", None)),
+            )
+            GLib.idle_add(self._apply_direct_connect_info, key, info)
+
+        self._executor.submit(worker)
+
+    def _apply_direct_connect_info(self, key: str, info: dict) -> bool:
+        obj = self._obj_by_key.get(key)
+        if obj is None:
+            return False
+        if not isinstance(info, dict) or not info.get("ok"):
+            obj.ping = -1
+            self._update_row_sort_ping(obj)
+            self.live.setdefault(key, {})["offline"] = True
+            self._on_filter_changed(reason="direct-connect")
+            return False
+
+        name = str(info.get("name") or "").strip()
+        if name:
+            obj.name = name
+            obj.name_lc = name.strip().lower()
+            obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
+        map_raw = str(info.get("map") or "").strip()
+        if map_raw:
+            standardized = standardize_map(map_raw)
+            if standardized:
+                obj.map_name = standardized
+        obj.players = int(info.get("players") or 0)
+        obj.max_players = int(info.get("max_players") or 0)
+        obj.queue = -1 if info.get("queue") is None else int(info.get("queue"))
+        obj.password = bool(info.get("password", obj.password))
+        proposed_time = str(info.get("time") or "")
+        if is_valid_hhmm(proposed_time):
+            obj.time = proposed_time
+        obj.ping = int(info.get("ping_ms", obj.ping))
+        self._update_row_sort_ping(obj)
+        self._update_row_sort_players(obj)
+        self.live.setdefault(key, {})["offline"] = False
+
+        self._update_retained_cache_for_obj(obj, manual=True)
+        self._on_filter_changed(reason="direct-connect")
+        return False
 
     def _set_background_download_column_visible(self, visible: bool) -> None:
         column = getattr(getattr(self, "list_view", None), "background_download_column", None)
