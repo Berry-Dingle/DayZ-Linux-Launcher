@@ -471,6 +471,18 @@ def get_app_css(
           color: @dzll_text_disabled;
         }}
 
+        .dzll-app-root checkbutton:disabled check,
+        .server-companion-panel checkbutton:disabled check {{
+          background: @dzll_control_disabled;
+          border-color: @dzll_text_disabled;
+        }}
+
+        .dzll-app-root checkbutton:disabled:checked check,
+        .server-companion-panel checkbutton:disabled:checked check {{
+          background: @dzll_text_disabled;
+          border-color: @dzll_text_disabled;
+        }}
+
         .dzll-app-root scrollbar,
         .dzll-app-root scrollbar trough,
         .required-mods-popover scrollbar,
@@ -697,30 +709,32 @@ def get_app_css(
           background-image: none;
         }}
 
+        .dzll-app-root scale:disabled trough,
+        .server-companion-panel scale:disabled trough {{
+          background: @dzll_control_disabled;
+          background-color: @dzll_control_disabled;
+        }}
+
         .dzll-app-root scale highlight,
         .dzll-app-root scale:hover highlight,
         .dzll-app-root scale:active highlight,
         .dzll-app-root scale:focus highlight,
         .dzll-app-root scale:focus-within highlight,
         .dzll-app-root scale:backdrop highlight,
-        .dzll-app-root scale:disabled highlight,
         .dzll-app-root scale highlight:hover,
         .dzll-app-root scale highlight:active,
         .dzll-app-root scale highlight:focus,
         .dzll-app-root scale highlight:backdrop,
-        .dzll-app-root scale highlight:disabled,
         .server-companion-panel scale highlight,
         .server-companion-panel scale:hover highlight,
         .server-companion-panel scale:active highlight,
         .server-companion-panel scale:focus highlight,
         .server-companion-panel scale:focus-within highlight,
         .server-companion-panel scale:backdrop highlight,
-        .server-companion-panel scale:disabled highlight,
         .server-companion-panel scale highlight:hover,
         .server-companion-panel scale highlight:active,
         .server-companion-panel scale highlight:focus,
-        .server-companion-panel scale highlight:backdrop,
-        .server-companion-panel scale highlight:disabled {{
+        .server-companion-panel scale highlight:backdrop {{
           background: @dzll_accent;
           background-color: @dzll_accent;
           background-image: none;
@@ -730,6 +744,22 @@ def get_app_css(
           outline: none;
           text-shadow: none;
           opacity: 1;
+          filter: none;
+        }}
+
+        .dzll-app-root scale:disabled highlight,
+        .dzll-app-root scale highlight:disabled,
+        .server-companion-panel scale:disabled highlight,
+        .server-companion-panel scale highlight:disabled {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          background-image: none;
+          border-color: transparent;
+          border-image: none;
+          box-shadow: none;
+          outline: none;
+          text-shadow: none;
+          opacity: 0.4;
           filter: none;
         }}
 
@@ -753,6 +783,15 @@ def get_app_css(
           text-shadow: none;
           opacity: 1;
           filter: none;
+        }}
+
+        .dzll-app-root scale:disabled slider,
+        .server-companion-panel scale:disabled slider,
+        .server-companion-panel scale.horizontal:disabled slider {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          border-color: @dzll_text_disabled;
+          opacity: 0.5;
         }}
 
         .dzll-app-root separator,
@@ -1590,6 +1629,25 @@ def get_app_css(
           text-shadow: none;
           opacity: 1;
           filter: none;
+        }}
+
+        .server-companion-panel:backdrop scale:disabled trough {{
+          background: @dzll_control_disabled;
+          background-color: @dzll_control_disabled;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop scale:disabled highlight {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          opacity: 0.4;
+        }}
+
+        .server-companion-panel:backdrop scale.horizontal:disabled slider {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          border-color: @dzll_text_disabled;
+          opacity: 0.5;
         }}
 
         .server-companion-panel:backdrop .ping-good {{ color: @dzll_ping_good; opacity: 1; }}
