@@ -992,7 +992,7 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
 
     window.refresh_status_btn = Gtk.Button()
     window.refresh_status_btn.set_can_focus(False)
-    window.refresh_status_btn.add_css_class("flat")
+    window.refresh_status_btn.add_css_class("circular")
     window.refresh_status_btn.set_child(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
     window.refresh_status_btn.set_tooltip_text("Refresh live ping, player count, queue and online status for all servers.")
     window.refresh_status_btn.connect("clicked", window._on_refresh_status_clicked)
