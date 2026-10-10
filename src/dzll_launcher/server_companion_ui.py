@@ -382,6 +382,7 @@ class ServerCompanionPanel(Gtk.Box):
 
         self.sound_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.sound_row.set_hexpand(True)
+        self.sound_row.set_sensitive(False)
         self.server_box.append(self.sound_row)
 
         sound_label = Gtk.Label(label="Alert Sound")
@@ -420,6 +421,7 @@ class ServerCompanionPanel(Gtk.Box):
 
         self.volume_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.volume_row.set_hexpand(True)
+        self.volume_row.set_sensitive(False)
         self.server_box.append(self.volume_row)
 
         volume_label = Gtk.Label(label="Alert Volume")
@@ -540,6 +542,8 @@ class ServerCompanionPanel(Gtk.Box):
 
     def set_restart_alert_enabled(self, enabled: bool):
         self.restart_alert_switch.set_active(bool(enabled))
+        self.sound_row.set_sensitive(bool(enabled))
+        self.volume_row.set_sensitive(bool(enabled))
         self.alert_sound_button.set_sensitive(bool(enabled))
         self.alert_volume_scale.set_sensitive(bool(enabled))
         self.alert_volume_percent_label.set_sensitive(bool(enabled))
@@ -654,6 +658,8 @@ class ServerCompanionPanel(Gtk.Box):
 
     def _on_restart_alert_clicked(self, *_args):
         enabled = self.restart_alert_enabled()
+        self.sound_row.set_sensitive(enabled)
+        self.volume_row.set_sensitive(enabled)
         self.alert_sound_button.set_sensitive(enabled)
         self.alert_volume_scale.set_sensitive(enabled)
         self.alert_volume_percent_label.set_sensitive(enabled)
