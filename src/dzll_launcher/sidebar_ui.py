@@ -26,7 +26,7 @@ from .mod_search import parse_required_mod_query, split_mod_search_operator
 _MOD_SEARCH_OPERATOR_RE = re.compile(r"(^|\s)(mods:|-mods=)", re.IGNORECASE)
 _MOD_SEARCH_MODE_OPERATOR_RE = re.compile(r"(^|\s)(mods:)", re.IGNORECASE)
 NORMAL_SEARCH_PLACEHOLDER = "Filter by name or IP. Click MOD-button to filter by mods."
-MOD_SEARCH_PLACEHOLDER = "Search for mods to filter by. Select a known mod, or press ESC to exit."
+MOD_SEARCH_PLACEHOLDER = "Search for mods to filter by. Press ESC to exit."
 MOD_SUGGESTION_VISIBLE_ROWS = 9
 MOD_SUGGESTION_ROW_HEIGHT_ESTIMATE = 34
 MOD_CHIP_VISIBLE_ROWS = 2
