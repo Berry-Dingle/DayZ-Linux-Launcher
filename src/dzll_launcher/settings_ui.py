@@ -1494,7 +1494,9 @@ class SettingsUI:
         box.append(btn)
 
         box.append(hr())
-        box.append(self._settings_row_switch("Auto Check For Updates", "auto_check_updates", default=True))
+        box.append(self._settings_row_switch("Auto Check For Launcher Updates", "auto_check_updates", default=True))
+
+        box.append(hr())
 
         update_db_btn = Gtk.Button(label="Update Server Database")
         update_db_btn.set_halign(Gtk.Align.START)
