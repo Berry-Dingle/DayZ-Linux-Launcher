@@ -10,6 +10,13 @@ from dzll_launcher import db, window
 from dzll_launcher.ui_row import ServerObject
 
 
+class _SyncExecutor:
+    """Runs submitted work inline so tests observe results synchronously."""
+
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+
 class _Store:
     def __init__(self):
         self.items = []
@@ -31,10 +38,12 @@ class _BrowserHost:
         self._browser_live_offline_streaks = {}
         self.favorites = {}
         self.last_played = {}
+        self.retained_servers = {}
         self.live = {}
         self.sorter = None
         self._discord = None
         self.map_choices = []
+        self._db_executor = _SyncExecutor()
 
     def _rebuild_mod_suggestion_index(self):
         pass
@@ -54,14 +63,14 @@ class _BrowserHost:
     def _debug_sort_attach_notify_probe(self, _obj):
         pass
 
-    def _is_likely_test_server_name(self, _name):
-        return False
-
     def _set_map_choices(self, choices):
         self.map_choices = list(choices)
 
-    def _load_rows_into_store(self, rows):
-        return window.DZLLWindow._load_rows_into_store(self, rows)
+    def _load_rows_into_store(self, rows, on_loaded=None):
+        return window.DZLLWindow._load_rows_into_store(self, rows, on_loaded=on_loaded)
+
+    def _finish_loading_rows(self, generation, built, on_loaded):
+        return window.DZLLWindow._finish_loading_rows(self, generation, built, on_loaded)
 
     def _restore_server_companion_if_enabled(self):
         pass
@@ -97,10 +106,17 @@ def _row(ip, gport=2302, qport=2303, *, name="Synthetic"):
 @pytest.fixture(autouse=True)
 def _disable_glib_timers(monkeypatch):
     monkeypatch.setattr(window.GLib, "timeout_add_seconds", lambda *_args: 1)
+    # Row loading hands its background-thread result back via GLib.idle_add;
+    # running the callback inline keeps these tests synchronous.
+    monkeypatch.setattr(window.GLib, "idle_add", lambda fn, *args, **kwargs: fn(*args, **kwargs))
 
 
 def _load(host, rows):
-    return window.DZLLWindow._load_rows_into_store(host, rows)
+    outcome = {"loaded": None}
+    window.DZLLWindow._load_rows_into_store(
+        host, rows, on_loaded=lambda loaded: outcome.__setitem__("loaded", loaded)
+    )
+    return outcome["loaded"]
 
 
 def _write_server_database(path, rows, *, include_official=False, include_night=False):

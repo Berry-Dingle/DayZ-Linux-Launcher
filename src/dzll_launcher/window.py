@@ -80,7 +80,6 @@ from .config import (
     AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED,
     SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED,
     SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED,
-    TEST_SERVER_MARKERS,
 )
 
 from .storage import (
@@ -95,10 +94,12 @@ from .storage import (
     clear_last_companion_server,
     load_dead_cache,
     save_dead_cache,
+    load_retained_servers,
+    save_retained_servers,
 )
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
-from .live import query_server_live, is_valid_hhmm
+from .live import query_server_live, query_server_mods, is_valid_hhmm
 from .server_endpoint import (
     ServerEndpointValidationError,
     normalize_server_endpoint,
@@ -552,6 +553,135 @@ def _db_advisory_flag(value) -> bool:
     return bool(value) if type(value) is int and value in (0, 1) else False
 
 
+def _build_server_rows(rows: list, favorites: dict, last_played: dict) -> list:
+    """Validate and construct ServerObjects from raw DB rows.
+
+    Pure computation only (no store/widget access) so it is safe to run on a
+    background thread; callers apply the returned (key, obj) pairs on the
+    main thread.
+    """
+    built = []
+    for dbrow in rows:
+        try:
+            ip, gport, qport = normalize_server_endpoint(
+                dbrow.get("ip"),
+                dbrow.get("gport"),
+                dbrow.get("qport"),
+                allow_missing_query_port=True,
+            )
+        except (AttributeError, ServerEndpointValidationError):
+            continue
+
+        name = _db_advisory_text(dbrow.get("name"))
+        raw_map = _db_advisory_text(dbrow.get("map"))
+        map_name = standardize_map(raw_map)
+
+        try:
+            players = int(dbrow.get("players") or 0)
+        except Exception:
+            players = 0
+        try:
+            maxp = int(dbrow.get("maxPlayers") or 0)
+        except Exception:
+            maxp = 0
+
+        password = _db_advisory_flag(dbrow.get("password"))
+        third_person = _db_advisory_flag(dbrow.get("third_person"))
+        official = type(dbrow.get("official")) is int and dbrow.get("official") == 1
+
+        raw_mods_json = dbrow.get("mods")
+        mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
+        mod_count_db = dbrow.get("modCount")
+        cnt, preview = parse_mods_preview(mods_json, max_names=8)
+        if mod_count_db is not None:
+            try:
+                cnt = int(mod_count_db)
+            except Exception:
+                pass
+
+        try:
+            timewarp = float(dbrow["timeWarp"]) if dbrow.get("timeWarp") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            timewarp = None
+        try:
+            night_timewarp = float(dbrow["nightTimeWarp"]) if dbrow.get("nightTimeWarp") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            night_timewarp = None
+        time_str = _db_advisory_text(dbrow.get("time"))
+        if not is_valid_hhmm(time_str):
+            time_str = "--:--"
+
+        country = _db_advisory_text(dbrow.get("country"))
+        try:
+            ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
+        except Exception:
+            ping_db = -1
+        try:
+            bm_rank = int(dbrow.get("bm_rank")) if dbrow.get("bm_rank") is not None else 999999999
+        except Exception:
+            bm_rank = 999999999
+
+        k = fav_key(ip, gport)
+        fav = bool(favorites.get(k, False))
+
+        lp_ts = last_played.get(k)
+        played_disp = human_last_played(lp_ts) if lp_ts else ""
+
+        obj = ServerObject(
+            fav=fav,
+            password=password,
+            third_person=third_person,
+            official=official,
+            name=name,
+            country=country,
+            ip=ip,
+            gport=gport,
+            qport=qport,
+            mod_count=cnt,
+            mods_preview=preview,
+            mods_json=mods_json,
+            time=time_str,
+            timewarp=timewarp,
+            night_timewarp=night_timewarp,
+            played=played_disp,
+            map_name=map_name,
+            players=players,
+            max_players=maxp,
+            ping=ping_db,
+            bm_rank=bm_rank,
+        )
+        obj.name_lc = name.strip().lower()
+        obj.ipport_lc = f"{ip}:{gport}".lower()
+        obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
+        obj.filter_key = k
+        obj.mod_search_index = build_server_mod_index(mods_json)
+        built.append((k, obj))
+    return built
+
+
+def _parse_direct_connect_address(text: str):
+    """Parse a user-typed "IP:Port" string into (ip, gport, qport).
+
+    Returns None if the text isn't a strict dotted-decimal IPv4 address with
+    a valid port - Direct Connect follows the same endpoint contract as every
+    other server source in the app.
+    """
+    text = (text or "").strip()
+    if ":" not in text:
+        return None
+    ip_part, _, port_part = text.rpartition(":")
+    ip_part = ip_part.strip()
+    port_part = port_part.strip()
+    try:
+        port = int(port_part)
+    except ValueError:
+        return None
+    try:
+        return normalize_server_endpoint(ip_part, port, None, allow_missing_query_port=True)
+    except (AttributeError, ServerEndpointValidationError):
+        return None
+
+
 def _initialize_companion_restart_runtime_for_window(
     *,
     active_path: str | Path,
@@ -594,7 +724,7 @@ def _pending_import_startup_error_kind(result) -> str:
 
 
 class DZLLWindow(Gtk.ApplicationWindow):
-    SORT_KEYS = ("ping", "players", "played")  # (list sorting keys only)
+    SORT_KEYS = ("ping", "players", "played", "fav")  # (list sorting keys only)
     _ANSI_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
     def __init__(self, app: Gtk.Application):
@@ -716,6 +846,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self.favorites = load_favorites()
         self.last_played = load_last_played()
+        self.retained_servers = load_retained_servers()
         self._last_played_presentation_token = None
         self._last_server_companion_saved = load_last_companion_server()
         self._companion_import_startup_result = apply_pending_import_at_startup(
@@ -794,14 +925,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._browser_live_filter_cooldown_logged_until = 0.0
         self._browser_live_apply_skip_logged_until = 0.0
         self._startup_live_generation = 0
-        self._startup_live_rest_queue = deque()
-        self._startup_live_rest_inflight = 0
-        self._startup_live_rest_buffer = []
-        self._startup_live_rest_flush_id = 0
-        self._startup_live_rest_total = 0
-        self._startup_live_rest_completed = 0
-        self._startup_live_rest_started_at = 0.0
-        self._startup_live_rest_last_log_completed = 0
+        self._row_load_generation = 0
         self._startup_warmup_keys = set()
         self._startup_warmup_completed = 0
         self._startup_warmup_target = 0
@@ -819,6 +943,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._status_refresh_last_log_completed = 0
         self._status_refresh_progress_update_id = 0
         self._status_refresh_progress_last_rendered = 0
+        self._status_refresh_last_completed_at = 0.0
+        self._status_refresh_last_completed_total = 0
+        self._status_refresh_last_label_tick_id = 0
 
         self._col_groups = [Gtk.SizeGroup(mode=Gtk.SizeGroupMode.HORIZONTAL) for _ in range(7)]
 
@@ -915,6 +1042,71 @@ class DZLLWindow(Gtk.ApplicationWindow):
         panel = self._settings_ui.build_panel()
         self.settings_revealer.set_child(panel)
         overlay.add_overlay(self.settings_revealer)
+
+        # DIRECT CONNECT DIALOG
+        self.direct_connect_scrim = Gtk.Box()
+        self.direct_connect_scrim.set_hexpand(True)
+        self.direct_connect_scrim.set_vexpand(True)
+        self.direct_connect_scrim.set_visible(False)
+        self.direct_connect_scrim.set_can_target(True)
+        self.direct_connect_scrim.add_css_class("settings-scrim")
+        direct_connect_scrim_click = Gtk.GestureClick.new()
+        direct_connect_scrim_click.set_button(0)
+        direct_connect_scrim_click.connect("pressed", lambda *_: self._close_direct_connect_dialog())
+        self.direct_connect_scrim.add_controller(direct_connect_scrim_click)
+        overlay.add_overlay(self.direct_connect_scrim)
+
+        self.direct_connect_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        self.direct_connect_box.set_halign(Gtk.Align.CENTER)
+        self.direct_connect_box.set_valign(Gtk.Align.CENTER)
+        self.direct_connect_box.set_visible(False)
+        self.direct_connect_box.set_can_target(True)
+        self.direct_connect_box.add_css_class("warning-card")
+        overlay.add_overlay(self.direct_connect_box)
+
+        direct_connect_title = Gtk.Label(label="Add Server by IP")
+        direct_connect_title.set_xalign(0.0)
+        direct_connect_title.add_css_class("dzll-overlay-heading")
+        direct_connect_title.add_css_class("confirmation-title")
+        self.direct_connect_box.append(direct_connect_title)
+
+        direct_connect_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        direct_connect_row.set_halign(Gtk.Align.FILL)
+        direct_connect_label = Gtk.Label(label="IP:Port")
+        direct_connect_label.set_xalign(0.0)
+        direct_connect_row.append(direct_connect_label)
+        self.direct_connect_entry = Gtk.Entry()
+        self.direct_connect_entry.set_hexpand(True)
+        self.direct_connect_entry.set_placeholder_text("203.0.113.10:2302")
+        self.direct_connect_entry.connect("activate", lambda *_: self._on_direct_connect_ok_clicked())
+        direct_connect_row.append(self.direct_connect_entry)
+        self.direct_connect_box.append(direct_connect_row)
+
+        self.direct_connect_error_label = Gtk.Label(label="")
+        self.direct_connect_error_label.add_css_class("confirmation-body")
+        self.direct_connect_error_label.set_xalign(0.0)
+        self.direct_connect_error_label.set_visible(False)
+        self.direct_connect_box.append(self.direct_connect_error_label)
+
+        self.direct_connect_fav_check = Gtk.CheckButton(label="Add to Favourites")
+        self.direct_connect_fav_check.set_active(True)
+        self.direct_connect_fav_check.set_halign(Gtk.Align.START)
+        self.direct_connect_box.append(self.direct_connect_fav_check)
+
+        direct_connect_btn_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
+        direct_connect_btn_row.set_halign(Gtk.Align.CENTER)
+        direct_connect_cancel_btn = Gtk.Button(label="Cancel")
+        direct_connect_cancel_btn.add_css_class("warning-btn")
+        attach_pointer_cursor(direct_connect_cancel_btn)
+        direct_connect_cancel_btn.connect("clicked", lambda *_: self._close_direct_connect_dialog())
+        direct_connect_btn_row.append(direct_connect_cancel_btn)
+        direct_connect_ok_btn = Gtk.Button(label="OK")
+        direct_connect_ok_btn.add_css_class("suggested-action")
+        direct_connect_ok_btn.add_css_class("warning-btn")
+        attach_pointer_cursor(direct_connect_ok_btn)
+        direct_connect_ok_btn.connect("clicked", lambda *_: self._on_direct_connect_ok_clicked())
+        direct_connect_btn_row.append(direct_connect_ok_btn)
+        self.direct_connect_box.append(direct_connect_btn_row)
 
         # DISCORD RICH FEATURES
         self._discord_last_join = None
@@ -1069,7 +1261,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         sidebar_stack.append(build_sidebar_toolbar(self))
 
         sidebar_frame = build_sidebar(self, include_toolbar=False)
-        self._install_header_mod_manager_button()
         try:
             self.refresh_status_btn.set_tooltip_text("Refresh all server status")
         except Exception:
@@ -1399,7 +1590,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # Titlebar counts
     # ----------------------------
     def _apply_titlebar_counts(self):
-        show_master = bool(self.settings.get("show_counts_in_title_bar", False))
+        show_master = bool(self.settings.get("show_counts_in_title_bar", True))
         show_servers = bool(self.settings.get("show_counts_servers_loaded", False))
         show_global = bool(self.settings.get("show_counts_global_players", False))
 
@@ -1435,7 +1626,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _steam_global_players_tick(self):
         if bool(getattr(self, "_shutdown_cleanup_done", False)):
             return False
-        if not bool(self.settings.get("show_counts_in_title_bar", False)):
+        if not bool(self.settings.get("show_counts_in_title_bar", True)):
             return True
         if not bool(self.settings.get("show_counts_global_players", True)):
             return True
@@ -2916,32 +3107,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception as e:
             print(f"[MODS UI] Failed to open mods manager: {e}")
 
-    def _install_header_mod_manager_button(self):
-        if getattr(self, "mod_manager_header_btn", None) is not None:
-            return
-        refresh_btn = getattr(self, "refresh_status_btn", None)
-        if refresh_btn is None:
-            return
-        try:
-            parent = refresh_btn.get_parent()
-        except Exception:
-            parent = None
-        if parent is None:
-            return
-
-        btn = Gtk.Button()
-        btn.set_can_focus(False)
-        btn.add_css_class("flat")
-        btn.set_child(Gtk.Image.new_from_icon_name("view-list-symbolic"))
-        btn.set_tooltip_text("Manage installed mods")
-        btn.connect("clicked", lambda *_: self.open_mods_manager())
-        attach_pointer_cursor(btn)
-        try:
-            parent.append(btn)
-            self.mod_manager_header_btn = btn
-        except Exception:
-            pass
-
     def _on_close_request(self, *_args):
         self._shutdown_cleanup()
         return False
@@ -3109,6 +3274,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._status_refresh_inflight = 0
             self._set_status_refresh_slot_running(False, generation=generation)
             self._status_refresh_generation = int(getattr(self, "_status_refresh_generation", 0) or 0) + 1
+            tick_id = int(getattr(self, "_status_refresh_last_label_tick_id", 0) or 0)
+            if tick_id:
+                try:
+                    GLib.source_remove(tick_id)
+                except Exception:
+                    pass
+            self._status_refresh_last_label_tick_id = 0
         except Exception:
             pass
 
@@ -3175,7 +3347,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         enabled = bool(self.settings.get("show_server_companion", False))
         undocked = enabled and not bool(getattr(self, "_server_companion_docked", True))
-        show_btn.set_visible((not enabled) or undocked)
+        show_btn.set_visible(undocked)
 
         icon = getattr(self, "server_companion_show_icon", None)
         if undocked:
@@ -3460,8 +3632,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _on_server_companion_undocked_close_request(self, *_args):
         if bool(getattr(self, "_server_companion_reparenting", False)):
             return False
-        self._debug_server_companion_dock("undocked window close requested")
-        self._dock_server_companion()
+        self._debug_server_companion_dock("undocked window close requested; turning off companion")
+        self.set_server_companion_enabled(False)
         return True
 
     def _update_server_companion_undocked_size(self) -> None:
@@ -5661,9 +5833,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _apply_db_rows(self, rows: list, fetched_ok: bool):
         endpoint_valid_rows = []
+        known_keys = set()
         for dbrow in rows or []:
             try:
-                normalize_server_endpoint(
+                ip, gport, _qport = normalize_server_endpoint(
                     dbrow.get("ip"),
                     dbrow.get("gport"),
                     dbrow.get("qport"),
@@ -5672,6 +5845,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except (AttributeError, ServerEndpointValidationError):
                 continue
             endpoint_valid_rows.append(dbrow)
+            known_keys.add(fav_key(ip, gport))
+
+        # Favourites and Direct Connect entries are retained even when the
+        # latest database snapshot drops them, so they don't silently vanish.
+        for key, retained_row in (self.retained_servers or {}).items():
+            if key in known_keys or not isinstance(retained_row, dict):
+                continue
+            endpoint_valid_rows.append(retained_row)
 
         try:
             choices = map_choices_from_db_rows(endpoint_valid_rows)
@@ -5679,153 +5860,79 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             self._set_map_choices(["All Maps"])
 
-        loaded = self._load_rows_into_store(endpoint_valid_rows)
-        if not loaded:
-            self._server_companion_rows_loaded = False
-            msg = "No Servers Found."
+        def on_loaded(loaded):
+            if not loaded:
+                self._server_companion_rows_loaded = False
+                msg = "No Servers Found."
+                if not fetched_ok:
+                    msg = "No Servers Found (DB Fetch Failed And No Usable Local DB)."
+                self.empty_label.set_text(msg)
+                self.empty_label.set_visible(True)
+                self._complete_startup_presentation()
+                return
+
+            self._server_companion_rows_loaded = True
+            self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
+            self._restore_server_companion_if_enabled()
+            self._set_updating(True, "Updating The Server Database, Please Wait…")
             if not fetched_ok:
-                msg = "No Servers Found (DB Fetch Failed And No Usable Local DB)."
-            self.empty_label.set_text(msg)
-            self.empty_label.set_visible(True)
-            self._complete_startup_presentation()
-            return False
+                self._auto_sort_lowest_ping_after_startup()
+                self._complete_startup_presentation()
+                return
+            keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
+            warmup_count = sum(self._bm_live_group(k) <= 1 for k in keys)
+            if DEBUG_STARTUP_LIVE:
+                print(
+                    f"[STARTUP-LIVE] warmup={warmup_count} total={len(keys)} "
+                    f"workers={STARTUP_LIVE_REST_WORKERS}",
+                    flush=True,
+                )
+            self._begin_status_refresh_sweep(keys, warmup_count=warmup_count)
 
-        self._server_companion_rows_loaded = True
-        self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
-        self._restore_server_companion_if_enabled()
-        self._set_updating(True, "Updating The Server Database, Please Wait…")
-        if not fetched_ok:
-            self._auto_sort_lowest_ping_after_startup()
-            self._complete_startup_presentation()
-            return False
-        keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
-        warmup_count = sum(self._bm_live_group(k) <= 1 for k in keys)
-        if DEBUG_STARTUP_LIVE:
-            print(
-                f"[STARTUP-LIVE] warmup={warmup_count} total={len(keys)} "
-                f"workers={STARTUP_LIVE_REST_WORKERS}",
-                flush=True,
-            )
-        self._submit_startup_rest_batches(keys, warmup_count=warmup_count)
+            GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
+            self._apply_titlebar_counts()
 
-        GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
-        self._apply_titlebar_counts()
+        self._load_rows_into_store(endpoint_valid_rows, on_loaded=on_loaded)
         return False
 
     # ----------------------------
     # Load rows
     # ----------------------------
-    def _load_rows_into_store(self, rows: list) -> bool:
+    def _load_rows_into_store(self, rows: list, on_loaded=None) -> None:
         n = self.store.get_n_items()
         if n:
             self.store.splice(0, n, [])
         self._obj_by_key.clear()
         self._browser_live_offline_streaks.clear()
 
+        self._row_load_generation = int(getattr(self, "_row_load_generation", 0) or 0) + 1
+        generation = self._row_load_generation
+
         if not rows:
             self._rebuild_mod_suggestion_index()
+            if on_loaded is not None:
+                on_loaded(False)
+            return
+
+        favorites = dict(self.favorites)
+        last_played = dict(self.last_played)
+
+        def worker():
+            built = _build_server_rows(rows, favorites, last_played)
+            GLib.idle_add(self._finish_loading_rows, generation, built, on_loaded)
+
+        self._db_executor.submit(worker)
+
+    def _finish_loading_rows(self, generation: int, built: list, on_loaded) -> bool:
+        if generation != int(getattr(self, "_row_load_generation", 0) or 0):
             return False
 
-        for dbrow in rows:
-            try:
-                ip, gport, qport = normalize_server_endpoint(
-                    dbrow.get("ip"),
-                    dbrow.get("gport"),
-                    dbrow.get("qport"),
-                    allow_missing_query_port=True,
-                )
-            except (AttributeError, ServerEndpointValidationError):
-                continue
-
-            name = _db_advisory_text(dbrow.get("name"))
-            raw_map = _db_advisory_text(dbrow.get("map"))
-            map_name = standardize_map(raw_map)
-
-            try:
-                players = int(dbrow.get("players") or 0)
-            except Exception:
-                players = 0
-            try:
-                maxp = int(dbrow.get("maxPlayers") or 0)
-            except Exception:
-                maxp = 0
-
-            password = _db_advisory_flag(dbrow.get("password"))
-            third_person = _db_advisory_flag(dbrow.get("third_person"))
-            official = type(dbrow.get("official")) is int and dbrow.get("official") == 1
-
-            raw_mods_json = dbrow.get("mods")
-            mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
-            mod_count_db = dbrow.get("modCount")
-            cnt, preview = parse_mods_preview(mods_json, max_names=8)
-            if mod_count_db is not None:
-                try:
-                    cnt = int(mod_count_db)
-                except Exception:
-                    pass
-
-            try:
-                timewarp = float(dbrow["timeWarp"]) if dbrow.get("timeWarp") is not None else None
-            except (TypeError, ValueError, OverflowError):
-                timewarp = None
-            try:
-                night_timewarp = float(dbrow["nightTimeWarp"]) if dbrow.get("nightTimeWarp") is not None else None
-            except (TypeError, ValueError, OverflowError):
-                night_timewarp = None
-            time_str = _db_advisory_text(dbrow.get("time"))
-            if not is_valid_hhmm(time_str):
-                time_str = "--:--"
-
-            country = _db_advisory_text(dbrow.get("country"))
-            try:
-                ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
-            except Exception:
-                ping_db = -1
-            try:
-                bm_rank = int(dbrow.get("bm_rank")) if dbrow.get("bm_rank") is not None else 999999999
-            except Exception:
-                bm_rank = 999999999
-
-            k = fav_key(ip, gport)
-            fav = bool(self.favorites.get(k, False))
-
-            lp_ts = self.last_played.get(k)
-            played_disp = human_last_played(lp_ts) if lp_ts else ""
-
-            obj = ServerObject(
-                fav=fav,
-                password=password,
-                third_person=third_person,
-                official=official,
-                name=name,
-                country=country,
-                ip=ip,
-                gport=gport,
-                qport=qport,
-                mod_count=cnt,
-                mods_preview=preview,
-                mods_json=mods_json,
-                time=time_str,
-                timewarp=timewarp,
-                night_timewarp=night_timewarp,
-                played=played_disp,
-                map_name=map_name,
-                players=players,
-                max_players=maxp,
-                ping=ping_db,
-                bm_rank=bm_rank,
-            )
-            obj.name_lc = name.strip().lower()
-            obj.ipport_lc = f"{ip}:{gport}".lower()
-            obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
-            obj.filter_key = k
-            obj.is_likely_test_server = self._is_likely_test_server_name(obj.name_lc)
-            obj.mod_search_index = build_server_mod_index(mods_json)
+        n = self.store.get_n_items()
+        self.store.splice(n, 0, [obj for _k, obj in built])
+        for k, obj in built:
             self._debug_sort_attach_notify_probe(obj)
-
-            self.store.append(obj)
             self._obj_by_key[k] = obj
-            self.live.setdefault(k, {"hide_high_ping": False, "offline": (ping_db < 0)})
+            self.live.setdefault(k, {"hide_high_ping": False, "offline": (int(getattr(obj, "ping", -1)) < 0)})
 
         self._rebuild_mod_suggestion_index()
         self._snapshot_all_sort_keys()
@@ -5848,7 +5955,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         # -----------------------------
 
-        return self.store.get_n_items() > 0
+        if on_loaded is not None:
+            on_loaded(self.store.get_n_items() > 0)
+        return False
 
     # ----------------------------
     # Snapshot sort keys
@@ -5922,8 +6031,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
 
         changed = False
-        membership_changed = False
-        played_only = bool((getattr(self, "_filter_state", None) or {}).get("played_only", False))
         current_rows = getattr(self, "_obj_by_key", {})
         for key, ts in self.last_played.items():
             obj = current_rows.get(key)
@@ -5934,11 +6041,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if old_played != played:
                 obj.played = played
                 changed = True
-                if played_only and bool(old_played) != bool(played):
-                    membership_changed = True
             if self._update_row_sort_played_days(obj, now_ts):
                 changed = True
-        if membership_changed or (changed and getattr(self, "sort_key", None) == "played"):
+        if changed and getattr(self, "sort_key", None) == "played":
             self._rebuild_column_view_store(reorder_reason="last-played-calendar")
         self._last_played_presentation_token = token
         return changed
@@ -6086,6 +6191,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         str(getattr(obj, "ip", "") or "").lower(),
                         gport,
                     )
+                elif self.sort_key == "fav":
+                    active_value = 0 if bool(getattr(obj, "fav", False)) else 1
                 else:
                     active_value = 0
                 if not self.sort_asc:
@@ -6411,231 +6518,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return 3
         return 0 if rank <= 100 else (1 if rank <= 1000 else (2 if rank <= 2000 else 3))
 
-    def _submit_startup_rest_batches(self, keys, warmup_count=0):
-        keys = list(keys or [])
-        self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
-        generation = self._startup_live_generation
-        self._startup_live_rest_queue = deque(keys)
-        self._startup_live_rest_inflight = 0
-        self._startup_live_rest_buffer = []
-        self._startup_live_rest_total = len(keys)
-        self._startup_live_rest_completed = 0
-        self._startup_live_rest_started_at = time.monotonic()
-        self._startup_live_rest_last_log_completed = 0
-        self._startup_warmup_keys = set(keys[:warmup_count])
-        self._startup_warmup_completed = 0
-        self._startup_warmup_target = max(
-            1, (warmup_count * int(STARTUP_WARMUP_READY_PERCENT) + 99) // 100
-        ) if warmup_count else 0
-        self._startup_warmup_revealed = False
-        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
-        if timeout_id:
-            GLib.source_remove(timeout_id)
-        self._startup_warmup_timeout_id = 0
-        tid = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
-        if tid:
-            try:
-                GLib.source_remove(tid)
-            except Exception:
-                pass
-        self._startup_live_rest_flush_id = 0
-        if DEBUG_STARTUP_LIVE:
-            print(
-                f"[STARTUP-LIVE] rest start queued={len(keys)} workers={STARTUP_LIVE_REST_WORKERS} "
-                f"timeout={STARTUP_LIVE_REST_TIMEOUT_SECS:.2f}s "
-                f"flush_max={STARTUP_LIVE_FLUSH_MAX} flush_ms={STARTUP_LIVE_FLUSH_MS}",
-                flush=True,
-            )
-        if not keys:
-            self._complete_startup_warmup(generation)
-            return False
-        if warmup_count:
-            self._startup_warmup_timeout_id = GLib.timeout_add_seconds(
-                STARTUP_WARMUP_MAX_WAIT_SECS, self._on_startup_warmup_timeout, generation
-            )
-        else:
-            self._complete_startup_warmup(generation)
-        self._pump_startup_rest_sweep(generation)
-        return False
-
-    def _on_startup_warmup_timeout(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        self._startup_warmup_timeout_id = 0
-        return self._complete_startup_warmup(generation)
-
-    def _complete_startup_warmup(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        if self._startup_warmup_revealed:
-            return False
-        self._startup_warmup_revealed = True
-        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
-        self._startup_warmup_timeout_id = 0
-        if timeout_id:
-            GLib.source_remove(timeout_id)
-        flush_id = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
-        if flush_id:
-            GLib.source_remove(flush_id)
-            self._startup_live_rest_flush_id = 0
-        self._flush_startup_rest_results(generation)
-        self._auto_sort_lowest_ping_after_startup()
-        was_completed = bool(getattr(getattr(self, "_startup_presentation", None), "startup_completed", False))
-        self._complete_startup_presentation()
-        if was_completed:
-            self._set_updating(False)
-        return False
-
-    def _query_startup_rest_one(self, generation: int, k, ip: str, qport: int):
-        obj = self._obj_by_key.get(k)
-        try:
-            info = query_server_live(
-                ip,
-                qport,
-                timeout=STARTUP_LIVE_REST_TIMEOUT_SECS,
-                gport=(obj.gport if obj is not None else qport),
-                cycle_id=f"startup-rest:{generation}:{k}",
-                generation=generation,
-                row_id=(id(obj) if obj is not None else "missing"),
-                model_id=id(getattr(self, "column_view_store", None)),
-            )
-        except Exception as e:
-            info = {"ok": False, "err": str(e)}
-        return generation, (k, info)
-
-    def _pump_startup_rest_sweep(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-
-        cap = int(STARTUP_LIVE_REST_WORKERS)
-        while int(getattr(self, "_startup_live_rest_inflight", 0) or 0) < cap:
-            try:
-                k = self._startup_live_rest_queue.popleft()
-            except Exception:
-                break
-            obj = self._obj_by_key.get(k)
-            if not obj:
-                self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-                continue
-            try:
-                ip = str(obj.ip)
-                qport = int(obj.qport)
-            except Exception:
-                self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-                continue
-
-            self._startup_live_rest_inflight = int(getattr(self, "_startup_live_rest_inflight", 0) or 0) + 1
-            try:
-                fut = self._startup_live_executor.submit(self._query_startup_rest_one, generation, k, ip, qport)
-                fut.add_done_callback(
-                    lambda done_fut, gen=generation, key=k: GLib.idle_add(
-                        self._on_startup_rest_future_done,
-                        gen,
-                        done_fut,
-                        key,
-                    )
-                )
-            except Exception:
-                self._startup_live_rest_inflight = max(0, int(getattr(self, "_startup_live_rest_inflight", 0) or 0) - 1)
-                self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-
-        self._maybe_finish_startup_rest_sweep(generation)
-        return False
-
-    def _on_startup_rest_future_done(self, generation: int, fut, key=None):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        self._startup_live_rest_inflight = max(0, int(getattr(self, "_startup_live_rest_inflight", 0) or 0) - 1)
-        self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
-        if key in self._startup_warmup_keys:
-            self._startup_warmup_completed += 1
-        try:
-            result_generation, result = fut.result()
-        except Exception:
-            result_generation, result = generation, None
-        if result_generation == generation and result:
-            self._startup_live_rest_buffer.append(result)
-            if len(self._startup_live_rest_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
-                self._flush_startup_rest_results(generation)
-            elif not int(getattr(self, "_startup_live_rest_flush_id", 0) or 0):
-                try:
-                    self._startup_live_rest_flush_id = GLib.timeout_add(
-                        int(STARTUP_LIVE_FLUSH_MS),
-                        self._flush_startup_rest_results,
-                        generation,
-                    )
-                except Exception:
-                    self._startup_live_rest_flush_id = 0
-
-        if (
-            not self._startup_warmup_revealed
-            and self._startup_warmup_completed >= self._startup_warmup_target
-        ):
-            self._complete_startup_warmup(generation)
-
-        if DEBUG_STARTUP_LIVE:
-            completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
-            total = int(getattr(self, "_startup_live_rest_total", 0) or 0)
-            last_logged = int(getattr(self, "_startup_live_rest_last_log_completed", 0) or 0)
-            if completed == total or completed - last_logged >= 250:
-                self._startup_live_rest_last_log_completed = completed
-                elapsed = time.monotonic() - float(getattr(self, "_startup_live_rest_started_at", time.monotonic()) or time.monotonic())
-                rate = (completed / elapsed) if elapsed > 0 else 0.0
-                print(
-                    f"[STARTUP-LIVE] rest progress completed={completed}/{total} "
-                    f"elapsed={elapsed:.1f}s rate={rate:.1f}/s",
-                    flush=True,
-                )
-
-        self._pump_startup_rest_sweep(generation)
-        return False
-
-    def _flush_startup_rest_results(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        self._startup_live_rest_flush_id = 0
-        results = list(getattr(self, "_startup_live_rest_buffer", ()) or ())
-        self._startup_live_rest_buffer = []
-        if results:
-            if DEBUG_STARTUP_LIVE:
-                print(f"[STARTUP-LIVE] rest flush size={len(results)}", flush=True)
-            self._apply_live_results(results, reason="startup-batch")
-        self._maybe_finish_startup_rest_sweep(generation)
-        return False
-
-    def _maybe_finish_startup_rest_sweep(self, generation: int):
-        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
-            return False
-        if int(getattr(self, "_startup_live_rest_inflight", 0) or 0) > 0:
-            return False
-        if len(getattr(self, "_startup_live_rest_queue", ()) or ()) > 0:
-            return False
-        if getattr(self, "_startup_live_rest_buffer", None):
-            tid = int(getattr(self, "_startup_live_rest_flush_id", 0) or 0)
-            if tid:
-                try:
-                    GLib.source_remove(tid)
-                except Exception:
-                    pass
-                self._startup_live_rest_flush_id = 0
-            self._flush_startup_rest_results(generation)
-            return False
-        if not self._startup_warmup_revealed:
-            self._complete_startup_warmup(generation)
-        if DEBUG_STARTUP_LIVE:
-            total = int(getattr(self, "_startup_live_rest_total", 0) or 0)
-            completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
-            elapsed = time.monotonic() - float(getattr(self, "_startup_live_rest_started_at", time.monotonic()) or time.monotonic())
-            rate = (completed / elapsed) if elapsed > 0 else 0.0
-            print(
-                f"[STARTUP-LIVE] rest complete completed={completed}/{total} "
-                f"elapsed={elapsed:.2f}s rate={rate:.1f}/s",
-                flush=True,
-            )
-        return False
-
     def _apply_status_refresh_cursor_for_state(self, btn=None):
         btn = btn or getattr(self, "refresh_status_btn", None)
         if btn is None:
@@ -6694,7 +6576,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         count_label = getattr(self, "status_refresh_progress_count_label", None)
         bar = getattr(self, "status_refresh_progress_bar", None)
         slot = getattr(self, "status_refresh_slot", None)
-        refresh_btn = getattr(self, "refresh_status_btn", None)
+        idle_row = getattr(self, "status_refresh_idle_row", None)
         if not visible:
             self._status_refresh_progress_last_rendered = 0
             try:
@@ -6705,8 +6587,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     bar.set_fraction(0.0)
                 if box is not None:
                     box.set_visible(False)
-                if slot is not None and refresh_btn is not None:
-                    slot.set_visible_child(refresh_btn)
+                if slot is not None and idle_row is not None:
+                    slot.set_visible_child(idle_row)
             except Exception:
                 pass
             return False
@@ -6776,7 +6658,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._set_status_refresh_progress_visible(False, generation=generation)
         return False
 
-    def _status_refresh_attempt_finished(self, generation: int, result=None):
+    def _status_refresh_attempt_finished(self, generation: int, key=None, result=None):
         if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         if bool(getattr(self, "_shutdown_cleanup_done", False)):
@@ -6786,6 +6668,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         total = max(0, int(getattr(self, "_status_refresh_total", 0) or 0))
         completed = max(0, int(getattr(self, "_status_refresh_completed", 0) or 0))
         self._status_refresh_completed = min(total, completed + 1)
+        if key is not None and key in (getattr(self, "_startup_warmup_keys", None) or ()):
+            self._startup_warmup_completed = int(getattr(self, "_startup_warmup_completed", 0) or 0) + 1
+            if (
+                not bool(getattr(self, "_startup_warmup_revealed", True))
+                and self._startup_warmup_completed >= int(getattr(self, "_startup_warmup_target", 0) or 0)
+            ):
+                self._complete_startup_warmup(generation)
         if result:
             self._status_refresh_buffer.append(result)
             if len(self._status_refresh_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
@@ -6806,9 +6695,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if generation is not None and generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         btn = getattr(self, "refresh_status_btn", None)
+        idle_row = getattr(self, "status_refresh_idle_row", None)
         progress = getattr(self, "status_refresh_progress_box", None)
         slot = getattr(self, "status_refresh_slot", None)
-        if btn is None or progress is None or slot is None:
+        if btn is None or idle_row is None or progress is None or slot is None:
             return False
         self._ensure_status_refresh_cursor_controller(btn)
         try:
@@ -6817,7 +6707,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 slot.set_visible_child(progress)
                 self._apply_status_refresh_cursor_for_state(btn)
             else:
-                slot.set_visible_child(btn)
+                slot.set_visible_child(idle_row)
                 self._apply_status_refresh_cursor_for_state(btn)
         except Exception:
             return False
@@ -6830,6 +6720,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not keys:
             self._clear_status_refresh_progress()
             return
+        self._begin_status_refresh_sweep(keys)
+
+    def _begin_status_refresh_sweep(self, keys, warmup_count=None):
+        if bool(getattr(self, "_status_refresh_running", False)):
+            return False
+        keys = list(keys or [])
+        if not keys:
+            return False
 
         self._status_refresh_generation = int(getattr(self, "_status_refresh_generation", 0) or 0) + 1
         generation = self._status_refresh_generation
@@ -6867,7 +6765,81 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 f"timeout={STARTUP_LIVE_REST_TIMEOUT_SECS:.2f}s",
                 flush=True,
             )
+        self._begin_startup_warmup_gate(generation, keys, warmup_count)
         self._pump_status_refresh(generation)
+        return False
+
+    def _begin_startup_warmup_gate(self, generation: int, keys: list, warmup_count: int | None):
+        """Optionally gate startup's reveal behind a sweep in progress.
+
+        warmup_count is None for ordinary (e.g. manual "Refresh All") sweeps -
+        no reveal-gating applies, and any leftover warmup-key bookkeeping from
+        an earlier startup sweep is cleared so it can't spuriously retrigger.
+        When given (startup only), the splash reveal waits for either
+        STARTUP_WARMUP_READY_PERCENT% of the first `warmup_count` keys (the
+        best-ranked servers) to get a live result, or STARTUP_WARMUP_MAX_WAIT_SECS,
+        whichever comes first.
+        """
+        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+        if timeout_id:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+        self._startup_warmup_timeout_id = 0
+
+        if warmup_count is None:
+            self._startup_warmup_keys = set()
+            self._startup_warmup_completed = 0
+            self._startup_warmup_target = 0
+            return
+
+        self._startup_warmup_keys = set(keys[:warmup_count])
+        self._startup_warmup_completed = 0
+        self._startup_warmup_target = max(
+            1, (warmup_count * int(STARTUP_WARMUP_READY_PERCENT) + 99) // 100
+        ) if warmup_count else 0
+        self._startup_warmup_revealed = False
+        if warmup_count:
+            self._startup_warmup_timeout_id = GLib.timeout_add_seconds(
+                STARTUP_WARMUP_MAX_WAIT_SECS, self._on_startup_warmup_timeout, generation
+            )
+        else:
+            self._complete_startup_warmup(generation)
+
+    def _on_startup_warmup_timeout(self, generation: int):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        self._startup_warmup_timeout_id = 0
+        return self._complete_startup_warmup(generation)
+
+    def _complete_startup_warmup(self, generation: int):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        if self._startup_warmup_revealed:
+            return False
+        self._startup_warmup_revealed = True
+        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+        self._startup_warmup_timeout_id = 0
+        if timeout_id:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+        flush_id = int(getattr(self, "_status_refresh_flush_id", 0) or 0)
+        if flush_id:
+            try:
+                GLib.source_remove(flush_id)
+            except Exception:
+                pass
+            self._status_refresh_flush_id = 0
+        self._flush_status_refresh_results(generation)
+        self._auto_sort_lowest_ping_after_startup()
+        was_completed = bool(getattr(getattr(self, "_startup_presentation", None), "startup_completed", False))
+        self._complete_startup_presentation()
+        if was_completed:
+            self._set_updating(False)
+        return False
 
     def _query_status_refresh_one(self, generation: int, k, ip: str, qport: int):
         obj = self._obj_by_key.get(k)
@@ -6900,33 +6872,34 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 break
             obj = self._obj_by_key.get(k)
             if not obj:
-                self._status_refresh_attempt_finished(generation)
+                self._status_refresh_attempt_finished(generation, key=k)
                 continue
             try:
                 ip = str(obj.ip)
                 qport = int(obj.qport)
             except Exception:
-                self._status_refresh_attempt_finished(generation)
+                self._status_refresh_attempt_finished(generation, key=k)
                 continue
 
             self._status_refresh_inflight = int(getattr(self, "_status_refresh_inflight", 0) or 0) + 1
             try:
                 fut = self._startup_live_executor.submit(self._query_status_refresh_one, generation, k, ip, qport)
                 fut.add_done_callback(
-                    lambda done_fut, gen=generation: GLib.idle_add(
+                    lambda done_fut, gen=generation, key=k: GLib.idle_add(
                         self._on_status_refresh_future_done,
                         gen,
                         done_fut,
+                        key,
                     )
                 )
             except Exception:
                 self._status_refresh_inflight = max(0, int(getattr(self, "_status_refresh_inflight", 0) or 0) - 1)
-                self._status_refresh_attempt_finished(generation)
+                self._status_refresh_attempt_finished(generation, key=k)
 
         self._maybe_finish_status_refresh(generation)
         return False
 
-    def _on_status_refresh_future_done(self, generation: int, fut):
+    def _on_status_refresh_future_done(self, generation: int, fut, key=None):
         if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         self._status_refresh_inflight = max(0, int(getattr(self, "_status_refresh_inflight", 0) or 0) - 1)
@@ -6936,6 +6909,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             result_generation, result = generation, None
         self._status_refresh_attempt_finished(
             generation,
+            key=key,
             result=(result if result_generation == generation else None),
         )
 
@@ -6987,6 +6961,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._flush_status_refresh_results(generation)
             return False
 
+        if not bool(getattr(self, "_startup_warmup_revealed", True)):
+            self._complete_startup_warmup(generation)
+
         self._cancel_status_refresh_progress_update(generation)
         self._render_status_refresh_progress(generation, force=True)
         self._status_refresh_running = False
@@ -7026,6 +7003,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             GLib.idle_add(restore_status_refresh_scroll)
         self._set_status_refresh_slot_running(False, generation=generation)
         self._clear_status_refresh_progress(generation)
+        self._status_refresh_last_completed_at = time.monotonic()
+        self._status_refresh_last_completed_total = int(getattr(self, "_status_refresh_total", 0) or 0)
+        self._update_status_refresh_last_label()
+        self._schedule_status_refresh_last_label_tick()
         if DEBUG_STARTUP_LIVE:
             total = int(getattr(self, "_status_refresh_total", 0) or 0)
             completed = int(getattr(self, "_status_refresh_completed", 0) or 0)
@@ -7037,6 +7018,49 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 flush=True,
             )
         return False
+
+    def _format_elapsed_ago(self, seconds: float) -> str:
+        total_minutes = max(0, int(seconds)) // 60
+        if total_minutes < 1:
+            return "just now"
+        hours, minutes = divmod(total_minutes, 60)
+        if hours <= 0:
+            return f"{minutes}m ago"
+        return f"{hours}h {minutes}m ago"
+
+    def _update_status_refresh_last_label(self):
+        label = getattr(self, "status_refresh_last_label", None)
+        if label is None:
+            return False
+        completed_at = float(getattr(self, "_status_refresh_last_completed_at", 0.0) or 0.0)
+        if completed_at <= 0.0:
+            label.set_visible(False)
+            return False
+        total = int(getattr(self, "_status_refresh_last_completed_total", 0) or 0)
+        ago_text = self._format_elapsed_ago(time.monotonic() - completed_at)
+        text = f"Refreshed {total:,} - {ago_text}"
+        label.set_text(text)
+        label.set_tooltip_text(text)
+        label.set_visible(True)
+        return False
+
+    def _schedule_status_refresh_last_label_tick(self):
+        if int(getattr(self, "_status_refresh_last_label_tick_id", 0) or 0):
+            return False
+        try:
+            self._status_refresh_last_label_tick_id = GLib.timeout_add_seconds(
+                30, self._on_status_refresh_last_label_tick
+            )
+        except Exception:
+            self._status_refresh_last_label_tick_id = 0
+        return False
+
+    def _on_status_refresh_last_label_tick(self):
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            self._status_refresh_last_label_tick_id = 0
+            return False
+        self._update_status_refresh_last_label()
+        return True
 
     def _submit_live_batch(self, keys, reason="batch"):
         if not keys:
@@ -7247,21 +7271,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
             k, ip, qport = item
             obj = self._obj_by_key.get(k)
             try:
-                return (
-                    k,
-                    query_server_live(
-                        ip,
-                        qport,
-                        timeout=BROWSER_LIVE_TIMEOUT_SECS,
-                        gport=(obj.gport if obj is not None else qport),
-                        cycle_id=f"browser:{token}:{k}",
-                        generation=token,
-                        row_id=(id(obj) if obj is not None else "missing"),
-                        model_id=id(getattr(self, "column_view_store", None)),
-                    ),
+                result = query_server_live(
+                    ip,
+                    qport,
+                    timeout=BROWSER_LIVE_TIMEOUT_SECS,
+                    gport=(obj.gport if obj is not None else qport),
+                    cycle_id=f"browser:{token}:{k}",
+                    generation=token,
+                    row_id=(id(obj) if obj is not None else "missing"),
+                    model_id=id(getattr(self, "column_view_store", None)),
                 )
             except Exception as e:
                 return (k, {"ok": False, "err": str(e)})
+            if result.get("ok") and bool(self.retained_servers.get(k, {}).get("manual")):
+                try:
+                    result["mods"] = query_server_mods(ip, qport, timeout=BROWSER_LIVE_TIMEOUT_SECS)
+                except Exception:
+                    pass
+            return (k, result)
 
         def worker():
             results = []
@@ -7558,6 +7585,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._update_row_sort_ping(obj)
                 debug_row_notifications += 1
                 debug_ping_updates += 1
+                if reason == "browser-live":
+                    obj.refresh_pulse = int(obj.refresh_pulse) + 1
                 self.live.setdefault(k, {})["offline"] = True
                 STATUS_DIAGNOSTICS.emit(
                     "status-observation",
@@ -7698,7 +7727,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._update_row_sort_ping(obj)
                 debug_row_notifications += 1
                 debug_ping_updates += 1
+            if reason == "browser-live":
+                obj.refresh_pulse = int(obj.refresh_pulse) + 1
             self.live.setdefault(k, {})["offline"] = False
+            if reason == "browser-live":
+                mods_result = info.get("mods")
+                if isinstance(mods_result, dict) and mods_result.get("ok"):
+                    mod_list = mods_result.get("mods") or []
+                    mods_json = json.dumps(mod_list)
+                    if mods_json != obj.mods_json:
+                        obj.mods_json = mods_json
+                        obj.mod_count = len(mod_list)
+                        _mod_cnt, preview = parse_mods_preview(mods_json, max_names=8)
+                        obj.mods_preview = preview
+                        obj.mod_search_index = build_server_mod_index(mods_json)
             if debug_success:
                 for notify_id in notify_ids:
                     try:
@@ -7834,43 +7876,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._apply_titlebar_counts()
         return False
 
-    def _is_likely_test_server_name(self, name: str) -> bool:
-        s = str(name or "").strip().lower()
-        if not s:
-            return False
-
-        # Normalize separators/punctuation to spaces
-        s = re.sub(r"[_\-\.\[\]\(\)#*/!]+", " ", s)
-
-        # Split joined alpha/number boundaries: test2 -> test 2, dev1 -> dev 1
-        s = re.sub(r"([a-z])(\d)", r"\1 \2", s)
-        s = re.sub(r"(\d)([a-z])", r"\1 \2", s)
-
-        # Collapse whitespace
-        s = re.sub(r"\s+", " ", s).strip()
-        if not s:
-            return False
-
-        tokens = set(s.split())
-
-        for marker in TEST_SERVER_MARKERS:
-            m = marker.strip().lower()
-            if not m:
-                continue
-
-            if " " in m:
-                if m in s:
-                    return True
-            else:
-                if m in tokens:
-                    return True
-
-                # Allow marker glued to start/end of a token, but not buried in the middle
-                for tok in tokens:
-                    if tok.startswith(m) or tok.endswith(m):
-                        return True
-
-        return False
 
 # ==== MAIN.PY PART 3 ==== #
     # ----------------------------
@@ -7900,14 +7905,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         q = str(state.get("query") or "")
         ipport = getattr(obj, "ipport_lc", "") or f"{obj.ip}:{obj.gport}".lower()
 
-        if bool(state.get("hide_test_servers", True)) and bool(getattr(obj, "is_likely_test_server", False)):
-            return False
-
         max_players_cutoff = int(state.get("max_players_cutoff", 0) or 0)
         if not is_fav and max_players_cutoff > 0 and int(obj.max_players) < max_players_cutoff:
-            return False
-
-        if bool(state.get("show_fav", False)) and not is_fav:
             return False
 
         # 1PP Only: reject servers that allow 3PP
@@ -7925,9 +7924,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if int(obj.ping) < 0:
                     return False
             except Exception:
-                return False
-        if bool(state.get("played_only", False)):
-            if not (obj.played or "").strip():
                 return False
 
         selected_map = str(state.get("selected_map") or "All Maps")
@@ -7985,14 +7981,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "mod_query": mod_query,
             "now": int(time.time()),
             "live": self.live,
-            "show_fav": active("cb_show_fav"),
             "one_pp_only": active("cb_1pp_only"),
             "three_pp_only": active("cb_3pp_only"),
             "no_password": active("cb_no_password"),
             "online_only": active("cb_online_only"),
-            "played_only": active("cb_played_only"),
             "selected_map": selected_map,
-            "hide_test_servers": bool(self.settings.get("hide_test_servers", True)),
             "hide_official_servers": bool(self.settings.get("hide_official_servers", False)),
             "max_players_cutoff": max_players_cutoff,
         }
@@ -8200,7 +8193,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             if entry:
                 entry.set_text(saved_text)
-                entry.set_placeholder_text("Filter by name or IP. Click MOD for required mods.")
+                entry.set_placeholder_text("Filter by name or IP. Click MOD-button to filter by mods.")
                 icon = "edit-clear-symbolic" if saved_text else None
                 entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, icon)
                 try:
@@ -9029,7 +9022,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._push_filter_refresh_suppression()
             try:
                 self.search_entry.set_text("")
-                self.search_entry.set_placeholder_text("Filter by name or IP. Click MOD for required mods.")
+                self.search_entry.set_placeholder_text("Filter by name or IP. Click MOD-button to filter by mods.")
                 self.search_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
                 try:
                     self.search_entry.remove_css_class("mod-search-entry-active")
@@ -9054,7 +9047,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self.map_dropdown.set_selected(0)
             except Exception:
                 pass
-            for cb in (self.cb_show_fav, self.cb_1pp_only, self.cb_3pp_only, self.cb_no_password, self.cb_online_only, self.cb_played_only):
+            for cb in (self.cb_1pp_only, self.cb_3pp_only, self.cb_no_password, self.cb_online_only):
                 try:
                     cb.set_active(False)
                 except Exception:
@@ -9424,9 +9417,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "played": "played",
             "players": "players",
             "ping": "ping",
+            "fav": "fav",
         }
         key = title_to_key.get(key, key)
-        if key in {"players", "ping", "played"}:
+        if key in {"players", "ping", "played", "fav"}:
             if DEBUG_FILTER_TIMING and isinstance(ctx, dict):
                 ctx["action"] = f"sort:{key}"
             self._set_sort(key, timing_ctx=ctx)
@@ -9467,6 +9461,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             save_favorites(self.favorites)
         except Exception:
             pass
+        if obj.fav:
+            self._update_retained_cache_for_obj(obj)
+        else:
+            entry = self.retained_servers.get(k)
+            if isinstance(entry, dict) and not bool(entry.get("manual", False)):
+                del self.retained_servers[k]
+                try:
+                    save_retained_servers(self.retained_servers)
+                except Exception:
+                    pass
         # Favourite membership is part of the visibility predicate: refresh so
         # the three ordinary-filter exemptions take effect (or are removed)
         # immediately. The existing row object and sort semantics are retained.
@@ -9482,6 +9486,198 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 return False
 
             GLib.idle_add(restore_favourite_scroll)
+
+    def _retained_snapshot_from_obj(self, obj: ServerObject) -> dict:
+        timewarp = getattr(obj, "timewarp", None)
+        night_timewarp = getattr(obj, "night_timewarp", None)
+        return {
+            "ip": obj.ip,
+            "gport": int(obj.gport),
+            "qport": int(obj.qport),
+            "name": obj.name,
+            "map": obj.map_name,
+            "players": int(obj.players),
+            "maxPlayers": int(obj.max_players),
+            "password": int(bool(obj.password)),
+            "official": int(bool(getattr(obj, "official", False))),
+            "mods": obj.mods_json,
+            "modCount": int(obj.mod_count),
+            "third_person": int(bool(obj.third_person)),
+            "timeWarp": (float(timewarp) if timewarp is not None else None),
+            "nightTimeWarp": (float(night_timewarp) if night_timewarp is not None else None),
+            "time": obj.time,
+            "country": obj.country,
+            "ping": int(obj.ping),
+            "bm_rank": int(obj.bm_rank),
+        }
+
+    def _update_retained_cache_for_obj(self, obj: ServerObject, *, manual: bool | None = None) -> None:
+        key = fav_key(obj.ip, obj.gport)
+        snapshot = self._retained_snapshot_from_obj(obj)
+        existing = self.retained_servers.get(key)
+        if manual is None:
+            manual = bool(existing.get("manual", False)) if isinstance(existing, dict) else False
+        snapshot["manual"] = bool(manual)
+        self.retained_servers[key] = snapshot
+        try:
+            save_retained_servers(self.retained_servers)
+        except Exception:
+            pass
+
+    # ----------------------------
+    # Direct Connect
+    # ----------------------------
+    def _open_direct_connect_dialog(self, *_args):
+        self.direct_connect_entry.set_text("")
+        self.direct_connect_fav_check.set_active(True)
+        self.direct_connect_error_label.set_visible(False)
+        self.direct_connect_scrim.set_visible(True)
+        self.direct_connect_box.set_visible(True)
+        self.direct_connect_entry.grab_focus()
+        return False
+
+    def _close_direct_connect_dialog(self, *_args):
+        self.direct_connect_scrim.set_visible(False)
+        self.direct_connect_box.set_visible(False)
+        return False
+
+    def _on_direct_connect_ok_clicked(self, *_args):
+        parsed = _parse_direct_connect_address(self.direct_connect_entry.get_text())
+        if parsed is None:
+            self.direct_connect_error_label.set_text("Enter a valid address as IP:Port.")
+            self.direct_connect_error_label.set_visible(True)
+            return False
+        ip, gport, qport = parsed
+        add_favorite = bool(self.direct_connect_fav_check.get_active())
+        self._close_direct_connect_dialog()
+        self._add_direct_connect_server(ip, gport, qport, add_favorite)
+        return False
+
+    def _add_direct_connect_server(self, ip: str, gport: int, qport: int, add_favorite: bool) -> None:
+        key = fav_key(ip, gport)
+        existing = self._obj_by_key.get(key)
+        if existing is not None:
+            if add_favorite and not bool(existing.fav):
+                self._toggle_favorite_for_obj(existing)
+            self._update_retained_cache_for_obj(existing, manual=True)
+            self._submit_live_batch([key], reason="direct-connect")
+            return
+
+        if add_favorite:
+            self.favorites[key] = True
+            try:
+                save_favorites(self.favorites)
+            except Exception:
+                pass
+
+        row = {
+            "ip": ip,
+            "gport": gport,
+            "qport": qport,
+            "name": "",
+            "map": "",
+            "players": 0,
+            "maxPlayers": 0,
+            "password": 0,
+            "mods": "[]",
+            "modCount": 0,
+            "third_person": 0,
+            "timeWarp": 1.0,
+            "time": "--:--",
+            "country": "",
+            "ping": -1,
+            "bm_rank": 999999999,
+        }
+        built = _build_server_rows([row], self.favorites, self.last_played)
+        if not built:
+            return
+        k, obj = built[0]
+        n = self.store.get_n_items()
+        self.store.splice(n, 0, [obj])
+        self._obj_by_key[k] = obj
+        self.live.setdefault(k, {"hide_high_ping": False, "offline": True})
+        self._snapshot_row_sort_keys(obj, int(time.time()))
+        self._update_retained_cache_for_obj(obj, manual=True)
+
+        self._rebuild_mod_suggestion_index()
+        self._on_filter_changed(reason="direct-connect")
+        try:
+            sorter = getattr(self, "sorter", None)
+            if sorter is not None:
+                self._debug_sort_note_model_event("direct_connect_sorter_changed")
+                sorter.changed(Gtk.SorterChange.DIFFERENT)
+        except Exception:
+            pass
+        self._apply_titlebar_counts()
+
+        self._query_direct_connect_info(k)
+
+    def _query_direct_connect_info(self, key: str) -> None:
+        obj = self._obj_by_key.get(key)
+        if obj is None:
+            return
+        ip, qport, gport = obj.ip, obj.qport, obj.gport
+
+        def worker():
+            info = query_server_live(
+                ip,
+                qport,
+                gport=gport,
+                cycle_id=f"direct-connect:{key}",
+                generation="untokened",
+                row_id=id(obj),
+                model_id=id(getattr(self, "column_view_store", None)),
+            )
+            mods = query_server_mods(ip, qport)
+            GLib.idle_add(self._apply_direct_connect_info, key, info, mods)
+
+        self._executor.submit(worker)
+
+    def _apply_direct_connect_info(self, key: str, info: dict, mods: dict | None = None) -> bool:
+        obj = self._obj_by_key.get(key)
+        if obj is None:
+            return False
+        if not isinstance(info, dict) or not info.get("ok"):
+            obj.ping = -1
+            self._update_row_sort_ping(obj)
+            self.live.setdefault(key, {})["offline"] = True
+            self._on_filter_changed(reason="direct-connect")
+            return False
+
+        name = str(info.get("name") or "").strip()
+        if name:
+            obj.name = name
+            obj.name_lc = name.strip().lower()
+            obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
+        map_raw = str(info.get("map") or "").strip()
+        if map_raw:
+            standardized = standardize_map(map_raw)
+            if standardized:
+                obj.map_name = standardized
+        obj.players = int(info.get("players") or 0)
+        obj.max_players = int(info.get("max_players") or 0)
+        obj.queue = -1 if info.get("queue") is None else int(info.get("queue"))
+        obj.password = bool(info.get("password", obj.password))
+        proposed_time = str(info.get("time") or "")
+        if is_valid_hhmm(proposed_time):
+            obj.time = proposed_time
+        obj.ping = int(info.get("ping_ms", obj.ping))
+        self._update_row_sort_ping(obj)
+        self._update_row_sort_players(obj)
+        self.live.setdefault(key, {})["offline"] = False
+
+        if isinstance(mods, dict) and mods.get("ok"):
+            mod_list = mods.get("mods") or []
+            mods_json = json.dumps(mod_list)
+            obj.mods_json = mods_json
+            obj.mod_count = len(mod_list)
+            _cnt, preview = parse_mods_preview(mods_json, max_names=8)
+            obj.mods_preview = preview
+            obj.mod_search_index = build_server_mod_index(mods_json)
+
+        self._update_retained_cache_for_obj(obj, manual=True)
+        self._on_filter_changed(reason="direct-connect")
+        return False
 
     def _set_background_download_column_visible(self, visible: bool) -> None:
         column = getattr(getattr(self, "list_view", None), "background_download_column", None)
@@ -9515,6 +9711,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._hi_executor.submit(worker)
 
     def _monitor_server_companion_for_obj(self, obj: ServerObject):
+        if self._is_server_companion_monitoring_obj(obj):
+            self.set_server_companion_enabled(False)
+            return
         self.set_server_companion_server(obj)
         if not bool(self.settings.get("show_server_companion", False)):
             self.set_server_companion_enabled(True)
@@ -10286,7 +10485,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                             k = fav_key(played_obj.ip, played_obj.gport)
                             self.last_played[k] = played_ts
                             current_obj = getattr(self, "_obj_by_key", {}).get(k) or played_obj
-                            was_played = bool((current_obj.played or "").strip())
                             now_ts = int(time.time())
                             current_obj.played = human_last_played(played_ts, now_ts=now_ts)
                             self._update_row_sort_played_days(current_obj, now_ts)
@@ -10294,10 +10492,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                                 save_last_played(self.last_played)
                             except Exception:
                                 pass
-                            played_only = bool((getattr(self, "_filter_state", None) or {}).get("played_only", False))
-                            if getattr(self, "sort_key", None) == "played" or (
-                                played_only and not was_played and bool(current_obj.played)
-                            ):
+                            if getattr(self, "sort_key", None) == "played":
                                 self._rebuild_column_view_store(reorder_reason="last-played-rejoin")
                         except Exception:
                             pass

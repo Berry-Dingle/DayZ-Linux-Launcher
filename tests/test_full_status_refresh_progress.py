@@ -31,6 +31,7 @@ class FakeLabel:
     def __init__(self):
         self.text = ""
         self.tooltip = None
+        self.visible = True
         self.history = []
 
     def set_text(self, text):
@@ -39,6 +40,9 @@ class FakeLabel:
 
     def set_tooltip_text(self, text):
         self.tooltip = text
+
+    def set_visible(self, visible):
+        self.visible = bool(visible)
 
 
 class FakeProgressBar:
@@ -78,6 +82,8 @@ def bind(host, *names):
 def progress_host(*, total=10, completed=0, generation=1, running=True):
     refresh_btn = FakeBox()
     refresh_btn.visible = True
+    idle_row = FakeBox()
+    idle_row.visible = True
     progress_box = FakeBox()
     prefix_label = FakeLabel()
     prefix_label.text = "Refreshing:"
@@ -90,6 +96,7 @@ def progress_host(*, total=10, completed=0, generation=1, running=True):
         _status_refresh_progress_update_id=0,
         _shutdown_cleanup_done=False,
         refresh_status_btn=refresh_btn,
+        status_refresh_idle_row=idle_row,
         status_refresh_slot=FakeStack(),
         status_refresh_progress_box=progress_box,
         status_refresh_progress_prefix_label=prefix_label,
@@ -116,15 +123,20 @@ def completion_host(*, total=1):
 
 
 def test_toolbar_order_has_no_separator_and_keeps_fixed_sidebar_width():
+    # Settings and Manage-Mods live next to the search entry (build_search_area),
+    # not in this toolbar row - only the refresh/progress slot lives here. The
+    # last-refreshed label sits inside the slot's "refresh" page, next to the
+    # button, so it is left-aligned immediately after it instead of pinned to
+    # the far right of the row.
     source = SIDEBAR_SOURCE.read_text(encoding="utf-8")
     body = source[source.index("def build_sidebar_toolbar"):source.index("def build_sidebar(")]
 
-    settings = body.index("search_header.append(settings_btn)")
-    mods = body.index("search_header.append(window.mod_manager_header_btn)")
-    slot = body.index("search_header.append(window.status_refresh_slot)")
-    refresh = body.index('status_refresh_slot.add_named(window.refresh_status_btn, "refresh")')
+    idle_row_append_btn = body.index("status_refresh_idle_row.append(window.refresh_status_btn)")
+    idle_row_append_label = body.index("status_refresh_idle_row.append(window.status_refresh_last_label)")
+    refresh = body.index('status_refresh_slot.add_named(window.status_refresh_idle_row, "refresh")')
     progress = body.index('status_refresh_slot.add_named(window.status_refresh_progress_box, "progress")')
-    assert settings < mods < refresh < progress < slot
+    slot = body.index("search_header.append(window.status_refresh_slot)")
+    assert idle_row_append_btn < idle_row_append_label < refresh < progress < slot
     assert "Gtk.Separator" not in body
     assert '"|"' not in body and "'|'" not in body
     assert config.SIDEBAR_WIDTH == 220
@@ -159,13 +171,27 @@ def test_progress_widget_is_compact_expanding_and_hidden_initially():
     assert source.index("status_refresh_progress_box.append(window.status_refresh_progress_text_row)") < source.index("status_refresh_progress_box.append(window.status_refresh_progress_bar)")
 
 
+def test_last_refreshed_label_widget_is_left_aligned_next_to_button():
+    source = SIDEBAR_SOURCE.read_text(encoding="utf-8")
+    body = source[source.index("def build_sidebar_toolbar"):source.index("def build_sidebar(")]
+    assert 'Gtk.Label(xalign=0.0)' in body
+    assert "status_refresh_last_label.add_css_class(\"status-refresh-last-label\")" in body
+    assert "status_refresh_last_label.set_hexpand(True)" in body
+    assert "status_refresh_last_label.set_halign(Gtk.Align.FILL)" in body
+    assert "status_refresh_last_label.set_ellipsize(Pango.EllipsizeMode.END)" in body
+    assert "status_refresh_last_label.set_visible(False)" in body
+
+
 def test_toolbar_spacing_is_tightened_locally_without_global_spacing_changes():
     source = SIDEBAR_SOURCE.read_text(encoding="utf-8")
     body = source[source.index("def build_sidebar_toolbar"):source.index("def build_sidebar(")]
     assert "Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)" in body
     assert "spacing=8" not in body
     assert 'add_css_class("dzll-sidebar-toolbar-row")' in body
-    assert "status_refresh_progress_box.set_margin_start(9)" in body
+    # The progress box must not add its own left inset on top of
+    # search_header's margin - that mismatched the refresh button's inset
+    # by 9px whenever the slot swapped between button and progress box.
+    assert "status_refresh_progress_box.set_margin_start" not in body
     assert "status_refresh_slot.set_margin_start" not in body
     assert "settings_btn.set_margin" not in body
     assert "mod_manager_header_btn.set_margin" not in body
@@ -182,7 +208,7 @@ def test_refresh_and_progress_share_one_slot_without_spinner_or_button_recreatio
     assert "spinner.stop" not in slot_state
     assert "set_child" not in slot_state
     assert "slot.set_visible_child(progress)" in slot_state
-    assert "slot.set_visible_child(btn)" in slot_state
+    assert "slot.set_visible_child(idle_row)" in slot_state
     assert "refresh_status_btn.set_size_request" not in refresh
     assert "refresh_status_btn.set_child(Gtk.Image.new_from_icon_name" in refresh
     assert "refresh_status_btn.connect(\"clicked\", window._on_refresh_status_clicked)" in refresh
@@ -202,7 +228,7 @@ def test_idle_progress_is_hidden_and_reset():
     assert host.status_refresh_progress_count_label.text == ""
     assert host.status_refresh_progress_count_label.tooltip is None
     assert host.status_refresh_progress_bar.fraction == 0.0
-    assert host.status_refresh_slot.visible_child is host.refresh_status_btn
+    assert host.status_refresh_slot.visible_child is host.status_refresh_idle_row
 
 
 def test_slot_switches_between_original_refresh_and_progress_exclusively():
@@ -211,13 +237,13 @@ def test_slot_switches_between_original_refresh_and_progress_exclusively():
     host._apply_status_refresh_cursor_for_state = lambda _btn: False
     bind(host, "_set_status_refresh_slot_running")
 
-    original_refresh = host.refresh_status_btn
+    original_idle_row = host.status_refresh_idle_row
     host._set_status_refresh_slot_running(True, generation=1)
     assert host.status_refresh_slot.visible_child is host.status_refresh_progress_box
 
     host._set_status_refresh_slot_running(False, generation=1)
-    assert host.status_refresh_slot.visible_child is original_refresh
-    assert host.refresh_status_btn is original_refresh
+    assert host.status_refresh_slot.visible_child is original_idle_row
+    assert host.status_refresh_idle_row is original_idle_row
 
 
 def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
@@ -233,7 +259,8 @@ def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
     host.scroller = SimpleNamespace(get_vadjustment=lambda: None)
     host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
     host._pump_status_refresh = lambda _generation: False
-    bind(host, "_on_refresh_status_clicked")
+    host._begin_startup_warmup_gate = lambda *_args, **_kwargs: None
+    bind(host, "_on_refresh_status_clicked", "_begin_status_refresh_sweep")
 
     host._on_refresh_status_clicked()
     host._obj_by_key["later"] = object()
@@ -396,6 +423,8 @@ def test_final_completion_force_renders_total_then_hides_and_resets(monkeypatch)
     host._debug_browser_reorder = lambda *_args, **_kwargs: None
     host._rebuild_column_view_store = lambda **_kwargs: None
     host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
+    host._update_status_refresh_last_label = lambda: False
+    host._schedule_status_refresh_last_label_tick = lambda: False
     removed = []
     monkeypatch.setattr(window_module.GLib, "source_remove", removed.append)
     bind(host, "_maybe_finish_status_refresh")
@@ -449,15 +478,148 @@ def test_repeated_click_while_running_is_ignored():
     assert host._status_refresh_generation == 1
 
 
-def test_progress_is_manual_sweep_only_and_no_manual_spinner_path_remains():
+def test_startup_driven_sweep_also_shows_progress_and_busy_slot():
+    host = progress_host(total=0, running=False)
+    host._obj_by_key = {index: object() for index in range(42)}
+    host._status_refresh_queue = deque()
+    host._status_refresh_inflight = 0
+    host._status_refresh_buffer = []
+    host._status_refresh_flush_id = 0
+    host._status_refresh_started_at = 0.0
+    host._status_refresh_last_log_completed = 0
+    host._status_refresh_scroll_value = None
+    host.scroller = SimpleNamespace(get_vadjustment=lambda: None)
+    slot_calls = []
+    host._set_status_refresh_slot_running = lambda running, **_kwargs: slot_calls.append(running)
+    host._pump_status_refresh = lambda _generation: False
+    host._begin_startup_warmup_gate = lambda *_args, **_kwargs: None
+    bind(host, "_begin_status_refresh_sweep")
+
+    rest_keys = list(host._obj_by_key.keys())
+    host._begin_status_refresh_sweep(rest_keys)
+
+    assert host._status_refresh_running is True
+    assert slot_calls == [True]
+    assert host._status_refresh_total == 42
+    assert host.status_refresh_progress_count_label.text == "0 / 42"
+    assert host.status_refresh_progress_box.visible is True
+
+
+def test_concurrent_sweep_start_while_running_is_ignored():
+    host = progress_host(running=True)
+    host._status_refresh_queue = deque(["existing"])
+    bind(host, "_begin_status_refresh_sweep")
+
+    result = host._begin_status_refresh_sweep(["new"])
+
+    assert result is False
+    assert list(host._status_refresh_queue) == ["existing"]
+    assert host._status_refresh_generation == 1
+
+
+@pytest.mark.parametrize(
+    "seconds,expected",
+    [
+        (0, "just now"),
+        (59, "just now"),
+        (60, "1m ago"),
+        (125, "2m ago"),
+        (3599, "59m ago"),
+        (3600, "1h 0m ago"),
+        (3660, "1h 1m ago"),
+        (8130, "2h 15m ago"),
+    ],
+)
+def test_format_elapsed_ago_matches_expected_wording(seconds, expected):
+    host = SimpleNamespace()
+    bind(host, "_format_elapsed_ago")
+
+    assert host._format_elapsed_ago(seconds) == expected
+
+
+def test_last_refreshed_label_hidden_until_first_completion():
+    host = SimpleNamespace(
+        status_refresh_last_label=FakeLabel(),
+        _status_refresh_last_completed_at=0.0,
+        _status_refresh_last_completed_total=0,
+    )
+    bind(host, "_update_status_refresh_last_label")
+
+    host._update_status_refresh_last_label()
+
+    assert host.status_refresh_last_label.visible is False
+
+
+def test_last_refreshed_label_shows_count_checkmark_and_elapsed_text(monkeypatch):
+    host = SimpleNamespace(
+        status_refresh_last_label=FakeLabel(),
+        _status_refresh_last_completed_total=11_762,
+    )
+    bind(host, "_update_status_refresh_last_label", "_format_elapsed_ago")
+    monkeypatch.setattr(window_module.time, "monotonic", lambda: 10_000.0)
+    host._status_refresh_last_completed_at = 10_000.0 - 8_130
+
+    host._update_status_refresh_last_label()
+
+    assert host.status_refresh_last_label.text == "Refreshed 11,762 - 2h 15m ago"
+    assert host.status_refresh_last_label.tooltip == "Refreshed 11,762 - 2h 15m ago"
+    assert host.status_refresh_last_label.visible is True
+
+
+def test_sweep_completion_records_last_refreshed_label_state(monkeypatch):
+    host = progress_host(total=2, completed=2)
+    host._status_refresh_queue = deque()
+    host._status_refresh_inflight = 0
+    host._status_refresh_buffer = []
+    host._status_refresh_flush_id = 0
+    host._status_refresh_progress_update_id = 0
+    host.combined_filter = None
+    host.sorter = None
+    host._status_refresh_scroll_value = None
+    host._snapshot_all_sort_keys = lambda: None
+    host._debug_browser_reorder = lambda *_args, **_kwargs: None
+    host._rebuild_column_view_store = lambda **_kwargs: None
+    host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
+    host._status_refresh_last_label_tick_id = 0
+    host.status_refresh_last_label = FakeLabel()
+    monkeypatch.setattr(window_module.GLib, "source_remove", lambda *_args: None)
+    monkeypatch.setattr(window_module.GLib, "timeout_add_seconds", lambda *_args, **_kwargs: 77)
+    monkeypatch.setattr(window_module.time, "monotonic", lambda: 5_000.0)
+    bind(
+        host,
+        "_maybe_finish_status_refresh",
+        "_update_status_refresh_last_label",
+        "_schedule_status_refresh_last_label_tick",
+        "_on_status_refresh_last_label_tick",
+        "_format_elapsed_ago",
+    )
+
+    host._maybe_finish_status_refresh(1)
+
+    assert host._status_refresh_last_completed_at == 5_000.0
+    assert host._status_refresh_last_completed_total == 2
+    assert host.status_refresh_last_label.text == "Refreshed 2 - just now"
+    assert host.status_refresh_last_label.visible is True
+    assert host._status_refresh_last_label_tick_id == 77
+
+
+def test_startup_sweep_and_manual_refresh_share_one_progress_pipeline():
     source = WINDOW_SOURCE.read_text(encoding="utf-8")
     manual = source[source.index("def _on_refresh_status_clicked"):source.index("def _query_status_refresh_one")]
     row_start = source.index("def _refresh_server_for_obj")
     row = source[row_start:source.index("\n    def ", row_start + 1)]
-    startup = source[source.index("def _submit_startup_rest_batches"):source.index("def _apply_status_refresh_cursor_for_state")]
-    assert "_render_status_refresh_progress" in manual
+    startup = source[source.index("def _apply_db_rows"):source.index("def _load_rows_into_store")]
     assert "_render_status_refresh_progress" not in row
-    assert "_render_status_refresh_progress" not in startup
+
+    # Both the manual "Refresh All" click and the startup sweep hand off into
+    # the same _begin_status_refresh_sweep entry point, so there is exactly
+    # one queue/executor/progress-bar implementation, not two - startup just
+    # additionally gates the splash reveal behind a warmup_count of it.
+    assert "self._begin_status_refresh_sweep(keys)" in manual
+    assert "self._begin_status_refresh_sweep(keys, warmup_count=warmup_count)" in startup
+    assert source.count("def _begin_status_refresh_sweep") == 1
+    assert "_submit_startup_rest_batches" not in source
+    assert "_submit_live_first_n_then_hide_band" not in source
 
     slot_state = source[source.index("def _set_status_refresh_slot_running"):source.index("def _on_refresh_status_clicked")]
     assert "Gtk.Spinner" not in slot_state

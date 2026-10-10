@@ -13,9 +13,9 @@ def test_general_companion_block_order_and_labels():
     heading = general.index('"Server Companion Learning Data"')
     background = general.index('"Show Background Download Buttons"')
     ingame_name = general.index('"Ingame Name"')
-    hide_test = general.index('"Hide Test Servers By Default"')
     counts = general.index('"Show Counts In Title Bar"')
-    assert ingame_name < background < hide_test < show < heading < counts
+    assert ingame_name < background < show < heading < counts
+    assert '"Hide Test Servers By Default"' not in general
     assert general.count("box.append(hr())", 0, show) >= 1
     assert general.count("box.append(hr())", heading, counts) >= 1
     assert '"Export Data"' in general

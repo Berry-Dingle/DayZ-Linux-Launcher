@@ -162,6 +162,11 @@ def get_app_css(
           color: @dzll_text_primary;
         }}
 
+        .dzll-app-root label:disabled,
+        .server-companion-panel label:disabled {{
+          color: @dzll_text_disabled;
+        }}
+
         .dzll-app-root button.flat,
         .dzll-app-root button.flat image,
         .dzll-app-root button.flat:backdrop,
@@ -471,6 +476,18 @@ def get_app_css(
           color: @dzll_text_disabled;
         }}
 
+        .dzll-app-root checkbutton:disabled check,
+        .server-companion-panel checkbutton:disabled check {{
+          background: @dzll_control_disabled;
+          border-color: @dzll_text_disabled;
+        }}
+
+        .dzll-app-root checkbutton:disabled:checked check,
+        .server-companion-panel checkbutton:disabled:checked check {{
+          background: @dzll_text_disabled;
+          border-color: @dzll_text_disabled;
+        }}
+
         .dzll-app-root scrollbar,
         .dzll-app-root scrollbar trough,
         .required-mods-popover scrollbar,
@@ -679,6 +696,12 @@ def get_app_css(
           font-size: 10px;
         }}
 
+        .dzll-app-root .status-refresh-last-label {{
+          min-width: 0;
+          font-size: 12px;
+          color: @dzll_text_secondary;
+        }}
+
         .dzll-app-root .status-refresh-progress-bar trough,
         .dzll-app-root .status-refresh-progress-bar progress {{
           min-height: 3px;
@@ -691,30 +714,32 @@ def get_app_css(
           background-image: none;
         }}
 
+        .dzll-app-root scale:disabled trough,
+        .server-companion-panel scale:disabled trough {{
+          background: @dzll_control_disabled;
+          background-color: @dzll_control_disabled;
+        }}
+
         .dzll-app-root scale highlight,
         .dzll-app-root scale:hover highlight,
         .dzll-app-root scale:active highlight,
         .dzll-app-root scale:focus highlight,
         .dzll-app-root scale:focus-within highlight,
         .dzll-app-root scale:backdrop highlight,
-        .dzll-app-root scale:disabled highlight,
         .dzll-app-root scale highlight:hover,
         .dzll-app-root scale highlight:active,
         .dzll-app-root scale highlight:focus,
         .dzll-app-root scale highlight:backdrop,
-        .dzll-app-root scale highlight:disabled,
         .server-companion-panel scale highlight,
         .server-companion-panel scale:hover highlight,
         .server-companion-panel scale:active highlight,
         .server-companion-panel scale:focus highlight,
         .server-companion-panel scale:focus-within highlight,
         .server-companion-panel scale:backdrop highlight,
-        .server-companion-panel scale:disabled highlight,
         .server-companion-panel scale highlight:hover,
         .server-companion-panel scale highlight:active,
         .server-companion-panel scale highlight:focus,
-        .server-companion-panel scale highlight:backdrop,
-        .server-companion-panel scale highlight:disabled {{
+        .server-companion-panel scale highlight:backdrop {{
           background: @dzll_accent;
           background-color: @dzll_accent;
           background-image: none;
@@ -724,6 +749,22 @@ def get_app_css(
           outline: none;
           text-shadow: none;
           opacity: 1;
+          filter: none;
+        }}
+
+        .dzll-app-root scale:disabled highlight,
+        .dzll-app-root scale highlight:disabled,
+        .server-companion-panel scale:disabled highlight,
+        .server-companion-panel scale highlight:disabled {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          background-image: none;
+          border-color: transparent;
+          border-image: none;
+          box-shadow: none;
+          outline: none;
+          text-shadow: none;
+          opacity: 0.4;
           filter: none;
         }}
 
@@ -749,6 +790,15 @@ def get_app_css(
           filter: none;
         }}
 
+        .dzll-app-root scale:disabled slider,
+        .server-companion-panel scale:disabled slider,
+        .server-companion-panel scale.horizontal:disabled slider {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          border-color: @dzll_text_disabled;
+          opacity: 0.5;
+        }}
+
         .dzll-app-root separator,
         .server-companion-panel separator {{
           background: @dzll_divider;
@@ -766,7 +816,17 @@ def get_app_css(
         .dzll-app-root listview row {{ background: transparent; }}
         .dzll-app-root listview row:hover {{ background: transparent; }}
         .dzll-app-root listview row:selected {{ background: transparent; }}
-        
+
+        /* ---------- Live-refresh pulse on browser rows ---------- */
+        .dzll-app-root columnview.dzll-column-view > listview > row {{
+          transition: box-shadow 500ms ease-out;
+        }}
+
+        .dzll-app-root columnview.dzll-column-view > listview > row.dzll-live-refresh-flash {{
+          transition: none;
+          box-shadow: inset 0 0 0 1px alpha(@dzll_ping_yellow, 0.45);
+        }}
+
         /* ---------- Favorites star ---------- */
         /* ON star stays yellow even when unfocused */
         button.fav-star {{ font-size: 1.8em; padding: 0; }}
@@ -1484,6 +1544,12 @@ def get_app_css(
           filter: none;
         }}
 
+        .server-companion-panel:backdrop label:disabled {{
+          color: @dzll_text_disabled;
+          opacity: 1;
+          filter: none;
+        }}
+
         .server-companion-panel:backdrop .companion-detail-label,
         .server-companion-panel:backdrop .dim-label {{
           color: @dzll_text_secondary;
@@ -1582,6 +1648,25 @@ def get_app_css(
           filter: none;
         }}
 
+        .server-companion-panel:backdrop scale:disabled trough {{
+          background: @dzll_control_disabled;
+          background-color: @dzll_control_disabled;
+          opacity: 1;
+        }}
+
+        .server-companion-panel:backdrop scale:disabled highlight {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          opacity: 0.4;
+        }}
+
+        .server-companion-panel:backdrop scale.horizontal:disabled slider {{
+          background: @dzll_text_disabled;
+          background-color: @dzll_text_disabled;
+          border-color: @dzll_text_disabled;
+          opacity: 0.5;
+        }}
+
         .server-companion-panel:backdrop .ping-good {{ color: @dzll_ping_good; opacity: 1; }}
         .server-companion-panel:backdrop .ping-greeny {{ color: @dzll_ping_greeny; opacity: 1; }}
         .server-companion-panel:backdrop .ping-yellow {{ color: @dzll_ping_yellow; opacity: 1; }}
@@ -1609,29 +1694,6 @@ def get_app_css(
           border-left: 1px solid @dzll_divider;
         }}
 
-        button.server-companion-power-on-button {{
-          background: transparent;
-          color: @dzll_restart_learning;
-          padding: 0;
-          min-height: 0;
-          min-width: 0;
-          border: none;
-          box-shadow: none;
-        }}
-
-        button.server-companion-power-on-button:hover,
-        button.server-companion-power-on-button:active,
-        button.server-companion-power-on-button:focus,
-        button.server-companion-power-on-button:focus-visible {{
-          background: transparent;
-          color: @dzll_restart_learning;
-          box-shadow: none;
-        }}
-
-        button.server-companion-power-on-button image {{
-          color: @dzll_restart_learning;
-        }}
-
         button.server-companion-power-off-button {{
           background: transparent;
           color: @dzll_error;
@@ -1656,11 +1718,6 @@ def get_app_css(
 
         button.server-companion-power-off-button .server-companion-power-off-icon {{
           color: @dzll_error;
-        }}
-
-        .server-companion-panel button.server-companion-power-on-button,
-        .server-companion-panel button.server-companion-power-on-button image {{
-          color: @dzll_restart_learning;
         }}
 
         .dzll-app-root button.server-companion-power-off-button,

@@ -596,6 +596,8 @@ def test_status_widgets_are_not_attached_below_alert_volume():
 def test_alert_toggle_sound_and_volume_controls_remain_unchanged():
     panel = SimpleNamespace(
         restart_alert_switch=FakeWidget(),
+        sound_row=FakeWidget(),
+        volume_row=FakeWidget(),
         alert_sound_button=FakeWidget(),
         alert_volume_scale=FakeWidget(),
         alert_volume_percent_label=FakeWidget(),

@@ -1411,7 +1411,6 @@ class SettingsUI:
             "show_background_download_buttons",
             default=False,
         ))
-        box.append(self._settings_row_switch("Hide Test Servers By Default", "hide_test_servers", default=True))
         # These controls are currently exposed in the sidebar; the underlying
         # settings are intentionally retained for persistence and future reuse.
 
@@ -1478,11 +1477,11 @@ class SettingsUI:
         )
 
         box.append(hr())
-        box.append(self._settings_row_switch("Show Counts In Title Bar", "show_counts_in_title_bar", default=False))
+        box.append(self._settings_row_switch("Show Counts In Title Bar", "show_counts_in_title_bar", default=True))
         box.append(self._settings_row_checkbox("Servers Loaded", "show_counts_servers_loaded", default=True))
         box.append(self._settings_row_checkbox("Global Players", "show_counts_global_players", default=True))
 
-        master = bool(self._win.settings.get("show_counts_in_title_bar", False))
+        master = bool(self._win.settings.get("show_counts_in_title_bar", True))
         self._win._set_widget_sensitive("show_counts_servers_loaded", master)
         self._win._set_widget_sensitive("show_counts_global_players", master)
 
@@ -1495,7 +1494,9 @@ class SettingsUI:
         box.append(btn)
 
         box.append(hr())
-        box.append(self._settings_row_switch("Auto Check For Updates", "auto_check_updates", default=True))
+        box.append(self._settings_row_switch("Auto Check For Launcher Updates", "auto_check_updates", default=True))
+
+        box.append(hr())
 
         update_db_btn = Gtk.Button(label="Update Server Database")
         update_db_btn.set_halign(Gtk.Align.START)
@@ -1896,7 +1897,6 @@ class SettingsUI:
         # Re-apply runtime-only effects from clean settings
         self._win._apply_setting_runtime_effects("high_ping_cutoff_ms")
         self._win._apply_setting_runtime_effects("hide_below_max_players")
-        self._win._apply_setting_runtime_effects("hide_test_servers")
         self._win._apply_setting_runtime_effects("hide_official_servers")
         self._win._apply_setting_runtime_effects("prioritise_trusted_servers")
         self._win._apply_setting_runtime_effects("pin_favorite_servers")
@@ -1981,9 +1981,6 @@ class SettingsUI:
                     self._win.live.setdefault(k, {})["hide_high_ping"] = (p > self._win._ping_cutoff_ms)
             self._win._on_filter_changed(reason="settings")
 
-        if key == "hide_test_servers":
-            self._win._on_filter_changed(reason="settings")
-
         if key == "hide_official_servers":
             self._win._on_filter_changed(reason="settings")
 
@@ -2041,7 +2038,7 @@ class SettingsUI:
             )
 
         if key in ("show_counts_in_title_bar", "show_counts_servers_loaded", "show_counts_global_players"):
-            master = bool(self._win.settings.get("show_counts_in_title_bar", False))
+            master = bool(self._win.settings.get("show_counts_in_title_bar", True))
             self._set_widget_sensitive("show_counts_servers_loaded", master)
             self._set_widget_sensitive("show_counts_global_players", master)
             self._win._apply_titlebar_counts()

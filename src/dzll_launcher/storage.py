@@ -14,6 +14,7 @@ from .config import (
     COMPANION_RESTART_LEARNING_PATH,
     DEAD_PATH,
     CACHE_DIR,
+    RETAINED_SERVERS_PATH,
 )
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,21 @@ def load_favorites() -> dict:
 def save_favorites(favs: dict) -> None:
     clean = {k: True for k, v in (favs or {}).items() if v}
     save_json_dict(FAV_PATH, clean)
+
+def load_retained_servers() -> dict:
+    raw = load_json_dict(RETAINED_SERVERS_PATH)
+    out = {}
+    for k, v in raw.items():
+        if isinstance(v, dict):
+            out[str(k)] = dict(v)
+    return out
+
+def save_retained_servers(retained: dict) -> None:
+    clean = {}
+    for k, v in (retained or {}).items():
+        if isinstance(v, dict):
+            clean[str(k)] = dict(v)
+    save_json_dict(RETAINED_SERVERS_PATH, clean)
 
 def load_last_played() -> dict:
     now = int(time.time())

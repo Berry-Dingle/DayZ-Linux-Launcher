@@ -205,13 +205,12 @@ class ServerCompanionPanel(Gtk.Box):
         heading_label.add_css_class("settings-section-title")
         heading_row.set_center_widget(heading_label)
 
-        power_off_icon = Gtk.Image.new_from_icon_name("system-shutdown-symbolic")
+        power_off_icon = Gtk.Image.new_from_icon_name("go-previous-symbolic")
         power_off_icon.set_pixel_size(16)
         self.power_off_btn = Gtk.Button()
         self.power_off_btn.set_can_focus(False)
         self.power_off_btn.set_child(power_off_icon)
         self.power_off_btn.add_css_class("flat")
-        self.power_off_btn.add_css_class("server-companion-power-on-button")
         self.power_off_btn.set_tooltip_text("Turn off Server Companion")
         self.power_off_btn.set_size_request(28, 28)
         self.power_off_btn.connect("clicked", self._on_power_off_clicked)
@@ -383,6 +382,7 @@ class ServerCompanionPanel(Gtk.Box):
 
         self.sound_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.sound_row.set_hexpand(True)
+        self.sound_row.set_sensitive(False)
         self.server_box.append(self.sound_row)
 
         sound_label = Gtk.Label(label="Alert Sound")
@@ -421,6 +421,7 @@ class ServerCompanionPanel(Gtk.Box):
 
         self.volume_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         self.volume_row.set_hexpand(True)
+        self.volume_row.set_sensitive(False)
         self.server_box.append(self.volume_row)
 
         volume_label = Gtk.Label(label="Alert Volume")
@@ -517,10 +518,12 @@ class ServerCompanionPanel(Gtk.Box):
             self.add_css_class("server-companion-panel-docked")
             self.dock_toggle_btn.set_label("↗")
             self.dock_toggle_btn.set_tooltip_text("Undock Companion")
+            self.power_off_btn.set_visible(True)
         else:
             self.remove_css_class("server-companion-panel-docked")
             self.dock_toggle_btn.set_label("↙")
             self.dock_toggle_btn.set_tooltip_text("Dock Companion")
+            self.power_off_btn.set_visible(False)
 
     def restart_learning_visible(self) -> bool:
         return bool(self.restart_learning_box.get_visible())
@@ -539,6 +542,8 @@ class ServerCompanionPanel(Gtk.Box):
 
     def set_restart_alert_enabled(self, enabled: bool):
         self.restart_alert_switch.set_active(bool(enabled))
+        self.sound_row.set_sensitive(bool(enabled))
+        self.volume_row.set_sensitive(bool(enabled))
         self.alert_sound_button.set_sensitive(bool(enabled))
         self.alert_volume_scale.set_sensitive(bool(enabled))
         self.alert_volume_percent_label.set_sensitive(bool(enabled))
@@ -653,6 +658,8 @@ class ServerCompanionPanel(Gtk.Box):
 
     def _on_restart_alert_clicked(self, *_args):
         enabled = self.restart_alert_enabled()
+        self.sound_row.set_sensitive(enabled)
+        self.volume_row.set_sensitive(enabled)
         self.alert_sound_button.set_sensitive(enabled)
         self.alert_volume_scale.set_sensitive(enabled)
         self.alert_volume_percent_label.set_sensitive(enabled)

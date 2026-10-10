@@ -115,6 +115,7 @@ def status_host(*, ping=42, streak=0, players=10):
         password=False,
         time="12:00",
         queue=3,
+        refresh_pulse=0,
     )
     key = fav_key(IP, GPORT)
     host = SimpleNamespace(

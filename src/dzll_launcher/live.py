@@ -1,4 +1,5 @@
 # live.py
+import os
 import time
 import re
 
@@ -210,6 +211,8 @@ def query_server_live(
             "queue": queue,
             "time": t,
             "password": pw,
+            "name": str(getattr(info, "server_name", "") or ""),
+            "map": str(getattr(info, "map_name", "") or ""),
         }
         emit_unrelated("success")
         STATUS_DIAGNOSTICS.observe_result(
@@ -286,3 +289,141 @@ def query_server_live(
         if STATUS_DIAGNOSTICS.enabled:
             result["_a2s_diag"] = {"classification": classification, "cycle_id": cycle_id, "generation": generation}
         return result
+
+
+def _reassemble_dayz_rules_chunks(rules: dict) -> bytes | None:
+    """Reassemble DayZ's chunked A2S_RULES payload into one byte buffer.
+
+    DayZ splits its binary mod-list payload across multiple rules whose
+    *key* (not value) is a 2-byte header: (chunk_index, total_chunks), both
+    1-based uint8s. The value of each such rule is a slice of the payload.
+    Requires rules() to have been queried with encoding=None - the payload
+    is arbitrary binary data, not text, and decoding it as UTF-8 first
+    (the normal/text rules() path) is lossy.
+    """
+    chunks: dict[int, bytes] = {}
+    total_chunks = 0
+    for key, value in rules.items():
+        if not isinstance(key, bytes) or len(key) != 2 or not isinstance(value, bytes):
+            continue
+        index, total = key[0], key[1]
+        if total <= 0 or not (1 <= index <= total):
+            continue
+        chunks[index] = value
+        total_chunks = total
+    if not chunks or len(chunks) < total_chunks:
+        return None
+    try:
+        return b"".join(chunks[i] for i in range(1, total_chunks + 1))
+    except KeyError:
+        return None
+
+
+# DayZ escapes exactly 4 bytes that can't appear raw in a rules payload -
+# 0x00 (would truncate the null-terminated A2S_RULES value), 0x01 (the
+# escape marker itself), and two others (0x02, 0xFF) that presumably collide
+# with other protocol-level markers. Each is written as 0x01 followed by its
+# index in this table, *not* its literal value - verified against a real
+# server's confirmed Workshop IDs, where index 3 decodes to 0xFF, not 0x03.
+_DAYZ_RULES_ESCAPE_TABLE = (0x00, 0x01, 0x02, 0xFF)
+
+
+def _unescape_dayz_rules_payload(buf: bytes) -> bytes:
+    """Undo DayZ's escaping of forbidden bytes within a rules payload.
+
+    See _DAYZ_RULES_ESCAPE_TABLE for which 4 bytes are escaped and how.
+    """
+    out = bytearray()
+    i = 0
+    n = len(buf)
+    while i < n:
+        b = buf[i]
+        if b == 0x01 and i + 1 < n and buf[i + 1] < len(_DAYZ_RULES_ESCAPE_TABLE):
+            out.append(_DAYZ_RULES_ESCAPE_TABLE[buf[i + 1]])
+            i += 2
+        else:
+            out.append(b)
+            i += 1
+    return bytes(out)
+
+
+def parse_dayz_rules_mods(rules: dict) -> list[dict]:
+    """Parse DayZ's chunked A2S_RULES mod-list binary payload.
+
+    Layout after reassembly+unescaping: 1 byte protocol version, 3 byte
+    flags, 1 byte mod count, then per mod: 4 byte hash, 1 byte Steam ID
+    length, that many bytes of little-endian Steam Workshop ID, 1 byte
+    name length, that many bytes of UTF-8 name (no null terminator).
+    rules must have been queried with encoding=None (raw bytes), or this
+    returns nothing - decoding this binary payload as text first is lossy.
+    """
+    if not isinstance(rules, dict):
+        return []
+    raw = _reassemble_dayz_rules_chunks(rules)
+    if raw is None:
+        return []
+    buf = _unescape_dayz_rules_payload(raw)
+    if len(buf) < 5:
+        return []
+
+    mod_count = buf[4]
+    pos = 5
+    mods = []
+    seen = set()
+    for _ in range(mod_count):
+        if pos + 4 > len(buf):
+            break
+        pos += 4  # mod content hash, not used
+        if pos + 1 > len(buf):
+            break
+        id_len = buf[pos]
+        pos += 1
+        if id_len not in (1, 2, 3, 4) or pos + id_len > len(buf):
+            break
+        workshop_id = int.from_bytes(buf[pos:pos + id_len], "little")
+        pos += id_len
+        if pos + 1 > len(buf):
+            break
+        name_len = buf[pos]
+        pos += 1
+        if pos + name_len > len(buf):
+            break
+        name = buf[pos:pos + name_len].decode("utf-8", errors="replace")
+        pos += name_len
+        if workshop_id <= 0 or workshop_id in seen:
+            continue
+        seen.add(workshop_id)
+        mods.append({"steamWorkshopId": workshop_id, "name": name})
+    return mods
+
+
+def query_server_mods(ip: str, qport: int, timeout: float = 3.0) -> dict:
+    """Query A2S_RULES for a server's required-mod list.
+
+    Unlike query_server_live() (A2S_INFO), this hits A2S_RULES - the query
+    DayZ servers actually use to advertise their Workshop mod list. Nothing
+    else in this app calls A2S_RULES: the normal server list gets its mod
+    data from the prebuilt database instead, so this only matters for
+    servers added without that database entry (Direct Connect).
+    """
+    try:
+        ip = str(ip).strip()
+        qport = int(qport)
+    except Exception:
+        return {"ok": False, "err": "invalid server endpoint"}
+    try:
+        from . import a2s
+    except Exception as e:
+        return {"ok": False, "err": f"vendored a2s unavailable: {e}"}
+    debug = os.environ.get("DZLL_MODS_DEBUG") == "1"
+    try:
+        raw_rules = a2s.rules((ip, qport), timeout=float(timeout), encoding=None)
+    except Exception as e:
+        if debug:
+            print(f"[MODS-DEBUG] {ip}:{qport} A2S_RULES failed: {e!r}", flush=True)
+        return {"ok": False, "err": str(e)}
+    parsed = parse_dayz_rules_mods(raw_rules)
+    if debug:
+        print(f"[MODS-DEBUG] {ip}:{qport} raw_rules={raw_rules!r}", flush=True)
+        print(f"[MODS-DEBUG] {ip}:{qport} parsed={len(parsed)} mods: {parsed!r}", flush=True)
+    return {"ok": True, "mods": parsed}

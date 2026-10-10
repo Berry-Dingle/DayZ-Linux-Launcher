@@ -25,8 +25,8 @@ from .mod_search import parse_required_mod_query, split_mod_search_operator
 
 _MOD_SEARCH_OPERATOR_RE = re.compile(r"(^|\s)(mods:|-mods=)", re.IGNORECASE)
 _MOD_SEARCH_MODE_OPERATOR_RE = re.compile(r"(^|\s)(mods:)", re.IGNORECASE)
-NORMAL_SEARCH_PLACEHOLDER = "Filter by name or IP. Click MOD for required mods."
-MOD_SEARCH_PLACEHOLDER = "Search required mods. Select a known mod, or press ESC to exit."
+NORMAL_SEARCH_PLACEHOLDER = "Filter by name or IP. Click MOD-button to filter by mods."
+MOD_SEARCH_PLACEHOLDER = "Search for mods to filter by. Press ESC to exit."
 MOD_SUGGESTION_VISIBLE_ROWS = 9
 MOD_SUGGESTION_ROW_HEIGHT_ESTIMATE = 34
 MOD_CHIP_VISIBLE_ROWS = 2
@@ -906,6 +906,31 @@ def build_search_area(window) -> Gtk.Widget:
     window.mod_search_control.append(window.search_entry)
     search_row.append(window.mod_search_control)
 
+    manage_mods_btn = Gtk.Button(label="Manage Mods")
+    manage_mods_btn.set_can_focus(False)
+    manage_mods_btn.set_tooltip_text("Manage installed mods")
+    manage_mods_btn.connect("clicked", lambda *_: window.open_mods_manager())
+    attach_pointer_cursor(manage_mods_btn)
+    manage_mods_btn.set_margin_start(6)
+    search_row.append(manage_mods_btn)
+    window.mod_manager_header_btn = manage_mods_btn
+
+    settings_btn = Gtk.Button()
+    settings_btn.set_can_focus(False)
+    settings_btn.add_css_class("flat")
+    settings_icon = Gtk.Image.new_from_icon_name("applications-system-symbolic")
+    settings_icon.set_pixel_size(24)
+    settings_btn.set_child(settings_icon)
+    settings_btn.set_tooltip_text("Settings")
+    try:
+        settings_btn.set_accessible_name("Settings")
+    except Exception:
+        pass
+    settings_btn.connect("clicked", window._on_settings_clicked)
+    attach_pointer_cursor(settings_btn)
+    settings_btn.set_margin_start(6)
+    search_row.append(settings_btn)
+
     window.mod_suggestion_panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     window.mod_suggestion_panel.add_css_class("mod-suggestion-panel")
     window.mod_suggestion_panel.set_visible(False)
@@ -965,31 +990,9 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     search_header.set_valign(Gtk.Align.CENTER)
     search_header.set_overflow(Gtk.Overflow.HIDDEN)
 
-    settings_btn = Gtk.Button()
-    settings_btn.set_can_focus(False)
-    settings_btn.add_css_class("flat")
-    settings_btn.set_child(Gtk.Image.new_from_icon_name("preferences-system-symbolic"))
-    settings_btn.set_tooltip_text("Settings")
-    try:
-        settings_btn.set_accessible_name("Settings")
-    except Exception:
-        pass
-    settings_btn.connect("clicked", window._on_settings_clicked)
-    attach_pointer_cursor(settings_btn)
-    search_header.append(settings_btn)
-
-    window.mod_manager_header_btn = Gtk.Button()
-    window.mod_manager_header_btn.set_can_focus(False)
-    window.mod_manager_header_btn.add_css_class("flat")
-    window.mod_manager_header_btn.set_child(Gtk.Image.new_from_icon_name("view-list-symbolic"))
-    window.mod_manager_header_btn.set_tooltip_text("Manage installed mods")
-    window.mod_manager_header_btn.connect("clicked", lambda *_: window.open_mods_manager())
-    attach_pointer_cursor(window.mod_manager_header_btn)
-    search_header.append(window.mod_manager_header_btn)
-
     window.refresh_status_btn = Gtk.Button()
     window.refresh_status_btn.set_can_focus(False)
-    window.refresh_status_btn.add_css_class("flat")
+    window.refresh_status_btn.add_css_class("circular")
     window.refresh_status_btn.set_child(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
     window.refresh_status_btn.set_tooltip_text("Refresh live ping, player count, queue and online status for all servers.")
     window.refresh_status_btn.connect("clicked", window._on_refresh_status_clicked)
@@ -1002,7 +1005,6 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     window.status_refresh_progress_box.add_css_class("status-refresh-progress")
     window.status_refresh_progress_box.set_hexpand(True)
     window.status_refresh_progress_box.set_size_request(1, -1)
-    window.status_refresh_progress_box.set_margin_start(9)
     window.status_refresh_progress_box.set_halign(Gtk.Align.FILL)
     window.status_refresh_progress_box.set_valign(Gtk.Align.CENTER)
     window.status_refresh_progress_box.set_visible(False)
@@ -1040,6 +1042,22 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     window.status_refresh_progress_bar.set_fraction(0.0)
     window.status_refresh_progress_box.append(window.status_refresh_progress_bar)
 
+    window.status_refresh_last_label = Gtk.Label(xalign=0.0)
+    window.status_refresh_last_label.add_css_class("status-refresh-last-label")
+    window.status_refresh_last_label.set_hexpand(True)
+    window.status_refresh_last_label.set_halign(Gtk.Align.FILL)
+    window.status_refresh_last_label.set_single_line_mode(True)
+    window.status_refresh_last_label.set_ellipsize(Pango.EllipsizeMode.END)
+    window.status_refresh_last_label.set_visible(False)
+
+    window.status_refresh_idle_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    window.status_refresh_idle_row.set_hexpand(True)
+    window.status_refresh_idle_row.set_halign(Gtk.Align.FILL)
+    window.refresh_status_btn.set_halign(Gtk.Align.START)
+    window.refresh_status_btn.set_valign(Gtk.Align.CENTER)
+    window.status_refresh_idle_row.append(window.refresh_status_btn)
+    window.status_refresh_idle_row.append(window.status_refresh_last_label)
+
     window.status_refresh_slot = Gtk.Stack()
     window.status_refresh_slot.add_css_class("status-refresh-slot")
     window.status_refresh_slot.set_hexpand(True)
@@ -1049,11 +1067,9 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     window.status_refresh_slot.set_hhomogeneous(False)
     window.status_refresh_slot.set_vhomogeneous(True)
     window.status_refresh_slot.set_transition_type(Gtk.StackTransitionType.NONE)
-    window.refresh_status_btn.set_halign(Gtk.Align.START)
-    window.refresh_status_btn.set_valign(Gtk.Align.CENTER)
-    window.status_refresh_slot.add_named(window.refresh_status_btn, "refresh")
+    window.status_refresh_slot.add_named(window.status_refresh_idle_row, "refresh")
     window.status_refresh_slot.add_named(window.status_refresh_progress_box, "progress")
-    window.status_refresh_slot.set_visible_child(window.refresh_status_btn)
+    window.status_refresh_slot.set_visible_child(window.status_refresh_idle_row)
     search_header.append(window.status_refresh_slot)
 
     toolbar_cell.append(search_header)
@@ -1064,7 +1080,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     Builds the entire sidebar and assigns the same widget refs onto `window`:
       - window.map_model
       - window.map_dropdown
-      - window.cb_show_fav / cb_1pp_only / cb_no_password / cb_online_only / cb_played_only
+      - window.cb_1pp_only / cb_3pp_only / cb_no_password / cb_online_only
       - window.reset_btn
     """
     sidebar_frame = Gtk.Overlay()
@@ -1168,10 +1184,6 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     window.map_dropdown.connect("notify::selected", lambda *_: timed_filter_callback("map", "map"))
     sidebar.append(window.map_dropdown)
 
-    row, window.cb_show_fav = sidebar_mini_toggle_row("Show Favourites")
-    window.cb_show_fav.connect("toggled", lambda *_: timed_filter_callback("show-favorites", "favourites"))
-    sidebar.append(row)
-
     row, window.cb_1pp_only = sidebar_mini_toggle_row("1st Person Only")
     sidebar.append(row)
 
@@ -1192,13 +1204,9 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     window.cb_online_only.connect("toggled", lambda *_: timed_filter_callback("online-only", "online"))
     sidebar.append(row)
 
-    row, window.cb_played_only = sidebar_mini_toggle_row("Previously Joined", tooltip="Show servers you have joined before")
-    window.cb_played_only.connect("toggled", lambda *_: timed_filter_callback("played-only", "played"))
-    sidebar.append(row)
-
     sidebar.append(hr())
 
-    window.reset_btn = Gtk.Button(label="RESET")
+    window.reset_btn = Gtk.Button(label="Reset Filters")
     window.reset_btn.connect("clicked", window._on_reset_clicked)
     sidebar.append(window.reset_btn)
 
@@ -1369,6 +1377,14 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     sidebar.append(default_filters)
 
     sidebar.append(hr())
+
+    direct_connect_btn = Gtk.Button(label="Add Server by IP")
+    direct_connect_btn.set_hexpand(True)
+    direct_connect_btn.set_halign(Gtk.Align.FILL)
+    direct_connect_btn.set_tooltip_text("Manually add a server to the list by providing an IP and Port.")
+    attach_pointer_cursor(direct_connect_btn)
+    direct_connect_btn.connect("clicked", lambda *_: window._open_direct_connect_dialog())
+    sidebar.append(direct_connect_btn)
 
     bottom_section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     bottom_section.set_hexpand(True)

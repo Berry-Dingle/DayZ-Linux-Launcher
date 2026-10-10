@@ -57,14 +57,11 @@ def base_state(obj):
         "query": "",
         "mod_query_mode": False,
         "mod_query": (),
-        "hide_test_servers": False,
         "max_players_cutoff": 0,
-        "show_fav": False,
         "one_pp_only": False,
         "three_pp_only": False,
         "no_password": False,
         "online_only": False,
-        "played_only": False,
         "selected_map": "All Maps",
     }
 
@@ -96,12 +93,6 @@ def test_favourite_bypasses_ping_and_minimum_slot_filters(obj, state):
     assert matches(obj, pin=False, **state)
 
 
-def test_pin_off_favourite_obeys_test_server_filter():
-    favourite = server("Test", fav=True)
-    favourite.is_likely_test_server = True
-    assert not matches(favourite, pin=False, hide_test_servers=True)
-
-
 @pytest.mark.parametrize(
     ("obj", "state", "visible"),
     [
@@ -117,7 +108,6 @@ def test_pin_off_favourite_obeys_test_server_filter():
         (server("Password", fav=True, password=True), {"no_password": True}, False),
         (server("Vanilla", fav=True), {"mod_query_mode": True, "mod_query": (("required", "modded"),)}, False),
         (server("Search", fav=True), {"query": "does-not-match"}, False),
-        (server("Unplayed", fav=True, played=""), {"played_only": True}, False),
     ],
 )
 def test_pin_setting_does_not_expand_favourite_exemption_scope(obj, state, visible):
@@ -174,7 +164,6 @@ def test_official_filter_rebuild_keeps_favourite_and_other_rows_once():
         (server("Small", max_players=20), {"max_players_cutoff": 60}),
         (server("Password", password=True), {"no_password": True}),
         (server("Search"), {"query": "does-not-match"}),
-        (server("Unplayed", played=""), {"played_only": True}),
     ],
 )
 def test_non_favourites_still_obey_active_filters(obj, state):
@@ -239,7 +228,8 @@ def test_favourite_toggle_updates_filtered_membership_immediately(monkeypatch):
     state["online_only"] = True
     host, visible = rebuild_host([obj], pin=True, state=state)
     host.favorites = {}
-    host.cb_show_fav = SimpleNamespace(get_active=lambda: False)
+    host.retained_servers = {}
+    host._update_retained_cache_for_obj = lambda *_args, **_kwargs: None
     host.scroller = SimpleNamespace(get_vadjustment=lambda: None)
     host._on_filter_changed = lambda **_kwargs: DZLLWindow._rebuild_column_view_store(
         host, reorder_reason="favourites"

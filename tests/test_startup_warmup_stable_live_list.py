@@ -49,18 +49,27 @@ def test_startup_queue_uses_both_top_rank_bands_before_lower_bands(monkeypatch):
         _obj_by_key={},
         _startup_live_generation=0,
         _server_companion_rows_loaded=False,
+        retained_servers={},
         empty_label=SimpleNamespace(set_text=lambda *_: None, set_visible=lambda *_: None),
         _set_map_choices=lambda *_: None,
         _restore_server_companion_if_enabled=lambda: None,
         _set_updating=lambda *_: None,
-        _submit_startup_rest_batches=lambda keys, warmup_count: captured.append((keys, warmup_count)),
+        _begin_status_refresh_sweep=lambda keys, warmup_count=None: captured.append((keys, warmup_count)),
         _apply_titlebar_counts=lambda: None,
         _offline_recheck_tick=lambda: False,
+        _auto_sort_lowest_ping_after_startup=lambda: None,
+        _complete_startup_presentation=lambda: None,
     )
-    host._load_rows_into_store = lambda valid: host._obj_by_key.update({
-        fav_key(row["ip"], row["gport"]): SimpleNamespace(bm_rank=row["bm_rank"])
-        for row in valid
-    }) or True
+
+    def fake_load_rows_into_store(valid, on_loaded=None):
+        host._obj_by_key.update({
+            fav_key(row["ip"], row["gport"]): SimpleNamespace(bm_rank=row["bm_rank"])
+            for row in valid
+        })
+        if on_loaded is not None:
+            on_loaded(True)
+
+    host._load_rows_into_store = fake_load_rows_into_store
     bind(host, "_bm_live_group")
     monkeypatch.setattr(window.GLib, "timeout_add_seconds", lambda *_: 1)
 
@@ -73,15 +82,6 @@ def test_startup_queue_uses_both_top_rank_bands_before_lower_bands(monkeypatch):
     assert all(rank <= 1000 for rank in ordered_ranks[:warmup_count])
 
 
-class Future:
-    def __init__(self, generation, key):
-        self.generation = generation
-        self.key = key
-
-    def result(self):
-        return self.generation, (self.key, {"ok": True})
-
-
 def warmup_host(monkeypatch, *, warmup_count=80, total=100):
     scheduled = []
     removed = []
@@ -90,40 +90,44 @@ def warmup_host(monkeypatch, *, warmup_count=80, total=100):
     monkeypatch.setattr(window.GLib, "timeout_add", lambda *_: 0)
     monkeypatch.setattr(window.GLib, "source_remove", removed.append)
     host = SimpleNamespace(
-        _startup_live_generation=0,
-        _startup_live_rest_flush_id=0,
+        _status_refresh_generation=1,
+        _status_refresh_running=True,
+        _status_refresh_flush_id=0,
+        _status_refresh_buffer=[],
+        _status_refresh_total=total,
+        _status_refresh_completed=0,
         _startup_warmup_timeout_id=0,
-        _startup_live_rest_buffer=[],
         _shutdown_cleanup_done=False,
-        _pump_startup_rest_sweep=lambda _generation: False,
-        _flush_startup_rest_results=lambda _generation: events.append("flush") or False,
+        _startup_presentation=None,
+        _flush_status_refresh_results=lambda _generation: events.append("flush") or False,
         _auto_sort_lowest_ping_after_startup=lambda: events.append("sort") or False,
         _complete_startup_presentation=lambda: events.append("reveal") or False,
+        _set_updating=lambda *_: None,
+        _schedule_status_refresh_progress_update=lambda *_: None,
     )
-    bind(host, "_submit_startup_rest_batches", "_on_startup_rest_future_done", "_on_startup_warmup_timeout", "_complete_startup_warmup")
+    bind(host, "_begin_startup_warmup_gate", "_status_refresh_attempt_finished", "_on_startup_warmup_timeout", "_complete_startup_warmup")
     keys = [f"server-{n}" for n in range(total)]
-    host._submit_startup_rest_batches(keys, warmup_count=warmup_count)
+    host._begin_startup_warmup_gate(1, keys, warmup_count)
     return host, keys, scheduled, removed, events
 
 
 def test_warmup_reveals_after_partial_top_1000_completion_and_sorts_first(monkeypatch):
     host, keys, scheduled, removed, events = warmup_host(monkeypatch)
     assert host._startup_warmup_target == 52  # ceil(65% of 80), beyond old first 50
-    assert list(host._startup_live_rest_queue) == keys
     assert scheduled[0][0] == config.STARTUP_WARMUP_MAX_WAIT_SECS
     for key in keys[:51]:
-        host._on_startup_rest_future_done(1, Future(1, key), key)
+        host._status_refresh_attempt_finished(1, key=key)
     assert events == []
-    host._on_startup_rest_future_done(1, Future(1, keys[51]), keys[51])
+    host._status_refresh_attempt_finished(1, key=keys[51])
     assert events == ["flush", "sort", "reveal"]
     assert removed == [41]
-    host._on_startup_rest_future_done(1, Future(1, keys[52]), keys[52])
+    host._status_refresh_attempt_finished(1, key=keys[52])
     assert events == ["flush", "sort", "reveal"]
 
 
 def test_warmup_max_wait_reveals_once_without_all_results(monkeypatch):
     host, keys, scheduled, _removed, events = warmup_host(monkeypatch)
-    host._on_startup_rest_future_done(1, Future(1, keys[0]), keys[0])
+    host._status_refresh_attempt_finished(1, key=keys[0])
     scheduled[0][1](scheduled[0][2])
     assert host._startup_warmup_completed == 1
     assert events == ["flush", "sort", "reveal"]
@@ -142,8 +146,9 @@ def test_cached_db_fallback_still_sorts_before_reveal():
     host = SimpleNamespace(
         _startup_live_generation=0,
         _server_companion_rows_loaded=False,
+        retained_servers={},
         _set_map_choices=lambda *_: None,
-        _load_rows_into_store=lambda _rows: True,
+        _load_rows_into_store=lambda _rows, on_loaded=None: (on_loaded(True) if on_loaded else None),
         _restore_server_companion_if_enabled=lambda: None,
         _set_updating=lambda *_: None,
         _auto_sort_lowest_ping_after_startup=lambda: events.append("sort"),
@@ -167,9 +172,9 @@ def make_live_host():
     live = {fav_key(obj.ip, obj.gport): {"hide_high_ping": False, "offline": False} for obj in rows}
     state = {
         "live": live, "query": "", "mod_query_mode": False, "mod_query": (),
-        "hide_test_servers": False, "max_players_cutoff": 50, "show_fav": False,
+        "max_players_cutoff": 50,
         "one_pp_only": False, "three_pp_only": False, "no_password": False,
-        "online_only": False, "played_only": False, "selected_map": "All Maps",
+        "online_only": False, "selected_map": "All Maps",
     }
     host = SimpleNamespace(
         store=Store(rows), column_view_store=Store(),
@@ -333,6 +338,9 @@ def test_refresh_all_final_rebuild_and_scroll_restoration_remain_separate(monkey
         _status_refresh_inflight=0, _status_refresh_queue=[], _status_refresh_buffer=[],
         _status_refresh_scroll_value=43.0, _status_refresh_total=2,
         _status_refresh_completed=2, _shutdown_cleanup_done=False,
+        _startup_warmup_revealed=True,
+        _update_status_refresh_last_label=lambda: None,
+        _schedule_status_refresh_last_label_tick=lambda: None,
         _cancel_status_refresh_progress_update=lambda *_: None,
         _render_status_refresh_progress=lambda *_, **__: None,
         _snapshot_all_sort_keys=lambda: None,

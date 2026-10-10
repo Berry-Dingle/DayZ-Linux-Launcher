@@ -41,6 +41,7 @@ _DUMP_COLUMNVIEW_TREE = os.environ.get("DZLL_DUMP_COLUMNVIEW_TREE") == "1"
 _DEBUG_COLUMN_SORT = os.environ.get("DZLL_DEBUG_COLUMN_SORT") == "1"
 _SORT_DEBUG_BIND_HOOK = None
 _SORTABLE_HEADER_KEYS = {
+    "FAV": "fav",
     "PLAYED": "played",
     "PLAYERS": "players",
     "PING": "ping",
@@ -635,6 +636,40 @@ def _bind_center_label(label: Gtk.Label, obj: ServerObject, binder) -> None:
         label.set_text("")
 
 
+_LIVE_FLASH_CSS_CLASS = "dzll-live-refresh-flash"
+_LIVE_FLASH_HOLD_MS = 350
+
+
+def _flash_row_from_cell(cell) -> None:
+    row = cell
+    while row is not None and not _css_name_is(row, "row"):
+        row = row.get_parent()
+    if row is None:
+        return
+
+    tid = int(getattr(row, "_dzll_live_flash_timeout_id", 0) or 0)
+    if tid:
+        try:
+            GLib.source_remove(tid)
+        except Exception:
+            pass
+        row._dzll_live_flash_timeout_id = 0
+    row.add_css_class(_LIVE_FLASH_CSS_CLASS)
+
+    def _clear(target=row):
+        try:
+            target.remove_css_class(_LIVE_FLASH_CSS_CLASS)
+        except Exception:
+            pass
+        target._dzll_live_flash_timeout_id = 0
+        return False
+
+    try:
+        row._dzll_live_flash_timeout_id = GLib.timeout_add(_LIVE_FLASH_HOLD_MS, _clear)
+    except Exception:
+        row._dzll_live_flash_timeout_id = 0
+
+
 def _make_label_factory(
     binder,
     *,
@@ -643,6 +678,7 @@ def _make_label_factory(
     drag_light=None,
     light_binder=None,
     notify_props=(),
+    flash_row_props=(),
     max_chars: int | None = None,
     cell_css_classes=None,
 ):
@@ -678,7 +714,7 @@ def _make_label_factory(
             perf_metrics.count("ping_label_writes")
             if isinstance(obj, ServerObject):
                 perf_metrics.count("ping_format_calls")
-        if not isinstance(obj, ServerObject) or not notify_props:
+        if not isinstance(obj, ServerObject) or not (notify_props or flash_row_props):
             return
         hids = []
 
@@ -699,6 +735,11 @@ def _make_label_factory(
                 if perf_metrics is not None:
                     perf_metrics.count("notify_connects")
                     perf_metrics.count(f"{factory_name}_notify_connects")
+            except Exception:
+                pass
+        for prop in flash_row_props:
+            try:
+                hids.append(obj.connect(f"notify::{prop}", lambda _obj, _pspec, cell=label: _flash_row_from_cell(cell)))
             except Exception:
                 pass
         label._dzll_notify_obj = obj
@@ -1866,6 +1907,34 @@ def _bind_name_cell_light(
         perf_metrics.count("drag_skipped_popup_preparation")
 
 
+# Properties the name cell actually renders (name, flag, lock, mod count)
+# that can change after the initial bind - e.g. a Direct Connect row whose
+# a2s query resolves after the row is already on screen.
+_NAME_CELL_NOTIFY_PROPS = ("name", "country", "third_person", "password", "mod_count")
+
+
+def _connect_name_cell_notify_handlers(cell, obj, perf_metrics=None) -> None:
+    if not isinstance(obj, ServerObject):
+        return
+
+    def notify(changed_obj, _pspec, cell=cell):
+        if not _notify_is_current(cell, changed_obj):
+            return
+        _bind_name_cell(cell, changed_obj, perf_metrics)
+
+    hids = []
+    for prop in _NAME_CELL_NOTIFY_PROPS:
+        try:
+            hids.append(obj.connect(f"notify::{prop}", notify))
+            if perf_metrics is not None:
+                perf_metrics.count("notify_connects")
+                perf_metrics.count("name_notify_connects")
+        except Exception:
+            pass
+    cell._dzll_notify_obj = obj
+    cell._dzll_notify_ids = hids
+
+
 def _make_name_factory(perf_metrics=None, drag_light=None):
     factory = Gtk.SignalListItemFactory()
 
@@ -1994,7 +2063,10 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         cell = list_item.get_child()
         if cell is None or (known_cell is not None and cell is not known_cell):
             return
-        _bind_name_cell(cell, list_item.get_item(), perf_metrics)
+        _disconnect_notify_handlers(cell, perf_metrics, "name")
+        obj = list_item.get_item()
+        _bind_name_cell(cell, obj, perf_metrics)
+        _connect_name_cell_notify_handlers(cell, obj, perf_metrics)
 
     def render_light(list_item, known_cell=None):
         cell = list_item.get_child()
@@ -2038,6 +2110,7 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         try:
             cell = list_item.get_child()
             _unregister_bound_cell(drag_light, cell, list_item)
+            _disconnect_notify_handlers(cell, perf_metrics, "name")
             if _drag_light_active(drag_light):
                 _bind_name_cell_light(cell, None, perf_metrics)
             else:
@@ -2436,6 +2509,7 @@ def build_server_column_view(
             drag_light=drag_light,
             light_binder=_bind_ping_light,
             notify_props=("ping",),
+            flash_row_props=("refresh-pulse",),
             max_chars=8,
             cell_css_classes=right_border,
         ),

@@ -467,6 +467,9 @@ class ServerObject(GObject.Object):
     ping = GObject.Property(type=int, default=-1)  # <0 = offline
     bm_rank = GObject.Property(type=int, default=999999999)
 
+    # Bumped whenever a live browser refresh is applied to this row
+    refresh_pulse = GObject.Property(type=int, default=0)
+
     # Snapshot sort keys (stable until user clicks sort)
     sort_ping = GObject.Property(type=int, default=999999)
     sort_players = GObject.Property(type=int, default=0)
@@ -484,7 +487,6 @@ class ServerObject(GObject.Object):
         self.ipport_lc = f"{self.ip}:{int(self.gport)}".lower()
         self.search_blob = f"{self.name_lc}\n{self.ipport_lc}"
         self.filter_key = self.ipport_lc
-        self.is_likely_test_server = False
 
 
 class ServerRowWidget(Gtk.Box):

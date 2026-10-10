@@ -116,11 +116,10 @@ class Store:
         self.rows[position:position + removed] = list(additions)
 
 
-def browser_host(rows, history, *, sort_key="ping", played_only=False):
+def browser_host(rows, history, *, sort_key="ping"):
     source = Store(rows)
     visible = Store()
     state = {
-        "played_only": played_only, "hide_test_servers": False,
         "selected_map": "All Maps", "live": {},
     }
     host = SimpleNamespace(
