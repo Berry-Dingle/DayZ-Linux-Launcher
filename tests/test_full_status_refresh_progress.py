@@ -259,6 +259,7 @@ def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
     host.scroller = SimpleNamespace(get_vadjustment=lambda: None)
     host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
     host._pump_status_refresh = lambda _generation: False
+    host._begin_startup_warmup_gate = lambda *_args, **_kwargs: None
     bind(host, "_on_refresh_status_clicked", "_begin_status_refresh_sweep")
 
     host._on_refresh_status_clicked()
@@ -491,6 +492,7 @@ def test_startup_driven_sweep_also_shows_progress_and_busy_slot():
     slot_calls = []
     host._set_status_refresh_slot_running = lambda running, **_kwargs: slot_calls.append(running)
     host._pump_status_refresh = lambda _generation: False
+    host._begin_startup_warmup_gate = lambda *_args, **_kwargs: None
     bind(host, "_begin_status_refresh_sweep")
 
     rest_keys = list(host._obj_by_key.keys())
@@ -606,16 +608,18 @@ def test_startup_sweep_and_manual_refresh_share_one_progress_pipeline():
     manual = source[source.index("def _on_refresh_status_clicked"):source.index("def _query_status_refresh_one")]
     row_start = source.index("def _refresh_server_for_obj")
     row = source[row_start:source.index("\n    def ", row_start + 1)]
-    startup = source[source.index("def _submit_live_first_n_then_hide_band"):source.index("def _submit_live_batch")]
+    startup = source[source.index("def _apply_db_rows"):source.index("def _load_rows_into_store")]
     assert "_render_status_refresh_progress" not in row
 
-    # Both the manual "Refresh All" click and the startup rest-of-list sweep
-    # hand off into the same _begin_status_refresh_sweep entry point, so there
-    # is exactly one queue/executor/progress-bar implementation, not two.
+    # Both the manual "Refresh All" click and the startup sweep hand off into
+    # the same _begin_status_refresh_sweep entry point, so there is exactly
+    # one queue/executor/progress-bar implementation, not two - startup just
+    # additionally gates the splash reveal behind a warmup_count of it.
     assert "self._begin_status_refresh_sweep(keys)" in manual
-    assert "self._begin_status_refresh_sweep" in startup
+    assert "self._begin_status_refresh_sweep(keys, warmup_count=warmup_count)" in startup
     assert source.count("def _begin_status_refresh_sweep") == 1
     assert "_submit_startup_rest_batches" not in source
+    assert "_submit_live_first_n_then_hide_band" not in source
 
     slot_state = source[source.index("def _set_status_refresh_slot_running"):source.index("def _on_refresh_status_clicked")]
     assert "Gtk.Spinner" not in slot_state

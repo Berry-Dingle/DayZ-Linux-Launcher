@@ -1464,6 +1464,12 @@ def get_app_css(
           color: @dzll_text_primary;
         }}
 
+        .dzll-column-view label.dzll-time-speed {{
+          font-size: 0.75em;
+          font-weight: normal;
+          color: @dzll_text_muted;
+        }}
+
         .dzll-column-view .dim-label {{
           color: @dzll_text_muted;
         }}

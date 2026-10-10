@@ -45,7 +45,8 @@ from .config import (
     DISCLAIMER_GAP_ABOVE,
     DISCLAIMER_COLOR,
     PING_MAX,
-    STARTUP_PING_FIRST_N,
+    STARTUP_WARMUP_READY_PERCENT,
+    STARTUP_WARMUP_MAX_WAIT_SECS,
     STARTUP_LIVE_REST_WORKERS,
     STARTUP_LIVE_REST_TIMEOUT_SECS,
     STARTUP_LIVE_FLUSH_MAX,
@@ -229,6 +230,48 @@ from .companion_restart_phase2_runtime import (
     phase2_alert_usability,
     phase2_learning_summary,
 )
+
+
+def companion_display_confidence_summary(
+    summary: dict | None, candidate: tuple[int, float] | None, *, period_seconds: int | None
+) -> dict | None:
+    """Label selected confidence or show a learning candidate in the UI only."""
+
+    learning = summary is None or (
+        period_seconds is None
+        and (
+            summary.get("presentation_key") in {"none", "pattern_only"}
+            or summary.get("cycle_text") in {"Still Learning", "Learning Restart Pattern"}
+        )
+    )
+    if summary is None and candidate is None:
+        return None
+    result = dict(summary or {})
+    named_cycle = period_seconds is not None and (
+        result.get("presentation_key")
+        in {"likely_cycle", "confirmed_cycle", "likely_new_cycle", "confirmed_new_cycle"}
+        or str(result.get("cycle_text") or "").startswith("Every ")
+    )
+    if named_cycle:
+        result["confidence_label"] = "Cycle Confidence:"
+        return result
+    if not learning:
+        return result
+    result["cycle_text"] = "Learning Restart Pattern"
+    result.setdefault("next_visible", False)
+    result.setdefault("countdown_visible", False)
+    result.setdefault("prediction_usable", False)
+    if candidate is None:
+        result["confidence_visible"] = False
+        return result
+    result.update(
+        confidence_percent=int(round(candidate[1] * 100)),
+        confidence_kind="period",
+        confidence_label="Learning Confidence:",
+        confidence_visible=True,
+    )
+    result.pop("confidence_severity", None)
+    return result
 
 BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET = 10
 BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING = 8
@@ -544,6 +587,7 @@ def _build_server_rows(rows: list, favorites: dict, last_played: dict) -> list:
 
         password = _db_advisory_flag(dbrow.get("password"))
         third_person = _db_advisory_flag(dbrow.get("third_person"))
+        official = type(dbrow.get("official")) is int and dbrow.get("official") == 1
 
         raw_mods_json = dbrow.get("mods")
         mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
@@ -556,9 +600,13 @@ def _build_server_rows(rows: list, favorites: dict, last_played: dict) -> list:
                 pass
 
         try:
-            timewarp = float(dbrow.get("timeWarp")) if dbrow.get("timeWarp") is not None else 1.0
-        except Exception:
-            timewarp = 1.0
+            timewarp = float(dbrow["timeWarp"]) if dbrow.get("timeWarp") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            timewarp = None
+        try:
+            night_timewarp = float(dbrow["nightTimeWarp"]) if dbrow.get("nightTimeWarp") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            night_timewarp = None
         time_str = _db_advisory_text(dbrow.get("time"))
         if not is_valid_hhmm(time_str):
             time_str = "--:--"
@@ -583,6 +631,7 @@ def _build_server_rows(rows: list, favorites: dict, last_played: dict) -> list:
             fav=fav,
             password=password,
             third_person=third_person,
+            official=official,
             name=name,
             country=country,
             ip=ip,
@@ -593,6 +642,7 @@ def _build_server_rows(rows: list, favorites: dict, last_played: dict) -> list:
             mods_json=mods_json,
             time=time_str,
             timewarp=timewarp,
+            night_timewarp=night_timewarp,
             played=played_disp,
             map_name=map_name,
             players=players,
@@ -876,6 +926,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._browser_live_apply_skip_logged_until = 0.0
         self._startup_live_generation = 0
         self._row_load_generation = 0
+        self._startup_warmup_keys = set()
+        self._startup_warmup_completed = 0
+        self._startup_warmup_target = 0
+        self._startup_warmup_timeout_id = 0
+        self._startup_warmup_revealed = False
         self._status_refresh_generation = 0
         self._status_refresh_running = False
         self._status_refresh_queue = deque()
@@ -3197,6 +3252,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
+            timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+            if timeout_id:
+                GLib.source_remove(timeout_id)
+            self._startup_warmup_timeout_id = 0
+        except Exception:
+            pass
+        try:
             generation = int(getattr(self, "_status_refresh_generation", 0) or 0)
             tid = int(getattr(self, "_status_refresh_flush_id", 0) or 0)
             if tid:
@@ -3952,6 +4014,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         else (*reason_codes, hold_reason)
                     ),
                 }
+            if summary_source == "schema4":
+                period_seconds = summary.get("cycle_period_seconds")
+            else:
+                period_seconds = getattr(decision, "selected_period_seconds", None)
+            projection = getattr(
+                self._companion_restart_phase2, "presentation_period_candidate", None
+            )
+            learning = period_seconds is None and (
+                summary is None
+                or summary.get("presentation_key") in {"none", "pattern_only"}
+                or summary.get("cycle_text") in {"Still Learning", "Learning Restart Pattern"}
+            )
+            candidate = (
+                projection(key, period_seconds=None)
+                if learning and callable(projection)
+                else None
+            )
+            summary = companion_display_confidence_summary(
+                summary, candidate, period_seconds=period_seconds
+            )
             return summary
         except Exception as exc:
             debug = getattr(self, "_debug_server_companion_alert", None)
@@ -5794,19 +5876,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._restore_server_companion_if_enabled()
             self._set_updating(True, "Updating The Server Database, Please Wait…")
             if not fetched_ok:
+                self._auto_sort_lowest_ping_after_startup()
                 self._complete_startup_presentation()
                 return
             keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
-            first_n = min(int(STARTUP_PING_FIRST_N), len(keys))
-            first_keys = keys[:first_n]
-            rest_keys = keys[first_n:]
+            warmup_count = sum(self._bm_live_group(k) <= 1 for k in keys)
             if DEBUG_STARTUP_LIVE:
                 print(
-                    f"[STARTUP-LIVE] first_n={first_n} rest={len(rest_keys)} "
-                    f"rest_workers={STARTUP_LIVE_REST_WORKERS}",
+                    f"[STARTUP-LIVE] warmup={warmup_count} total={len(keys)} "
+                    f"workers={STARTUP_LIVE_REST_WORKERS}",
                     flush=True,
                 )
-            self._submit_live_first_n_then_hide_band(first_n, first_keys, rest_keys)
+            self._begin_status_refresh_sweep(keys, warmup_count=warmup_count)
 
             GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
             self._apply_titlebar_counts()
@@ -5865,8 +5946,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         self._apply_titlebar_counts()
-
-        GLib.timeout_add_seconds(1, self._auto_sort_lowest_ping_after_startup)
 
         # ---- Init Discord Status ----
         try:
@@ -6579,7 +6658,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._set_status_refresh_progress_visible(False, generation=generation)
         return False
 
-    def _status_refresh_attempt_finished(self, generation: int, result=None):
+    def _status_refresh_attempt_finished(self, generation: int, key=None, result=None):
         if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         if bool(getattr(self, "_shutdown_cleanup_done", False)):
@@ -6589,6 +6668,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         total = max(0, int(getattr(self, "_status_refresh_total", 0) or 0))
         completed = max(0, int(getattr(self, "_status_refresh_completed", 0) or 0))
         self._status_refresh_completed = min(total, completed + 1)
+        if key is not None and key in (getattr(self, "_startup_warmup_keys", None) or ()):
+            self._startup_warmup_completed = int(getattr(self, "_startup_warmup_completed", 0) or 0) + 1
+            if (
+                not bool(getattr(self, "_startup_warmup_revealed", True))
+                and self._startup_warmup_completed >= int(getattr(self, "_startup_warmup_target", 0) or 0)
+            ):
+                self._complete_startup_warmup(generation)
         if result:
             self._status_refresh_buffer.append(result)
             if len(self._status_refresh_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
@@ -6636,7 +6722,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         self._begin_status_refresh_sweep(keys)
 
-    def _begin_status_refresh_sweep(self, keys):
+    def _begin_status_refresh_sweep(self, keys, warmup_count=None):
         if bool(getattr(self, "_status_refresh_running", False)):
             return False
         keys = list(keys or [])
@@ -6679,7 +6765,80 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 f"timeout={STARTUP_LIVE_REST_TIMEOUT_SECS:.2f}s",
                 flush=True,
             )
+        self._begin_startup_warmup_gate(generation, keys, warmup_count)
         self._pump_status_refresh(generation)
+        return False
+
+    def _begin_startup_warmup_gate(self, generation: int, keys: list, warmup_count: int | None):
+        """Optionally gate startup's reveal behind a sweep in progress.
+
+        warmup_count is None for ordinary (e.g. manual "Refresh All") sweeps -
+        no reveal-gating applies, and any leftover warmup-key bookkeeping from
+        an earlier startup sweep is cleared so it can't spuriously retrigger.
+        When given (startup only), the splash reveal waits for either
+        STARTUP_WARMUP_READY_PERCENT% of the first `warmup_count` keys (the
+        best-ranked servers) to get a live result, or STARTUP_WARMUP_MAX_WAIT_SECS,
+        whichever comes first.
+        """
+        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+        if timeout_id:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+        self._startup_warmup_timeout_id = 0
+
+        if warmup_count is None:
+            self._startup_warmup_keys = set()
+            self._startup_warmup_completed = 0
+            self._startup_warmup_target = 0
+            return
+
+        self._startup_warmup_keys = set(keys[:warmup_count])
+        self._startup_warmup_completed = 0
+        self._startup_warmup_target = max(
+            1, (warmup_count * int(STARTUP_WARMUP_READY_PERCENT) + 99) // 100
+        ) if warmup_count else 0
+        self._startup_warmup_revealed = False
+        if warmup_count:
+            self._startup_warmup_timeout_id = GLib.timeout_add_seconds(
+                STARTUP_WARMUP_MAX_WAIT_SECS, self._on_startup_warmup_timeout, generation
+            )
+        else:
+            self._complete_startup_warmup(generation)
+
+    def _on_startup_warmup_timeout(self, generation: int):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        self._startup_warmup_timeout_id = 0
+        return self._complete_startup_warmup(generation)
+
+    def _complete_startup_warmup(self, generation: int):
+        if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
+            return False
+        if self._startup_warmup_revealed:
+            return False
+        self._startup_warmup_revealed = True
+        timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
+        self._startup_warmup_timeout_id = 0
+        if timeout_id:
+            try:
+                GLib.source_remove(timeout_id)
+            except Exception:
+                pass
+        flush_id = int(getattr(self, "_status_refresh_flush_id", 0) or 0)
+        if flush_id:
+            try:
+                GLib.source_remove(flush_id)
+            except Exception:
+                pass
+            self._status_refresh_flush_id = 0
+        self._flush_status_refresh_results(generation)
+        self._auto_sort_lowest_ping_after_startup()
+        was_completed = bool(getattr(getattr(self, "_startup_presentation", None), "startup_completed", False))
+        self._complete_startup_presentation()
+        if was_completed:
+            self._set_updating(False)
         return False
 
     def _query_status_refresh_one(self, generation: int, k, ip: str, qport: int):
@@ -6713,33 +6872,34 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 break
             obj = self._obj_by_key.get(k)
             if not obj:
-                self._status_refresh_attempt_finished(generation)
+                self._status_refresh_attempt_finished(generation, key=k)
                 continue
             try:
                 ip = str(obj.ip)
                 qport = int(obj.qport)
             except Exception:
-                self._status_refresh_attempt_finished(generation)
+                self._status_refresh_attempt_finished(generation, key=k)
                 continue
 
             self._status_refresh_inflight = int(getattr(self, "_status_refresh_inflight", 0) or 0) + 1
             try:
                 fut = self._startup_live_executor.submit(self._query_status_refresh_one, generation, k, ip, qport)
                 fut.add_done_callback(
-                    lambda done_fut, gen=generation: GLib.idle_add(
+                    lambda done_fut, gen=generation, key=k: GLib.idle_add(
                         self._on_status_refresh_future_done,
                         gen,
                         done_fut,
+                        key,
                     )
                 )
             except Exception:
                 self._status_refresh_inflight = max(0, int(getattr(self, "_status_refresh_inflight", 0) or 0) - 1)
-                self._status_refresh_attempt_finished(generation)
+                self._status_refresh_attempt_finished(generation, key=k)
 
         self._maybe_finish_status_refresh(generation)
         return False
 
-    def _on_status_refresh_future_done(self, generation: int, fut):
+    def _on_status_refresh_future_done(self, generation: int, fut, key=None):
         if generation != int(getattr(self, "_status_refresh_generation", 0) or 0):
             return False
         self._status_refresh_inflight = max(0, int(getattr(self, "_status_refresh_inflight", 0) or 0) - 1)
@@ -6749,6 +6909,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             result_generation, result = generation, None
         self._status_refresh_attempt_finished(
             generation,
+            key=key,
             result=(result if result_generation == generation else None),
         )
 
@@ -6799,6 +6960,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._status_refresh_flush_id = 0
             self._flush_status_refresh_results(generation)
             return False
+
+        if not bool(getattr(self, "_startup_warmup_revealed", True)):
+            self._complete_startup_warmup(generation)
 
         self._cancel_status_refresh_progress_update(generation)
         self._render_status_refresh_progress(generation, force=True)
@@ -6897,72 +7061,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
         self._update_status_refresh_last_label()
         return True
-
-    def _submit_live_first_n_then_hide_band(self, n: int, ordered_keys=None, rest_keys=None):
-        keys = list(ordered_keys or self._obj_by_key.keys())[:max(0, int(n))]
-        if not keys:
-            self._complete_startup_presentation()
-            GLib.idle_add(self._begin_status_refresh_sweep, rest_keys)
-            return
-
-        def query_one(k):
-            try:
-                obj = self._obj_by_key.get(k)
-                if not obj:
-                    return None
-                generation = int(getattr(self, "_startup_live_generation", 0) or 0)
-                return (
-                    k,
-                    query_server_live(
-                        obj.ip,
-                        obj.qport,
-                        gport=obj.gport,
-                        cycle_id=f"startup-first:{generation}:{k}",
-                        generation=generation,
-                        row_id=id(obj),
-                        model_id=id(getattr(self, "column_view_store", None)),
-                    ),
-                )
-            except Exception as e:
-                return (k, {"ok": False, "err": str(e)})
-
-        def apply_late_result(fut):
-            try:
-                result = fut.result()
-                if result:
-                    GLib.idle_add(self._apply_live_results, [result], "startup-first")
-            except Exception:
-                pass
-
-        def worker():
-            futures = [self._executor.submit(query_one, k) for k in keys]
-            target = max(1, (len(futures) * 65 + 99) // 100)
-            deadline = time.monotonic() + 6.0
-            done = set()
-            pending = set(futures)
-            while pending and len(done) < target:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    break
-                newly_done, pending = wait(pending, timeout=min(0.2, remaining))
-                done.update(newly_done)
-            results = []
-            for fut in done:
-                try:
-                    result = fut.result()
-                    if result:
-                        results.append(result)
-                except Exception:
-                    pass
-            for fut in pending:
-                fut.add_done_callback(apply_late_result)
-            GLib.idle_add(self._apply_live_results_and_hide_band, results)
-            GLib.idle_add(self._begin_status_refresh_sweep, rest_keys)
-
-        try:
-            self._executor.submit(worker)
-        except Exception:
-            self._complete_startup_presentation()
 
     def _submit_live_batch(self, keys, reason="batch"):
         if not keys:
@@ -7370,17 +7468,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._submit_live_batch(batch, reason="offline-recheck")
         return True
 
-    def _apply_live_results_and_hide_band(self, results):
-        self._apply_live_results(results, reason="startup-first")
-        self._complete_startup_presentation()
-        return False
-
     def _apply_live_results(self, results, reason="batch"):
         now = int(time.time())
         changed_any = False
         background_live_update = reason in ("batch", "browser-live", "offline-recheck")
         trigger_filter = reason not in ("manual-refresh", "batch", "browser-live", "offline-recheck")
-        live_filter_active = background_live_update and self._active_filter_depends_on_live_values()
+        live_filter_active = False
         live_filter_membership_changed = False
         live_filter_membership_changed_rows = 0
         manual_success = False
@@ -7518,8 +7611,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     reason=f"failure-streak-{streak}",
                     row_lifecycle="retained",
                 )
-                if live_filter_active:
-                    self.live.setdefault(k, {})["hide_high_ping"] = False
+                self.live.setdefault(k, {})["hide_high_ping"] = False
 
                 d = self.dead.get(k, {"fail_count": 0, "dead_until": 0, "last_fail": 0})
                 d["last_fail"] = now
@@ -7722,9 +7814,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 row_lifecycle="retained",
             )
 
-            if trigger_filter or live_filter_active:
-                cut = int(getattr(self, "_ping_cutoff_ms", 250) or 250)
-                self.live.setdefault(k, {})["hide_high_ping"] = (ping_ms > cut)
+            cut = int(getattr(self, "_ping_cutoff_ms", 250) or 250)
+            self.live.setdefault(k, {})["hide_high_ping"] = (ping_ms > cut)
 
             if k in self.dead:
                 self.dead.pop(k, None)
@@ -7750,11 +7841,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         called_membership_reconcile = False
         skipped_stable_order = False
         if changed_any and background_live_update:
-            if live_filter_active and live_filter_membership_changed:
-                called_membership_reconcile = True
-                self._reconcile_visible_store_membership_preserve_order(reason=reason)
-            else:
-                skipped_stable_order = True
+            skipped_stable_order = True
             if DEBUG_FILTER_TIMING and skipped_stable_order:
                 print(
                     f"[filter-timing] action={reason} live_rebuild=skipped stable_order "
@@ -7804,6 +7891,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._filter_state = state
         k = getattr(obj, "filter_key", None) or fav_key(obj.ip, obj.gport)
         is_fav = bool(getattr(self, "favorites", {}).get(k, False))
+        if bool(state.get("hide_official_servers", False)) and bool(getattr(obj, "official", False)) and not is_fav:
+            return False
 
         live = state.get("live", {}).get(k)
         if not is_fav and live and bool(live.get("hide_high_ping", False)):
@@ -7897,6 +7986,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "no_password": active("cb_no_password"),
             "online_only": active("cb_online_only"),
             "selected_map": selected_map,
+            "hide_official_servers": bool(self.settings.get("hide_official_servers", False)),
             "max_players_cutoff": max_players_cutoff,
         }
 
@@ -9398,6 +9488,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             GLib.idle_add(restore_favourite_scroll)
 
     def _retained_snapshot_from_obj(self, obj: ServerObject) -> dict:
+        timewarp = getattr(obj, "timewarp", None)
+        night_timewarp = getattr(obj, "night_timewarp", None)
         return {
             "ip": obj.ip,
             "gport": int(obj.gport),
@@ -9407,10 +9499,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "players": int(obj.players),
             "maxPlayers": int(obj.max_players),
             "password": int(bool(obj.password)),
+            "official": int(bool(getattr(obj, "official", False))),
             "mods": obj.mods_json,
             "modCount": int(obj.mod_count),
             "third_person": int(bool(obj.third_person)),
-            "timeWarp": float(obj.timewarp),
+            "timeWarp": (float(timewarp) if timewarp is not None else None),
+            "nightTimeWarp": (float(night_timewarp) if night_timewarp is not None else None),
             "time": obj.time,
             "country": obj.country,
             "ping": int(obj.ping),

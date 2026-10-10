@@ -6,7 +6,7 @@ APP_ID = "com.bdingle.dzll"
 # ----------------------------
 # VERSION / UPDATES
 # ----------------------------
-APP_VERSION = "v0.4.0-beta"
+APP_VERSION = "v0.4.1-beta"
 RELEASES_URL = "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
 GITHUB_LATEST_API = "https://api.github.com/repos/Berry-Dingle/DayZ-Linux-Launcher/releases/latest"
 
@@ -108,7 +108,8 @@ DB_LOCAL_DIR = os.path.expanduser("~/.local/share/dzll")
 DB_LOCAL_PATH = os.path.join(DB_LOCAL_DIR, "dzll-servers.db")
 
 # Live refresh rules
-STARTUP_PING_FIRST_N = 50
+STARTUP_WARMUP_READY_PERCENT = 65
+STARTUP_WARMUP_MAX_WAIT_SECS = 20
 STARTUP_LIVE_REST_WORKERS = 32
 STARTUP_LIVE_REST_TIMEOUT_SECS = 0.9
 STARTUP_LIVE_FLUSH_MAX = 75

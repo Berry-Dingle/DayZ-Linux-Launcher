@@ -625,9 +625,10 @@ def test_all_production_switches_are_enabled():
 
 def test_bob_temporary_warning_recovery_compaction_and_rollback_when_available(tmp_path):
     prepared = Path(tempfile.gettempdir()) / "bob_phase2_schema4_prepared_20260722.json"
-    active = Path.home() / ".config/dzll/companion_restart_learning_phase2.json"
-    if not prepared.exists() or not active.exists():
+    if not prepared.exists():
         pytest.skip("detached Bob fixtures unavailable")
+    active = tmp_path / "active-bob.json"
+    active.write_bytes(prepared.read_bytes())
     active_identity = (active.stat().st_size, active.stat().st_mtime_ns, hashlib.sha256(active.read_bytes()).hexdigest())
     original = prepared.read_bytes()
     fixture = tmp_path / "bob-schema4.json"

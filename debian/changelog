@@ -1,3 +1,11 @@
+dzll-launcher (0.4.1~b0-1) noble; urgency=medium
+
+  * Keep browser ordering stable during live updates and improve startup refresh.
+  * Clarify Server Companion confidence and notification identity.
+  * Add official server controls and day/night time acceleration display.
+
+ -- Gareth Brown <dzll-launcher@tutamail.com>  Fri, 09 Oct 2026 00:00:00 +0100
+
 dzll-launcher (0.4.0~b0-1) noble; urgency=medium
 
   * Improve sort header responsiveness.

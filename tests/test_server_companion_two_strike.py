@@ -18,6 +18,7 @@ from dzll_launcher.companion_restart_phase2_runtime import (
 )
 from dzll_launcher.companion_restart_phase2_detection import EventOutcome
 from dzll_launcher import window as window_module
+from dzll_launcher.server_companion_ui import restart_learning_presentation
 from dzll_launcher.window import DZLLWindow
 
 
@@ -939,6 +940,189 @@ def _summary_host(authority_summary, *, online=False, strikes=2, debug=None):
             ),
         ),
     )
+
+
+def test_pattern_only_final_summary_uses_exact_period_confidence(monkeypatch):
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", True)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    original = {
+        **_authority_summary(
+            presentation="pattern_only", cycle_text="Still Learning",
+            countdown_text="--", countdown_visible=False,
+            countdown_safe=False, prediction_usable=False,
+        ),
+        "confidence_percent": 95,
+        "cycle_period_seconds": None,
+        "next_visible": False,
+    }
+    host = _summary_host(original, online=True)
+    host._companion_restart_phase2.presentation_period_candidate = (
+        lambda _key, *, period_seconds: (4 * 3600, 0.532)
+    )
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    presentation = restart_learning_presentation(summary)
+    assert original["confidence_percent"] == 95
+    assert summary["cycle_text"] == "Learning Restart Pattern"
+    assert summary["confidence_percent"] == 53
+    assert summary["confidence_label"] == "Learning Confidence:"
+    assert presentation["confidence_percent"] == 53
+    assert presentation["confidence_style_class"] == "ping-yellow"
+    assert not summary["prediction_usable"]
+    assert not summary["countdown_safe"]
+    assert not summary["countdown_visible"]
+    assert summary["reason_codes"] == original["reason_codes"]
+
+
+def test_pattern_only_without_backed_candidate_hides_percentage(monkeypatch):
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", True)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    host = _summary_host({
+        **_authority_summary(presentation="pattern_only", cycle_text="Still Learning"),
+        "cycle_period_seconds": None,
+    }, online=True)
+    host._companion_restart_phase2.presentation_period_candidate = (
+        lambda _key, *, period_seconds: None
+    )
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    assert summary["cycle_text"] == "Learning Restart Pattern"
+    assert not summary["confidence_visible"]
+
+
+def test_schema3_low_candidate_can_show_before_pattern_gate(monkeypatch):
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", False)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    host = _summary_host(None, online=True)
+    host._companion_restart_phase2.presentation_period_candidate = (
+        lambda _key, *, period_seconds: (4 * 3600, 0.12)
+    )
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    assert summary["cycle_text"] == "Learning Restart Pattern"
+    assert summary["confidence_percent"] == 12
+    assert summary["confidence_label"] == "Learning Confidence:"
+    assert summary["confidence_visible"]
+    assert not summary["prediction_usable"]
+    assert not summary["countdown_visible"]
+
+
+@pytest.mark.parametrize(("confidence", "expected", "colour"), (
+    (0.12, 12, "ping-orange"),
+    (0.27, 27, "ping-orange"),
+    (0.99, 95, "ping-good"),
+))
+def test_low_and_capped_candidate_confidence_in_suppressed_learning_state(
+    monkeypatch, confidence, expected, colour
+):
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", True)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    host = _summary_host({
+        **_authority_summary(presentation="none", cycle_text="--", countdown_visible=False,
+                             countdown_safe=False, prediction_usable=False),
+        "cycle_period_seconds": None,
+        "confidence_visible": False,
+        "next_visible": False,
+    }, online=True)
+    host._companion_restart_phase2.presentation_period_candidate = (
+        lambda _key, *, period_seconds: (4 * 3600, confidence)
+    )
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    presentation = restart_learning_presentation(summary)
+    assert summary["cycle_text"] == "Learning Restart Pattern"
+    assert presentation["confidence_visible"]
+    assert presentation["confidence_percent"] == expected
+    assert presentation["confidence_label"] == "Learning Confidence:"
+    assert presentation["confidence_style_class"] == colour
+    assert not presentation["prediction_usable"]
+    assert not presentation["countdown_visible"]
+
+
+@pytest.mark.parametrize(("period_hours", "consumer_percent", "normal_confidence", "expected"), (
+    (3, 97, 0.122839, 95),
+    (4, 95, 0.797908, 95),
+    (3, 88, 0.12, 88),
+))
+def test_selected_cycle_keeps_consumer_confidence(
+    monkeypatch, period_hours, consumer_percent, normal_confidence, expected
+):
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", True)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    original = {
+        **_authority_summary(cycle_text=f"Confirmed: Every {period_hours} hours"),
+        "confidence_percent": consumer_percent,
+        "cycle_period_seconds": period_hours * 3600,
+    }
+    host = _summary_host(original, online=True)
+    host._companion_restart_phase2.presentation_period_candidate = (
+        lambda _key, *, period_seconds=None: (period_hours * 3600, normal_confidence)
+    )
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    presentation = restart_learning_presentation(summary)
+    assert round(normal_confidence * 100) != consumer_percent
+    assert summary["confidence_percent"] == consumer_percent
+    assert summary["confidence_label"] == "Cycle Confidence:"
+    assert presentation["confidence_percent"] == expected
+    assert presentation["confidence_label"] == "Cycle Confidence:"
+    assert presentation["confidence_visible"]
+    assert summary["cycle_text"] == original["cycle_text"]
+    assert summary["countdown_text"] == original["countdown_text"]
+    assert summary["countdown_safe"] == original["countdown_safe"]
+    assert summary["countdown_visible"] == original["countdown_visible"]
+    assert summary["prediction_usable"] == original["prediction_usable"]
+    assert summary["reason_codes"] == original["reason_codes"]
+
+
+def test_likely_new_cycle_only_changes_final_confidence_label(monkeypatch):
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", True)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    original = {
+        **_authority_summary(
+            presentation="likely_new_cycle",
+            cycle_text="Likely new: Every 4 hours",
+            countdown_text="--",
+            countdown_visible=False,
+            countdown_safe=False,
+            prediction_usable=False,
+        ),
+        "confidence_percent": 81,
+        "cycle_period_seconds": 4 * 3600,
+        "next_text": "Prediction suspended",
+        "next_restart_at": None,
+        "next_visible": True,
+    }
+    host = _summary_host(original, online=True)
+
+    def unexpected_candidate(*_args, **_kwargs):
+        raise AssertionError("selected cycle must not request normal confidence")
+
+    host._companion_restart_phase2.presentation_period_candidate = unexpected_candidate
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    presentation = restart_learning_presentation(summary)
+
+    assert summary == {**original, "confidence_label": "Cycle Confidence:"}
+    assert presentation["cycle_text"] == "Likely new: Every 4 hours"
+    assert presentation["confidence_percent"] == 81
+    assert presentation["confidence_label"] == "Cycle Confidence:"
+    assert presentation["next_text"] == "Prediction suspended"
+    assert presentation["next_visible"]
+    assert not presentation["prediction_usable"]
+    assert not presentation["countdown_visible"]
+
+
+def test_transition_keeps_existing_confidence_label_and_value():
+    original = {
+        **_authority_summary(
+            presentation="schedule_change_suspected",
+            cycle_text="Schedule change suspected",
+            countdown_visible=False,
+            countdown_safe=False,
+            prediction_usable=False,
+        ),
+        "confidence_percent": 81,
+        "confidence_label": "Confidence:",
+    }
+    summary = window_module.companion_display_confidence_summary(
+        original, (4 * 3600, 0.12), period_seconds=3 * 3600
+    )
+    assert summary == original
 
 
 def test_confirmed_offline_safe_schema4_holds_only_displayed_countdown(monkeypatch):

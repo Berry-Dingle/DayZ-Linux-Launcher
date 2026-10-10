@@ -167,7 +167,7 @@ def isolated_window_state(tmp_path, monkeypatch):
 
     monkeypatch.setattr(settings, "SETTINGS_PATH", str(config_dir / "settings.json"))
     (config_dir / "settings.json").write_text(
-        '{"discord_rich_presence":false}', encoding="utf-8"
+        '{"discord_rich_presence":false,"auto_check_updates":false}', encoding="utf-8"
     )
     for name, filename in (
         ("FAV_PATH", "favorites.json"),
@@ -190,6 +190,9 @@ def isolated_window_state(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(window_module, "ensure_user_desktop_integration", lambda **_kw: None)
     monkeypatch.setattr(window_module, "PERF_LOG_ENABLED", False)
+    # These tests exercise window construction and cleanup, not the network
+    # startup updater. Prevent its idle callback from starting an executor job.
+    monkeypatch.setattr(window_module.DZLLWindow, "_begin_startup_update", lambda self: False)
     return {"config": config_dir, "cache": cache_dir}
 
 
@@ -229,6 +232,31 @@ def test_real_window_constructs_from_fresh_isolated_state(isolated_window_state)
     try:
         assert window.settings["high_ping_cutoff_ms"] == 250
         assert not window._shutdown_cleanup_done
+    finally:
+        _close_window(app, window)
+
+
+def test_official_sidebar_toggle_restores_saves_and_refreshes_real_window(
+    isolated_window_state, monkeypatch,
+):
+    path = isolated_window_state["config"] / "settings.json"
+    path.write_text(
+        '{"discord_rich_presence":false,"hide_official_servers":true}',
+        encoding="utf-8",
+    )
+    app = _new_app()
+    window = window_module.DZLLWindow(app)
+    try:
+        toggle = window._sidebar_settings_widgets["hide_official_servers"]
+        assert toggle.get_active()
+        assert window._build_filter_state()["hide_official_servers"] is True
+        refreshes = []
+        monkeypatch.setattr(window, "_on_filter_changed", lambda **kw: refreshes.append(kw))
+        toggle.set_active(False)
+        assert window.settings["hide_official_servers"] is False
+        assert settings.load_settings()["hide_official_servers"] is False
+        assert window._build_filter_state()["hide_official_servers"] is False
+        assert refreshes == [{"reason": "settings"}]
     finally:
         _close_window(app, window)
 

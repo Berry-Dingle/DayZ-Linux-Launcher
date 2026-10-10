@@ -130,15 +130,20 @@ def read_servers_from_db() -> list:
         con = sqlite3.connect(db_uri, uri=True)
         con.row_factory = sqlite3.Row
         cur = con.cursor()
-        cur.execute("""
+        cur.execute("PRAGMA table_info(servers)")
+        columns = {row[1] for row in cur.fetchall()}
+        official_column = "official" if "official" in columns else "NULL AS official"
+        night_column = "nightTimeWarp" if "nightTimeWarp" in columns else "NULL AS nightTimeWarp"
+        cur.execute(f"""
             SELECT
                 ip, gport, qport,
                 name, map,
                 players, maxPlayers,
                 password, mods, modCount,
                 third_person,
-                timeWarp, time,
-                country, ping, bm_rank
+                timeWarp, {night_column}, time,
+                country, ping, bm_rank,
+                {official_column}
             FROM servers
             ORDER BY players DESC, ping ASC
         """)

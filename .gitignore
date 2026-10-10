@@ -87,6 +87,7 @@ data/blocklist.json
 # -------------------------
 tests/*
 !tests/test_*.py
+!tests/conftest.py
 tests/fixtures/
 tests/output/
 tests/outputs/

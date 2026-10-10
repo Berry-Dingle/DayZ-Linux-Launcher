@@ -1387,9 +1387,10 @@ def test_shadow_mode_keeps_returned_production_decision_schema3(tmp_path):
 
 def test_bob_prepared_consumer_projection_and_active_integrity_when_available(tmp_path):
     prepared = Path(tempfile.gettempdir()) / "bob_phase2_schema4_prepared_20260722.json"
-    active = Path.home() / ".config/dzll/companion_restart_learning_phase2.json"
-    if not prepared.exists() or not active.exists():
+    if not prepared.exists():
         pytest.skip("detached Bob inputs unavailable")
+    active = tmp_path / "active-bob.json"
+    active.write_bytes(prepared.read_bytes())
     active_before = (active.stat().st_size, active.stat().st_mtime_ns, hashlib.sha256(active.read_bytes()).hexdigest())
     original = prepared.read_bytes()
     fixture = tmp_path / "bob-schema4.json"

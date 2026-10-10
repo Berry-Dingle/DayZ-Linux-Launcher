@@ -935,6 +935,15 @@ class Phase2RestartRuntime:
     def compatibility(self, server_key: str, *, now: float) -> CompatibilitySummary:
         return compatibility_summary(self.decision(server_key, now=now))
 
+    def presentation_period_candidate(
+        self, server_key: str, *, period_seconds: int | None = None
+    ) -> tuple[int, float] | None:
+        """Read a scored exact-period candidate for the Companion display only."""
+
+        server = self._servers.get(str(server_key))
+        score = server.score if server is not None else None
+        return presentation_period_candidate(score, period_seconds=period_seconds)
+
     def mark_fired(self, server_key: str, key: SuppressionKey, *, now: float) -> bool:
         server = self._server(server_key)
         if key in server.fired_keys:
@@ -1116,7 +1125,11 @@ class Phase2RestartRuntime:
             return None
         if not isinstance(resolution.selected_output, AuthorityConsumerDecision):
             return None
-        return authority_consumer_summary(resolution.selected_output, now=now)
+        summary = authority_consumer_summary(resolution.selected_output, now=now)
+        return {
+            **summary,
+            "cycle_period_seconds": resolution.selected_output.cycle_period_seconds,
+        }
 
     def dispatch_authority_consumer_action(
         self,
@@ -3574,6 +3587,40 @@ def _learning_confidence_severity(confidence: float) -> str:
     return "strong"
 
 
+def presentation_period_candidate(
+    score: ScheduleScore | None, *, period_seconds: int | None = None
+) -> tuple[int, float] | None:
+    """Project evidence-backed normal confidence without selecting a period."""
+
+    if score is None:
+        return None
+    candidates = (
+        (item for item in score.candidates if item.period_seconds == period_seconds)
+        if period_seconds is not None
+        else iter(score.candidates)
+    )
+    backed = [
+        item for item in candidates
+        if item.fundamental_period_confidence > 0
+        and (
+            item.direct_support > 0
+            or item.compatible_multiple_support > 0
+            or item.fundamental_relationship_count > 0
+            or item.hints.event_count > 0
+        )
+    ]
+    if not backed:
+        return None
+    leading = max(
+        backed,
+        key=lambda item: (
+            item.fundamental_period_confidence,
+            item.direct_support + item.compatible_multiple_support,
+        ),
+    )
+    return leading.period_seconds, leading.fundamental_period_confidence
+
+
 def phase2_learning_summary(decision: ConsumerDecision | None, *, now: float) -> dict | None:
     if decision is None or decision.model_status is ConsumerModelStatus.NO_PATTERN:
         return None
@@ -3587,7 +3634,7 @@ def phase2_learning_summary(decision: ConsumerDecision | None, *, now: float) ->
         confidence_kind = "period"
         confidence_label = "Confidence:"
     elif decision.model_status is ConsumerModelStatus.PATTERN_OBSERVED:
-        cycle_text = "Recurring timing observed"
+        cycle_text = "Learning Restart Pattern"
         confidence = decision.schedule_existence_confidence
         confidence_kind = "pattern"
         confidence_label = "Pattern Confidence:"

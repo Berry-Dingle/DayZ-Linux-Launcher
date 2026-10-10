@@ -128,6 +128,14 @@ def test_before_after_changed_fields_notify_and_visible_readback(monkeypatch):
     assert "players':_7" in visible and "ping':_30" in visible and "time':_'12:34'" in visible
 
 
+def test_live_time_update_keeps_database_day_and_night_speeds():
+    host, key, obj = host_with_obj()
+    obj.night_timewarp = 4.5
+    DZLLWindow._apply_live_results(host, [(key, success_result())], reason="browser-live")
+    assert obj.time == "12:34"
+    assert (obj.timewarp, obj.night_timewarp) == (12.0, 4.5)
+
+
 def test_unchanged_success_is_reported_as_unchanged(monkeypatch):
     lines = enable_target(monkeypatch)
     host, key, _obj = host_with_obj(players=4, ping=21, game_time="12:00", queue=2)

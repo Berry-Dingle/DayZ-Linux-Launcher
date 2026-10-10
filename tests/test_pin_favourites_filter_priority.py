@@ -115,6 +115,43 @@ def test_pin_setting_does_not_expand_favourite_exemption_scope(obj, state, visib
 
 
 @pytest.mark.parametrize(
+    ("official", "favourite", "hide", "visible"),
+    [
+        (True, False, False, True),
+        (True, False, True, False),
+        (True, True, True, True),
+        (False, False, True, True),
+        (False, True, True, True),
+    ],
+)
+def test_official_filter_exempts_only_favourites(official, favourite, hide, visible):
+    obj = server("Official" if official else "Community", fav=favourite, official=official)
+    assert matches(obj, pin=False, hide_official_servers=hide) is visible
+
+
+def test_official_favourite_still_obeys_unrelated_filters():
+    obj = server("Passworded Official", fav=True, official=True, password=True)
+    assert not matches(obj, pin=True, hide_official_servers=True, no_password=True)
+
+
+def test_official_filter_rebuild_keeps_favourite_and_other_rows_once():
+    official = server("Official", ip="10.0.0.10", official=True)
+    favourite = server("Favourite Official", ip="10.0.0.11", fav=True, official=True)
+    community = server("Community", ip="10.0.0.12")
+    unknown = server("Unknown", ip="10.0.0.13")
+    state = base_state(official)
+    state["hide_official_servers"] = True
+    host, visible = rebuild_host([official, favourite, community, unknown], pin=False, state=state)
+    DZLLWindow._rebuild_column_view_store(host, reorder_reason="official")
+    assert set(visible.rows) == {favourite, community, unknown}
+    assert len(visible.rows) == 3
+    state["hide_official_servers"] = False
+    DZLLWindow._rebuild_column_view_store(host, reorder_reason="official-off")
+    assert set(visible.rows) == {official, favourite, community, unknown}
+    assert len(visible.rows) == 4
+
+
+@pytest.mark.parametrize(
     ("obj", "state"),
     [
         (server("Offline", ping=-1), {"online_only": True}),

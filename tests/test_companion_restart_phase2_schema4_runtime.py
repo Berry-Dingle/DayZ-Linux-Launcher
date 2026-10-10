@@ -1818,9 +1818,10 @@ def test_deterministic_soak_harness_restarts_compacts_and_rolls_back(tmp_path):
 
 def test_bob_prepared_authoritative_runtime_isolated_soak_when_available(tmp_path):
     prepared = Path(tempfile.gettempdir()) / "bob_phase2_schema4_prepared_20260722.json"
-    active = Path.home() / ".config/dzll/companion_restart_learning_phase2.json"
-    if not prepared.exists() or not active.exists():
+    if not prepared.exists():
         pytest.skip("detached Bob prepared state is unavailable")
+    active = tmp_path / "active-bob.json"
+    active.write_bytes(prepared.read_bytes())
     active_stat = active.stat()
     active_hash = hashlib.sha256(active.read_bytes()).hexdigest()
     fixture = tmp_path / "bob-prepared-schema4.json"

@@ -1209,7 +1209,7 @@ def test_detached_preview_duplicate_immutable_id_fails_validation():
 
 
 def test_historical_and_current_bob_sources_have_identical_corrected_semantics():
-    state_dir = Path.home() / ".config/dzll"
+    state_dir = Path(__file__).parent / "fixtures" / "bob"
     old_path = state_dir / (
         "companion_restart_learning_phase2.schema3.precutover."
         "20260723-082421-BST.json"

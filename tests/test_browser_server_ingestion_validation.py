@@ -63,9 +63,6 @@ class _BrowserHost:
     def _debug_sort_attach_notify_probe(self, _obj):
         pass
 
-    def _is_likely_test_server_name(self, _name):
-        return False
-
     def _set_map_choices(self, choices):
         self.map_choices = list(choices)
 
@@ -122,20 +119,99 @@ def _load(host, rows):
     return outcome["loaded"]
 
 
-def _write_server_database(path, rows):
+def _write_server_database(path, rows, *, include_official=False, include_night=False):
     connection = sqlite3.connect(path)
-    connection.execute(
-        """CREATE TABLE servers (
-            ip, gport, qport, name, map, players, maxPlayers, password,
-            mods, modCount, third_person, timeWarp, time, country, ping, bm_rank
-        )"""
+    columns = (
+        "ip", "gport", "qport", "name", "map", "players", "maxPlayers",
+        "password", "mods", "modCount", "third_person", "timeWarp", "time",
+        "country", "ping", "bm_rank",
     )
+    connection.execute(
+        "CREATE TABLE servers (" + ", ".join(columns) +
+        (", official" if include_official else "") +
+        (", nightTimeWarp" if include_night else "") + ")"
+    )
+    placeholders = ",".join("?" for _ in range(len(columns) + int(include_official) + int(include_night)))
     connection.executemany(
-        "INSERT INTO servers VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-        [tuple(row.values()) for row in rows],
+        f"INSERT INTO servers VALUES ({placeholders})",
+        [
+            tuple(row.get(column) for column in columns) +
+            ((row.get("official"),) if include_official else ()) +
+            ((row.get("nightTimeWarp"),) if include_night else ())
+            for row in rows
+        ],
     )
     connection.commit()
     connection.close()
+
+
+@pytest.mark.parametrize("include_official", [False, True])
+def test_optional_official_column_reads_and_old_database_remains_usable(
+    tmp_path, monkeypatch, include_official,
+):
+    local_path = tmp_path / "local.db"
+    published_path = tmp_path / "published.db"
+    rows = [_row("1.1.1.1"), _row("2.2.2.2"), _row("3.3.3.3")]
+    for row, value in zip(rows, (1, 0, None)):
+        row["official"] = value
+    _write_server_database(published_path, rows, include_official=include_official)
+    monkeypatch.setattr(db, "_fetch_db_bytes_with_retries", published_path.read_bytes)
+    monkeypatch.setattr(db, "DB_LOCAL_DIR", str(tmp_path))
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(local_path))
+
+    assert db.fetch_db_overwrite_local() is True
+    read = db.read_servers_from_db()
+    by_ip = {row["ip"]: row["official"] for row in read}
+    assert by_ip == (
+        {"1.1.1.1": 1, "2.2.2.2": 0, "3.3.3.3": None}
+        if include_official else
+        {"1.1.1.1": None, "2.2.2.2": None, "3.3.3.3": None}
+    )
+    host = _BrowserHost()
+    assert _load(host, read) is True
+    assert {obj.ip: obj.official for obj in host.store.items} == (
+        {"1.1.1.1": True, "2.2.2.2": False, "3.3.3.3": False}
+        if include_official else
+        {"1.1.1.1": False, "2.2.2.2": False, "3.3.3.3": False}
+    )
+
+
+@pytest.mark.parametrize("include_night", [False, True])
+def test_optional_night_speed_projection_and_nullable_model(tmp_path, monkeypatch, include_night):
+    local_path = tmp_path / "local.db"
+    published_path = tmp_path / "published.db"
+    rows = [_row("1.1.1.1"), _row("2.2.2.2")]
+    rows[0].update(timeWarp=4.5, nightTimeWarp=11.6)
+    rows[1].update(timeWarp=None, nightTimeWarp="bad")
+    _write_server_database(published_path, rows, include_night=include_night)
+    monkeypatch.setattr(db, "_fetch_db_bytes_with_retries", published_path.read_bytes)
+    monkeypatch.setattr(db, "DB_LOCAL_DIR", str(tmp_path))
+    monkeypatch.setattr(db, "DB_LOCAL_PATH", str(local_path))
+    assert db.fetch_db_overwrite_local() is True
+    read = db.read_servers_from_db()
+    assert {r["ip"]: r["nightTimeWarp"] for r in read} == {
+        "1.1.1.1": 11.6 if include_night else None,
+        "2.2.2.2": "bad" if include_night else None,
+    }
+    host = _BrowserHost()
+    assert _load(host, read) is True
+    by_ip = {obj.ip: obj for obj in host.store.items}
+    assert by_ip["1.1.1.1"].timewarp == 4.5
+    assert by_ip["1.1.1.1"].night_timewarp == (11.6 if include_night else None)
+    assert by_ip["2.2.2.2"].timewarp is None
+    assert by_ip["2.2.2.2"].night_timewarp is None
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1, True), (0, False), (None, False), ("1", False), (2, False), (True, False), ("official", False)],
+)
+def test_official_mapping_accepts_only_integer_one(value, expected):
+    host = _BrowserHost()
+    row = _row("1.2.3.4")
+    row["official"] = value
+    assert _load(host, [row]) is True
+    assert host.store.items[0].official is expected
 
 
 def test_read_servers_uses_safe_read_only_uri_for_unusual_path(tmp_path, monkeypatch):
@@ -433,7 +509,7 @@ def test_malformed_advisory_fields_default_without_changing_endpoint_or_mods():
     assert obj.mod_search_index["ids"] == frozenset({"42"})
     assert (obj.map_name, obj.players, obj.max_players) == ("", 0, 0)
     assert (obj.password, obj.third_person) == (False, False)
-    assert (obj.timewarp, obj.time, obj.country) == (1.0, "--:--", "")
+    assert (obj.timewarp, obj.time, obj.country) == (None, "--:--", "")
     assert (obj.ping, obj.bm_rank) == (-1, 999999999)
     assert obj.mod_count == 1
 

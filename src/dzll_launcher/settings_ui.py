@@ -1897,6 +1897,7 @@ class SettingsUI:
         # Re-apply runtime-only effects from clean settings
         self._win._apply_setting_runtime_effects("high_ping_cutoff_ms")
         self._win._apply_setting_runtime_effects("hide_below_max_players")
+        self._win._apply_setting_runtime_effects("hide_official_servers")
         self._win._apply_setting_runtime_effects("prioritise_trusted_servers")
         self._win._apply_setting_runtime_effects("pin_favorite_servers")
         self._win._apply_setting_runtime_effects("show_server_companion")
@@ -1954,7 +1955,7 @@ class SettingsUI:
             if isinstance(widget, Gtk.Entry):
                 if not _entry_has_focus(widget):
                     _set_entry_text_if_changed(widget, "" if val is None else str(val))
-            elif isinstance(widget, Gtk.CheckButton):
+            elif isinstance(widget, (Gtk.CheckButton, Gtk.ToggleButton)):
                 if bool(widget.get_active()) != bool(val):
                     widget.set_active(bool(val))
         except Exception:
@@ -1980,6 +1981,9 @@ class SettingsUI:
                     self._win.live.setdefault(k, {})["hide_high_ping"] = (p > self._win._ping_cutoff_ms)
             self._win._on_filter_changed(reason="settings")
 
+        if key == "hide_official_servers":
+            self._win._on_filter_changed(reason="settings")
+
         if key == "hide_below_max_players":
             self._win._on_filter_changed(reason="settings")
 
@@ -1989,6 +1993,8 @@ class SettingsUI:
                 sorter = getattr(self._win, "sorter", None)
                 if sorter is not None:
                     sorter.changed(Gtk.SorterChange.DIFFERENT)
+                if bool(self._win.settings.get("prioritise_trusted_servers", False)):
+                    self._win._rebuild_column_view_store(reorder_reason="settings:trusted-first")
                 GLib.idle_add(self._win._scroll_to_top)
             except Exception:
                 pass
