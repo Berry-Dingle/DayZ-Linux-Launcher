@@ -1365,7 +1365,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     sidebar.append(hr())
 
-    direct_connect_btn = Gtk.Button(label="Add by IP")
+    direct_connect_btn = Gtk.Button(label="Add Server by IP")
     direct_connect_btn.set_hexpand(True)
     direct_connect_btn.set_halign(Gtk.Align.FILL)
     direct_connect_btn.set_tooltip_text("Manually add a server to the list by providing an IP and Port.")

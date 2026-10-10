@@ -1009,7 +1009,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.direct_connect_box.add_css_class("warning-card")
         overlay.add_overlay(self.direct_connect_box)
 
-        direct_connect_title = Gtk.Label(label="Add by IP")
+        direct_connect_title = Gtk.Label(label="Add Server by IP")
         direct_connect_title.set_xalign(0.0)
         direct_connect_title.add_css_class("dzll-overlay-heading")
         direct_connect_title.add_css_class("confirmation-title")
