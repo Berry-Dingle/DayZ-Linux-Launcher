@@ -162,6 +162,11 @@ def get_app_css(
           color: @dzll_text_primary;
         }}
 
+        .dzll-app-root label:disabled,
+        .server-companion-panel label:disabled {{
+          color: @dzll_text_disabled;
+        }}
+
         .dzll-app-root button.flat,
         .dzll-app-root button.flat image,
         .dzll-app-root button.flat:backdrop,
@@ -1529,6 +1534,12 @@ def get_app_css(
 
         .server-companion-panel:backdrop label {{
           color: @dzll_text_primary;
+          opacity: 1;
+          filter: none;
+        }}
+
+        .server-companion-panel:backdrop label:disabled {{
+          color: @dzll_text_disabled;
           opacity: 1;
           filter: none;
         }}
