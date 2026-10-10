@@ -25,7 +25,7 @@ from .mod_search import parse_required_mod_query, split_mod_search_operator
 
 _MOD_SEARCH_OPERATOR_RE = re.compile(r"(^|\s)(mods:|-mods=)", re.IGNORECASE)
 _MOD_SEARCH_MODE_OPERATOR_RE = re.compile(r"(^|\s)(mods:)", re.IGNORECASE)
-NORMAL_SEARCH_PLACEHOLDER = "Filter by name or IP. Click MOD for required mods."
+NORMAL_SEARCH_PLACEHOLDER = "Filter by name or IP. Click MOD-button to filter by mods."
 MOD_SEARCH_PLACEHOLDER = "Search required mods. Select a known mod, or press ESC to exit."
 MOD_SUGGESTION_VISIBLE_ROWS = 9
 MOD_SUGGESTION_ROW_HEIGHT_ESTIMATE = 34
@@ -1206,7 +1206,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     sidebar.append(hr())
 
-    window.reset_btn = Gtk.Button(label="RESET")
+    window.reset_btn = Gtk.Button(label="Reset Filters")
     window.reset_btn.connect("clicked", window._on_reset_clicked)
     sidebar.append(window.reset_btn)
 
@@ -1368,7 +1368,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     direct_connect_btn = Gtk.Button(label="Add by IP")
     direct_connect_btn.set_hexpand(True)
     direct_connect_btn.set_halign(Gtk.Align.FILL)
-    direct_connect_btn.set_tooltip_text("Add a server by IP:Port and fetch its current status.")
+    direct_connect_btn.set_tooltip_text("Manually add a server to the list by providing an IP and Port.")
     attach_pointer_cursor(direct_connect_btn)
     direct_connect_btn.connect("clicked", lambda *_: window._open_direct_connect_dialog())
     sidebar.append(direct_connect_btn)

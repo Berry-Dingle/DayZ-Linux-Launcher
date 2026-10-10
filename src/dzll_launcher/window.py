@@ -8103,7 +8103,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             if entry:
                 entry.set_text(saved_text)
-                entry.set_placeholder_text("Filter by name or IP. Click MOD for required mods.")
+                entry.set_placeholder_text("Filter by name or IP. Click MOD-button to filter by mods.")
                 icon = "edit-clear-symbolic" if saved_text else None
                 entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, icon)
                 try:
@@ -8932,7 +8932,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._push_filter_refresh_suppression()
             try:
                 self.search_entry.set_text("")
-                self.search_entry.set_placeholder_text("Filter by name or IP. Click MOD for required mods.")
+                self.search_entry.set_placeholder_text("Filter by name or IP. Click MOD-button to filter by mods.")
                 self.search_entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
                 try:
                     self.search_entry.remove_css_class("mod-search-entry-active")
