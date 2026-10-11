@@ -5,6 +5,7 @@ from typing import Any, Iterable
 
 from .mod_alias import alias_values_for, is_exact_alias
 from .mod_metadata import clean_display_mod_name
+from .mod_parsed import ParsedServerMods
 from .mod_search import compact_mod_text, normalize_mod_text
 
 
@@ -228,17 +229,23 @@ def _build_lookup_maps(entries: list[dict[str, Any]]) -> tuple[dict[str, tuple[i
     return frozen_prefix_map, frozen_exact_map
 
 
-def build_mod_suggestion_index(mods_json_values: Iterable[Any]) -> dict[str, Any]:
+def build_mod_suggestion_index(
+    mods_json_values: Iterable[Any], *, parsed_mods_values: Iterable[ParsedServerMods] | None = None,
+) -> dict[str, Any]:
     mods_by_identity: dict[str, dict[str, Any]] = {}
 
-    for mods_json in mods_json_values or ():
+    source = parsed_mods_values if parsed_mods_values is not None else mods_json_values or ()
+    for mods_json in source:
         seen_on_server: set[str] = set()
         seen_names_on_server: set[tuple[str, str]] = set()
-        for item in _parse_mods_json(mods_json):
+        parsed_mods = mods_json if parsed_mods_values is not None else None
+        items = parsed_mods.items if parsed_mods is not None else _parse_mods_json(mods_json)
+        for item in items:
+            if not isinstance(item, dict):
+                continue
             workshop_id = _clean_workshop_id(item.get("steamWorkshopId"))
-            name = clean_display_mod_name(
-                item.get("name"), workshop_id or None, fallback=False,
-            )
+            name = (parsed_mods.clean_name(item, workshop_id or None) if parsed_mods is not None else
+                    clean_display_mod_name(item.get("name"), workshop_id or None, fallback=False))
             if not name:
                 continue
 

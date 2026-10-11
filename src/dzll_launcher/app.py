@@ -2,6 +2,7 @@
 import os
 import sys
 import logging
+import time
 from pathlib import Path
 import gi
 
@@ -10,6 +11,7 @@ from gi.repository import GLib, Gtk
 
 from .config import APP_ID
 from .window import DZLLWindow
+from .startup_perf import log_startup_phase
 
 logger = logging.getLogger(__name__)
 
@@ -82,16 +84,28 @@ class DZLLApp(Gtk.Application):
                 Gtk.Application.quit(self)
             return
 
+        perf_enabled = os.environ.get("DZLL_PERF_LOG") == "1"
+        if perf_enabled:
+            self._startup_perf_origin_ns = time.monotonic_ns()
+            log_startup_phase(self._startup_perf_origin_ns, "activation", self._startup_perf_origin_ns)
+            construction_start_ns = time.monotonic_ns()
         existing_windows = tuple(self.get_windows())
         try:
             candidate = DZLLWindow(self)
         except Exception as exc:
+            if perf_enabled:
+                log_startup_phase(self._startup_perf_origin_ns, "window_construction_failed", construction_start_ns)
             self._handle_window_startup_failure(existing_windows, exc)
             return
 
+        if perf_enabled:
+            log_startup_phase(self._startup_perf_origin_ns, "window_construction", construction_start_ns)
         self.window = candidate
         try:
+            present_start_ns = time.monotonic_ns() if perf_enabled else 0
             candidate.present()
+            if perf_enabled:
+                log_startup_phase(self._startup_perf_origin_ns, "window_present", present_start_ns)
         except Exception as exc:
             self.window = None
             self._cleanup_failed_window(candidate)

@@ -236,6 +236,65 @@ def test_real_window_constructs_from_fresh_isolated_state(isolated_window_state)
         _close_window(app, window)
 
 
+def test_a2s_warmup_opt_in_perf_activation_constructs_and_presents_real_window(
+    isolated_window_state, monkeypatch,
+):
+    phases = []
+    monkeypatch.setenv("DZLL_PERF_LOG", "1")
+    monkeypatch.setattr(window_module, "PERF_LOG_ENABLED", True)
+    monkeypatch.setattr(window_module, "A2S_WARMUP_500_ENABLED", True)
+    monkeypatch.setattr(
+        app_module,
+        "log_startup_phase",
+        lambda _origin, phase, _start, **_fields: phases.append(phase),
+    )
+    app = _new_app()
+
+    app.do_activate()
+
+    window = app.window
+    try:
+        assert window is not None
+        assert window.get_visible()
+        assert window._startup_warmup_mode == "default"
+        assert phases[:3] == ["activation", "window_construction", "window_present"]
+    finally:
+        if window is not None:
+            _close_window(app, window)
+
+
+def test_a2s_warmup_opt_in_perf_activation_reports_constructor_failure(
+    isolated_window_state, monkeypatch,
+):
+    phases = []
+    monkeypatch.setenv("DZLL_PERF_LOG", "1")
+    monkeypatch.setattr(window_module, "PERF_LOG_ENABLED", True)
+    monkeypatch.setattr(window_module, "A2S_WARMUP_500_ENABLED", True)
+    monkeypatch.setattr(
+        app_module,
+        "log_startup_phase",
+        lambda _origin, phase, _start, **_fields: phases.append(phase),
+    )
+    monkeypatch.setattr(
+        window_module,
+        "build_sidebar",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("injected constructor failure")
+        ),
+    )
+    app = _new_app()
+
+    app.do_activate()
+
+    fatal = app._startup_failure_window
+    assert app.window is None
+    assert app._startup_failed
+    assert fatal is not None
+    assert fatal.get_visible()
+    assert phases[:2] == ["activation", "window_construction_failed"]
+    app._dismiss_startup_failure(fatal)
+
+
 def test_official_sidebar_toggle_restores_saves_and_refreshes_real_window(
     isolated_window_state, monkeypatch,
 ):

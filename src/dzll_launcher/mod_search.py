@@ -5,6 +5,7 @@ from typing import Any
 
 from .mod_alias import alias_values_for, is_exact_alias
 from .mod_metadata import clean_display_mod_name
+from .mod_parsed import ParsedServerMods
 
 
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
@@ -96,19 +97,22 @@ def split_mod_search_operator(raw_query: Any) -> tuple[str, str, bool]:
     return raw[:match.start()].strip(), raw[match.end():].strip(), True
 
 
-def build_server_mod_index(mods_json: Any) -> dict[str, frozenset[str]]:
+def build_server_mod_index(mods_json: Any, *, parsed_mods: ParsedServerMods | None = None) -> dict[str, frozenset[str]]:
     ids: set[str] = set()
     normalized_names: set[str] = set()
     compact_names: set[str] = set()
     tokens: set[str] = set()
 
-    if not mods_json:
+    if parsed_mods is None and not mods_json:
         return _empty_index()
 
-    try:
-        arr = json.loads(str(mods_json))
-    except Exception:
-        return _empty_index()
+    if parsed_mods is None:
+        try:
+            arr = json.loads(str(mods_json))
+        except Exception:
+            return _empty_index()
+    else:
+        arr = parsed_mods.items
 
     if not isinstance(arr, list):
         return _empty_index()
@@ -124,10 +128,9 @@ def build_server_mod_index(mods_json: Any) -> dict[str, frozenset[str]]:
             if sid_text.isdigit():
                 ids.add(sid_text)
 
-        name = clean_display_mod_name(
-            item.get("name"), sid_text if sid_text.isdigit() else None,
-            fallback=False,
-        )
+        name_id = sid_text if sid_text.isdigit() else None
+        name = (parsed_mods.clean_name(item, name_id) if parsed_mods is not None else
+                clean_display_mod_name(item.get("name"), name_id, fallback=False))
         normalized_name = normalize_mod_text(name)
         compact_name = compact_mod_text(name)
         if normalized_name:

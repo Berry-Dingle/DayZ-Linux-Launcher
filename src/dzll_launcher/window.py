@@ -15,6 +15,7 @@ import gi
 import shutil
 import traceback
 import weakref
+import resource
 from pathlib import Path
 import sys
 from datetime import datetime
@@ -98,6 +99,7 @@ from .storage import (
 )
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
+from .startup_perf import log_startup_phase
 from .live import query_server_live, is_valid_hhmm
 from .server_endpoint import (
     ServerEndpointValidationError,
@@ -198,6 +200,18 @@ from .preparation_presentation import (
     PreparationProgressMode,
 )
 from .mod_metadata import clean_display_mod_name, mark_mods_used
+from .mod_parsed import ParsedServerMods
+from .atomic_json import _fsync_directory_best_effort
+from . import server_mod_cache
+from .mod_suggestion_cache import (
+    build_staged_suggestion_migration,
+    REFRESH_SECONDS as MOD_SUGGESTION_REFRESH_SECONDS,
+    build_staged_suggestion_cache,
+    load_suggestion_cache,
+    prepare_deferred_suggestions,
+    save_suggestion_cache,
+    suggestion_cache_path,
+)
 from .mod_search import (
     build_server_mod_index,
     compact_mod_text,
@@ -290,6 +304,12 @@ SERVER_COMPANION_ALERT_SOUNDS = {
 }
 MOD_SUGGESTION_RESULT_LIMIT = 50
 PERF_LOG_ENABLED = os.environ.get("DZLL_PERF_LOG") == "1"
+STARTUP_BATCHING_ENABLED = os.environ.get("DZLL_STARTUP_BATCHING") == "1"
+A2S_WARMUP_500_ENABLED = os.environ.get("DZLL_A2S_WARMUP_500") == "1"
+_A2S_WARMUP_EXPERIMENT_MAX = 500
+_A2S_WARMUP_EXPERIMENT_READY_PERCENT = 60
+STARTUP_ROW_BATCH_BUDGET_NS = 6_000_000
+_STARTUP_DB_APPLY_PENDING = object()
 DEBUG_COLUMN_SORT = os.environ.get("DZLL_DEBUG_COLUMN_SORT") == "1"
 DEBUG_SORT = os.environ.get("DZLL_DEBUG_SORT") == "1"
 # Temporary opt-in timing for comparing sidebar filters with column sorting.
@@ -301,6 +321,46 @@ ENABLE_LEGACY_GTK_SORT_MODEL = os.environ.get("DZLL_ENABLE_LEGACY_GTK_SORT_MODEL
 DEBUG_SC_DOCK = os.environ.get("DZLL_DEBUG_SC_DOCK") == "1"
 DEBUG_SC_ALERTS = os.environ.get("DZLL_DEBUG_SC_ALERTS") == "1"
 DEBUG_STARTUP_LIVE = os.environ.get("DZLL_DEBUG_STARTUP_LIVE") == "1"
+
+
+def _log_startup_apply_phase(owner, phase: str, start_ns: int, *, duration_ns=None, **fields) -> None:
+    """Attach the current DB-application identity to one aggregate startup phase."""
+    context = dict(getattr(owner, "_startup_perf_db_apply_context", {}) or {})
+    context.update(fields)
+    if duration_ns is None:
+        log_startup_phase(owner._startup_perf_origin_ns, phase, start_ns, **context)
+    else:
+        log_startup_phase(
+            owner._startup_perf_origin_ns, phase, start_ns,
+            duration_ns=duration_ns, **context,
+        )
+
+
+def _schedule_startup_perf_next_frame_tick(owner, visible_rows: int) -> None:
+    """Mark the next frame-clock tick after initial publication; this is not a draw-complete signal."""
+    if not PERF_LOG_ENABLED:
+        return
+    widget = getattr(owner, "list_view", None)
+    add_tick_callback = getattr(widget, "add_tick_callback", None)
+    if not callable(add_tick_callback):
+        return
+    start_ns = time.monotonic_ns()
+    context = dict(getattr(owner, "_startup_perf_db_apply_context", {}) or {})
+
+    def on_tick(_widget, _frame_clock):
+        log_startup_phase(
+            owner._startup_perf_origin_ns, "initial_next_frame_tick", start_ns,
+            timer_scope="latency_marker", meaning="next_frame_clock_tick_not_draw_complete",
+            visible_rows=visible_rows, **context,
+        )
+        return False
+
+    try:
+        add_tick_callback(on_tick)
+    except Exception:
+        pass
+
+
 FAST_SCROLL_RENDER_ENABLED = os.environ.get("DZLL_FAST_SCROLL_RENDER") == "1"
 SCROLL_DRAG_PERF_ENABLED = os.environ.get("DZLL_SCROLL_DRAG_PERF") == "1"
 SCROLL_DRAG_LIGHT_BIND_ENABLED = drag_light_enabled_from_env(
@@ -503,7 +563,9 @@ def _a2s_changed_live_fields(before: dict, proposed: dict) -> list[str]:
     return [name for name in proposed if before.get(name) != proposed.get(name)]
 
 
-def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
+def parse_mods_preview(
+    mods_json: str, max_names: int = 8, *, parsed_mods: ParsedServerMods | None = None,
+) -> tuple[int, str]:
     """
     Returns:
       (total_mod_count, preview_string)
@@ -512,10 +574,10 @@ def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
       - up to max_names mod names
       - adds ", ..." if truncated
     """
-    if not mods_json:
+    if parsed_mods is None and not mods_json:
         return 0, ""
     try:
-        arr = json.loads(mods_json)
+        arr = parsed_mods.items if parsed_mods is not None else json.loads(mods_json)
         if not isinstance(arr, list):
             return 0, ""
 
@@ -523,10 +585,9 @@ def parse_mods_preview(mods_json: str, max_names: int = 8) -> tuple[int, str]:
         for it in arr:
             if isinstance(it, dict):
                 sid = str(it.get("steamWorkshopId") or "").strip()
-                nm = clean_display_mod_name(
-                    it.get("name"), sid if sid.isdigit() else None,
-                    fallback=False,
-                )
+                name_id = sid if sid.isdigit() else None
+                nm = (parsed_mods.clean_name(it, name_id) if parsed_mods is not None else
+                      clean_display_mod_name(it.get("name"), name_id, fallback=False))
                 if nm:
                     names.append(nm)
 
@@ -602,11 +663,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         # Keep construction-failure cleanup usable from the first fallible step.
         self._shutdown_cleanup_done = False
+        self._startup_perf_origin_ns = (
+            int(getattr(app, "_startup_perf_origin_ns", 0) or 0) if PERF_LOG_ENABLED else 0
+        )
+        self._startup_perf_db_apply_id = 0
+        self._startup_perf_db_apply_context = {}
         self._perf_diagnostic_source_ids = []
         self._steam_global_players_startup_source_id = 0
         self._steam_global_players_poll_source_id = 0
         self._settings_init_idle_id = 0
         self._startup_update_idle_id = 0
+        self._startup_row_batch_idle_id = 0
+        self._startup_row_batch_generation = 0
+        self._startup_row_batch_state = None
         self._companion_restart_phase2 = None
         self.server_companion_panel = None
         self._executor = None
@@ -705,6 +774,32 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._filter_query = ""
         self._filter_refresh_suppress_depth = 0
         self._mod_suggestion_index = build_mod_suggestion_index(())
+        self._suggestion_cache_path = suggestion_cache_path()
+        self._suggestion_cache_ready = False
+        self._suggestion_cache_expired = False
+        self._suggestion_cache_created_at = 0.0
+        self._suggestion_cache_generation = 0
+        self._server_mod_cache_path = server_mod_cache.cache_path()
+        self._server_mod_cache_generation = 0
+        self._server_mod_cache_records = None
+        self._server_mod_cache_persisted = {}
+        self._server_mod_cache_candidate = {}
+        self._server_mod_cache_needs_repair = False
+        self._server_mod_cache_file_bytes = 0
+        self._suggestion_refresh_inflight = False
+        self._suggestion_refresh_retry_after = 0.0
+        self._suggestion_cache_migration_pending = False
+        self._suggestion_cache_migration_inflight = False
+        self._suggestion_cache_migration_retry_after = 0.0
+        self._suggestion_cache_migration_created_at = 0.0
+        self._suggestion_cache_migration_kind = None
+        self._deferred_suggestion_restore_pending = False
+        self._deferred_suggestion_restore_allowed = False
+        self._deferred_suggestion_restore_inflight = False
+        self._deferred_suggestion_restore_generation = 0
+        self._deferred_suggestion_restore_retry_after = 0.0
+        self._suggestion_sweep_complete = False
+        self._suggestion_sweep_fallback_ready = False
         self._mod_suggestion_selecting = False
         self._mod_suggestion_dismissed = None
         self._mod_suggestion_refresh_id = 0
@@ -805,6 +900,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._startup_warmup_keys = set()
         self._startup_warmup_completed = 0
         self._startup_warmup_target = 0
+        self._startup_warmup_mode = "default"
+        self._startup_warmup_cohort_count = 0
+        self._startup_warmup_ready_percent = int(STARTUP_WARMUP_READY_PERCENT)
         self._startup_warmup_timeout_id = 0
         self._startup_warmup_revealed = False
         self._status_refresh_generation = 0
@@ -1324,7 +1422,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         elapsed_ms = (now - float(getattr(self, "_perf_stall_last", now))) * 1000.0
         self._perf_stall_last = now
         if elapsed_ms > float(PERF_STALL_INTERVAL_MS + PERF_STALL_LATE_MS):
-            print(f"[PERF] main loop stall: {elapsed_ms:.0f}ms", flush=True)
+            startup_ms = (
+                (time.monotonic_ns() - self._startup_perf_origin_ns) / 1_000_000
+                if self._startup_perf_origin_ns else 0.0
+            )
+            print(f"[PERF] main loop stall: {elapsed_ms:.0f}ms startup_ms={startup_ms:.1f}", flush=True)
         return True
 
     def _perf_row_bind_tick(self):
@@ -2991,6 +3093,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if getattr(self, "_shutdown_cleanup_done", False):
             return
         self._shutdown_cleanup_done = True
+        DZLLWindow._cancel_startup_row_batches(self, "shutdown")
+        self._suggestion_cache_generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0) + 1
+        self._deferred_suggestion_restore_pending = False
+        self._deferred_suggestion_restore_allowed = False
+        self._deferred_suggestion_restore_inflight = False
+        self._server_mod_cache_generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0) + 1
         try:
             self._dayz_watch_shutdown_event.set()
         except Exception:
@@ -5367,12 +5475,31 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return False
 
     def _complete_startup_presentation(self):
+        perf_visible = False
+        if PERF_LOG_ENABLED:
+            try:
+                perf_visible = bool(self.startup_dimmer.get_visible())
+            except Exception:
+                pass
+        overlay_start_ns = time.monotonic_ns() if perf_visible else 0
         coordinator = getattr(self, "_startup_presentation", None)
         if coordinator is not None:
             coordinator.complete_startup()
         else:
             self._set_updating(False)
         self._apply_titlebar_counts()
+        if perf_visible:
+            try:
+                visible_rows = int(self.column_view_store.get_n_items())
+            except Exception:
+                visible_rows = -1
+            _log_startup_apply_phase(
+                self, "startup_overlay_dismissal", overlay_start_ns,
+                timer_scope="exclusive", visible_rows=visible_rows,
+            )
+        if bool(getattr(self, "_deferred_suggestion_restore_pending", False)):
+            self._deferred_suggestion_restore_allowed = True
+            DZLLWindow._maybe_schedule_deferred_suggestion_restore(self)
         return False
 
     def _begin_startup_update_from_idle(self):
@@ -5391,19 +5518,61 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.empty_label.set_visible(False)
         self._startup_db_applied = False
         self._startup_db_provisional = False
+        if PERF_LOG_ENABLED:
+            log_startup_phase(self._startup_perf_origin_ns, "db_startup_submit", time.monotonic_ns())
 
-        def apply_db_rows_once(rows, ok, provisional=False):
+        def apply_db_rows_once(rows, ok, provisional=False, allow_batch=False):
             if getattr(self, "_startup_db_applied", False):
                 return False
             if provisional:
                 if getattr(self, "_startup_db_provisional", False):
                     return False
                 self._startup_db_provisional = True
-                return self._apply_db_rows(rows, ok)
+                self._suggestion_provisional_load = True
+                apply_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+                try:
+                    return self._apply_db_rows(rows, ok)
+                finally:
+                    self._suggestion_provisional_load = False
+                    if PERF_LOG_ENABLED:
+                        _log_startup_apply_phase(
+                            self, "db_gtk_completion", apply_start_ns,
+                            timer_scope="parent", includes="all_db_gtk_apply_phases",
+                            rows=len(rows or ()), fetched_ok=ok, provisional=True,
+                        )
             self._startup_db_applied = True
-            return self._apply_db_rows(rows, ok)
+            apply_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            def batched_complete(outcome):
+                if PERF_LOG_ENABLED:
+                    _log_startup_apply_phase(
+                        self, "db_gtk_completion", apply_start_ns,
+                        timer_scope="parent", includes="all_db_gtk_apply_phases",
+                        rows=len(rows or ()), fetched_ok=ok, provisional=False,
+                        path="batched", outcome=outcome,
+                    )
+                self._server_db_update_inflight = False
+            result = None
+            try:
+                result = self._apply_db_rows(
+                    rows, ok,
+                    allow_startup_batching=allow_batch,
+                    batched_complete=batched_complete,
+                )
+                if result is _STARTUP_DB_APPLY_PENDING:
+                    return result
+                return result
+            finally:
+                if PERF_LOG_ENABLED and result is not _STARTUP_DB_APPLY_PENDING:
+                    _log_startup_apply_phase(
+                        self, "db_gtk_completion", apply_start_ns,
+                        timer_scope="parent", includes="all_db_gtk_apply_phases",
+                        rows=len(rows or ()), fetched_ok=ok, provisional=False, path="synchronous",
+                    )
 
         def finish_startup(rows, ok, err=None):
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "db_gtk_callback_entry", time.monotonic_ns(),
+                                  rows=len(rows or ()), fetched_ok=ok, error=bool(err))
             if err is not None:
                 print(f"[DB] Startup server database update failed: {err}")
                 if rows:
@@ -5449,39 +5618,63 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     self._server_db_update_inflight = False
                 return False
 
+            result = None
             try:
-                apply_db_rows_once(rows, ok)
+                result = apply_db_rows_once(rows, ok, allow_batch=True)
             finally:
-                self._server_db_update_inflight = False
+                if result is not _STARTUP_DB_APPLY_PENDING:
+                    self._server_db_update_inflight = False
             return False
 
         def db_watchdog():
             if getattr(self, "_startup_db_applied", False):
                 return False
+            read_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             rows = read_servers_from_db()
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "db_watchdog_gtk_read", read_start_ns,
+                                  rows=len(rows))
             apply_db_rows_once(rows, False, True)
             return False
 
         GLib.timeout_add_seconds(30, db_watchdog)
 
         def worker():
+            worker_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "db_worker_start", worker_start_ns)
             try:
                 self._check_updates_worker()
             except Exception:
                 pass
 
             try:
+                fetch_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
                 ok = fetch_db_overwrite_local()
+                if PERF_LOG_ENABLED:
+                    log_startup_phase(self._startup_perf_origin_ns, "db_worker_fetch", fetch_start_ns,
+                                      fetched_ok=ok)
                 if not ok:
+                    read_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
                     rows = read_servers_from_db()
+                    if PERF_LOG_ENABLED:
+                        log_startup_phase(self._startup_perf_origin_ns, "db_worker_read_cached", read_start_ns,
+                                          rows=len(rows))
                     GLib.idle_add(finish_startup, rows, False, None)
                     return
 
+                read_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
                 rows = read_servers_from_db()
+                if PERF_LOG_ENABLED:
+                    log_startup_phase(self._startup_perf_origin_ns, "db_worker_read", read_start_ns,
+                                      rows=len(rows))
 
                 GLib.idle_add(finish_startup, rows, ok, None)
             except Exception as e:
                 GLib.idle_add(finish_startup, [], False, e)
+            finally:
+                if PERF_LOG_ENABLED:
+                    log_startup_phase(self._startup_perf_origin_ns, "db_worker_total", worker_start_ns)
 
         try:
             self._db_executor.submit(worker)
@@ -5659,7 +5852,33 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._update_executor.submit(worker)
 
-    def _apply_db_rows(self, rows: list, fetched_ok: bool):
+    def _apply_db_rows(
+            self, rows: list, fetched_ok: bool, *,
+            allow_startup_batching: bool = False, batched_complete=None):
+        db_ready_ns = time.monotonic_ns()
+        if getattr(self, "_startup_row_batch_state", None) is not None:
+            DZLLWindow._cancel_startup_row_batches(self, "superseded")
+        if PERF_LOG_ENABLED:
+            load_id = int(getattr(self, "_startup_perf_db_apply_id", 0) or 0) + 1
+            self._startup_perf_db_apply_id = load_id
+            self._startup_perf_db_apply_context = {
+                "load_id": load_id,
+                "input_rows": len(rows or ()),
+                "fetched_ok": bool(fetched_ok),
+                "provisional": bool(getattr(self, "_suggestion_provisional_load", False)),
+                "server_cache_state": (
+                    "memory_reuse" if getattr(self, "_server_mod_cache_records", None) is not None
+                    else "disk_load"
+                ),
+                "suggestion_cache_state": (
+                    "memory_hit" if bool(getattr(self, "_suggestion_cache_ready", False))
+                    else "disk_lookup_pending"
+                ),
+            }
+        self._suggestion_current_db_fetched_ok = bool(fetched_ok)
+        self._suggestion_sweep_complete = False
+        self._suggestion_sweep_fallback_ready = not fetched_ok
+        validation_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
         endpoint_valid_rows = []
         for dbrow in rows or []:
             try:
@@ -5673,14 +5892,80 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 continue
             endpoint_valid_rows.append(dbrow)
 
-        try:
-            choices = map_choices_from_db_rows(endpoint_valid_rows)
-            self._set_map_choices(choices)
-        except Exception:
-            self._set_map_choices(["All Maps"])
+        if PERF_LOG_ENABLED:
+            self._startup_perf_db_apply_context["valid_rows"] = len(endpoint_valid_rows)
+            _log_startup_apply_phase(
+                self, "endpoint_validation", validation_start_ns,
+                timer_scope="exclusive", valid_rows=len(endpoint_valid_rows),
+            )
 
+        previous_map_state = DZLLWindow._snapshot_startup_map_state(self)
+        map_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        map_choice_ns = map_model_ns = 0
+        map_choices_finished = False
+        try:
+            map_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            choices = map_choices_from_db_rows(endpoint_valid_rows)
+            if PERF_LOG_ENABLED:
+                map_choice_ns += time.monotonic_ns() - map_tick_ns
+                map_choices_finished = True
+            map_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            self._set_map_choices(choices)
+            if PERF_LOG_ENABLED:
+                map_model_ns += time.monotonic_ns() - map_tick_ns
+        except Exception:
+            if PERF_LOG_ENABLED and not map_choices_finished:
+                map_choice_ns += time.monotonic_ns() - map_tick_ns
+            elif PERF_LOG_ENABLED:
+                map_model_ns += time.monotonic_ns() - map_tick_ns
+            map_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            self._set_map_choices(["All Maps"])
+            if PERF_LOG_ENABLED:
+                map_model_ns += time.monotonic_ns() - map_tick_ns
+        if PERF_LOG_ENABLED:
+            map_total_ns = time.monotonic_ns() - map_start_ns
+            _log_startup_apply_phase(
+                self, "map_choice_build", map_start_ns, duration_ns=map_choice_ns,
+                timer_scope="exclusive", rows=len(endpoint_valid_rows),
+            )
+            _log_startup_apply_phase(
+                self, "map_model_update", map_start_ns, duration_ns=map_model_ns,
+                timer_scope="exclusive", rows=len(endpoint_valid_rows),
+            )
+            _log_startup_apply_phase(
+                self, "map_preparation", map_start_ns,
+                duration_ns=map_total_ns,
+                timer_scope="parent", includes="map_choice_build,map_model_update",
+                rows=len(endpoint_valid_rows),
+            )
+
+        fallback_reason = DZLLWindow._startup_batching_fallback_reason(
+            self, fetched_ok, allow_startup_batching,
+        )
+        if not fallback_reason and not endpoint_valid_rows:
+            fallback_reason = "no_valid_rows"
+        if not fallback_reason:
+            if PERF_LOG_ENABLED:
+                _log_startup_apply_phase(
+                    self, "startup_row_load_path", time.monotonic_ns(), duration_ns=0,
+                    timer_scope="marker", path="batched", rows=len(endpoint_valid_rows),
+                )
+            return DZLLWindow._start_startup_row_batches(
+                self, endpoint_valid_rows, batched_complete, db_ready_ns=db_ready_ns,
+                previous_map_state=previous_map_state,
+            )
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "startup_row_load_path", time.monotonic_ns(), duration_ns=0,
+                timer_scope="marker", path="synchronous", reason=fallback_reason,
+                rows=len(endpoint_valid_rows),
+            )
         loaded = self._load_rows_into_store(endpoint_valid_rows)
+        return DZLLWindow._finish_db_rows_application(self, loaded, fetched_ok)
+
+    def _finish_db_rows_application(self, loaded: bool, fetched_ok: bool):
         if not loaded:
+            self._suggestion_sweep_fallback_ready = True
             self._server_companion_rows_loaded = False
             msg = "No Servers Found."
             if not fetched_ok:
@@ -5690,6 +5975,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._complete_startup_presentation()
             return False
 
+        post_load_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        if PERF_LOG_ENABLED:
+            self._startup_perf_list_publication_ns = post_load_start_ns
+        if bool(fetched_ok) and not bool(getattr(self, "_suggestion_provisional_load", False)) and hasattr(self, "_server_mod_cache_candidate"):
+            generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0)
+            try:
+                GLib.timeout_add_seconds(25, DZLLWindow._schedule_server_mod_cache_write, self, generation)
+            except Exception:
+                pass  # A cache timer failure cannot invalidate the loaded server rows.
+
         self._server_companion_rows_loaded = True
         self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
         self._restore_server_companion_if_enabled()
@@ -5697,6 +5992,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not fetched_ok:
             self._auto_sort_lowest_ping_after_startup()
             self._complete_startup_presentation()
+            if PERF_LOG_ENABLED:
+                _log_startup_apply_phase(
+                    self, "post_load_startup_coordination", post_load_start_ns,
+                    timer_scope="parent",
+                    includes="cached_final_visible_store_rebuild,startup_overlay_dismissal",
+                    outcome="cached_reveal",
+                )
             return False
         keys = sorted(self._obj_by_key.keys(), key=self._bm_live_group)
         warmup_count = sum(self._bm_live_group(k) <= 1 for k in keys)
@@ -5706,27 +6008,774 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 f"workers={STARTUP_LIVE_REST_WORKERS}",
                 flush=True,
             )
+        a2s_submit_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
         self._submit_startup_rest_batches(keys, warmup_count=warmup_count)
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "a2s_initial_submission", a2s_submit_start_ns,
+                timer_scope="parent", includes="a2s_setup,warmup_marker,initial_executor_submissions",
+                total_rows=len(keys), warmup_rows=warmup_count,
+            )
 
         GLib.timeout_add_seconds(OFFLINE_RECHECK_SECS, self._offline_recheck_tick)
         self._apply_titlebar_counts()
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "post_load_startup_coordination", post_load_start_ns,
+                timer_scope="parent", includes="a2s_initial_submission",
+                total_rows=len(keys), warmup_rows=warmup_count, outcome="a2s_started",
+            )
         return False
+
+    def _startup_batching_fallback_reason(
+            self, fetched_ok: bool, allow_startup_batching: bool) -> str:
+        if not STARTUP_BATCHING_ENABLED:
+            return "disabled"
+        if not allow_startup_batching:
+            return "unsupported_caller"
+        if not fetched_ok:
+            return "nonfinal_database"
+        if bool(getattr(self, "_suggestion_provisional_load", False)) or bool(
+                getattr(self, "_startup_db_provisional", False)):
+            return "provisional_or_replacement"
+        if ENABLE_LEGACY_GTK_SORT_MODEL or getattr(self, "sort_model", None) is not None:
+            return "legacy_model"
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return "shutdown"
+        if getattr(self, "column_view_store", None) is None:
+            return "column_view_unavailable"
+        try:
+            if int(self.store.get_n_items()) or int(self.column_view_store.get_n_items()):
+                return "rows_already_committed"
+        except Exception:
+            return "ambiguous_model_state"
+        if getattr(self, "_obj_by_key", None):
+            return "endpoint_index_not_empty"
+        return ""
+
+    def _start_startup_row_batches(
+            self, rows: list, batched_complete, *, db_ready_ns: int | None = None,
+            previous_map_state=None):
+        self._suggestion_cache_generation = int(
+            getattr(self, "_suggestion_cache_generation", 0) or 0
+        ) + 1
+        self._deferred_suggestion_restore_pending = False
+        self._deferred_suggestion_restore_allowed = False
+        self._deferred_suggestion_restore_inflight = False
+        self._server_mod_cache_generation = int(
+            getattr(self, "_server_mod_cache_generation", 0) or 0
+        ) + 1
+        cache_path = getattr(self, "_server_mod_cache_path", None) or server_mod_cache.cache_path()
+        cache_load_stages = {} if PERF_LOG_ENABLED else None
+        cache_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        cache_state = (
+            "disk_load" if getattr(self, "_server_mod_cache_records", None) is None
+            else "memory_reuse"
+        )
+        if getattr(self, "_server_mod_cache_records", None) is None:
+            records = server_mod_cache.load(
+                cache_path,
+                perf_report=(cache_load_stages.update if cache_load_stages is not None else None),
+            )
+            self._server_mod_cache_records = records
+            self._server_mod_cache_persisted = {
+                key: record[0] for key, record in records.items()
+            }
+            self._server_mod_cache_file_bytes = int(
+                (cache_load_stages or {}).get("file_bytes", 0)
+            )
+        else:
+            records = self._server_mod_cache_records
+        if PERF_LOG_ENABLED:
+            context = getattr(self, "_startup_perf_db_apply_context", None)
+            if isinstance(context, dict):
+                context["server_cache_state"] = cache_state
+
+        generation = int(getattr(self, "_startup_row_batch_generation", 0) or 0) + 1
+        self._startup_row_batch_generation = generation
+        started_ns = time.monotonic_ns()
+        self._startup_row_batch_state = {
+            "generation": generation,
+            "rows": tuple(rows),
+            "index": 0,
+            "objects": [],
+            "obj_by_key": {},
+            "live_defaults": {},
+            "committed_live_keys": [],
+            "records": dict(records),
+            "cache_candidate": {},
+            "cache_load_stages": cache_load_stages,
+            "cache_start_ns": cache_start_ns,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "cache_needs_repair": False,
+            "fingerprint_ns": 0,
+            "restore_ns": 0,
+            "rebuild_ns": 0,
+            "scalar_ns": 0,
+            "sidecar_ns": 0,
+            "mod_prep_ns": 0,
+            "object_ns": 0,
+            "slice_ns": [],
+            "started_ns": started_ns,
+            "db_ready_ns": int(db_ready_ns or started_ns),
+            "row_build_finished_ns": 0,
+            "setup_ns": 0,
+            "complete": batched_complete,
+            "published": False,
+            "previous_map_state": previous_map_state,
+        }
+        try:
+            self._startup_row_batch_idle_id = int(
+                GLib.idle_add(DZLLWindow._run_startup_row_batch, self, generation) or 0
+            )
+        except Exception:
+            self._fail_startup_row_batches(generation, "idle_submission_failed")
+            return False
+        if not self._startup_row_batch_idle_id:
+            self._fail_startup_row_batches(generation, "idle_submission_failed")
+            return False
+        state = getattr(self, "_startup_row_batch_state", None)
+        if isinstance(state, dict) and state.get("generation") == generation:
+            state["setup_ns"] = time.monotonic_ns() - state["db_ready_ns"]
+        return _STARTUP_DB_APPLY_PENDING
+
+    def _build_startup_batched_row(self, state: dict, dbrow: dict) -> None:
+        scalar_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        ip, gport, qport = normalize_server_endpoint(
+            dbrow.get("ip"), dbrow.get("gport"), dbrow.get("qport"),
+            allow_missing_query_port=True,
+        )
+        name = _db_advisory_text(dbrow.get("name"))
+        map_name = standardize_map(_db_advisory_text(dbrow.get("map")))
+        try:
+            players = int(dbrow.get("players") or 0)
+        except Exception:
+            players = 0
+        try:
+            maxp = int(dbrow.get("maxPlayers") or 0)
+        except Exception:
+            maxp = 0
+        password = _db_advisory_flag(dbrow.get("password"))
+        third_person = _db_advisory_flag(dbrow.get("third_person"))
+        official = type(dbrow.get("official")) is int and dbrow.get("official") == 1
+        raw_mods_json = dbrow.get("mods")
+        mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
+        mod_count_db = dbrow.get("modCount")
+        k = fav_key(ip, gport)
+        if PERF_LOG_ENABLED:
+            state["scalar_ns"] += time.monotonic_ns() - scalar_tick_ns
+
+        cache_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        digest = server_mod_cache.fingerprint(mods_json)
+        if PERF_LOG_ENABLED:
+            state["fingerprint_ns"] += time.monotonic_ns() - cache_tick_ns
+        cache_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        cached_mods = server_mod_cache.lookup(state["records"], k, digest)
+        if PERF_LOG_ENABLED:
+            state["restore_ns"] += time.monotonic_ns() - cache_tick_ns
+        parsed_mods = None
+        if cached_mods is None:
+            state["cache_misses"] += 1
+            if k in self._server_mod_cache_persisted and self._server_mod_cache_persisted[k] == digest:
+                state["cache_needs_repair"] = True
+            mod_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            parsed_mods = ParsedServerMods.from_json(mods_json)
+            cnt, preview = parse_mods_preview(
+                mods_json, max_names=8, parsed_mods=parsed_mods,
+            )
+            mod_index = build_server_mod_index(mods_json, parsed_mods=parsed_mods)
+            if PERF_LOG_ENABLED:
+                elapsed_ns = time.monotonic_ns() - mod_start_ns
+                state["mod_prep_ns"] += elapsed_ns
+                state["rebuild_ns"] += elapsed_ns
+            record = (digest, cnt, preview, mod_index)
+            state["records"][k] = record
+        else:
+            state["cache_hits"] += 1
+            cnt, preview, mod_index = cached_mods
+            record = state["records"][k]
+        state["cache_candidate"][k] = record
+
+        scalar_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        if mod_count_db is not None:
+            try:
+                cnt = int(mod_count_db)
+            except Exception:
+                pass
+        try:
+            timewarp = float(dbrow["timeWarp"]) if dbrow.get("timeWarp") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            timewarp = None
+        try:
+            night_timewarp = float(dbrow["nightTimeWarp"]) if dbrow.get("nightTimeWarp") is not None else None
+        except (TypeError, ValueError, OverflowError):
+            night_timewarp = None
+        time_str = _db_advisory_text(dbrow.get("time"))
+        if not is_valid_hhmm(time_str):
+            time_str = "--:--"
+        country = _db_advisory_text(dbrow.get("country"))
+        try:
+            ping_db = int(dbrow.get("ping")) if dbrow.get("ping") is not None else -1
+        except Exception:
+            ping_db = -1
+        try:
+            bm_rank = int(dbrow.get("bm_rank")) if dbrow.get("bm_rank") is not None else 999999999
+        except Exception:
+            bm_rank = 999999999
+        fav = bool(self.favorites.get(k, False))
+        lp_ts = self.last_played.get(k)
+        played_disp = human_last_played(lp_ts) if lp_ts else ""
+        if PERF_LOG_ENABLED:
+            state["scalar_ns"] += time.monotonic_ns() - scalar_tick_ns
+
+        object_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        obj = ServerObject(
+            fav=fav, password=password, third_person=third_person, official=official,
+            name=name, country=country, ip=ip, gport=gport, qport=qport,
+            mod_count=cnt, mods_preview=preview, mods_json=mods_json,
+            time=time_str, timewarp=timewarp, night_timewarp=night_timewarp,
+            played=played_disp, map_name=map_name, players=players,
+            max_players=maxp, ping=ping_db, bm_rank=bm_rank,
+        )
+        if PERF_LOG_ENABLED:
+            state["object_ns"] += time.monotonic_ns() - object_start_ns
+        sidecar_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        obj.name_lc = name.strip().lower()
+        obj.ipport_lc = f"{ip}:{gport}".lower()
+        obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
+        obj.filter_key = k
+        obj.is_likely_test_server = self._is_likely_test_server_name(obj.name_lc)
+        obj.mod_search_index = mod_index
+        self._debug_sort_attach_notify_probe(obj)
+        state["objects"].append(obj)
+        state["obj_by_key"][k] = obj
+        state["live_defaults"].setdefault(
+            k, {"hide_high_ping": False, "offline": (ping_db < 0)},
+        )
+        if PERF_LOG_ENABLED:
+            state["sidecar_ns"] += time.monotonic_ns() - sidecar_start_ns
+
+    def _run_startup_row_batch(self, generation: int):
+        state = getattr(self, "_startup_row_batch_state", None)
+        if (not isinstance(state, dict) or state.get("generation") != generation or
+                generation != int(getattr(self, "_startup_row_batch_generation", 0) or 0) or
+                bool(getattr(self, "_shutdown_cleanup_done", False))):
+            return False
+        slice_start_ns = time.monotonic_ns()
+        deadline_ns = slice_start_ns + STARTUP_ROW_BATCH_BUDGET_NS
+        try:
+            while state["index"] < len(state["rows"]):
+                dbrow = state["rows"][state["index"]]
+                self._build_startup_batched_row(state, dbrow)
+                state["index"] += 1
+                if time.monotonic_ns() >= deadline_ns:
+                    break
+        except Exception:
+            logger.exception("Experimental startup row batching failed during construction")
+            state["slice_ns"].append(time.monotonic_ns() - slice_start_ns)
+            self._fail_startup_row_batches(generation, "row_construction_failed")
+            return False
+        state["slice_ns"].append(time.monotonic_ns() - slice_start_ns)
+        if state["index"] < len(state["rows"]):
+            return True
+        state["row_build_finished_ns"] = time.monotonic_ns()
+        return self._publish_startup_row_batches(generation)
+
+    def _publish_startup_row_batches(self, generation: int):
+        state = getattr(self, "_startup_row_batch_state", None)
+        if (not isinstance(state, dict) or state.get("generation") != generation or
+                bool(getattr(self, "_shutdown_cleanup_done", False))):
+            return False
+        if not state.get("objects"):
+            complete = state.get("complete")
+            self._startup_row_batch_generation = generation + 1
+            self._startup_row_batch_state = None
+            self._startup_row_batch_idle_id = 0
+            self._deferred_suggestion_restore_pending = False
+            self._deferred_suggestion_restore_allowed = False
+            try:
+                self._finish_db_rows_application(False, True)
+            except Exception:
+                logger.exception("Empty experimental startup row transaction failed during recovery")
+                try:
+                    self._set_updating(False)
+                except Exception:
+                    pass
+            finally:
+                self._server_db_update_inflight = False
+                if callable(complete):
+                    try:
+                        complete("empty")
+                    except Exception:
+                        logger.exception("Empty startup row completion callback failed")
+            return False
+        publication_start_ns = time.monotonic_ns()
+        component_ns = {}
+        try:
+            state["previous_server_cache_state"] = {
+                "records": self._server_mod_cache_records,
+                "candidate": self._server_mod_cache_candidate,
+                "needs_repair": self._server_mod_cache_needs_repair,
+            }
+            tick_ns = time.monotonic_ns()
+            self.store.splice(0, int(self.store.get_n_items()), state["objects"])
+            self._obj_by_key.clear()
+            self._obj_by_key.update(state["obj_by_key"])
+            self._browser_live_offline_streaks.clear()
+            for key, default in state["live_defaults"].items():
+                if key not in self.live:
+                    self.live[key] = default
+                    state["committed_live_keys"].append(key)
+            self._server_mod_cache_candidate = state["cache_candidate"]
+            if len(state["records"]) > server_mod_cache.MAX_ENTRIES:
+                self._server_mod_cache_records = dict(state["cache_candidate"])
+            else:
+                self._server_mod_cache_records = state["records"]
+            self._server_mod_cache_needs_repair = bool(state["cache_needs_repair"])
+            component_ns["source_store_publication"] = time.monotonic_ns() - tick_ns
+
+            tick_ns = time.monotonic_ns()
+            self._snapshot_all_sort_keys()
+            component_ns["sort_key_snapshot"] = time.monotonic_ns() - tick_ns
+            tick_ns = time.monotonic_ns()
+            self._on_filter_changed(reason="load")
+            component_ns["initial_visible_store_rebuild"] = time.monotonic_ns() - tick_ns
+            try:
+                sorter = getattr(self, "sorter", None)
+                if sorter is not None:
+                    self._debug_sort_note_model_event("load_sorter_changed")
+                    sorter.changed(Gtk.SorterChange.DIFFERENT)
+            except Exception:
+                pass
+            state["published"] = True
+            if state["objects"] and not bool(getattr(self, "_suggestion_cache_ready", False)):
+                self._deferred_suggestion_restore_pending = True
+                self._deferred_suggestion_restore_allowed = False
+        except Exception:
+            logger.exception("Experimental startup row batching failed during publication")
+            self._rollback_startup_row_publication(state)
+            self._fail_startup_row_batches(generation, "publication_failed")
+            return False
+
+        complete = state.get("complete")
+        self._startup_row_batch_state = None
+        self._startup_row_batch_idle_id = 0
+        terminal_outcome = "published"
+        recover_deferred_suggestions = False
+        post_load_start_ns = time.monotonic_ns()
+        post_load_ns = 0
+        try:
+            try:
+                self._apply_titlebar_counts()
+            except Exception:
+                terminal_outcome = "published_titlebar_failed"
+                logger.exception("Experimental startup row publication titlebar coordination failed")
+            try:
+                if getattr(self, "_discord", None):
+                    self._discord.set_menu()
+            except Exception:
+                pass
+
+            publication_ns = time.monotonic_ns() - publication_start_ns
+            slices = state["slice_ns"]
+            row_cpu_ns = sum(slices)
+            if PERF_LOG_ENABLED:
+                DZLLWindow._log_server_mod_cache_apply(
+                    self, state["cache_start_ns"], state["cache_load_stages"],
+                    state["cache_hits"], state["cache_misses"], state["fingerprint_ns"],
+                    state["restore_ns"], state["rebuild_ns"], len(state["cache_candidate"]),
+                )
+                row_other_ns = max(
+                    0, row_cpu_ns - state["scalar_ns"] - state["sidecar_ns"] -
+                    state["mod_prep_ns"] - state["object_ns"],
+                )
+                for phase, duration_ns, scope in (
+                    ("row_scalar_conversion", state["scalar_ns"], "exclusive_aggregate"),
+                    ("row_sidecar_attachment", state["sidecar_ns"], "exclusive_aggregate"),
+                    ("row_conversion", row_other_ns, "exclusive_residual"),
+                    ("mod_preview_index", state["mod_prep_ns"], "exclusive_aggregate"),
+                    ("server_object_construction", state["object_ns"], "exclusive_aggregate"),
+                ):
+                    _log_startup_apply_phase(
+                        self, phase, state["started_ns"], duration_ns=duration_ns,
+                        timer_scope=scope, rows=len(state["objects"]), path="batched",
+                    )
+                _log_startup_apply_phase(
+                    self, "row_loop_total", state["started_ns"], duration_ns=row_cpu_ns,
+                    timer_scope="parent", includes="idle_slice_execution_only",
+                    rows=len(state["objects"]), path="batched",
+                    elapsed_ms=f"{(state['row_build_finished_ns'] - state['started_ns']) / 1_000_000:.3f}",
+                )
+                _log_startup_apply_phase(
+                    self, "startup_row_batch_build", state["started_ns"],
+                    duration_ns=state["row_build_finished_ns"] - state["started_ns"],
+                    timer_scope="wall_elapsed", batch_count=len(slices),
+                    max_slice_ms=f"{max(slices, default=0) / 1_000_000:.3f}",
+                    average_slice_ms=f"{(row_cpu_ns / len(slices) if slices else 0) / 1_000_000:.3f}",
+                    row_build_cpu_ms=f"{row_cpu_ns / 1_000_000:.3f}",
+                    rows=len(state["objects"]), cache_hits=state["cache_hits"],
+                    cache_misses=state["cache_misses"],
+                )
+                for name, duration_ns in component_ns.items():
+                    _log_startup_apply_phase(
+                        self, f"batched_{name}", publication_start_ns,
+                        duration_ns=duration_ns, timer_scope="exclusive",
+                        rows=len(state["objects"]),
+                    )
+                largest_name, largest_ns = max(component_ns.items(), key=lambda item: item[1])
+                _log_startup_apply_phase(
+                    self, "startup_row_batch_publication", publication_start_ns,
+                    duration_ns=publication_ns, timer_scope="parent",
+                    includes=",".join(f"batched_{name}" for name in component_ns),
+                    rows=len(state["objects"]), visible_rows=int(self.column_view_store.get_n_items()),
+                    largest_publication_component=largest_name,
+                    largest_publication_component_ms=f"{largest_ns / 1_000_000:.3f}",
+                    db_ready_to_publication_ms=f"{(time.monotonic_ns() - state['db_ready_ns']) / 1_000_000:.3f}",
+                )
+
+            post_load_start_ns = time.monotonic_ns()
+            self._finish_db_rows_application(True, True)
+            post_load_ns = time.monotonic_ns() - post_load_start_ns
+            if PERF_LOG_ENABLED:
+                uninterrupted = {
+                    "initial_batch_setup": int(state.get("setup_ns", 0) or 0),
+                    "max_idle_slice": max(slices, default=0),
+                    "final_publication": publication_ns,
+                    "post_load_startup_coordination": post_load_ns,
+                }
+                largest_sync_name, largest_sync_ns = max(
+                    uninterrupted.items(), key=lambda item: item[1],
+                )
+                _log_startup_apply_phase(
+                    self, "startup_row_batch_summary", state["db_ready_ns"],
+                    duration_ns=time.monotonic_ns() - state["db_ready_ns"],
+                    timer_scope="wall_elapsed", batch_count=len(slices),
+                    largest_sync_phase=largest_sync_name,
+                    largest_sync_ms=f"{largest_sync_ns / 1_000_000:.3f}",
+                    initial_batch_setup_ms=f"{uninterrupted['initial_batch_setup'] / 1_000_000:.3f}",
+                    max_idle_slice_ms=f"{uninterrupted['max_idle_slice'] / 1_000_000:.3f}",
+                    final_publication_ms=f"{publication_ns / 1_000_000:.3f}",
+                    post_load_coordination_ms=f"{post_load_ns / 1_000_000:.3f}",
+                    cache_hits=state["cache_hits"], cache_misses=state["cache_misses"],
+                )
+        except Exception:
+            terminal_outcome = "published_post_load_failed"
+            logger.exception("Experimental startup row batching failed after publication")
+            self._startup_live_generation = int(
+                getattr(self, "_startup_live_generation", 0) or 0
+            ) + 1
+            for attr in ("_startup_warmup_timeout_id", "_startup_live_rest_flush_id"):
+                source_id = int(getattr(self, attr, 0) or 0)
+                if source_id:
+                    try:
+                        GLib.source_remove(source_id)
+                    except Exception:
+                        pass
+                setattr(self, attr, 0)
+            self._startup_live_rest_queue = deque()
+            self._startup_live_rest_buffer = []
+            self._startup_live_rest_inflight = 0
+            self._suggestion_sweep_fallback_ready = True
+            try:
+                coordinator = getattr(self, "_startup_presentation", None)
+                if coordinator is not None:
+                    coordinator.complete_startup()
+                else:
+                    self._set_updating(False)
+            except Exception:
+                try:
+                    self._set_updating(False)
+                except Exception:
+                    pass
+            if bool(getattr(self, "_deferred_suggestion_restore_pending", False)):
+                self._deferred_suggestion_restore_allowed = True
+                recover_deferred_suggestions = True
+        finally:
+            self._server_db_update_inflight = False
+            if callable(complete):
+                try:
+                    complete(terminal_outcome)
+                except Exception:
+                    logger.exception("Startup row completion callback failed")
+        if recover_deferred_suggestions:
+            try:
+                DZLLWindow._maybe_schedule_deferred_suggestion_restore(self)
+            except Exception:
+                logger.exception("Deferred suggestions could not resume after startup coordination failure")
+        return False
+
+    def _rollback_startup_row_publication(self, state=None) -> None:
+        for store_name in ("column_view_store", "store"):
+            store = getattr(self, store_name, None)
+            if store is None:
+                continue
+            try:
+                count = int(store.get_n_items())
+                if count:
+                    store.splice(0, count, [])
+            except Exception:
+                pass
+        try:
+            self._obj_by_key.clear()
+            self._browser_live_offline_streaks.clear()
+        except Exception:
+            pass
+        if isinstance(state, dict):
+            for key in state.get("committed_live_keys", ()):
+                self.live.pop(key, None)
+            previous_cache = state.get("previous_server_cache_state", {})
+            if previous_cache:
+                self._server_mod_cache_records = previous_cache["records"]
+                self._server_mod_cache_candidate = previous_cache["candidate"]
+                self._server_mod_cache_needs_repair = previous_cache["needs_repair"]
+                return
+        self._server_mod_cache_candidate = {}
+
+    def _snapshot_startup_map_state(self):
+        try:
+            choices = tuple(
+                self.map_model.get_string(index)
+                for index in range(int(self.map_model.get_n_items()))
+            )
+            selected = int(self.map_dropdown.get_selected())
+        except Exception:
+            return None
+        filter_state = getattr(self, "_filter_state", None)
+        return {
+            "choices": choices,
+            "selected": selected,
+            "filter_state": dict(filter_state) if isinstance(filter_state, dict) else filter_state,
+        }
+
+    def _restore_startup_map_state(self, state) -> None:
+        if not isinstance(state, dict):
+            return
+        snapshot = state.get("previous_map_state")
+        if not isinstance(snapshot, dict):
+            return
+        try:
+            self._set_map_choices(list(snapshot["choices"]))
+            self._push_filter_refresh_suppression()
+            try:
+                self.map_dropdown.set_selected(int(snapshot["selected"]))
+            finally:
+                self._pop_filter_refresh_suppression()
+        except Exception:
+            logger.exception("Experimental startup row batching could not restore map choices")
+        filter_state = snapshot.get("filter_state")
+        self._filter_state = dict(filter_state) if isinstance(filter_state, dict) else filter_state
+
+    def _fail_startup_row_batches(self, generation: int, outcome: str) -> None:
+        state = getattr(self, "_startup_row_batch_state", None)
+        if not isinstance(state, dict) or state.get("generation") != generation:
+            return
+        complete = state.get("complete")
+        DZLLWindow._restore_startup_map_state(self, state)
+        self._startup_row_batch_generation = generation + 1
+        self._startup_row_batch_state = None
+        self._startup_row_batch_idle_id = 0
+        self._suggestion_sweep_fallback_ready = True
+        self._server_companion_rows_loaded = False
+        try:
+            self.empty_label.set_text("No Servers Found (Startup List Build Failed).")
+            self.empty_label.set_visible(True)
+            self._complete_startup_presentation()
+        except Exception:
+            try:
+                self._set_updating(False)
+            except Exception:
+                pass
+        finally:
+            self._server_db_update_inflight = False
+            if callable(complete):
+                try:
+                    complete(outcome)
+                except Exception:
+                    logger.exception("Failed startup row completion callback failed")
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "startup_row_batch_failure", time.monotonic_ns(), duration_ns=0,
+                timer_scope="marker", outcome=outcome,
+            )
+
+    def _cancel_startup_row_batches(self, reason: str) -> None:
+        state = getattr(self, "_startup_row_batch_state", None)
+        source_id = int(getattr(self, "_startup_row_batch_idle_id", 0) or 0)
+        DZLLWindow._restore_startup_map_state(self, state)
+        self._startup_row_batch_generation = int(
+            getattr(self, "_startup_row_batch_generation", 0) or 0
+        ) + 1
+        self._startup_row_batch_state = None
+        self._startup_row_batch_idle_id = 0
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+        if PERF_LOG_ENABLED and isinstance(state, dict):
+            _log_startup_apply_phase(
+                self, "startup_row_batch_cancelled", time.monotonic_ns(), duration_ns=0,
+                timer_scope="marker", reason=reason,
+                completed_rows=state.get("index", 0), total_rows=len(state.get("rows", ())),
+            )
 
     # ----------------------------
     # Load rows
     # ----------------------------
+    def _log_server_mod_cache_apply(self, start_ns, stages, hits, misses, fingerprint_ns, restore_ns, rebuild_ns, entries):
+        stages = stages or {}
+        load_ns = int(stages.get("total_ns", 0))
+        total_ns = load_ns + fingerprint_ns + restore_ns + rebuild_ns
+        _log_startup_apply_phase(
+            self, "server_mod_cache_apply", start_ns,
+            duration_ns=total_ns, hits=hits, misses=misses,
+            timer_scope="overlap", overlaps="row_loop_total",
+            hit_rate=f"{hits / (hits + misses):.4f}" if hits + misses else "0.0000",
+            entries=entries, file_bytes=getattr(self, "_server_mod_cache_file_bytes", 0),
+            cache_read_ms=f"{stages.get('read_ns', 0) / 1_000_000:.3f}",
+            cache_integrity_ms=f"{stages.get('integrity_ns', 0) / 1_000_000:.3f}",
+            cache_decode_ms=f"{stages.get('decode_ns', 0) / 1_000_000:.3f}",
+            cache_envelope_restore_ms=f"{stages.get('restore_ns', 0) / 1_000_000:.3f}",
+            fingerprint_ms=f"{fingerprint_ns / 1_000_000:.3f}",
+            record_restore_ms=f"{restore_ns / 1_000_000:.3f}",
+            miss_rebuild_ms=f"{rebuild_ns / 1_000_000:.3f}",
+            total_cache_ms=f"{total_ns / 1_000_000:.3f}",
+            peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+        )
+
+    def _schedule_server_mod_cache_write(self, expected_generation=None):
+        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
+                (expected_generation is not None and expected_generation != int(getattr(self, "_server_mod_cache_generation", 0) or 0))):
+            return False
+        candidate = getattr(self, "_server_mod_cache_candidate", None)
+        if not candidate:
+            return False
+        fingerprints = {key: record[0] for key, record in candidate.items()}
+        self._server_mod_cache_records = dict(candidate)
+        if (fingerprints == getattr(self, "_server_mod_cache_persisted", {}) and
+                not bool(getattr(self, "_server_mod_cache_needs_repair", False))):
+            return False
+        path = getattr(self, "_server_mod_cache_path", None) or server_mod_cache.cache_path()
+        generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0)
+        plain_records = dict(candidate)
+        start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        try:
+            future = self._update_executor.submit(server_mod_cache.stage, path, plain_records,
+                                                  perf_report=(lambda _stages: None) if PERF_LOG_ENABLED else None)
+            future.add_done_callback(lambda done, gen=generation, began=start_ns, expected=fingerprints: GLib.idle_add(
+                DZLLWindow._on_server_mod_cache_write_done, self, gen, began, expected, done,
+            ))
+        except Exception:
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "server_mod_cache_write", start_ns,
+                                  result="submit_failed", entries=len(candidate))
+        return False
+
+    def _on_server_mod_cache_write_done(self, generation, start_ns, fingerprints, future):
+        try:
+            staged, stages = future.result()
+        except Exception:
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "server_mod_cache_write", start_ns,
+                                  result="worker_failed")
+            return False
+        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
+                generation != int(getattr(self, "_server_mod_cache_generation", 0) or 0)):
+            staged.unlink(missing_ok=True)
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "server_mod_cache_write", start_ns,
+                                  result="stale", entries=stages["entries"])
+            return False
+        path = getattr(self, "_server_mod_cache_path", None) or server_mod_cache.cache_path()
+        try:
+            server_mod_cache.publish(staged, path)
+        except OSError:
+            staged.unlink(missing_ok=True)
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "server_mod_cache_write", start_ns,
+                                  result="publish_failed", entries=stages["entries"])
+            return False
+        self._server_mod_cache_persisted = fingerprints
+        self._server_mod_cache_needs_repair = False
+        self._server_mod_cache_file_bytes = stages["file_bytes"]
+        if PERF_LOG_ENABLED:
+            log_startup_phase(
+                self._startup_perf_origin_ns, "server_mod_cache_write", start_ns,
+                result="published", generation=generation, entries=stages["entries"], file_bytes=stages["file_bytes"],
+                serialization_ms=f"{stages['serialize_ns'] / 1_000_000:.3f}",
+                write_ms=f"{stages['write_ns'] / 1_000_000:.3f}",
+                total_write_ms=f"{(time.monotonic_ns() - start_ns) / 1_000_000:.3f}",
+                peak_rss_kib=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            )
+        return False
+
     def _load_rows_into_store(self, rows: list) -> bool:
+        self._suggestion_cache_generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0) + 1
+        self._deferred_suggestion_restore_pending = False
+        self._deferred_suggestion_restore_allowed = False
+        self._deferred_suggestion_restore_inflight = False
+        self._server_mod_cache_generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0) + 1
+        cache_path = getattr(self, "_server_mod_cache_path", None) or server_mod_cache.cache_path()
+        cache_load_stages = {} if PERF_LOG_ENABLED else None
+        cache_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        cache_state = "disk_load" if getattr(self, "_server_mod_cache_records", None) is None else "memory_reuse"
+        if getattr(self, "_server_mod_cache_records", None) is None:
+            records = server_mod_cache.load(
+                cache_path, perf_report=(cache_load_stages.update if cache_load_stages is not None else None),
+            )
+            self._server_mod_cache_records = records
+            self._server_mod_cache_persisted = {key: record[0] for key, record in records.items()}
+            self._server_mod_cache_file_bytes = int((cache_load_stages or {}).get("file_bytes", 0))
+        else:
+            records = self._server_mod_cache_records
+        cache_candidate = {}
+        self._server_mod_cache_candidate = cache_candidate
+        cache_hits = cache_misses = fingerprint_ns = restore_ns = rebuild_ns = 0
+        if PERF_LOG_ENABLED:
+            context = getattr(self, "_startup_perf_db_apply_context", None)
+            if not isinstance(context, dict):
+                context = {}
+                self._startup_perf_db_apply_context = context
+            context["server_cache_state"] = cache_state
+        clear_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
         n = self.store.get_n_items()
         if n:
             self.store.splice(0, n, [])
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "source_store_clear", clear_start_ns,
+                timer_scope="exclusive", removed_rows=n,
+            )
+        sidecar_clear_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
         self._obj_by_key.clear()
         self._browser_live_offline_streaks.clear()
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "source_sidecar_clear", sidecar_clear_start_ns,
+                timer_scope="exclusive", endpoint_rows=n,
+            )
 
         if not rows:
+            if len(records) > server_mod_cache.MAX_ENTRIES:
+                self._server_mod_cache_records = {}
+            if PERF_LOG_ENABLED:
+                DZLLWindow._log_server_mod_cache_apply(self, cache_start_ns, cache_load_stages, 0, 0, 0, 0, 0, 0)
+            index_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             self._rebuild_mod_suggestion_index()
+            if PERF_LOG_ENABLED:
+                _log_startup_apply_phase(
+                    self, "global_mod_suggestion_index", index_start_ns,
+                    timer_scope="parent", includes="mod_suggestion_cache_load_or_hit", rows=0,
+                )
             return False
 
+        row_loop_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        scalar_ns = sidecar_ns = mod_prep_ns = object_ns = insertion_ns = 0
+        inserted_rows = 0
+        parsed_mods_by_key = {}
         for dbrow in rows:
+            scalar_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             try:
                 ip, gport, qport = normalize_server_endpoint(
                     dbrow.get("ip"),
@@ -5757,7 +6806,38 @@ class DZLLWindow(Gtk.ApplicationWindow):
             raw_mods_json = dbrow.get("mods")
             mods_json = raw_mods_json if isinstance(raw_mods_json, str) else ""
             mod_count_db = dbrow.get("modCount")
-            cnt, preview = parse_mods_preview(mods_json, max_names=8)
+            k = fav_key(ip, gport)
+            if PERF_LOG_ENABLED:
+                scalar_ns += time.monotonic_ns() - scalar_tick_ns
+            cache_tick = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            digest = server_mod_cache.fingerprint(mods_json)
+            if PERF_LOG_ENABLED:
+                fingerprint_ns += time.monotonic_ns() - cache_tick
+            cache_tick = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            cached_mods = server_mod_cache.lookup(records, k, digest)
+            if PERF_LOG_ENABLED:
+                restore_ns += time.monotonic_ns() - cache_tick
+            parsed_mods = None
+            if cached_mods is None:
+                cache_misses += 1
+                if k in self._server_mod_cache_persisted and self._server_mod_cache_persisted[k] == digest:
+                    self._server_mod_cache_needs_repair = True
+                mod_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+                parsed_mods = ParsedServerMods.from_json(mods_json)
+                cnt, preview = parse_mods_preview(mods_json, max_names=8, parsed_mods=parsed_mods)
+                mod_index = build_server_mod_index(mods_json, parsed_mods=parsed_mods)
+                if PERF_LOG_ENABLED:
+                    elapsed = time.monotonic_ns() - mod_start_ns
+                    mod_prep_ns += elapsed
+                    rebuild_ns += elapsed
+                record = (digest, cnt, preview, mod_index)
+                records[k] = record
+            else:
+                cache_hits += 1
+                cnt, preview, mod_index = cached_mods
+                record = records[k]
+            cache_candidate[k] = record
+            scalar_tick_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             if mod_count_db is not None:
                 try:
                     cnt = int(mod_count_db)
@@ -5786,12 +6866,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 bm_rank = 999999999
 
-            k = fav_key(ip, gport)
             fav = bool(self.favorites.get(k, False))
 
             lp_ts = self.last_played.get(k)
             played_disp = human_last_played(lp_ts) if lp_ts else ""
+            if PERF_LOG_ENABLED:
+                scalar_ns += time.monotonic_ns() - scalar_tick_ns
 
+            object_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             obj = ServerObject(
                 fav=fav,
                 password=password,
@@ -5815,20 +6897,93 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 ping=ping_db,
                 bm_rank=bm_rank,
             )
+            if PERF_LOG_ENABLED:
+                object_ns += time.monotonic_ns() - object_start_ns
+            sidecar_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             obj.name_lc = name.strip().lower()
             obj.ipport_lc = f"{ip}:{gport}".lower()
             obj.search_blob = f"{obj.name_lc}\n{obj.ipport_lc}"
             obj.filter_key = k
             obj.is_likely_test_server = self._is_likely_test_server_name(obj.name_lc)
-            obj.mod_search_index = build_server_mod_index(mods_json)
+            obj.mod_search_index = mod_index
             self._debug_sort_attach_notify_probe(obj)
+            if PERF_LOG_ENABLED:
+                sidecar_ns += time.monotonic_ns() - sidecar_start_ns
 
+            insertion_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             self.store.append(obj)
+            if PERF_LOG_ENABLED:
+                insertion_ns += time.monotonic_ns() - insertion_start_ns
+                inserted_rows += 1
+            sidecar_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             self._obj_by_key[k] = obj
+            parsed_mods_by_key[k] = parsed_mods
             self.live.setdefault(k, {"hide_high_ping": False, "offline": (ping_db < 0)})
+            if PERF_LOG_ENABLED:
+                sidecar_ns += time.monotonic_ns() - sidecar_start_ns
 
-        self._rebuild_mod_suggestion_index()
+        row_loop_ns = time.monotonic_ns() - row_loop_start_ns if PERF_LOG_ENABLED else 0
+        if PERF_LOG_ENABLED:
+            DZLLWindow._log_server_mod_cache_apply(
+                self, cache_start_ns, cache_load_stages, cache_hits, cache_misses,
+                fingerprint_ns, restore_ns, rebuild_ns, len(cache_candidate),
+            )
+            row_other_ns = max(
+                0, row_loop_ns - scalar_ns - sidecar_ns - mod_prep_ns - object_ns - insertion_ns
+            )
+            _log_startup_apply_phase(
+                self, "row_scalar_conversion", row_loop_start_ns,
+                duration_ns=scalar_ns, timer_scope="exclusive_aggregate", rows=inserted_rows,
+            )
+            _log_startup_apply_phase(
+                self, "row_sidecar_attachment", row_loop_start_ns,
+                duration_ns=sidecar_ns, timer_scope="exclusive_aggregate", rows=inserted_rows,
+            )
+            _log_startup_apply_phase(
+                self, "row_conversion", row_loop_start_ns,
+                duration_ns=row_other_ns, timer_scope="exclusive_residual",
+                excludes="row_scalar_conversion,row_sidecar_attachment,mod_preview_index,server_object_construction,source_store_insertion",
+                rows=inserted_rows,
+            )
+            _log_startup_apply_phase(
+                self, "mod_preview_index", row_loop_start_ns,
+                duration_ns=mod_prep_ns, timer_scope="exclusive_aggregate", rows=inserted_rows,
+            )
+            _log_startup_apply_phase(
+                self, "server_object_construction", row_loop_start_ns,
+                duration_ns=object_ns, timer_scope="exclusive_aggregate", rows=inserted_rows,
+            )
+            _log_startup_apply_phase(
+                self, "source_store_insertion", row_loop_start_ns,
+                duration_ns=insertion_ns, timer_scope="exclusive_aggregate", rows=inserted_rows,
+            )
+            _log_startup_apply_phase(
+                self, "row_loop_total", row_loop_start_ns,
+                duration_ns=row_loop_ns,
+                timer_scope="parent", includes="row_scalar_conversion,row_sidecar_attachment,row_conversion,mod_preview_index,server_object_construction,source_store_insertion",
+                rows=inserted_rows,
+            )
+        index_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        self._load_parsed_mods_by_key = parsed_mods_by_key if all(value is not None for value in parsed_mods_by_key.values()) else None
+        if len(records) > server_mod_cache.MAX_ENTRIES:
+            self._server_mod_cache_records = dict(cache_candidate)
+        try:
+            self._rebuild_mod_suggestion_index()
+        finally:
+            self._load_parsed_mods_by_key = None
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "global_mod_suggestion_index", index_start_ns,
+                timer_scope="parent", includes="mod_suggestion_cache_load_or_hit",
+                rows=inserted_rows,
+            )
+        snapshot_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
         self._snapshot_all_sort_keys()
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "sort_key_snapshot", snapshot_start_ns,
+                timer_scope="exclusive", rows=inserted_rows,
+            )
         self._on_filter_changed(reason="load")
         try:
             sorter = getattr(self, "sorter", None)
@@ -5974,6 +7129,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
 
         reason = str(reorder_reason or "unknown")
+        startup_rebuild = PERF_LOG_ENABLED and reason in {"load", "sort:ping"} and not bool(
+            getattr(getattr(self, "_startup_presentation", None), "startup_completed", False)
+        )
+        perf_rebuild_name = ""
+        if startup_rebuild:
+            perf_rebuild_name = (
+                "initial" if reason == "load" else
+                ("warmup" if getattr(self, "_startup_live_rest_started_at", 0.0) else "cached_final")
+            )
+        perf_rebuild_start_ns = time.monotonic_ns() if startup_rebuild else 0
         if self.sort_key == "players" and not self._browser_reorder_is_background_reason(reason):
             self._snapshot_all_sort_keys()
         debug_reorder = DEBUG_BROWSER_REORDER
@@ -6013,6 +7178,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         rejected_rows = 0
         filter_func_elapsed = 0.0
 
+        perf_scan_start_ns = time.monotonic_ns() if startup_rebuild else 0
         for i in range(n):
             obj = self.store.get_item(i)
             if not isinstance(obj, ServerObject):
@@ -6034,8 +7200,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 continue
             rows.append(obj)
         filter_elapsed = (time.perf_counter() - filter_start) if filter_start is not None else 0.0
+        if startup_rebuild:
+            _log_startup_apply_phase(
+                self, f"{perf_rebuild_name}_filter_scan", perf_scan_start_ns,
+                timer_scope="exclusive", source_rows=n, matched_rows=len(rows),
+            )
 
         sort_start = time.perf_counter() if (DEBUG_COLUMN_SORT or DEBUG_SORT or timing_enabled) else None
+        perf_sort_start_ns = time.monotonic_ns() if startup_rebuild else 0
 
         def bm_group_for_sort(obj: ServerObject) -> int:
             try:
@@ -6109,8 +7281,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         rows.sort(key=row_sort_key)
         sort_elapsed = (time.perf_counter() - sort_start) if sort_start is not None else 0.0
+        if startup_rebuild:
+            _log_startup_apply_phase(
+                self, f"{perf_rebuild_name}_sort", perf_sort_start_ns,
+                timer_scope="exclusive", rows=len(rows),
+            )
 
         replace_start = time.perf_counter() if (DEBUG_COLUMN_SORT or timing_enabled) else None
+        perf_splice_start_ns = time.monotonic_ns() if startup_rebuild else 0
         old_count_start = time.perf_counter() if timing_enabled else None
         old_count = 0
         old_count_elapsed = 0.0
@@ -6178,6 +7356,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             new_store_count = len(rows)
         post_splice_elapsed = (time.perf_counter() - post_splice_start) if post_splice_start is not None else 0.0
         replace_elapsed = (time.perf_counter() - replace_start) if replace_start is not None else 0.0
+        if startup_rebuild:
+            _log_startup_apply_phase(
+                self, f"{perf_rebuild_name}_visible_store_splice", perf_splice_start_ns,
+                timer_scope="exclusive", removed_rows=old_count, inserted_rows=len(rows),
+                update=store_update,
+            )
 
         if STATUS_DIAGNOSTICS.enabled:
             included_ids = {id(obj) for obj in rows}
@@ -6260,6 +7444,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 f"sort_key={self.sort_key} asc={self.sort_asc}",
                 flush=True,
             )
+        if startup_rebuild:
+            _log_startup_apply_phase(
+                self, f"{perf_rebuild_name}_visible_store_rebuild", perf_rebuild_start_ns,
+                timer_scope="parent",
+                includes=f"{perf_rebuild_name}_filter_scan,{perf_rebuild_name}_sort,{perf_rebuild_name}_visible_store_splice",
+                source_rows=n, visible_rows=len(rows),
+            )
+            if perf_rebuild_name == "initial":
+                _schedule_startup_perf_next_frame_tick(self, len(rows))
 
     def _reconcile_visible_store_membership_preserve_order(self, reason: str = "live"):
         display_store = getattr(self, "column_view_store", None)
@@ -6413,6 +7606,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _submit_startup_rest_batches(self, keys, warmup_count=0):
         keys = list(keys or [])
+        eligible_keys = keys[:max(0, int(warmup_count or 0))]
+        startup_completed = bool(
+            getattr(getattr(self, "_startup_presentation", None), "startup_completed", False)
+        )
+        experimental_warmup = bool(A2S_WARMUP_500_ENABLED and not startup_completed)
+        if experimental_warmup:
+            # The production source is already unique (_obj_by_key keys). Keep
+            # the experimental boundary robust for direct callers while
+            # retaining first-occurrence dispatch order.
+            keys = list(dict.fromkeys(keys))
+            warmup_keys = list(dict.fromkeys(eligible_keys))[:_A2S_WARMUP_EXPERIMENT_MAX]
+            warmup_percent = _A2S_WARMUP_EXPERIMENT_READY_PERCENT
+            warmup_mode = "experimental_500_60"
+        else:
+            warmup_keys = keys[:max(0, int(warmup_count or 0))]
+            warmup_percent = int(STARTUP_WARMUP_READY_PERCENT)
+            warmup_mode = "default"
+        self._suggestion_sweep_complete = False
+        self._suggestion_sweep_fallback_ready = False
         self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
         generation = self._startup_live_generation
         self._startup_live_rest_queue = deque(keys)
@@ -6421,12 +7633,29 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._startup_live_rest_total = len(keys)
         self._startup_live_rest_completed = 0
         self._startup_live_rest_started_at = time.monotonic()
-        self._startup_live_rest_last_log_completed = 0
-        self._startup_warmup_keys = set(keys[:warmup_count])
+        self._startup_warmup_mode = warmup_mode
+        self._startup_warmup_cohort_count = len(warmup_keys)
+        self._startup_warmup_ready_percent = warmup_percent
+        self._startup_warmup_keys = set(warmup_keys)
         self._startup_warmup_completed = 0
-        self._startup_warmup_target = max(
-            1, (warmup_count * int(STARTUP_WARMUP_READY_PERCENT) + 99) // 100
-        ) if warmup_count else 0
+        self._startup_warmup_target = (
+            (len(warmup_keys) * warmup_percent + 99) // 100
+        ) if warmup_keys else 0
+        if PERF_LOG_ENABLED:
+            self._startup_perf_warmup_start_ns = time.monotonic_ns()
+            self._startup_perf_sweep_logged_generation = 0
+            _log_startup_apply_phase(
+                self, "a2s_warmup_start", self._startup_perf_warmup_start_ns,
+                timer_scope="marker", a2s_generation=generation,
+                warmup_mode=warmup_mode,
+                eligible_rows=len(eligible_keys),
+                warmup_rows=len(warmup_keys),
+                cohort_count=len(warmup_keys),
+                completion_percent=warmup_percent,
+                completion_target=self._startup_warmup_target,
+                total_rows=len(keys),
+            )
+        self._startup_live_rest_last_log_completed = 0
         self._startup_warmup_revealed = False
         timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
         if timeout_id:
@@ -6447,14 +7676,23 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 flush=True,
             )
         if not keys:
-            self._complete_startup_warmup(generation)
+            self._complete_startup_warmup(generation, reveal_reason="threshold")
+            self._suggestion_sweep_complete = True
+            if PERF_LOG_ENABLED:
+                self._startup_perf_sweep_logged_generation = generation
+                _log_startup_apply_phase(
+                    self, "a2s_sweep_completion", self._startup_perf_warmup_start_ns,
+                    timer_scope="parent", includes="entire_a2s_sweep_wait_and_callbacks",
+                    a2s_generation=generation, warmup_mode=warmup_mode,
+                    cohort_count=len(warmup_keys), completed=0, total=0,
+                )
             return False
-        if warmup_count:
+        if warmup_keys:
             self._startup_warmup_timeout_id = GLib.timeout_add_seconds(
                 STARTUP_WARMUP_MAX_WAIT_SECS, self._on_startup_warmup_timeout, generation
             )
         else:
-            self._complete_startup_warmup(generation)
+            self._complete_startup_warmup(generation, reveal_reason="threshold")
         self._pump_startup_rest_sweep(generation)
         return False
 
@@ -6462,13 +7700,30 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
             return False
         self._startup_warmup_timeout_id = 0
-        return self._complete_startup_warmup(generation)
+        return self._complete_startup_warmup(generation, reveal_reason="timeout")
 
-    def _complete_startup_warmup(self, generation: int):
+    def _complete_startup_warmup(self, generation: int, reveal_reason=None):
         if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
             return False
         if self._startup_warmup_revealed:
             return False
+        if reveal_reason not in {"threshold", "timeout", "sweep_exhausted"}:
+            reveal_reason = (
+                "threshold"
+                if self._startup_warmup_completed >= self._startup_warmup_target
+                else "timeout"
+            )
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "a2s_warmup_threshold",
+                getattr(self, "_startup_perf_warmup_start_ns", time.monotonic_ns()),
+                timer_scope="parent", includes="warmup_wait_and_result_callbacks",
+                a2s_generation=generation, completed=self._startup_warmup_completed,
+                target=self._startup_warmup_target,
+                warmup_mode=getattr(self, "_startup_warmup_mode", "default"),
+                cohort_count=getattr(self, "_startup_warmup_cohort_count", 0),
+                reason=reveal_reason,
+            )
         self._startup_warmup_revealed = True
         timeout_id = int(getattr(self, "_startup_warmup_timeout_id", 0) or 0)
         self._startup_warmup_timeout_id = 0
@@ -6482,6 +7737,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._auto_sort_lowest_ping_after_startup()
         was_completed = bool(getattr(getattr(self, "_startup_presentation", None), "startup_completed", False))
         self._complete_startup_presentation()
+        if PERF_LOG_ENABLED:
+            publication_ns = int(
+                getattr(self, "_startup_perf_list_publication_ns", 0) or 0
+            )
+            publication_to_dismissal_ms = (
+                f"{(time.monotonic_ns() - publication_ns) / 1_000_000:.3f}"
+                if publication_ns else "unknown"
+            )
+            _log_startup_apply_phase(
+                self, "a2s_warmup_reveal",
+                getattr(self, "_startup_perf_warmup_start_ns", time.monotonic_ns()),
+                timer_scope="parent", includes="warmup_wait,flush,final_sort,overlay_dismissal",
+                a2s_generation=generation, completed=self._startup_warmup_completed,
+                target=self._startup_warmup_target,
+                warmup_mode=getattr(self, "_startup_warmup_mode", "default"),
+                cohort_count=getattr(self, "_startup_warmup_cohort_count", 0),
+                reveal_reason=reveal_reason,
+                publication_to_overlay_dismissal_ms=publication_to_dismissal_ms,
+            )
         if was_completed:
             self._set_updating(False)
         return False
@@ -6573,7 +7847,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             not self._startup_warmup_revealed
             and self._startup_warmup_completed >= self._startup_warmup_target
         ):
-            self._complete_startup_warmup(generation)
+            self._complete_startup_warmup(generation, reveal_reason="threshold")
 
         if DEBUG_STARTUP_LIVE:
             completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
@@ -6623,7 +7897,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._flush_startup_rest_results(generation)
             return False
         if not self._startup_warmup_revealed:
-            self._complete_startup_warmup(generation)
+            reveal_reason = (
+                "threshold"
+                if self._startup_warmup_completed >= self._startup_warmup_target
+                else "sweep_exhausted"
+            )
+            self._complete_startup_warmup(generation, reveal_reason=reveal_reason)
+        self._suggestion_sweep_complete = True
+        if PERF_LOG_ENABLED and getattr(self, "_startup_perf_sweep_logged_generation", 0) != generation:
+            self._startup_perf_sweep_logged_generation = generation
+            _log_startup_apply_phase(
+                self, "a2s_sweep_completion",
+                getattr(self, "_startup_perf_warmup_start_ns", time.monotonic_ns()),
+                timer_scope="parent", includes="entire_a2s_sweep_wait_and_callbacks",
+                a2s_generation=generation, completed=self._startup_live_rest_completed,
+                total=self._startup_live_rest_total,
+                warmup_mode=getattr(self, "_startup_warmup_mode", "default"),
+                cohort_count=getattr(self, "_startup_warmup_cohort_count", 0),
+            )
         if DEBUG_STARTUP_LIVE:
             total = int(getattr(self, "_startup_live_rest_total", 0) or 0)
             completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0)
@@ -7196,8 +8487,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return visible_rows, ahead_rows
 
     def _browser_live_tick(self):
+        DZLLWindow._maybe_schedule_deferred_suggestion_restore(self)
         if self._browser_live_should_pause():
             return True
+        self._maybe_schedule_mod_suggestion_refresh()
+        DZLLWindow._maybe_schedule_mod_suggestion_migration(self)
         self._refresh_last_played_calendar()
         if bool(getattr(self, "_browser_live_inflight", False)):
             return True
@@ -8054,6 +9348,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         raw = str(text or "").strip()
         if not raw:
             return None
+        if (not bool(getattr(self, "_suggestion_cache_ready", False)) and
+                (bool(getattr(self, "_deferred_suggestion_restore_pending", False)) or
+                 bool(getattr(self, "_deferred_suggestion_restore_inflight", False)))):
+            return None
         normalized = normalize_mod_text(raw)
         compact = compact_mod_text(raw)
         index = getattr(self, "_mod_suggestion_index", None)
@@ -8240,14 +9538,399 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._search_filter_debounce_id = 0
 
     def _rebuild_mod_suggestion_index(self):
-        mods_json_values = []
-        try:
-            for obj in self._obj_by_key.values():
-                mods_json_values.append(getattr(obj, "mods_json", "") or "")
-        except Exception:
+        if bool(getattr(self, "_suggestion_cache_ready", False)):
+            if PERF_LOG_ENABLED:
+                context = getattr(self, "_startup_perf_db_apply_context", None)
+                if isinstance(context, dict):
+                    context["suggestion_cache_state"] = "memory_hit"
+                _log_startup_apply_phase(
+                    self, "mod_suggestion_cache_hit", time.monotonic_ns(),
+                    timer_scope="nested", parent="global_mod_suggestion_index",
+                    source="memory", expired=bool(getattr(self, "_suggestion_cache_expired", False)),
+                )
+            self._mod_suggestion_last_rows = ()
+            return
+
+        cache_path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
+        load_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        load_stages = {} if PERF_LOG_ENABLED else None
+        cached = load_suggestion_cache(
+            cache_path, perf_report=(load_stages.update if load_stages is not None else None),
+        )
+        if PERF_LOG_ENABLED:
+            stage_fields = {
+                key.removesuffix("_ns") + "_ms": f"{value / 1_000_000:.3f}"
+                for key, value in load_stages.items() if key.endswith("_ns")
+            }
+            stage_fields["bytes_read"] = load_stages.get("bytes_read", 0)
+            context = getattr(self, "_startup_perf_db_apply_context", None)
+            if isinstance(context, dict):
+                context["suggestion_cache_state"] = "disk_hit" if cached is not None else "disk_miss"
+            _log_startup_apply_phase(
+                self, "mod_suggestion_cache_load", load_start_ns,
+                timer_scope="nested", parent="global_mod_suggestion_index",
+                result=("hit" if cached is not None else "miss"),
+                format=load_stages.get("format", "unknown"),
+                expired=(cached.expired if cached is not None else False),
+                entries=(len(cached.index) if cached is not None else 0),
+                **stage_fields,
+            )
+        if cached is not None:
+            self._mod_suggestion_index = cached.index
+            self._mod_suggestion_last_rows = ()
+            self._suggestion_cache_ready = True
+            self._suggestion_cache_expired = cached.expired
+            self._suggestion_cache_created_at = time.time() - cached.age_seconds
+            self._suggestion_cache_migration_pending = cached.format_version == 1
+            self._suggestion_cache_migration_created_at = cached.created_at
+            self._suggestion_cache_migration_kind = (
+                "v1_migration" if cached.format_version == 1 else None
+            )
+            return
+
+        parsed_mods_by_key = getattr(self, "_load_parsed_mods_by_key", None)
+        if parsed_mods_by_key is not None:
+            self._mod_suggestion_index = build_mod_suggestion_index(
+                (), parsed_mods_values=(parsed_mods_by_key[key] for key in self._obj_by_key),
+            )
+        else:
             mods_json_values = []
-        self._mod_suggestion_index = build_mod_suggestion_index(mods_json_values)
+            try:
+                for obj in self._obj_by_key.values():
+                    mods_json_values.append(getattr(obj, "mods_json", "") or "")
+            except Exception:
+                mods_json_values = []
+            self._mod_suggestion_index = build_mod_suggestion_index(mods_json_values)
         self._mod_suggestion_last_rows = ()
+        if (self._obj_by_key or bool(getattr(self, "_suggestion_current_db_fetched_ok", False))) and not bool(getattr(self, "_suggestion_provisional_load", False)):
+            try:
+                save_suggestion_cache(cache_path, self._mod_suggestion_index)
+                self._suggestion_cache_ready = True
+                self._suggestion_cache_expired = False
+                self._suggestion_cache_created_at = time.time()
+                self._suggestion_cache_migration_pending = False
+                self._suggestion_cache_migration_kind = None
+                if PERF_LOG_ENABLED:
+                    _log_startup_apply_phase(
+                        self, "mod_suggestion_cache_save", load_start_ns,
+                        timer_scope="nested", parent="global_mod_suggestion_index",
+                        entries=len(self._mod_suggestion_index),
+                    )
+            except (OSError, ValueError, TypeError):
+                # The in-memory catalogue remains usable; a later load may retry persistence.
+                pass
+
+    def _maybe_schedule_deferred_suggestion_restore(self):
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return False
+        if bool(getattr(self, "_suggestion_cache_ready", False)):
+            self._deferred_suggestion_restore_pending = False
+            self._deferred_suggestion_restore_allowed = False
+            return False
+        if (not bool(getattr(self, "_deferred_suggestion_restore_pending", False)) or
+                not bool(getattr(self, "_deferred_suggestion_restore_allowed", False)) or
+                bool(getattr(self, "_deferred_suggestion_restore_inflight", False))):
+            return False
+        if not getattr(self, "_obj_by_key", None):
+            return False
+        if (bool(getattr(self, "_suggestion_refresh_inflight", False)) or
+                bool(getattr(self, "_suggestion_cache_migration_inflight", False)) or
+                bool(getattr(self, "_server_db_update_inflight", False)) or
+                time.monotonic() < float(
+                    getattr(self, "_deferred_suggestion_restore_retry_after", 0.0) or 0.0
+                )):
+            return False
+
+        schedule_start_ns = time.monotonic_ns()
+        generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0)
+        perf_context = dict(getattr(self, "_startup_perf_db_apply_context", {}) or {})
+        cache_path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
+        payloads = tuple(
+            getattr(obj, "mods_json", "") or "" for obj in self._obj_by_key.values()
+        )
+        self._deferred_suggestion_restore_inflight = True
+        self._deferred_suggestion_restore_generation = generation
+        try:
+            future = self._update_executor.submit(
+                prepare_deferred_suggestions, cache_path, payloads,
+                measure=PERF_LOG_ENABLED,
+            )
+            future.add_done_callback(
+                lambda done, gen=generation, started=schedule_start_ns: GLib.idle_add(
+                    DZLLWindow._on_deferred_suggestion_restore_done,
+                    self, gen, started, perf_context, done,
+                )
+            )
+        except Exception:
+            if self._deferred_suggestion_restore_generation == generation:
+                self._deferred_suggestion_restore_inflight = False
+            self._deferred_suggestion_restore_retry_after = time.monotonic() + 60.0
+            if PERF_LOG_ENABLED:
+                _log_startup_apply_phase(
+                    self, "deferred_suggestion_schedule", schedule_start_ns,
+                    timer_scope="exclusive", result="submit_failed",
+                    suggestion_generation=generation, rows=len(payloads),
+                )
+            return False
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "deferred_suggestion_schedule", schedule_start_ns,
+                timer_scope="exclusive", result="submitted",
+                suggestion_generation=generation, rows=len(payloads),
+            )
+        return False
+
+    def _on_deferred_suggestion_restore_done(
+            self, generation: int, schedule_start_ns: int,
+            perf_context: dict, future):
+        owns_inflight = (
+            bool(getattr(self, "_deferred_suggestion_restore_inflight", False)) and
+            generation == int(
+                getattr(self, "_deferred_suggestion_restore_generation", 0) or 0
+            )
+        )
+        if owns_inflight:
+            self._deferred_suggestion_restore_inflight = False
+        try:
+            result = future.result()
+        except Exception:
+            if (not bool(getattr(self, "_shutdown_cleanup_done", False)) and
+                    generation == int(getattr(self, "_suggestion_cache_generation", 0) or 0)):
+                self._deferred_suggestion_restore_retry_after = time.monotonic() + 60.0
+            if PERF_LOG_ENABLED:
+                _log_startup_apply_phase(
+                    self, "deferred_suggestion_worker", schedule_start_ns,
+                    timer_scope="worker_duration_unavailable", result="worker_failed",
+                    suggestion_generation=generation, **perf_context,
+                )
+            return False
+
+        stages = dict(getattr(result, "stages", {}) or {})
+        if PERF_LOG_ENABLED:
+            stage_fields = {
+                key.removesuffix("_ns") + "_ms": f"{value / 1_000_000:.3f}"
+                for key, value in stages.items()
+                if key.endswith("_ns") and isinstance(value, int)
+            }
+            _log_startup_apply_phase(
+                self, "deferred_suggestion_worker", schedule_start_ns,
+                duration_ns=int(stages.get("worker_total_ns", 0) or 0),
+                timer_scope="worker_duration_reported_on_main",
+                execution_thread="worker", result=result.outcome,
+                suggestion_generation=generation,
+                entries=int(result.index.get("count", 0) or 0),
+                bytes_read=int(stages.get("bytes_read", 0) or 0),
+                format=stages.get("format", "unknown"),
+                **stage_fields, **perf_context,
+            )
+        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
+                generation != int(getattr(self, "_suggestion_cache_generation", 0) or 0)):
+            if PERF_LOG_ENABLED:
+                _log_startup_apply_phase(
+                    self, "deferred_suggestion_apply", time.monotonic_ns(),
+                    duration_ns=0, timer_scope="main_thread", result="stale",
+                    suggestion_generation=generation, **perf_context,
+                )
+            return False
+
+        apply_start_ns = time.monotonic_ns()
+        self._mod_suggestion_index = result.index
+        self._mod_suggestion_last_rows = ()
+        self._suggestion_cache_ready = True
+        self._suggestion_cache_expired = bool(result.expired)
+        self._suggestion_cache_created_at = float(result.created_at or 0.0)
+        self._suggestion_cache_migration_pending = result.format_version in (0, 1)
+        self._suggestion_cache_migration_created_at = float(result.created_at or 0.0)
+        self._suggestion_cache_migration_kind = {
+            0: "first_save", 1: "v1_migration",
+        }.get(result.format_version)
+        self._deferred_suggestion_restore_pending = False
+        self._deferred_suggestion_restore_allowed = False
+        self._deferred_suggestion_restore_retry_after = 0.0
+        try:
+            self._queue_mod_suggestions_refresh()
+        except Exception:
+            pass
+        apply_ns = time.monotonic_ns() - apply_start_ns
+        if PERF_LOG_ENABLED:
+            _log_startup_apply_phase(
+                self, "deferred_suggestion_apply", apply_start_ns,
+                duration_ns=apply_ns, timer_scope="main_thread",
+                result="committed", source=result.outcome,
+                suggestion_generation=generation,
+                entries=int(result.index.get("count", 0) or 0),
+                **perf_context,
+            )
+            _log_startup_apply_phase(
+                self, "autocomplete_ready", time.monotonic_ns(), duration_ns=0,
+                timer_scope="marker", suggestion_generation=generation,
+                entries=int(result.index.get("count", 0) or 0),
+                source=result.outcome,
+                **perf_context,
+            )
+        return False
+
+    def _maybe_schedule_mod_suggestion_refresh(self):
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return
+        created_at = float(getattr(self, "_suggestion_cache_created_at", 0.0) or 0.0)
+        if created_at and time.time() - created_at >= MOD_SUGGESTION_REFRESH_SECONDS:
+            self._suggestion_cache_expired = True
+        if not bool(getattr(self, "_suggestion_cache_ready", False)) or not bool(getattr(self, "_suggestion_cache_expired", False)):
+            return
+        if (bool(getattr(self, "_suggestion_cache_migration_pending", False)) or
+                bool(getattr(self, "_suggestion_refresh_inflight", False)) or
+                bool(getattr(self, "_suggestion_cache_migration_inflight", False)) or
+                bool(getattr(self, "_server_db_update_inflight", False))):
+            return
+        if not (bool(getattr(self, "_suggestion_sweep_complete", False)) or
+                bool(getattr(self, "_suggestion_sweep_fallback_ready", False))):
+            return
+        if not getattr(self, "_obj_by_key", None) or time.monotonic() < float(getattr(self, "_suggestion_refresh_retry_after", 0.0) or 0.0):
+            return
+
+        generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0)
+        payloads = tuple(getattr(obj, "mods_json", "") or "" for obj in self._obj_by_key.values())
+        cache_path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
+        start_ns = time.monotonic_ns()
+        self._suggestion_refresh_inflight = True
+        try:
+            future = self._update_executor.submit(build_staged_suggestion_cache, cache_path, payloads)
+            future.add_done_callback(lambda done, gen=generation, started=start_ns: GLib.idle_add(
+                self._on_mod_suggestion_refresh_done, gen, started, done,
+            ))
+        except Exception:
+            self._suggestion_refresh_inflight = False
+            self._suggestion_refresh_retry_after = time.monotonic() + 60.0
+            return
+        if PERF_LOG_ENABLED:
+            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_start", start_ns,
+                              generation=generation, rows=len(payloads))
+
+    def _on_mod_suggestion_refresh_done(self, generation: int, start_ns: int, future):
+        self._suggestion_refresh_inflight = False
+        try:
+            replacement, staged_path = future.result()
+        except Exception:
+            self._suggestion_refresh_retry_after = time.monotonic() + 60.0
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_complete", start_ns,
+                                  result="worker_failed")
+            return False
+        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
+                generation != int(getattr(self, "_suggestion_cache_generation", 0) or 0)):
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        try:
+            destination = Path(
+                getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
+            )
+            os.replace(staged_path, destination)
+            _fsync_directory_best_effort(destination.parent)
+        except OSError:
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._suggestion_refresh_retry_after = time.monotonic() + 60.0
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_complete", start_ns,
+                                  result="publish_failed")
+            return False
+        self._mod_suggestion_index = replacement
+        self._mod_suggestion_last_rows = ()
+        self._suggestion_cache_created_at = time.time()
+        self._suggestion_cache_expired = False
+        self._suggestion_cache_migration_pending = False
+        self._suggestion_cache_migration_kind = None
+        if PERF_LOG_ENABLED:
+            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_complete", start_ns,
+                              result="committed", entries=len(replacement))
+        return False
+
+    def _maybe_schedule_mod_suggestion_migration(self):
+        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
+                not bool(getattr(self, "_suggestion_cache_migration_pending", False)) or
+                bool(getattr(self, "_suggestion_cache_migration_inflight", False)) or
+                bool(getattr(self, "_suggestion_refresh_inflight", False)) or
+                bool(getattr(self, "_server_db_update_inflight", False))):
+            return
+        if not (bool(getattr(self, "_suggestion_sweep_complete", False)) or
+                bool(getattr(self, "_suggestion_sweep_fallback_ready", False))):
+            return
+        if time.monotonic() < float(getattr(self, "_suggestion_cache_migration_retry_after", 0.0) or 0.0):
+            return
+        generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0)
+        path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
+        index = self._mod_suggestion_index
+        created_at = float(getattr(self, "_suggestion_cache_migration_created_at", 0.0) or
+                           getattr(self, "_suggestion_cache_created_at", 0.0) or 0.0)
+        kind = getattr(self, "_suggestion_cache_migration_kind", None) or "v1_migration"
+        start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        self._suggestion_cache_migration_inflight = True
+        try:
+            future = self._update_executor.submit(build_staged_suggestion_migration, path, index, created_at)
+            future.add_done_callback(lambda done, gen=generation, started=start_ns: GLib.idle_add(
+                self._on_mod_suggestion_migration_done, gen, started, done,
+            ))
+        except Exception:
+            self._suggestion_cache_migration_inflight = False
+            self._suggestion_cache_migration_retry_after = time.monotonic() + 60.0
+            if bool(getattr(self, "_suggestion_cache_expired", False)):
+                self._suggestion_cache_migration_pending = False
+            return
+        if PERF_LOG_ENABLED:
+            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_start", start_ns,
+                              generation=generation, entries=len(index), kind=kind)
+
+    def _on_mod_suggestion_migration_done(self, generation: int, start_ns: int, future):
+        self._suggestion_cache_migration_inflight = False
+        kind = getattr(self, "_suggestion_cache_migration_kind", None) or "v1_migration"
+        try:
+            staged_path = future.result()
+        except Exception:
+            self._suggestion_cache_migration_retry_after = time.monotonic() + 60.0
+            if bool(getattr(self, "_suggestion_cache_expired", False)):
+                self._suggestion_cache_migration_pending = False
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_complete", start_ns,
+                                  result="worker_failed", kind=kind)
+            return False
+        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
+                generation != int(getattr(self, "_suggestion_cache_generation", 0) or 0) or
+                not bool(getattr(self, "_suggestion_cache_migration_pending", False))):
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+        try:
+            destination = Path(
+                getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
+            )
+            os.replace(staged_path, destination)
+            _fsync_directory_best_effort(destination.parent)
+        except OSError:
+            try:
+                staged_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._suggestion_cache_migration_retry_after = time.monotonic() + 60.0
+            if bool(getattr(self, "_suggestion_cache_expired", False)):
+                self._suggestion_cache_migration_pending = False
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_complete", start_ns,
+                                  result="publish_failed", kind=kind)
+            return False
+        self._suggestion_cache_migration_pending = False
+        self._suggestion_cache_migration_kind = None
+        if PERF_LOG_ENABLED:
+            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_complete", start_ns,
+                              result="committed", entries=len(self._mod_suggestion_index), kind=kind)
+        return False
 
     def _log_mod_suggest(self, message: str):
         if not DEBUG_MOD_SUGGESTIONS:
@@ -8485,8 +10168,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._hide_mod_suggestions("dismissed_token")
             return
 
+        if (not bool(getattr(self, "_suggestion_cache_ready", False)) and
+                (bool(getattr(self, "_deferred_suggestion_restore_pending", False)) or
+                 bool(getattr(self, "_deferred_suggestion_restore_inflight", False)))):
+            self._log_mod_suggest("catalogue not ready; suggestions temporarily unavailable")
+            self._hide_mod_suggestions("catalogue_not_ready")
+            return
+
         try:
-            if len(getattr(self, "_mod_suggestion_index", {}) or {}) <= 0 and getattr(self, "_obj_by_key", None):
+            if (not bool(getattr(self, "_suggestion_cache_ready", False)) and
+                    len(getattr(self, "_mod_suggestion_index", {}) or {}) <= 0 and getattr(self, "_obj_by_key", None)):
                 self._log_mod_suggest("index empty; rebuilding from loaded rows")
                 self._rebuild_mod_suggestion_index()
         except Exception:

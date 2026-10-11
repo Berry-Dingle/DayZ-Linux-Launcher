@@ -232,12 +232,13 @@ def test_map_and_eligible_live_tick_check_rollover(monkeypatch):
     calls = []
     host = SimpleNamespace(
         _refresh_last_played_calendar=lambda: calls.append("refresh"),
+        _maybe_schedule_mod_suggestion_refresh=lambda: calls.append("suggestion"),
         _browser_live_should_pause=lambda: False,
         _browser_live_inflight=True,
     )
     DZLLWindow._on_last_played_map(host)
     assert DZLLWindow._browser_live_tick(host) is True
-    assert calls == ["refresh", "refresh"]
+    assert calls == ["refresh", "suggestion", "refresh"]
     host._browser_live_should_pause = lambda: True
     assert DZLLWindow._browser_live_tick(host) is True
-    assert calls == ["refresh", "refresh"]
+    assert calls == ["refresh", "suggestion", "refresh"]
