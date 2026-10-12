@@ -86,6 +86,7 @@ def warmup_host(monkeypatch, *, warmup_count=80, total=100):
     scheduled = []
     removed = []
     events = []
+    monkeypatch.setattr(window, "A2S_WARMUP_500_ENABLED", False)
     monkeypatch.setattr(window.GLib, "timeout_add_seconds", lambda seconds, callback, generation: scheduled.append((seconds, callback, generation)) or 41)
     monkeypatch.setattr(window.GLib, "timeout_add", lambda *_: 0)
     monkeypatch.setattr(window.GLib, "source_remove", removed.append)

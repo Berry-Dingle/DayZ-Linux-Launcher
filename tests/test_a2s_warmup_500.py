@@ -9,6 +9,75 @@ from dzll_launcher import config, window
 from dzll_launcher.window import DZLLWindow
 
 
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        (None, True),
+        ("1", True),
+        ("0", False),
+        ("", True),
+        ("true", True),
+        ("false", True),
+        ("invalid", True),
+    ],
+)
+@pytest.mark.parametrize(
+    "name", ("DZLL_STARTUP_BATCHING", "DZLL_A2S_WARMUP_500"),
+)
+def test_startup_optimisation_environment_defaults_and_exact_opt_out(
+    monkeypatch, name, value, expected,
+):
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+
+    assert window._environment_feature_enabled(name, default=True) is expected
+
+
+@pytest.mark.parametrize(
+    "batching, warmup, expected",
+    [
+        (None, None, (True, True)),
+        ("1", "1", (True, True)),
+        ("0", "0", (False, False)),
+        ("0", "1", (False, True)),
+        ("1", "0", (True, False)),
+        ("invalid", "invalid", (True, True)),
+    ],
+)
+def test_startup_optimisations_support_independent_explicit_opt_outs(
+    monkeypatch, batching, warmup, expected,
+):
+    for name, value in (
+        ("DZLL_STARTUP_BATCHING", batching),
+        ("DZLL_A2S_WARMUP_500", warmup),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+
+    assert (
+        window._environment_feature_enabled("DZLL_STARTUP_BATCHING", default=True),
+        window._environment_feature_enabled("DZLL_A2S_WARMUP_500", default=True),
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    "value, expected", [(None, False), ("1", True), ("0", False), ("invalid", False)],
+)
+def test_a2s_sweep_diagnostics_remain_exact_opt_in(monkeypatch, value, expected):
+    if value is None:
+        monkeypatch.delenv("DZLL_A2S_SWEEP_DIAGNOSTICS", raising=False)
+    else:
+        monkeypatch.setenv("DZLL_A2S_SWEEP_DIAGNOSTICS", value)
+
+    assert window._environment_feature_enabled(
+        "DZLL_A2S_SWEEP_DIAGNOSTICS", default=False,
+    ) is expected
+
+
 def bind(host, *names):
     for name in names:
         setattr(host, name, MethodType(getattr(DZLLWindow, name), host))
@@ -65,7 +134,7 @@ def warmup_host(monkeypatch, *, experimental, startup_completed=False):
     return host, scheduled, removed, events
 
 
-def test_default_path_keeps_full_eligible_cohort_and_65_percent(monkeypatch):
+def test_explicit_warmup_opt_out_keeps_full_eligible_cohort_and_65_percent(monkeypatch):
     host, scheduled, _removed, _events = warmup_host(monkeypatch, experimental=False)
     keys = [f"server-{index}" for index in range(600)]
 

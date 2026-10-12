@@ -170,7 +170,7 @@ def map_state(host):
     )
 
 
-def test_default_path_is_synchronous_and_opt_in_path_is_idle_batched(monkeypatch):
+def test_explicit_batching_opt_out_is_synchronous_and_default_path_is_idle_batched(monkeypatch):
     rows = [row("One", "10.0.0.1", 40)]
     queued, _removed = install_idle_queue(monkeypatch)
     monkeypatch.setattr(window, "STARTUP_BATCHING_ENABLED", False)

@@ -57,7 +57,7 @@ Rules:
 
 | ID | Investigation | Priority | Status | Decision |
 |---|---|---|---|---|
-| PR16-01 | Startup performance | HIGH | IN PROGRESS | ADAPT — READY FOR DEFAULT ENABLEMENT |
+| PR16-01 | Startup performance | HIGH | CLOSED — IMPLEMENTED | ADAPT |
 | PR16-02 | Direct Connect | MEDIUM | OPEN | INVESTIGATE |
 | PR16-03 | Retained favourites | MEDIUM | OPEN | INVESTIGATE |
 | PR16-04 | Steam Workshop stall detection | MEDIUM | OPEN | INVESTIGATE |
@@ -71,9 +71,9 @@ Rules:
 ## PR16-01 — Startup Performance
 
 Priority: HIGH
-Status: IN PROGRESS
-Decision: ADAPT — READY FOR DEFAULT ENABLEMENT
-Implementation: DEFAULT-OFF STARTUP BATCHING, DEFERRED SUGGESTIONS, VERSION-2 SUGGESTION CACHE, CANONICAL IN-MEMORY PER-SERVER DERIVED-MOD CACHE AND A2S 500/60 EXPERIMENTS IMPLEMENTED AND VERIFIED; COMPACT AUTOCOMPLETE POSTINGS PROTOTYPE REJECTED; FINAL INTEGRATION ACCEPTED FOR A SEPARATE DEFAULT-ENABLEMENT CHANGE
+Status: CLOSED — IMPLEMENTED
+Decision: ADAPT
+Implementation: STARTUP BATCHING, DEFERRED SUGGESTIONS, VERSION-2 SUGGESTION CACHE, CANONICAL IN-MEMORY PER-SERVER DERIVED-MOD CACHE AND A2S 500/60 WARMUP IMPLEMENTED, VERIFIED AND ENABLED BY DEFAULT; EXPLICIT `=0` OPT-OUTS RETAINED; COMPACT AUTOCOMPLETE POSTINGS PROTOTYPE REJECTED
 
 ### Objective
 
@@ -123,10 +123,14 @@ guards. Suggestion restoration and cache persistence are deferred, and A2S
 500/60 changes only the initial readiness cohort; the complete queue continues
 after reveal.
 
-Both experiments remain exact-value, default-off switches:
+Both accepted optimisations are production defaults. Only the exact value `0`
+opts out; absence, `1` and invalid values retain the default-enabled state:
 
-- `DZLL_STARTUP_BATCHING=1`
-- `DZLL_A2S_WARMUP_500=1`
+- `DZLL_STARTUP_BATCHING=0` disables startup row batching.
+- `DZLL_A2S_WARMUP_500=0` disables A2S 500/60 readiness.
+
+`DZLL_A2S_SWEEP_DIAGNOSTICS` remains disabled by default and requires the exact
+value `1`.
 
 | Finding | Resolution evidence | Status |
 |---|---|---|
@@ -182,9 +186,8 @@ establishes production-default acceptance.
   reliability, responsiveness and memory acceptance: **READY**. Both may become
   production defaults in a separate change; this review did not change them.
 
-PR16-01 remains IN PROGRESS only until the separately scoped default-enablement
-change is made and verified. The implementation and acceptance review are
-otherwise complete.
+PR16-01 is CLOSED — IMPLEMENTED. The separately scoped default-enablement
+change and its regression verification are complete.
 
 ### Closure criteria
 
@@ -196,6 +199,11 @@ Close as IMPLEMENTED only when:
 
 Otherwise document the outcome and close as REJECTED
 or DEFERRED as appropriate.
+
+Closure reason: the adapted implementation is incorporated into official DZLL,
+the full lifecycle and display-backed suites pass, both independent live sweeps
+completed, the maintainer accepted the remaining micro-pauses, and the two
+approved optimisations are now production defaults with explicit opt-outs.
 
 ---
 
@@ -629,6 +637,14 @@ before implementing changes.
 
 ### 2026-10-12
 
+- PR16-01 closed as IMPLEMENTED: startup GTK row batching and A2S 500/60 warmup
+  readiness are now enabled when their environment variables are absent. Exact
+  value `1` also enables each feature; exact value `0` independently opts out;
+  invalid values preserve the enabled production default. The synchronous row
+  path and original full-cohort 65% A2S readiness path remain available through
+  those opt-outs. A2S sweep completion, cache behavior and the separately
+  default-off aggregate diagnostic are unchanged. Focused, full display-backed,
+  compilation and diff verification are recorded in the completing commit.
 - PR16-01 final integration review: maintainer-verified Fedora KDE live runs
   independently exhausted the same 12,166 eligible endpoints in both modes.
   The combined experimental run reached its 300/500 readiness threshold,

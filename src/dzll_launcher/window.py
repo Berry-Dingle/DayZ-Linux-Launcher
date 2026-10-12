@@ -304,9 +304,27 @@ SERVER_COMPANION_ALERT_SOUNDS = {
 }
 MOD_SUGGESTION_RESULT_LIMIT = 50
 PERF_LOG_ENABLED = os.environ.get("DZLL_PERF_LOG") == "1"
-STARTUP_BATCHING_ENABLED = os.environ.get("DZLL_STARTUP_BATCHING") == "1"
-A2S_WARMUP_500_ENABLED = os.environ.get("DZLL_A2S_WARMUP_500") == "1"
-A2S_SWEEP_DIAGNOSTICS_ENABLED = os.environ.get("DZLL_A2S_SWEEP_DIAGNOSTICS") == "1"
+
+
+def _environment_feature_enabled(name: str, *, default: bool) -> bool:
+    """Honor exact enable/disable values and otherwise preserve the default."""
+    value = os.environ.get(name)
+    if value == "1":
+        return True
+    if value == "0":
+        return False
+    return default
+
+
+STARTUP_BATCHING_ENABLED = _environment_feature_enabled(
+    "DZLL_STARTUP_BATCHING", default=True,
+)
+A2S_WARMUP_500_ENABLED = _environment_feature_enabled(
+    "DZLL_A2S_WARMUP_500", default=True,
+)
+A2S_SWEEP_DIAGNOSTICS_ENABLED = _environment_feature_enabled(
+    "DZLL_A2S_SWEEP_DIAGNOSTICS", default=False,
+)
 _A2S_WARMUP_EXPERIMENT_MAX = 500
 _A2S_WARMUP_EXPERIMENT_READY_PERCENT = 60
 STARTUP_ROW_BATCH_BUDGET_NS = 6_000_000
