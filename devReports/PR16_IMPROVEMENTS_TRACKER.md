@@ -1,7 +1,7 @@
 # DZLL — PR #16 Improvement Investigation Tracker
 
 Created: 2026-10-10
-Last updated: 2026-10-11
+Last updated: 2026-10-12
 Overall status: OPEN
 Source: GitHub PR #16 — mrmaffen
 Baseline: DZLL v0.4.1-beta
@@ -57,7 +57,7 @@ Rules:
 
 | ID | Investigation | Priority | Status | Decision |
 |---|---|---|---|---|
-| PR16-01 | Startup performance | HIGH | IN PROGRESS | ADAPT |
+| PR16-01 | Startup performance | HIGH | IN PROGRESS | ADAPT — READY FOR DEFAULT ENABLEMENT |
 | PR16-02 | Direct Connect | MEDIUM | OPEN | INVESTIGATE |
 | PR16-03 | Retained favourites | MEDIUM | OPEN | INVESTIGATE |
 | PR16-04 | Steam Workshop stall detection | MEDIUM | OPEN | INVESTIGATE |
@@ -72,8 +72,8 @@ Rules:
 
 Priority: HIGH
 Status: IN PROGRESS
-Decision: ADAPT
-Implementation: DEFAULT-OFF STARTUP BATCHING, DEFERRED SUGGESTIONS, VERSION-2 SUGGESTION CACHE, PER-SERVER DERIVED-MOD CACHE AND A2S 500/60 EXPERIMENTS IMPLEMENTED AND OFFLINE-VERIFIED; PRODUCTION-DEFAULT RUNTIME AND MEMORY ACCEPTANCE PENDING
+Decision: ADAPT — READY FOR DEFAULT ENABLEMENT
+Implementation: DEFAULT-OFF STARTUP BATCHING, DEFERRED SUGGESTIONS, VERSION-2 SUGGESTION CACHE, CANONICAL IN-MEMORY PER-SERVER DERIVED-MOD CACHE AND A2S 500/60 EXPERIMENTS IMPLEMENTED AND VERIFIED; COMPACT AUTOCOMPLETE POSTINGS PROTOTYPE REJECTED; FINAL INTEGRATION ACCEPTED FOR A SEPARATE DEFAULT-ENABLEMENT CHANGE
 
 ### Objective
 
@@ -143,43 +143,48 @@ Both experiments remain exact-value, default-off switches:
 | H1 | Repository tests now assert exact `os.replace` then directory-fsync ordering for refresh and first-save/v1-migration publication. | RESOLVED |
 | H2 | The deferred restoration matrix now covers format v2, asserting no pending migration, `kind is None`, and no publication submission. | RESOLVED |
 
-These resolutions establish scoped default-off commit readiness only. They do
-not establish production-default acceptance.
+These resolutions established scoped default-off commit readiness only. The
+later runtime, live-sweep and maintainer desktop evidence recorded below
+establishes production-default acceptance.
 
 ### Next steps
 
 - [x] Add opt-in startup baseline phase instrumentation to official DZLL.
 - [x] Profile official DZLL startup with representative, controlled data.
-- [ ] Measure main-thread stalls during loading.
+- [x] Measure main-thread stalls during loading.
 - [x] Measure database processing and row preparation.
 - [x] Measure model insertion, filtering and sorting.
 - [x] Measure time to first usable server list.
-- [ ] Measure total startup time and peak memory.
+- [x] Measure total startup time and peak memory.
 - [x] Identify actual bottlenecks before implementing changes.
 - [x] Evaluate worker-side pure Python data preparation.
 - [x] Keep GTK model operations on the main thread.
 - [x] Establish safe GObject ownership and lifecycle.
 - [x] Implement worker failure and executor-submit recovery.
 - [x] Protect against overlapping reloads and stale results.
-- [ ] Test shutdown while asynchronous work is active.
+- [x] Test shutdown while asynchronous work is active.
 - [x] Benchmark against the original implementation.
 
 ### Remaining acceptance work
 
-- [ ] Obtain controlled repeated combined GTK batching/deferred-suggestion runs
+- [x] Obtain controlled repeated combined GTK batching/deferred-suggestion runs
   against matched synchronous controls from byte-identical isolated profiles.
-- [ ] Capture external frame/input responsiveness, first nonempty frame, first
-  responsive interaction, and any post-reveal worker hitch.
-- [ ] Measure maximum and p95 row-slice duration on the final combined code.
-- [ ] Measure current and settled RSS/USS at pre-construction, staging peak,
+- [x] Obtain maintainer desktop acceptance of rendered responsiveness and
+  interaction through startup and post-reveal work.
+- [x] Measure maximum and p95 row-slice duration on the final combined code.
+- [x] Measure current and settled RSS/USS at pre-construction, staging peak,
   suggestion restoration and readiness; peak/high-water RSS alone is not enough.
-- [ ] Complete display-backed filter, favourites, Previously Joined, chip, map,
+- [x] Complete automated display-backed filter, favourites, Previously Joined, chip, map,
   sort and autocomplete checks, including live shutdown/reload fault injection.
-- [ ] Repeat A2S full-sweep accounting in both A/B arms and exercise threshold,
+- [x] Repeat A2S full-sweep accounting in both A/B arms and exercise threshold,
   timeout, offline/failure, submission-failure and user-interaction cases.
-- [ ] Decide whether each default-off experiment meets production-default
-  reliability, responsiveness and memory acceptance. Until then PR16-01 stays
-  IN PROGRESS and neither switch may become default-on.
+- [x] Decide whether each default-off experiment meets production-default
+  reliability, responsiveness and memory acceptance: **READY**. Both may become
+  production defaults in a separate change; this review did not change them.
+
+PR16-01 remains IN PROGRESS only until the separately scoped default-enablement
+change is made and verified. The implementation and acceptance review are
+otherwise complete.
 
 ### Closure criteria
 
@@ -621,6 +626,75 @@ before implementing changes.
 ---
 
 ## Progress log
+
+### 2026-10-12
+
+- PR16-01 final integration review: maintainer-verified Fedora KDE live runs
+  independently exhausted the same 12,166 eligible endpoints in both modes.
+  The combined experimental run reached its 300/500 readiness threshold,
+  dispatched and completed 12,166 attempts, found 10,295 responsive endpoints,
+  and exhausted in 124.042 seconds with zero queued and zero in flight. The
+  normal run reached 922/1,414, dispatched and completed 12,166 attempts, found
+  10,443 responsive endpoints, and exhausted in 122.278 seconds with zero
+  queued and zero in flight. These separate live-network observations establish
+  full-sweep completion but are not a deterministic timing or response-rate
+  comparison. The maintainer reports substantially faster, smoother startup,
+  accepts the remaining two or three minor micro-pauses for this release, and
+  verified filters, search and mod suggestions. Together with the stable
+  45-minute memory plateau, retained cache canonicalisation, GTK publication
+  improvement, lifecycle/failure coverage and the current full display-backed
+  result (2,821 passed, 4 unrelated detached-fixture skips), both startup
+  experiments are **READY** to become production defaults in a separate change.
+  They remain default-off in this review. See
+  `PR16_01_FINAL_INTEGRATION_REVIEW.md`.
+- PR16-01 GTK responsiveness follow-up: temporary per-row, cyclic-GC,
+  idle-gap, model-notification and full-application probes on the byte-identical
+  12,101-row inputs demonstrated that slice overruns are automatic cyclic-GC
+  pauses inside otherwise sub-millisecond row construction, not pathological
+  server records or time between idle callbacks. The final-publication hitch is
+  dominated by the first visible `Gio.ListStore.splice` and its synchronous GTK
+  consumers (193.6–214.2 ms in the matched baseline), plus a 64.1–65.5 ms
+  all-row sort-key snapshot; source-store publication was only 5.4–6.9 ms.
+  The sort-key snapshot now runs incrementally inside the GTK-owned row batches
+  using one captured timestamp. In three matched before/after runs, median final
+  publication improved from 310.4 to 252.1 ms and the median sampled maximum
+  main-loop gap improved from 426.7 to 356.7 ms, with no material HWM increase.
+  Slice maxima remain above the 6 ms budget (matched medians 14.5 before and
+  15.9 ms after), so GC-control experiments were not retained: they moved or
+  deferred pauses rather than proving a lifecycle-safe responsiveness gain.
+  Focused tests passed (86), and the full isolated display-backed suite passed
+  (2,813 passed, 4 unrelated detached-fixture skips). Both switches remain
+  default-off and PR16-01 remains IN PROGRESS; rendered input/frame evidence,
+  the residual first-visible-model hitch and completed matched live A2S sweeps
+  remain acceptance blockers. See `PR16_01_GTK_RESPONSIVENESS_FOLLOWUP.md`.
+- PR16-01 final acceptance: three byte-identical isolated Xvfb controls and
+  three combined experimental runs loaded 12,101 rows with 100% per-server
+  cache hits. Median DB-to-GTK completion improved 1,897 to 1,494 ms, overlay
+  dismissal improved 2.718 to 2.228 seconds, and the sampled pre-overlay
+  main-loop maximum improved 1,955 to 433 ms. Experimental settled USS was
+  15.18 MiB higher and observed peak USS was 20.92 MiB higher. Both synthetic
+  A2S arms completed all 12,101 attempts; early reveal left late results active,
+  autocomplete/filtering worked, and explicit ping sorting restored canonical
+  order. The display-backed full suite passed (2,813 passed, 4 unrelated
+  detached-fixture skips). A bounded live experimental run revealed at 300/500
+  but did not finish the 12,101-endpoint sweep within 90 seconds. More
+  importantly, all three batched runs exceeded the 6 ms slice budget (59.6–77.6
+  ms), final publication remained 325–351 ms, and no external rendered-frame or
+  human input-latency observation was available. Recommendation: **NOT READY**
+  to enable either experiment by default; keep both opt-in and PR16-01 IN
+  PROGRESS pending the blockers in `PR16_01_FINAL_ACCEPTANCE.md`.
+- PR16-01: retained canonical in-memory per-server cache records after successful
+  restoration. On the current 12,101-record cache this removed 14.70 MiB from
+  the reachable Python graph and 8.91 MiB from matched process USS deltas while
+  reusing the restored `frozenset` for row construction and subsequent hits.
+  The on-disk format, atomic writer and join authority are unchanged. A packed
+  32-bit autocomplete-posting prototype was rejected and removed: despite a
+  35.65 MiB traced steady-Python reduction on the same 20,335-entry catalogue,
+  it increased matched warm-load USS by about 16.7 MiB, increased cold-build
+  USS and peak, slowed restoration, and made all measured representative
+  uncached lookups slightly slower. Focused and full regression results are
+  recorded in `PR16_01_MEMORY_OPTIMISATION_RESULTS.md`. Both startup experiments
+  remain default-off and PR16-01 remains IN PROGRESS.
 
 ### 2026-10-11
 

@@ -60,7 +60,12 @@ def lookup(records: dict[str, Any], endpoint: str, digest: str):
     record = records.get(endpoint)
     if isinstance(record, tuple) and len(record) == 4 and record[0] == digest:
         return record[1], record[2], record[3]
-    return _restore(record, digest)
+    restored = _restore(record, digest)
+    if restored is None:
+        return None
+    count, preview, index = restored
+    records[endpoint] = (digest, count, preview, index)
+    return count, preview, index
 
 
 def load(path: Path, *, perf_report: Callable[[dict[str, int]], None] | None = None) -> dict[str, Any]:

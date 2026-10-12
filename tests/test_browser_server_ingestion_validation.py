@@ -1217,10 +1217,46 @@ def test_server_mod_cache_nonstring_input_and_bounded_record_restore(tmp_path, m
     assert host.store.items[0].mods_preview == ""
     _persist_server_mod_candidate(path, host._server_mod_cache_candidate)
     records = server_mod_cache.load(path)
-    assert server_mod_cache.lookup(records, "1.2.3.4:2302", server_mod_cache.fingerprint("")) is not None
     monkeypatch.setattr(server_mod_cache, "MAX_SET_ITEMS", 0)
     records["1.2.3.4:2302"][3] = ["oversized"]
     assert server_mod_cache.lookup(records, "1.2.3.4:2302", server_mod_cache.fingerprint("")) is None
+
+
+def test_server_mod_cache_restoration_canonicalizes_once_and_round_trips_mixed_records(tmp_path):
+    path = tmp_path / "server_mods_v1.json"
+    first = _row("1.2.3.4")
+    first["mods"] = '[{"steamWorkshopId":"42","name":"Code Lock"}]'
+    second = _row("2.3.4.5")
+    second["mods"] = '[{"steamWorkshopId":"84","name":"Other Mod"}]'
+    seed = _BrowserHost()
+    seed._server_mod_cache_path = path
+    assert _load(seed, [first, second]) is True
+    _persist_server_mod_candidate(path, seed._server_mod_cache_candidate)
+
+    records = server_mod_cache.load(path)
+    first_key = "1.2.3.4:2302"
+    second_key = "2.3.4.5:2302"
+    assert type(records[first_key]) is list
+    assert type(records[second_key]) is list
+
+    digest = server_mod_cache.fingerprint(first["mods"])
+    restored = server_mod_cache.lookup(records, first_key, digest)
+    canonical = records[first_key]
+    assert type(canonical) is tuple and len(canonical) == 4
+    assert canonical[0] == digest
+    assert canonical[1:] == restored
+    assert canonical[3] is restored[2]
+
+    second_lookup = server_mod_cache.lookup(records, first_key, digest)
+    assert second_lookup[2] is canonical[3]
+    assert type(records[second_key]) is list
+
+    mixed_path = tmp_path / "mixed.json"
+    _persist_server_mod_candidate(mixed_path, records)
+    reloaded = server_mod_cache.load(mixed_path)
+    assert type(reloaded[first_key]) is list
+    assert type(reloaded[second_key]) is list
+    assert server_mod_cache.lookup(reloaded, first_key, digest) == restored
 
 
 def test_server_mod_cache_hit_preserves_cold_global_suggestion_fallback(tmp_path, monkeypatch):

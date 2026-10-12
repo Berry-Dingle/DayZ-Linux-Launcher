@@ -306,6 +306,7 @@ MOD_SUGGESTION_RESULT_LIMIT = 50
 PERF_LOG_ENABLED = os.environ.get("DZLL_PERF_LOG") == "1"
 STARTUP_BATCHING_ENABLED = os.environ.get("DZLL_STARTUP_BATCHING") == "1"
 A2S_WARMUP_500_ENABLED = os.environ.get("DZLL_A2S_WARMUP_500") == "1"
+A2S_SWEEP_DIAGNOSTICS_ENABLED = os.environ.get("DZLL_A2S_SWEEP_DIAGNOSTICS") == "1"
 _A2S_WARMUP_EXPERIMENT_MAX = 500
 _A2S_WARMUP_EXPERIMENT_READY_PERCENT = 60
 STARTUP_ROW_BATCH_BUDGET_NS = 6_000_000
@@ -321,6 +322,17 @@ ENABLE_LEGACY_GTK_SORT_MODEL = os.environ.get("DZLL_ENABLE_LEGACY_GTK_SORT_MODEL
 DEBUG_SC_DOCK = os.environ.get("DZLL_DEBUG_SC_DOCK") == "1"
 DEBUG_SC_ALERTS = os.environ.get("DZLL_DEBUG_SC_ALERTS") == "1"
 DEBUG_STARTUP_LIVE = os.environ.get("DZLL_DEBUG_STARTUP_LIVE") == "1"
+
+
+def _log_a2s_sweep(message: str, *args) -> None:
+    if not A2S_SWEEP_DIAGNOSTICS_ENABLED:
+        return
+    try:
+        rendered = message % args if args else message
+        sys.stderr.write(f"{rendered}\n")
+        sys.stderr.flush()
+    except Exception:
+        pass  # Diagnostics must never affect sweep scheduling or lifecycle guards.
 
 
 def _log_startup_apply_phase(owner, phase: str, start_ns: int, *, duration_ns=None, **fields) -> None:
@@ -3191,6 +3203,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
         try:
+            DZLLWindow._log_a2s_sweep_terminal(self, "cancelled")
             self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
         except Exception:
             pass
@@ -5986,6 +5999,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass  # A cache timer failure cannot invalidate the loaded server rows.
 
         self._server_companion_rows_loaded = True
+        DZLLWindow._log_a2s_sweep_terminal(self, "superseded")
         self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
         self._restore_server_companion_if_enabled()
         self._set_updating(True, "Updating The Server Database, Please Wait…")
@@ -6116,6 +6130,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "sidecar_ns": 0,
             "mod_prep_ns": 0,
             "object_ns": 0,
+            "sort_key_ns": 0,
             "slice_ns": [],
             "started_ns": started_ns,
             "db_ready_ns": int(db_ready_ns or started_ns),
@@ -6124,6 +6139,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "complete": batched_complete,
             "published": False,
             "previous_map_state": previous_map_state,
+            "sort_snapshot_now_ts": int(time.time()),
         }
         try:
             self._startup_row_batch_idle_id = int(
@@ -6225,9 +6241,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             bm_rank = 999999999
         fav = bool(self.favorites.get(k, False))
         lp_ts = self.last_played.get(k)
-        played_disp = human_last_played(lp_ts) if lp_ts else ""
         if PERF_LOG_ENABLED:
             state["scalar_ns"] += time.monotonic_ns() - scalar_tick_ns
+        sort_key_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+        sort_snapshot_now_ts = int(state["sort_snapshot_now_ts"])
+        played_disp = human_last_played(lp_ts, now_ts=sort_snapshot_now_ts) if lp_ts else ""
+        played_days = local_days_ago(lp_ts, now_ts=sort_snapshot_now_ts) if lp_ts is not None else None
+        sort_ping = (PING_MAX + 999) if ping_db < 0 else ping_db
+        sort_played_days = 999999 if played_days is None else played_days
+        if PERF_LOG_ENABLED:
+            state["sort_key_ns"] += time.monotonic_ns() - sort_key_start_ns
 
         object_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
         obj = ServerObject(
@@ -6237,6 +6260,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             time=time_str, timewarp=timewarp, night_timewarp=night_timewarp,
             played=played_disp, map_name=map_name, players=players,
             max_players=maxp, ping=ping_db, bm_rank=bm_rank,
+            sort_ping=sort_ping, sort_players=players,
+            sort_played_days=sort_played_days,
         )
         if PERF_LOG_ENABLED:
             state["object_ns"] += time.monotonic_ns() - object_start_ns
@@ -6336,9 +6361,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             component_ns["source_store_publication"] = time.monotonic_ns() - tick_ns
 
             tick_ns = time.monotonic_ns()
-            self._snapshot_all_sort_keys()
-            component_ns["sort_key_snapshot"] = time.monotonic_ns() - tick_ns
-            tick_ns = time.monotonic_ns()
             self._on_filter_changed(reason="load")
             component_ns["initial_visible_store_rebuild"] = time.monotonic_ns() - tick_ns
             try:
@@ -6388,7 +6410,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
                 row_other_ns = max(
                     0, row_cpu_ns - state["scalar_ns"] - state["sidecar_ns"] -
-                    state["mod_prep_ns"] - state["object_ns"],
+                    state["mod_prep_ns"] - state["object_ns"] - state["sort_key_ns"],
                 )
                 for phase, duration_ns, scope in (
                     ("row_scalar_conversion", state["scalar_ns"], "exclusive_aggregate"),
@@ -6396,6 +6418,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     ("row_conversion", row_other_ns, "exclusive_residual"),
                     ("mod_preview_index", state["mod_prep_ns"], "exclusive_aggregate"),
                     ("server_object_construction", state["object_ns"], "exclusive_aggregate"),
+                    ("row_sort_key_snapshot", state["sort_key_ns"], "exclusive_aggregate"),
                 ):
                     _log_startup_apply_phase(
                         self, phase, state["started_ns"], duration_ns=duration_ns,
@@ -6462,6 +6485,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             terminal_outcome = "published_post_load_failed"
             logger.exception("Experimental startup row batching failed after publication")
+            DZLLWindow._log_a2s_sweep_terminal(self, "cancelled")
             self._startup_live_generation = int(
                 getattr(self, "_startup_live_generation", 0) or 0
             ) + 1
@@ -7604,7 +7628,51 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return 3
         return 0 if rank <= 100 else (1 if rank <= 1000 else (2 if rank <= 2000 else 3))
 
+    def _log_a2s_sweep_terminal(self, reason: str, generation=None):
+        if not A2S_SWEEP_DIAGNOSTICS_ENABLED:
+            return
+        try:
+            DZLLWindow._log_a2s_sweep_terminal_enabled(self, reason, generation)
+        except Exception:
+            pass  # Diagnostics must never affect sweep lifecycle guards.
+
+    def _log_a2s_sweep_terminal_enabled(self, reason: str, generation=None):
+        active_generation = getattr(self, "_a2s_sweep_diag_generation", None)
+        if active_generation is None:
+            return
+        if generation is not None and generation != active_generation:
+            return
+        if getattr(self, "_a2s_sweep_diag_terminal_generation", None) == active_generation:
+            return
+        queued = len(getattr(self, "_startup_live_rest_queue", ()) or ())
+        inflight = int(getattr(self, "_startup_live_rest_inflight", 0) or 0)
+        dispatched = int(getattr(self, "_a2s_sweep_diag_dispatched", 0) or 0)
+        completed = int(getattr(self, "_a2s_sweep_diag_completed", 0) or 0)
+        responsive = int(getattr(self, "_a2s_sweep_diag_responsive", 0) or 0)
+        started_at = float(getattr(self, "_startup_live_rest_started_at", 0.0) or 0.0)
+        elapsed = max(0.0, time.monotonic() - started_at) if started_at else 0.0
+        self._a2s_sweep_diag_terminal_generation = active_generation
+        _log_a2s_sweep(
+            "[A2S-SWEEP] terminal generation=%s reason=%s elapsed=%.3fs "
+            "attempted_dispatched=%d completed_attempts=%d successfully_responsive=%d "
+            "remaining_queued=%d remaining_inflight=%d",
+            active_generation, reason, elapsed, dispatched, completed, responsive,
+            queued, inflight,
+        )
+        if (
+            reason == "exhausted"
+            and queued == 0
+            and inflight == 0
+            and completed == dispatched
+        ):
+            _log_a2s_sweep(
+                "FULL A2S SWEEP COMPLETE generation=%s elapsed=%.3fs "
+                "attempted_dispatched=%d completed_attempts=%d successfully_responsive=%d",
+                active_generation, elapsed, dispatched, completed, responsive,
+            )
+
     def _submit_startup_rest_batches(self, keys, warmup_count=0):
+        DZLLWindow._log_a2s_sweep_terminal(self, "superseded")
         keys = list(keys or [])
         eligible_keys = keys[:max(0, int(warmup_count or 0))]
         startup_completed = bool(
@@ -7633,6 +7701,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._startup_live_rest_total = len(keys)
         self._startup_live_rest_completed = 0
         self._startup_live_rest_started_at = time.monotonic()
+        self._a2s_sweep_diag_generation = generation
+        self._a2s_sweep_diag_terminal_generation = None
+        self._a2s_sweep_diag_dispatched = 0
+        self._a2s_sweep_diag_completed = 0
+        self._a2s_sweep_diag_responsive = 0
         self._startup_warmup_mode = warmup_mode
         self._startup_warmup_cohort_count = len(warmup_keys)
         self._startup_warmup_ready_percent = warmup_percent
@@ -7641,6 +7714,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._startup_warmup_target = (
             (len(warmup_keys) * warmup_percent + 99) // 100
         ) if warmup_keys else 0
+        if A2S_SWEEP_DIAGNOSTICS_ENABLED:
+            _log_a2s_sweep(
+                "[A2S-SWEEP] start generation=%s distinct_eligible_endpoints=%d",
+                generation, len(set(keys)),
+            )
         if PERF_LOG_ENABLED:
             self._startup_perf_warmup_start_ns = time.monotonic_ns()
             self._startup_perf_sweep_logged_generation = 0
@@ -7678,6 +7756,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if not keys:
             self._complete_startup_warmup(generation, reveal_reason="threshold")
             self._suggestion_sweep_complete = True
+            DZLLWindow._log_a2s_sweep_terminal(self, "exhausted", generation)
             if PERF_LOG_ENABLED:
                 self._startup_perf_sweep_logged_generation = generation
                 _log_startup_apply_phase(
@@ -7712,6 +7791,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 "threshold"
                 if self._startup_warmup_completed >= self._startup_warmup_target
                 else "timeout"
+            )
+        if A2S_SWEEP_DIAGNOSTICS_ENABLED and reveal_reason == "threshold":
+            _log_a2s_sweep(
+                "[A2S-SWEEP] warmup threshold reached generation=%s completed=%d target=%d",
+                generation, self._startup_warmup_completed, self._startup_warmup_target,
             )
         if PERF_LOG_ENABLED:
             _log_startup_apply_phase(
@@ -7803,6 +7887,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._startup_live_rest_inflight = int(getattr(self, "_startup_live_rest_inflight", 0) or 0) + 1
             try:
                 fut = self._startup_live_executor.submit(self._query_startup_rest_one, generation, k, ip, qport)
+                if A2S_SWEEP_DIAGNOSTICS_ENABLED:
+                    self._a2s_sweep_diag_dispatched = int(
+                        getattr(self, "_a2s_sweep_diag_dispatched", 0) or 0
+                    ) + 1
                 fut.add_done_callback(
                     lambda done_fut, gen=generation, key=k: GLib.idle_add(
                         self._on_startup_rest_future_done,
@@ -7829,6 +7917,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
             result_generation, result = fut.result()
         except Exception:
             result_generation, result = generation, None
+        if A2S_SWEEP_DIAGNOSTICS_ENABLED:
+            self._a2s_sweep_diag_completed = int(
+                getattr(self, "_a2s_sweep_diag_completed", 0) or 0
+            ) + 1
+            if (
+                result_generation == generation
+                and isinstance(result, (tuple, list))
+                and len(result) > 1
+                and isinstance(result[1], dict)
+                and bool(result[1].get("ok", False))
+            ):
+                self._a2s_sweep_diag_responsive = int(
+                    getattr(self, "_a2s_sweep_diag_responsive", 0) or 0
+                ) + 1
         if result_generation == generation and result:
             self._startup_live_rest_buffer.append(result)
             if len(self._startup_live_rest_buffer) >= int(STARTUP_LIVE_FLUSH_MAX):
@@ -7904,6 +8006,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
             self._complete_startup_warmup(generation, reveal_reason=reveal_reason)
         self._suggestion_sweep_complete = True
+        DZLLWindow._log_a2s_sweep_terminal(self, "exhausted", generation)
         if PERF_LOG_ENABLED and getattr(self, "_startup_perf_sweep_logged_generation", 0) != generation:
             self._startup_perf_sweep_logged_generation = generation
             _log_startup_apply_phase(

@@ -206,6 +206,11 @@ def test_batched_source_filter_sort_favorite_played_and_duplicate_parity(monkeyp
     monkeypatch.setattr(window, "STARTUP_BATCHING_ENABLED", False)
     sync_events = []
     sync = make_host(rows, sync_events, filter_func=lambda obj: obj.fav)
+    bind(
+        sync, "_set_int_property_if_changed", "_update_row_sort_ping",
+        "_update_row_sort_players", "_update_row_sort_played_days",
+        "_snapshot_row_sort_keys", "_snapshot_all_sort_keys",
+    )
     DZLLWindow._apply_db_rows(sync, rows, True, allow_startup_batching=True)
 
     queued, _removed = install_idle_queue(monkeypatch)
@@ -220,7 +225,8 @@ def test_batched_source_filter_sort_favorite_played_and_duplicate_parity(monkeyp
 
     fields = lambda obj: (
         obj.name, obj.ip, obj.gport, obj.fav, obj.played, obj.mods_json,
-        obj.mod_count, obj.mod_search_index,
+        obj.mod_count, obj.mod_search_index, obj.sort_ping,
+        obj.sort_players, obj.sort_played_days,
     )
     assert [fields(obj) for obj in batch.store.rows] == [fields(obj) for obj in sync.store.rows]
     assert [fields(obj) for obj in batch.column_view_store.rows] == [
@@ -494,9 +500,9 @@ def test_batch_instrumentation_reports_slices_publication_identity_and_cache_cou
     publication = by_name["startup_row_batch_publication"]
     assert publication["load_id"] == 1 and publication["visible_rows"] == 2
     assert publication["largest_publication_component"] in {
-        "source_store_publication", "sort_key_snapshot",
-        "initial_visible_store_rebuild",
+        "source_store_publication", "initial_visible_store_rebuild",
     }
+    assert by_name["row_sort_key_snapshot"]["rows"] == 2
     summary = by_name["startup_row_batch_summary"]
     assert summary["load_id"] == 1
     assert summary["largest_sync_phase"] in {
