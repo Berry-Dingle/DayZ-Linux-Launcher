@@ -12,7 +12,7 @@ Join the DZLL Discord for help, feedback, testing, and community discussion: htt
 
 ## 📦 Requirements
 
-- Linux (Fedora / Ubuntu / Arch / openSUSE)
+- 64-bit x86_64 Linux (Fedora, Ubuntu/Debian, or Arch Linux packages are provided; other distributions may use the source install below)
 - Python 3.10 or newer
 - Native Steam (with DayZ installed)
 - Flatpak Steam is unsupported — use native Steam
@@ -22,7 +22,16 @@ Join the DZLL Discord for help, feedback, testing, and community discussion: htt
 
 ---
 
-## 🚀 Full Install Guide (Step-by-Step)
+## 🚀 Install DZLL
+
+Prebuilt beta packages are provided in the GitHub release for Fedora x86_64
+(RPM), Ubuntu/Debian amd64 (DEB), and Arch Linux x86_64. Verify downloads with
+`SHA256SUMS` before installing. The Fedora source RPM is for rebuilding the
+Fedora package. Distribution package installation is preferred where available;
+the source installation steps below are for users installing from a source
+archive.
+
+## 🛠️ Source Install Guide (Step-by-Step)
 
 **Follow everything in order — do not skip steps.**
 
@@ -67,10 +76,10 @@ sudo zypper install python3 python3-pip python3-gobject python3-gobject-Gdk type
 mkdir -p ~/DayZLinuxLauncher
 cd ~/DayZLinuxLauncher
 
-# Replace with your actual file path
-tar -xzf ~/Downloads/dzll-launcher-v0.4.2-beta.tar.gz
+# Replace with the downloaded tagged source archive path
+tar -xzf ~/Downloads/dzll-tagged-source.tar.gz
 
-cd dzll-launcher-v0.4.2-beta
+cd dzll-release
 ```
 
 ---
@@ -142,12 +151,6 @@ sudo apt install steam-installer
 
 ```bash
 sudo pacman -S steam
-```
-
-### openSUSE
-
-```bash
-sudo zypper install steam
 ```
 
 Launch Steam once and install **DayZ**, then launch DayZ at least once before continuing.
@@ -245,19 +248,6 @@ To fully wipe DZLL state manually:
 
 ```bash
 rm -rf ~/.config/dzll ~/.cache/dzll ~/.local/share/dzll
-```
-
----
-
-## 🧠 Recommended Project Layout
-
-```text
-dzll-launcher-v0.4.2-beta/
-├── src/dzll_launcher/
-├── pyproject.toml
-├── README.md
-├── requirements.txt
-└── .venv/
 ```
 
 ---

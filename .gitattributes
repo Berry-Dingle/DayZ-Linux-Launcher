@@ -1,0 +1,9 @@
+# Keep internal project material in Git without shipping it in source archives.
+/devReports/ export-ignore
+/docs/audit/ export-ignore
+/AGENTS.md export-ignore
+/DZLL_MEMORY.md export-ignore
+/DZLL_RELEASE_PLAYBOOK.md export-ignore
+/.agents/ export-ignore
+/.codex/ export-ignore
+/.qwen/ export-ignore
