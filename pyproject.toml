@@ -7,7 +7,7 @@ name = "dzll_launcher"
 version = "0.4.2b0"
 description = "DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation."
 readme = "README.md"
-license = { text = "LicenseRef-DZLL-Community-Source-1.0 AND LicenseRef-Valve-Steamworks-SDK-terms" }
+license = { text = "LicenseRef-DZLL-Community-Source-1.0 AND LicenseRef-Valve-Steamworks-SDK-Access-Agreement" }
 requires-python = ">=3.10"
 
 dependencies = [

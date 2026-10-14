@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc="Native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation"
 arch=('x86_64')
 url="https://github.com/Berry-Dingle/DayZ-Linux-Launcher"
-license=('LicenseRef-DZLL-Community-Source-1.0' 'LicenseRef-Valve-Steamworks-SDK-terms')
+license=('LicenseRef-DZLL-Community-Source-1.0' 'LicenseRef-Valve-Steamworks-SDK-Access-Agreement')
 depends=(
   'python'
   'python-gobject'

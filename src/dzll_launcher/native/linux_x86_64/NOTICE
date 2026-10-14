@@ -5,6 +5,15 @@ Origin: steamworks_sdk_165.zip, sdk/redistributable_bin/linux64/libsteam_api.so
 SHA-256: eb2dd015b84177cf4f4326fe578aab375fd8931bbbd719c7492420d9777007fe
 Target: Linux x86-64 only
 
-This notice records the binary's origin. The applicable Valve redistribution
-terms and any additional required notices must be confirmed before public
-distribution. DZLL's own licence does not license this Valve binary.
+This file is the Linux x86-64 Steamworks SDK redistributable identified above.
+Valve's Steamworks SDK Access Agreement, section 1.1(b), grants the licensee a
+nonexclusive, royalty-free, terminable, worldwide, nontransferable license to
+reproduce and distribute SDK files from redistributable_bin in object code form
+along with the Licensee Software. The agreement is available at:
+https://partner.steamgames.com/documentation/sdk_access_agreement/
+
+That grant is subject to the agreement's scope and conditions; this notice
+does not expand it or determine whether a particular distribution qualifies as
+Licensee Software. The agreement page reviewed does not state a separate
+redistributable-binary attribution requirement. Valve's copyright is retained
+above. DZLL's own licence does not apply to this binary.

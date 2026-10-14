@@ -3,7 +3,7 @@ Version:        0.4.2
 Release:        0.beta%{?dist}
 Summary:        DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation
 
-License:        LicenseRef-DZLL-Community-Source-1.0 AND LicenseRef-Valve-Steamworks-SDK-terms
+License:        LicenseRef-DZLL-Community-Source-1.0 AND LicenseRef-Valve-Steamworks-SDK-Access-Agreement
 URL:            https://dzllauncher.uk/
 Source0:        %{name}-0.4.2b0.tar.gz
 
