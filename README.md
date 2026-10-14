@@ -79,7 +79,7 @@ cd ~/DayZLinuxLauncher
 # Replace with the downloaded tagged source archive path
 tar -xzf ~/Downloads/dzll-tagged-source.tar.gz
 
-cd dzll-release
+cd DayZ-Linux-Launcher-0.4.2-beta
 ```
 
 ---
