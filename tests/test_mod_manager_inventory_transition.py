@@ -473,9 +473,9 @@ def test_backend_rejects_unproven_or_flatpak_helper_attachment(monkeypatch):
 def test_helper_rejects_short_subscription_buffer_as_partial():
     helper = steam_ugc_helper.SteamUGC.__new__(steam_ugc_helper.SteamUGC)
     helper.ugc = object()
-    helper.GetNumSubscribedItems = lambda _ugc: 5
+    helper.GetNumSubscribedItems = lambda _ugc, _include_disabled: 5
 
-    def get_items(_ugc, values, _maximum):
+    def get_items(_ugc, values, _maximum, _include_disabled):
         values[0] = 10
         values[1] = 20
         return 2

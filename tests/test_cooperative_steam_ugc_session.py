@@ -1486,6 +1486,62 @@ def test_unset_cancel_never_sends_cancel_while_startup_waits_then_succeeds(
     assert not appid_dir.exists()
 
 
+def test_startup_error_preserves_helper_diagnostic_and_session_cleanup(
+        monkeypatch):
+    appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_error_"))
+    process = ProtocolProcess(appid_dir)
+    process.stdout = QueueStdout()
+    process.stdout.push({
+        "type": "session_starting", "request_id": None,
+        "helper_pid": process.pid, "temp_dir": str(appid_dir),
+    })
+    process.stdout.push({
+        "type": "error", "ok": False, "code": "missing_symbols",
+        "message": "Steam UGC entry point unavailable",
+    })
+    monkeypatch.setattr(
+        steam_ugc_backend.subprocess, "Popen", lambda *_args, **_kwargs: process,
+    )
+    session = steam_ugc_backend.CooperativeUGCSession()
+    with pytest.raises(steam_ugc_backend.UGCSessionError) as exc_info:
+        session.run_command("state", timeout=2, mod_ids=[1])
+    assert str(exc_info.value) == (
+        "Steam UGC helper startup failed (missing_symbols): "
+        "Steam UGC entry point unavailable"
+    )
+    assert process.commands == []
+    session.close()
+    assert [message["command"] for message in process.commands] == ["shutdown"]
+    assert not appid_dir.exists()
+
+
+def test_startup_error_with_empty_message_still_shows_helper_code():
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._event = lambda _timeout: {
+        "type": "error", "ok": False, "code": "missing_symbols", "message": "",
+    }
+    with pytest.raises(steam_ugc_backend.UGCSessionError) as exc_info:
+        session._wait_until_ready(timeout=1)
+    assert str(exc_info.value) == (
+        "Steam UGC helper startup failed (missing_symbols): <no message>"
+    )
+
+
+@pytest.mark.parametrize("event", [
+    {"type": "error", "ok": False, "code": "missing_symbols"},
+    {"type": "error", "ok": True, "code": "missing_symbols", "message": "bad"},
+    {"type": "error", "ok": False, "code": "", "message": "bad"},
+    {"type": "unknown", "ok": False, "code": "x", "message": "bad"},
+    {"ok": False, "code": "x", "message": "bad"},
+])
+def test_malformed_or_unknown_startup_event_remains_rejected(event):
+    session = steam_ugc_backend.CooperativeUGCSession()
+    session._event = lambda _timeout: event
+    with pytest.raises(steam_ugc_backend.UGCSessionError,
+                       match="unexpected Steam UGC startup event"):
+        session._wait_until_ready(timeout=1)
+
+
 def test_readiness_timeout_is_failure_without_protocol_cancel(monkeypatch):
     appid_dir = Path(tempfile.mkdtemp(prefix="dzll_steam_ugc_wait_timeout_"))
     process = ProtocolProcess(appid_dir)

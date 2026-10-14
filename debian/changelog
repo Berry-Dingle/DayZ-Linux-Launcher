@@ -1,3 +1,10 @@
+dzll-launcher (0.4.2~b0-1) noble; urgency=medium
+
+  * Vendor Steamworks SDK 1.65 for native Steam UGC on amd64.
+  * Correct Workshop inventory ABI and improve startup diagnostics.
+
+ -- Gareth Brown <dzll-launcher@tutamail.com>  Wed, 14 Oct 2026 00:00:00 +0100
+
 dzll-launcher (0.4.1~b0-1) noble; urgency=medium
 
   * Keep browser ordering stable during live updates and improve startup refresh.

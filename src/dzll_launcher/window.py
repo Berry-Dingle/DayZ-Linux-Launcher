@@ -11521,6 +11521,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             message = (
                 "Steam preparation could not shut down cleanly. Join was aborted."
             )
+            if error.primary_error:
+                message = f"{error.primary_error} {message}"
             if error.helper_process_may_be_alive:
                 if not DZLLWindow._block_join_preparation_lease(
                     self, attempt_id, error,

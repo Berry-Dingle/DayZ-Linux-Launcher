@@ -326,6 +326,7 @@ class UGCHelperReapError(RuntimeError):
         )
         self.reader_cleanup_only = bool(reader_cleanup_only)
         self.steamapi_shutdown_confirmed = bool(steamapi_shutdown_confirmed)
+        self.primary_error = ""
         self._recovery_process = process
         self._recovery_session = session
 
@@ -786,6 +787,16 @@ class CooperativeUGCSession:
             event_type = str(event.get("type") or "")
             if event_type in ("session_starting", "session_waiting", "session_ready"):
                 continue
+            if event_type == "error":
+                code = event.get("code")
+                message = event.get("message")
+                if (event.get("ok") is False
+                        and isinstance(code, str) and code.strip()
+                        and isinstance(message, str)):
+                    raise UGCSessionError(
+                        f"Steam UGC helper startup failed ({code}): "
+                        f"{message if message.strip() else '<no message>'}"
+                    )
             raise UGCSessionError(
                 f"unexpected Steam UGC startup event: {event_type or '<missing>'}"
             )
@@ -1519,7 +1530,8 @@ def _progress(progress_cb, event: dict) -> None:
             pass
 
 
-def _ugc_preflight_event(progress_cb, message: str, *, ok=None, reason: str = "", error: bool = False) -> None:
+def _ugc_preflight_event(progress_cb, message: str, *, ok=None, reason: str = "", error: bool = False,
+                         helper_code=None, helper_message=None, helper_returncode=None) -> None:
     event = {
         "backend": "steam_ugc",
         "type": "preflight",
@@ -1531,6 +1543,12 @@ def _ugc_preflight_event(progress_cb, message: str, *, ok=None, reason: str = ""
         event["reason"] = str(reason)
     if error:
         event["error"] = True
+    if helper_code is not None:
+        event["helper_code"] = helper_code
+    if helper_message is not None:
+        event["helper_message"] = helper_message
+    if helper_returncode is not None:
+        event["helper_returncode"] = helper_returncode
     _progress(progress_cb, event)
 
 
@@ -1635,6 +1653,9 @@ def _run_ugc_native_steam_preflight(
     deadline = time.monotonic() + max(1.0, float(timeout_s))
     last_message_at = 0.0
     attempt = 0
+    last_probe_error = None
+    last_probe_error_rc = None
+    last_probe_rc = None
     while time.monotonic() < deadline:
         if cancel_event is not None and cancel_event.is_set():
             _ugc_preflight_event(progress_cb, "Steam startup cancelled.", ok=False, reason="cancelled", error=True)
@@ -1652,15 +1673,24 @@ def _run_ugc_native_steam_preflight(
         remaining = max(0.1, deadline - time.monotonic())
         probe_timeout = min(UGC_PREFLIGHT_PROBE_TIMEOUT_S, remaining)
         attempt += 1
-        ok, _rc = _run_helper_json_lines(
+        probe_error = []
+
+        def capture_probe_error(event):
+            if isinstance(event, dict) and event.get("type") == "error" and event.get("ok") is False:
+                probe_error.append(event)
+
+        ok, last_probe_rc = _run_helper_json_lines(
             "state",
             appid=int(appid),
             timeout=probe_timeout,
             mod_ids=probe_ids,
             cancel_event=cancel_event,
-            on_event=None,
+            on_event=capture_probe_error,
             progress_cb=None,
         )
+        if probe_error:
+            last_probe_error = probe_error[-1]
+            last_probe_error_rc = last_probe_rc
         if ok:
             _ugc_preflight_event(progress_cb, "Steam is ready.", ok=True, reason="ready")
             return True
@@ -1674,7 +1704,20 @@ def _run_ugc_native_steam_preflight(
             return False
 
     message = "Steam did not become ready. Please make sure native Steam is running and logged in."
-    _ugc_preflight_event(progress_cb, message, ok=False, reason="steam_not_ready", error=True)
+    helper_code = None
+    helper_message = None
+    if last_probe_error is not None:
+        helper_code = last_probe_error.get("code")
+        helper_message = last_probe_error.get("message")
+        if helper_code or helper_message:
+            message += f" Last helper error ({helper_code or 'unknown'}): {helper_message or '<no message>'}"
+    elif last_probe_rc is not None:
+        message += f" Last helper exit status: {last_probe_rc}."
+    _ugc_preflight_event(
+        progress_cb, message, ok=False, reason="steam_not_ready", error=True,
+        helper_code=helper_code, helper_message=helper_message,
+        helper_returncode=last_probe_error_rc if last_probe_error is not None else last_probe_rc,
+    )
     eprint(f"[Steam UGC] {message}")
     return False
 
@@ -2034,6 +2077,12 @@ def _native_helper_attachment_verified(init_event: dict, *, appid: int) -> bool:
         library_path = Path(str(init_event.get("lib") or "")).expanduser().resolve()
         root_low = str(steam_root).casefold()
         lib_low = str(library_path).casefold()
+        from .steam_ugc_helper import bundled_steam_api_path
+        bundled = bundled_steam_api_path()
+        bundled_attachment = bundled is not None and library_path == bundled.resolve()
+        if bundled_attachment:
+            from .steam_native import _valid_native_steam_root
+            bundled_attachment = _valid_native_steam_root(steam_root) is not None
         return bool(
             init_event.get("ok", False)
             and int(init_event.get("appid") or 0) == int(appid)
@@ -2042,7 +2091,7 @@ def _native_helper_attachment_verified(init_event: dict, *, appid: int) -> bool:
             and "com.valvesoftware.steam" not in lib_low
             and "flatpak" not in root_low
             and "flatpak" not in lib_low
-            and library_path.is_relative_to(steam_root)
+            and (library_path.is_relative_to(steam_root) or bundled_attachment)
             and library_path.name == "libsteam_api.so"
         )
     except Exception:

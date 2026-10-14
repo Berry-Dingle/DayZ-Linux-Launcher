@@ -10,8 +10,10 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import subprocess
@@ -37,6 +39,7 @@ SUBSCRIBED_REFRESH_BATCH_TIMEOUT_S = 2.0
 CANCEL_CLEANUP_BATCH_TIMEOUT_S = 2.0
 REMOTE_STORAGE_SUBSCRIBE_RESULT_CALLBACK_ID = 1313
 ERESULT_OK = 1
+SDK_165_LIB_SHA256 = "eb2dd015b84177cf4f4326fe578aab375fd8931bbbd719c7492420d9777007fe"
 
 
 _protocol_stdout = None
@@ -227,6 +230,21 @@ def likely_steam_roots() -> list[Path]:
     ]
 
 
+def bundled_steam_api_path() -> Path | None:
+    """Return only the pinned SDK binary on its supported platform."""
+    if sys.platform != "linux" or platform.machine().lower() not in ("x86_64", "amd64"):
+        return None
+    path = Path(__file__).resolve().parent / "native/linux_x86_64/libsteam_api.so"
+    if not path.is_file():
+        return None
+    try:
+        if hashlib.sha256(path.read_bytes()).hexdigest() != SDK_165_LIB_SHA256:
+            raise CliError(f"bundled Steamworks SDK 1.65 library checksum mismatch: {path}")
+    except OSError as exc:
+        raise CliError(f"could not read bundled Steamworks SDK 1.65 library: {exc}") from exc
+    return path
+
+
 def detect_steam_paths() -> SteamPaths:
     candidates: list[tuple[Path, Path]] = []
     for root in likely_steam_roots():
@@ -234,16 +252,18 @@ def detect_steam_paths() -> SteamPaths:
     for root in likely_steam_roots():
         candidates.append((root, root / "steamapps/common/DayZServer/libsteam_api.so"))
 
+    bundled = bundled_steam_api_path()
     for root, lib in candidates:
         try:
-            if lib.is_file():
+            # A native Steam root is still needed even when SteamAPI is bundled.
+            if lib.is_file() or (bundled is not None and root.is_dir() and (root / "steamapps").is_dir()):
                 dirs = (
                     root / "linux64",
                     root / "steamrt64",
                     root / "steamapps/common/DayZServer",
                 )
                 existing_dirs = tuple(path for path in dirs if path.is_dir())
-                return SteamPaths(root=root, libsteam_api=lib, library_dirs=existing_dirs)
+                return SteamPaths(root=root, libsteam_api=bundled or lib, library_dirs=existing_dirs)
         except Exception:
             continue
     raise CliError("could not find native Steam libsteam_api.so")
@@ -369,7 +389,10 @@ def find_steam_utils_accessor(lib, lib_path: Path) -> str:
 class SteamUGC:
     def __init__(self, paths: SteamPaths):
         self.paths = paths
-        self.lib = ctypes.CDLL(str(paths.libsteam_api))
+        try:
+            self.lib = ctypes.CDLL(str(paths.libsteam_api))
+        except OSError as exc:
+            raise CliError(f"could not load Steam libsteam_api.so at {paths.libsteam_api}: {exc}") from exc
         self.ugc_accessor_name = find_ugc_accessor(self.lib, paths.libsteam_api)
         self.utils_accessor_name = find_steam_utils_accessor(
             self.lib, paths.libsteam_api,
@@ -461,7 +484,7 @@ class SteamUGC:
             "SteamAPI_ISteamUGC_GetNumSubscribedItems"
         )
         if self.GetNumSubscribedItems is not None:
-            self.GetNumSubscribedItems.argtypes = [ctypes.c_void_p]
+            self.GetNumSubscribedItems.argtypes = [ctypes.c_void_p, ctypes.c_bool]
             self.GetNumSubscribedItems.restype = ctypes.c_uint32
 
         self.GetSubscribedItems = self._optional(
@@ -472,6 +495,7 @@ class SteamUGC:
                 ctypes.c_void_p,
                 ctypes.POINTER(ctypes.c_uint64),
                 ctypes.c_uint32,
+                ctypes.c_bool,
             ]
             self.GetSubscribedItems.restype = ctypes.c_uint32
 
@@ -599,13 +623,13 @@ class SteamUGC:
             raise MissingSymbolsError(
                 "Steam UGC subscription enumeration symbols are unavailable"
             )
-        count = int(self.GetNumSubscribedItems(self.ugc))
+        count = int(self.GetNumSubscribedItems(self.ugc, ctypes.c_bool(False)))
         if count <= 0:
             return []
         values = (ctypes.c_uint64 * count)()
         returned = int(
             self.GetSubscribedItems(
-                self.ugc, values, ctypes.c_uint32(count),
+                self.ugc, values, ctypes.c_uint32(count), ctypes.c_bool(False),
             )
         )
         if returned != count:
@@ -671,6 +695,12 @@ class SteamUGC:
         )
 
 
+def flatpak_steam_environment() -> bool:
+    """Report Steam Flatpak identity from Flatpak's application ID."""
+    flatpak_id = str(os.environ.get("FLATPAK_ID") or "").casefold()
+    return flatpak_id == "com.valvesoftware.steam"
+
+
 def init_steam(appid: int) -> tuple[SteamUGC, SteamPaths, tempfile.TemporaryDirectory]:
     paths = detect_steam_paths()
     ensure_ld_library_path(paths)
@@ -687,11 +717,7 @@ def init_steam(appid: int) -> tuple[SteamUGC, SteamPaths, tempfile.TemporaryDire
                 "steam_root": str(paths.root),
                 "lib": str(paths.libsteam_api),
                 "ugc_accessor": steam.ugc_accessor_name,
-                "flatpak_environment": any(
-                    "com.valvesoftware.steam" in f"{key}={value}".casefold()
-                    or str(key).upper().startswith("FLATPAK_")
-                    for key, value in os.environ.items()
-                ),
+                "flatpak_environment": flatpak_steam_environment(),
             }
         )
         return steam, paths, tmp

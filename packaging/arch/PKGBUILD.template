@@ -1,0 +1,61 @@
+# Release-side template. After tagging, pin the measured GitHub tag archive SHA-256.
+# Keep the finalized PKGBUILD outside the tagged source tree to avoid a self-referential checksum.
+pkgname=dzll-launcher
+pkgver=0.4.2
+pkgrel=1
+pkgdesc="Native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation"
+arch=('x86_64')
+url="https://github.com/Berry-Dingle/DayZ-Linux-Launcher"
+license=('LicenseRef-DZLL-Community-Source-1.0' 'LicenseRef-Valve-Steamworks-SDK-terms')
+depends=(
+  'python'
+  'python-gobject'
+  'python-cairo'
+  'gtk4'
+  'gdk-pixbuf2'
+  'graphene'
+)
+makedepends=(
+  'python-build'
+  'python-installer'
+  'python-wheel'
+  'python-setuptools'
+)
+optdepends=(
+  'ffmpeg: Server Companion alert audio playback via ffplay'
+  'mpg123: fallback Server Companion alert audio playback'
+)
+# Native Steam is a runtime prerequisite, not a package dependency.
+# Flatpak Steam is unsupported.
+source=("$url/archive/refs/tags/v0.4.2-beta.tar.gz")
+sha256sums=('REPLACE_WITH_V0_4_2_BETA_TAG_ARCHIVE_SHA256')
+
+build() {
+  cd "DayZ-Linux-Launcher-0.4.2-beta"
+  python -m build --wheel --no-isolation
+}
+
+package() {
+  cd "DayZ-Linux-Launcher-0.4.2-beta"
+
+  python -m installer --destdir="$pkgdir" dist/*.whl
+
+  install -Dm644 com.bdingle.dzll.desktop \
+    "$pkgdir/usr/share/applications/com.bdingle.dzll.desktop"
+  install -Dm644 src/dzll_launcher/images/com.bdingle.dzll.png \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/com.bdingle.dzll.png"
+
+  install -Dm644 src/dzll_launcher/native/linux_x86_64/NOTICE \
+    "$pkgdir/usr/share/licenses/$pkgname/steamworks-sdk-1.65-NOTICE"
+
+  install -Dm644 LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 src/dzll_launcher/a2s/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/python-a2s-LICENSE"
+  install -Dm644 src/dzll_launcher/a2s/NOTICE \
+    "$pkgdir/usr/share/licenses/$pkgname/python-a2s-NOTICE"
+  install -Dm644 src/dzll_launcher/vendor/pypresence/LICENSE \
+    "$pkgdir/usr/share/licenses/$pkgname/pypresence-LICENSE"
+  install -Dm644 src/dzll_launcher/vendor/pypresence/NOTICE \
+    "$pkgdir/usr/share/licenses/$pkgname/pypresence-NOTICE"
+}

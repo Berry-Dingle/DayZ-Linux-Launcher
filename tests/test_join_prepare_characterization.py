@@ -832,6 +832,93 @@ def test_ugc_teardown_error_is_secondary_to_operation_or_confirmed_success(
     assert "shutdown failed" not in str(outcome.error or "").lower()
 
 
+def test_readiness_startup_error_reaches_join_overlay_despite_cleanup_error(
+        monkeypatch, capsys):
+    diagnostic = (
+        "Steam Workshop could not start. Helper error (missing_symbols): "
+        "Steam UGC entry point unavailable"
+    )
+
+    class TeardownFailingSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            steam_ugc_backend.unregister_owned_ugc_session(self)
+            raise RuntimeError("secondary teardown failure")
+
+    def fail_readiness(*_args, **_kwargs):
+        raise steam_ugc_backend.UGCSessionError(diagnostic)
+
+    monkeypatch.setattr(join_prepare, "CooperativeUGCSession", TeardownFailingSession)
+    monkeypatch.setattr(join_prepare, "wait_for_ugc_ready", fail_readiness)
+    monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
+    win = CharacterizationHarness()
+    obj = SimpleNamespace(name="Synthetic", ip="127.0.0.1", gport=2302)
+    join_prepare.join_prepare_and_launch(
+        win, obj, [(101, "Mod 101")], "/unused", "/prefix", "/watch",
+        True, True, attempt_id=1,
+    )
+    assert diagnostic in win.errors
+    assert all("teardown failure" not in error for error in win.errors)
+    assert win.launches == 0
+    assert "Secondary cleanup diagnostic" in capsys.readouterr().err
+
+
+def test_unconfirmed_reap_retains_primary_startup_error(monkeypatch):
+    diagnostic = "Steam Workshop could not start. Helper error (missing_symbols): unavailable"
+
+    class ReapFailingSession:
+        def __init__(self, **_kwargs):
+            pass
+
+        def close(self):
+            steam_ugc_backend.unregister_owned_ugc_session(self)
+            raise steam_ugc_backend.UGCHelperReapError("helper may still be running")
+
+    monkeypatch.setattr(join_prepare, "CooperativeUGCSession", ReapFailingSession)
+    monkeypatch.setattr(join_prepare, "dayz_paths_summary", lambda: {})
+    monkeypatch.setattr(
+        join_prepare, "wait_for_ugc_ready",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            steam_ugc_backend.UGCSessionError(diagnostic)
+        ),
+    )
+    win = CharacterizationHarness()
+    with pytest.raises(steam_ugc_backend.UGCHelperReapError) as exc_info:
+        join_prepare.prepare_required_mods(
+            win, [(101, "Mod 101")], "/unused", True, True,
+            operation_id=1, server_name="Synthetic",
+        )
+    assert exc_info.value.primary_error == diagnostic
+    assert exc_info.value.helper_process_may_be_alive
+
+
+def test_backend_error_reaches_join_overlay_without_changing_failure_or_cancel(
+        monkeypatch):
+    diagnostic = (
+        "Steam Workshop could not start. Helper error (missing_symbols): "
+        "Steam UGC entry point unavailable"
+    )
+
+    def failed_install(self, **kwargs):
+        kwargs["progress_cb"]({"type": "error", "message": diagnostic})
+        kwargs["progress_cb"]({"type": "error", "message": "cleanup failed"})
+        if self.cancelled:
+            self._join_preparation_cancel_event.set()
+        return False
+
+    monkeypatch.setattr(CharacterizationHarness, "run_steam_client_install", failed_install)
+    win = run_characterized(monkeypatch, backend_ok=False)
+    assert diagnostic in win.errors
+    assert win.launches == 0
+
+    cancelled = run_characterized(monkeypatch, backend_ok=False, cancelled=True)
+    assert "Mod download cancelled" in cancelled.errors
+    assert diagnostic not in cancelled.errors
+    assert cancelled.launches == 0
+
+
 def test_shared_preparation_source_has_no_join_only_operations():
     shared_source = JOIN_SOURCE.split("def prepare_required_mods", 1)[1].split(
         "def join_prepare_and_launch", 1

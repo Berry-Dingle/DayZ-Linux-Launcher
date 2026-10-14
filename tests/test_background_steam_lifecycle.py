@@ -193,6 +193,40 @@ def test_wait_only_preflight_never_launches_across_false_process_probes(monkeypa
     assert len(attempts) == 3
 
 
+def test_readiness_timeout_retains_last_helper_error_without_forwarding_probe(
+        monkeypatch):
+    events = []
+    clock = [0.0]
+
+    def monotonic():
+        clock[0] += 0.2
+        return clock[0]
+
+    def failed_probe(*_args, **kwargs):
+        assert kwargs["progress_cb"] is None
+        kwargs["on_event"]({
+            "type": "error", "ok": False, "code": "missing_symbols",
+            "message": "Steam UGC entry point unavailable",
+        })
+        return False, 3
+
+    monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
+    monkeypatch.setattr(steam_native, "is_native_steam_running", lambda: True)
+    monkeypatch.setattr(steam_ugc_backend, "time", SimpleNamespace(
+        monotonic=monotonic, sleep=lambda _duration: None,
+    ))
+    monkeypatch.setattr(steam_ugc_backend, "_run_helper_json_lines", failed_probe)
+    assert not steam_ugc_backend.wait_for_ugc_ready(
+        [7], launch_policy="wait_only", timeout_s=1.0,
+        progress_cb=events.append,
+    )
+    assert events[-1]["reason"] == "steam_not_ready"
+    assert events[-1]["helper_code"] == "missing_symbols"
+    assert events[-1]["helper_message"] == "Steam UGC entry point unavailable"
+    assert events[-1]["helper_returncode"] == 3
+    assert "Last helper error (missing_symbols)" in events[-1]["message"]
+
+
 def test_wait_only_readiness_cancel_is_prompt_and_launches_nothing(monkeypatch):
     monkeypatch.setattr(steam_native, "is_flatpak_steam_running", lambda: False)
     monkeypatch.setattr(steam_native, "is_native_steam_running", lambda: False)

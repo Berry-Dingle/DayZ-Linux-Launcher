@@ -76,8 +76,10 @@ def run_steam_client_install(
                 if should_log:
                     log(f"[Steam UGC] {message}")
                     last_ugc_preflight_log = message
-            if bool(forwarded.get("error", False)):
-                last_ugc_error = str(forwarded.get("message") or "").strip()
+            if forwarded.get("type") == "error" or bool(forwarded.get("error", False)):
+                message = str(forwarded.get("message") or "").strip()
+                if message and not last_ugc_error:
+                    last_ugc_error = message
             if callable(progress_cb):
                 try:
                     progress_cb(forwarded)

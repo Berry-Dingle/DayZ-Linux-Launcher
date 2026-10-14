@@ -1,0 +1,10 @@
+Steamworks SDK v1.65 (23 July 2026)
+Copyright (c) 1996-2026 Valve Corporation. All rights reserved.
+
+Origin: steamworks_sdk_165.zip, sdk/redistributable_bin/linux64/libsteam_api.so
+SHA-256: eb2dd015b84177cf4f4326fe578aab375fd8931bbbd719c7492420d9777007fe
+Target: Linux x86-64 only
+
+This notice records the binary's origin. The applicable Valve redistribution
+terms and any additional required notices must be confirmed before public
+distribution. DZLL's own licence does not license this Valve binary.

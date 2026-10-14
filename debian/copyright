@@ -17,6 +17,18 @@ License: MIT
 Comment: Unmodified pypresence 4.6.1 snapshot from upstream tag v4.6.1,
  commit 54a4dc1f6c0d6feed47e3e8285b8cb83d843c091.
 
+Files: src/dzll_launcher/native/linux_x86_64/libsteam_api.so
+Copyright: 1996-2026 Valve Corporation
+License: LicenseRef-Valve-Steamworks-SDK-terms
+Comment: Steamworks SDK v1.65, sdk/redistributable_bin/linux64/libsteam_api.so.
+ SHA-256 eb2dd015b84177cf4f4326fe578aab375fd8931bbbd719c7492420d9777007fe.
+ Redistribution rights and required notices must be confirmed before publication.
+
+License: LicenseRef-Valve-Steamworks-SDK-terms
+ The applicable Valve Steamworks SDK redistribution terms have not yet been
+ established for this project. This stanza records provenance only; it does
+ not grant permission to redistribute the library.
+
 License: LicenseRef-DZLL-Community-Source-1.0
  .
  Copyright (c) Gareth Brown and DZLL contributors.

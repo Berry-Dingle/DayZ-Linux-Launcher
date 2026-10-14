@@ -14,7 +14,7 @@ Rules-Requires-Root: no
 Homepage: https://dzllauncher.uk/
 
 Package: dzll-launcher
-Architecture: all
+Architecture: amd64
 Depends:
  ${misc:Depends},
  ${python3:Depends},

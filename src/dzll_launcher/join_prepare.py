@@ -223,6 +223,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
 
         download_ids = []
         status_msg = ""
+        backend_error = [""]
 
         if mod_management_enabled:
             report_readiness = bool(
@@ -558,6 +559,12 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                 ugc_final_ready_logged = [False]
 
                 def _steam_ugc_progress(event):
+                    if (
+                        isinstance(event, dict)
+                        and (event.get("type") == "error" or event.get("error"))
+                        and not backend_error[0]
+                    ):
+                        backend_error[0] = str(event.get("message") or "").strip()
                     event = dict(event or {})
                     event["join_attempt_id"] = int(attempt_id or 0)
                     event["backend_owner"] = "steam_client"
@@ -614,7 +621,7 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                 if bool(operation_cancel_event.is_set()):
                     err_msg = "Mod download cancelled"
                 elif not err_msg:
-                    err_msg = "Mod download failed"
+                    err_msg = backend_error[0] or "Mod download failed"
 
                 try:
                     if manage_join_presence and getattr(win, "_discord", None):
@@ -840,6 +847,8 @@ def prepare_required_mods(win, mods, workshop_dir, mod_management_enabled,
                     cancelled=bool(operation_cancel_event.is_set()),
                 )
         except UGCHelperReapError as exc:
+            if not ok and err_msg:
+                exc.primary_error = str(err_msg)
             raise
         except Exception as exc:
             secondary_error = f"Steam UGC session shutdown failed: {exc}"

@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dzll_launcher"
-version = "0.4.1b0"
+version = "0.4.2b0"
 description = "DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation."
 readme = "README.md"
-license = { text = "LicenseRef-DZLL-Community-Source-1.0" }
+license = { text = "LicenseRef-DZLL-Community-Source-1.0 AND LicenseRef-Valve-Steamworks-SDK-terms" }
 requires-python = ">=3.10"
 
 dependencies = [
@@ -30,6 +30,8 @@ dzll_launcher = [
     "images/*.png",
     "images/*.svg",
     "audio/*.mp3",
+    "native/linux_x86_64/libsteam_api.so",
+    "native/linux_x86_64/NOTICE",
 ]
 "dzll_launcher.a2s" = [
     "LICENSE",

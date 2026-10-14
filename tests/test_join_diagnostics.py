@@ -86,6 +86,28 @@ def test_successful_steam_client_install_is_quiet_by_default(monkeypatch, capsys
     assert captured.err == ""
 
 
+def test_steam_client_logs_first_backend_error_without_changing_failure(monkeypatch):
+    messages = []
+
+    def failed_install(_ids, **kwargs):
+        kwargs["progress_cb"]({
+            "type": "error", "ok": False,
+            "message": "Steam Workshop could not start. Helper error (missing_symbols): entry point unavailable",
+        })
+        kwargs["progress_cb"]({
+            "type": "error", "ok": False, "message": "secondary cleanup error",
+        })
+        return False
+
+    monkeypatch.setattr(steam_client_mods, "run_ugc_install", failed_install)
+    assert not steam_client_mods.run_steam_client_install(
+        workshop_dir="/unused", mod_ids=[101], log_fn=messages.append,
+    )
+    assert messages[-1].endswith(
+        "Helper error (missing_symbols): entry point unavailable"
+    )
+
+
 def test_immutable_server_key_survives_replacement():
     value, _clock, _lines = tracker()
     attempt = begin(value)
@@ -571,6 +593,24 @@ def test_uncaught_join_worker_exception_is_marshaled_and_fails_current_attempt(
         assert gate.blocked_reap_failure
     else:
         assert gate.active_owner == ""
+
+
+def test_join_reap_failure_shows_primary_error_and_keeps_recovery_gate():
+    host, scheduled, events = worker_exception_host()
+    error = steam_ugc_backend.UGCHelperReapError("helper may still be running")
+    error.primary_error = (
+        "Steam Workshop could not start. Helper error (missing_symbols): unavailable"
+    )
+    DZLLWindow._join_worker_future_done(host, 1, failed_future(error))
+    callback, args = scheduled.calls[-1]
+    assert callback(*args) is False
+    assert any(
+        event[0] == "error"
+        and error.primary_error in event[2]
+        and "could not shut down cleanly" in event[2]
+        for event in events
+    )
+    assert preparation_operation_gate(host).blocked_reap_failure
 
 
 def test_foreground_unconfirmed_reap_failure_blocks_later_join_until_recovery():

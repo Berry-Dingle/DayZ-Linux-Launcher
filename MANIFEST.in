@@ -2,6 +2,8 @@ include LICENSE
 include README.md
 include com.bdingle.dzll.desktop
 include requirements.txt
+include src/dzll_launcher/native/linux_x86_64/libsteam_api.so
+include src/dzll_launcher/native/linux_x86_64/NOTICE
 
 graft src/dzll_launcher
 
