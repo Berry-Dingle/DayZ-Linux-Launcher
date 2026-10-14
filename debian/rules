@@ -4,3 +4,17 @@ export PYBUILD_SYSTEM=pyproject
 
 %:
 	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_install:
+	dh_auto_install --destdir=debian/dzll-launcher/
+	install -D -m 0644 \
+		src/dzll_launcher/native/linux_x86_64/libsteam_api.so \
+		debian/dzll-launcher/usr/lib/python3/dist-packages/dzll_launcher/native/linux_x86_64/libsteam_api.so
+
+override_dh_python3:
+	dh_python3
+	find debian/dzll-launcher/usr/lib/python3/dist-packages/dzll_launcher/native/linux_x86_64 \
+		-maxdepth 1 -name 'libsteam_api.cpython-*.so' -delete
+
+override_dh_strip:
+	dh_strip -Xlibsteam_api
