@@ -115,3 +115,6 @@ htmlcov/
 /debian/debhelper-build-stamp
 /debian/files
 /debian/*.substvars
+
+# Internal development reports remain local
+/devReports/
