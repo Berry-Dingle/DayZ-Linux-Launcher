@@ -118,3 +118,8 @@ htmlcov/
 
 # Internal development reports remain local
 /devReports/
+
+# Local development and release instructions
+/AGENTS.md
+/MEMORY.md
+/DZLL_RELEASE_PLAYBOOK.md
