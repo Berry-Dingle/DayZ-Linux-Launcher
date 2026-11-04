@@ -393,7 +393,7 @@ def test_final_completion_force_renders_total_then_hides_and_resets(monkeypatch)
     host.sorter = None
     host._status_refresh_scroll_value = None
     host._snapshot_all_sort_keys = lambda: None
-    host._debug_browser_reorder = lambda *_args, **_kwargs: None
+    host._browser_reorder = SimpleNamespace(log=lambda *_args, **_kwargs: None)
     host._rebuild_column_view_store = lambda **_kwargs: None
     host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
     removed = []

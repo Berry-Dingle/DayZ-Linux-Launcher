@@ -537,3 +537,154 @@ class ScrollbarInteractionState:
         generation: int | None = None,
     ) -> ScrollbarInteractionSettlement | None:
         return self.settle(reason=reason, now=now, generation=generation)
+
+
+def scroll_drag_value_text(value) -> str:
+    return "-" if value is None else f"{float(value):.1f}"
+
+
+def format_scroll_drag_summary(
+    settlement: ScrollbarInteractionSettlement,
+    final_value,
+    settle_latency: float,
+    *,
+    applied: int,
+    popup_closed: int,
+    popup_suppressed: int,
+    adjustment_total: float,
+    adjustment_max: float,
+) -> str:
+    """Return the one-line ``[SCROLL-DRAG]`` summary for a settled drag."""
+    watchdog = int(settlement.reason == "watchdog")
+    last_event_gap = settlement.last_adjustment_to_settle
+    last_event_gap_ms = -1.0 if last_event_gap is None else last_event_gap * 1000.0
+    return (
+        "[SCROLL-DRAG] "
+        f"id={settlement.generation} duration_ms={settlement.duration * 1000.0:.1f} "
+        f"reason={settlement.reason} events={settlement.adjustment_events} "
+        f"first={scroll_drag_value_text(settlement.first_adjustment_value)} "
+        f"latest={scroll_drag_value_text(settlement.latest_adjustment_value)} "
+        f"final={scroll_drag_value_text(final_value)} "
+        f"deferred={settlement.deferred_requests} coalesced={settlement.coalesced_requests} "
+        f"deferred_categories={len(settlement.deferred_work)} applied={applied} "
+        "model_rebuild_deferred=0 model_rebuild_applied=0 "
+        "model_reconcile_deferred=0 model_reconcile_applied=0 "
+        f"popup_closed={popup_closed} popup_suppressed={popup_suppressed} "
+        f"adjustment_total_ms={adjustment_total * 1000.0:.3f} "
+        f"adjustment_max_ms={adjustment_max * 1000.0:.3f} "
+        f"settle_latency_ms={settle_latency * 1000.0:.3f} watchdog={watchdog} "
+        f"last_adjustment_to_settle_ms={last_event_gap_ms:.1f} "
+        f"release_observed={int(settlement.reason == 'release')} "
+        f"cancel_observed={int(settlement.reason == 'cancel')} "
+        f"unpaired_release_observed={int(settlement.reason == 'unpaired-release')}"
+    )
+
+
+def format_scroll_drag_factory_summary(
+    snapshot: ScrollbarFactoryMetricsSnapshot | None,
+    *,
+    light_enabled: bool,
+) -> str:
+    """Return the one-line ``[SCROLL-DRAG-FACTORIES]`` summary, or ``""`` without a snapshot."""
+    if snapshot is None:
+        return ""
+    factories = snapshot.factories
+    total_setup = sum(item.setup_count for item in factories.values())
+    total_bind = sum(item.bind_count for item in factories.values())
+    total_unbind = sum(item.unbind_count for item in factories.values())
+    total_bind_ns = sum(item.bind_total_ns for item in factories.values())
+    total_unbind_ns = sum(item.unbind_total_ns for item in factories.values())
+    max_bind_name, max_bind = max(
+        factories.items(), key=lambda item: item[1].bind_max_ns
+    )
+    max_unbind_name, max_unbind = max(
+        factories.items(), key=lambda item: item[1].unbind_max_ns
+    )
+    factory_parts = []
+    for name in SCROLLBAR_FACTORY_NAMES:
+        item = factories[name]
+        factory_parts.append(
+            f"{name}=s{item.setup_count}/b{item.bind_count}:"
+            f"{item.bind_total_ns / 1_000_000.0:.3f}:"
+            f"{item.bind_max_ns / 1_000_000.0:.3f}/u{item.unbind_count}:"
+            f"{item.unbind_total_ns / 1_000_000.0:.3f}:"
+            f"{item.unbind_max_ns / 1_000_000.0:.3f}/"
+            f"l{item.light_bind_count}/f{item.full_bind_count}"
+        )
+    operations = snapshot.operations
+    name_ops = (
+        f"text:{operations.get('name_text_writes', 0)},"
+        f"tip:{operations.get('name_tooltip_writes', 0)},"
+        f"css:{operations.get('name_css_changes', 0)},"
+        f"vis:{operations.get('name_visibility_changes', 0)},"
+        f"owner:{operations.get('name_popover_owner_checks', 0)},"
+        f"popdown:{operations.get('name_popover_popdowns', 0)},"
+        f"prep:{operations.get('name_mod_prepare_calls', 0)},"
+        f"content:{operations.get('name_popover_content_work', 0)},"
+        f"format:{operations.get('name_flag_address_format_calls', 0)}"
+    )
+    action_bound = sum(
+        operations.get(f"{name}_bound_assignments", 0)
+        for name in ("fav", "monitor", "join")
+    )
+    action_tip = sum(
+        operations.get(f"{name}_tooltip_writes", 0)
+        for name in ("fav", "monitor", "join")
+    )
+    action_css = sum(
+        operations.get(f"{name}_css_changes", 0)
+        for name in ("fav", "monitor", "join")
+    )
+    action_image = sum(
+        operations.get(f"{name}_image_state_changes", 0)
+        for name in ("fav", "monitor", "join")
+    )
+    action_label = operations.get("fav_label_writes", 0)
+    light_bind_total_ns = sum(
+        item.light_bind_total_ns for item in factories.values()
+    )
+    settle_cells = ",".join(
+        f"{name}:{operations.get(f'{name}_settle_cells_refreshed', 0)}"
+        for name in SCROLLBAR_FACTORY_NAMES
+    )
+    skipped = (
+        f"text:{operations.get('drag_skipped_text_writes', 0)},"
+        f"tip:{operations.get('drag_skipped_tooltip_writes', 0)},"
+        f"css:{operations.get('drag_skipped_css_writes', 0)},"
+        f"vis:{operations.get('drag_skipped_visibility_writes', 0)},"
+        f"notify_c:{operations.get('drag_skipped_notify_connects', 0)},"
+        f"notify_d:{operations.get('drag_skipped_notify_disconnects', 0)},"
+        f"popup:{operations.get('drag_skipped_popup_preparation', 0)}"
+    )
+    return (
+        f"[SCROLL-DRAG-FACTORIES] id={snapshot.generation} "
+        f"light_enabled={int(light_enabled)} "
+        f"totals=s{total_setup}/b{total_bind}/u{total_unbind} "
+        f"bind_ms={total_bind_ns / 1_000_000.0:.3f} "
+        f"unbind_ms={total_unbind_ns / 1_000_000.0:.3f} "
+        f"max_bind={max_bind_name}:{max_bind.bind_max_ns / 1_000_000.0:.3f} "
+        f"max_unbind={max_unbind_name}:{max_unbind.unbind_max_ns / 1_000_000.0:.3f} "
+        f"light_bind_ms={light_bind_total_ns / 1_000_000.0:.3f} "
+        f"settle_passes={operations.get('settle_full_refresh_passes', 0)} "
+        f"settle_refresh={snapshot.settle_refresh_count}:"
+        f"{snapshot.settle_refresh_total_ns / 1_000_000.0:.3f}:"
+        f"{snapshot.settle_refresh_max_factory}:"
+        f"{snapshot.settle_refresh_max_ns / 1_000_000.0:.3f} "
+        f"registry_before_settle={operations.get('registry_before_settle', 0)} "
+        f"registry_live={operations.get('registry_live', 0)} "
+        f"registry_stale={operations.get('registry_stale', 0)} "
+        f"registry_after_settle={operations.get('registry_after_settle', 0)} "
+        + " ".join(factory_parts)
+        + f" name_ops=({name_ops}) "
+        f"notify={operations.get('notify_connects', 0)}/"
+        f"{operations.get('notify_disconnects', 0)} "
+        f"players_ops=format:{operations.get('players_format_calls', 0)},"
+        f"write:{operations.get('players_label_writes', 0)} "
+        f"ping_ops=format:{operations.get('ping_format_calls', 0)},"
+        f"write:{operations.get('ping_label_writes', 0)} "
+        f"light_visuals=flag:{operations.get('light_flag_updates', 0)},"
+        f"ping_color:{operations.get('light_ping_colour_updates', 0)} "
+        f"action_ops=bound:{action_bound},tip:{action_tip},css:{action_css},"
+        f"image:{action_image},label:{action_label} "
+        f"settle_cells=({settle_cells}) skipped=({skipped})"
+    )

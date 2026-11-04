@@ -6,6 +6,7 @@ import sqlite3
 import time
 from concurrent.futures import Future
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -55,8 +56,7 @@ class _BrowserHost:
     def _auto_sort_lowest_ping_after_startup(self):
         return False
 
-    def _debug_sort_attach_notify_probe(self, _obj):
-        pass
+    _sort_debug = SimpleNamespace(attach_notify_probe=lambda _obj: None)
 
     def _is_likely_test_server_name(self, _name):
         return False

@@ -89,7 +89,7 @@ def make_host(rows, events, *, source_store=None, filter_func=None):
         _server_db_update_inflight=True,
         _set_map_choices=lambda _choices: events.append("maps"),
         _is_likely_test_server_name=lambda _name: False,
-        _debug_sort_attach_notify_probe=lambda _obj: None,
+        _sort_debug=SimpleNamespace(attach_notify_probe=lambda _obj: None),
         _rebuild_mod_suggestion_index=lambda: events.append("suggestions"),
         _snapshot_all_sort_keys=lambda: events.append("snapshot"),
         _restore_server_companion_if_enabled=lambda: events.append("companion"),

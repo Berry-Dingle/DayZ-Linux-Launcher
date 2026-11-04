@@ -118,11 +118,20 @@ from .column_view import (
     set_sort_debug_bind_hook,
 )
 from .scrollbar_interaction import (
-    SCROLLBAR_FACTORY_NAMES,
     ScrollbarDragLightController,
     ScrollbarFactoryMetrics,
     ScrollbarInteractionState,
     drag_light_enabled_from_env,
+    format_scroll_drag_factory_summary,
+    format_scroll_drag_summary,
+)
+from .browser_diagnostics import (
+    PERF_STALL_INTERVAL_MS,
+    BrowserPerfDiagnostics,
+    BrowserReorderDebug,
+    FilterTimingLogger,
+    SortDebugRecorder,
+    model_row_count,
 )
 
 from .settings import (
@@ -398,8 +407,6 @@ SCROLL_DRAG_LIGHT_BIND_ENABLED = drag_light_enabled_from_env(
 )
 INCREMENTAL_MODELS_DISABLED = os.environ.get("DZLL_DISABLE_INCREMENTAL_MODELS") == "1"
 INCREMENTAL_MODELS_ENABLED = not INCREMENTAL_MODELS_DISABLED
-PERF_STALL_INTERVAL_MS = 250
-PERF_STALL_LATE_MS = 250
 
 BROWSER_LIVE_SCROLL_PAUSE_SECONDS = 1.0
 SCROLLBAR_INTERACTION_WATCHDOG_MS = 15000
@@ -740,13 +747,33 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.connect("close-request", self._on_close_request)
         self.connect("map", self._on_last_played_map)
         self.connect("unmap", self._on_browser_scrollbar_unmap)
-        self._perf_row_binds = 0
-        self._perf_sort_calls = 0
-        self._perf_sort_total = 0.0
-        self._perf_sort_max = 0.0
-        self._perf_scroll_events = 0
-        self._perf_scroll_total = 0.0
-        self._perf_scroll_max = 0.0
+        self._perf_diagnostics = BrowserPerfDiagnostics(
+            origin_ns=self._startup_perf_origin_ns,
+            is_shut_down=lambda: bool(getattr(self, "_shutdown_cleanup_done", False)),
+            sort_model=lambda: getattr(self, "sort_model", None),
+            filter_model=lambda: getattr(self, "filter_model", None),
+        )
+        self._sort_debug = SortDebugRecorder(
+            enabled=DEBUG_SORT,
+            row_count=lambda: model_row_count(
+                getattr(self, "column_view_store", None),
+                getattr(self, "filter_model", None),
+                getattr(self, "store", None),
+            ),
+        )
+        self._filter_timing = FilterTimingLogger(
+            enabled=DEBUG_FILTER_TIMING,
+            sort_description=lambda: f"{self.sort_key}:{'asc' if self.sort_asc else 'desc'}",
+        )
+        self._browser_reorder = BrowserReorderDebug(
+            enabled=DEBUG_BROWSER_REORDER,
+            store=lambda: getattr(self, "column_view_store", None),
+            scroller=lambda: self.scroller,
+            filter_state=lambda: getattr(self, "_filter_state", None),
+            ping_cutoff=lambda: getattr(self, "_ping_cutoff_ms", 0),
+            key_for_obj=self._browser_reorder_key_for_obj,
+            row_height_px=BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX,
+        )
         self._row_widgets = weakref.WeakSet()
         self._fast_scroll_render_refresh_id = 0
         self._scrollbar_interaction = ScrollbarInteractionState()
@@ -764,12 +791,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._scroll_drag_popup_closed = 0
         self._scroll_drag_popup_suppression_start = 0
         self._scroll_drag_deferred_applied = {}
-        self._perf_stall_last = time.perf_counter()
-        self._filter_timing_enabled = DEBUG_FILTER_TIMING
         if PERF_LOG_ENABLED:
             self._start_perf_diagnostics()
         if DEBUG_SORT:
-            set_sort_debug_bind_hook(self._debug_sort_note_bind)
+            set_sort_debug_bind_hook(self._sort_debug.note_bind)
 
         # SETTINGS (persisted)
         self.settings = load_settings()
@@ -796,7 +821,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.sort_key = "ping"
         self.sort_asc = False  # default: highest ping / offline first
         self._sort_changed_by_user = False
-        self._debug_sort_stats = None
         self._search_filter_debounce_id = 0
         self._scroll_to_top_idle_id = 0
         self._sort_generation = 0
@@ -1438,94 +1462,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
 
     def _start_perf_diagnostics(self):
+        perf = self._perf_diagnostics
         add = self._perf_diagnostic_source_ids.append
-        add(int(GLib.timeout_add(PERF_STALL_INTERVAL_MS, self._perf_main_loop_stall_tick) or 0))
-        add(int(GLib.timeout_add_seconds(1, self._perf_row_bind_tick) or 0))
-        add(int(GLib.timeout_add_seconds(1, self._perf_sort_tick) or 0))
-        add(int(GLib.timeout_add_seconds(1, self._perf_scroll_tick) or 0))
-        add(int(GLib.timeout_add_seconds(1, self._perf_model_pending_tick) or 0))
-
-    def _perf_main_loop_stall_tick(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        now = time.perf_counter()
-        elapsed_ms = (now - float(getattr(self, "_perf_stall_last", now))) * 1000.0
-        self._perf_stall_last = now
-        if elapsed_ms > float(PERF_STALL_INTERVAL_MS + PERF_STALL_LATE_MS):
-            startup_ms = (
-                (time.monotonic_ns() - self._startup_perf_origin_ns) / 1_000_000
-                if self._startup_perf_origin_ns else 0.0
-            )
-            print(f"[PERF] main loop stall: {elapsed_ms:.0f}ms startup_ms={startup_ms:.1f}", flush=True)
-        return True
-
-    def _perf_row_bind_tick(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        count = int(getattr(self, "_perf_row_binds", 0) or 0)
-        self._perf_row_binds = 0
-        if count > 0:
-            print(f"[PERF] row binds/sec={count}", flush=True)
-        return True
-
-    def _perf_sort_tick(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        count = int(getattr(self, "_perf_sort_calls", 0) or 0)
-        total = float(getattr(self, "_perf_sort_total", 0.0) or 0.0)
-        max_one = float(getattr(self, "_perf_sort_max", 0.0) or 0.0)
-        self._perf_sort_calls = 0
-        self._perf_sort_total = 0.0
-        self._perf_sort_max = 0.0
-        if count > 0:
-            print(f"[PERF] sort calls/sec={count} total={total * 1000.0:.1f}ms max={max_one * 1000.0:.1f}ms", flush=True)
-        return True
-
-    def _perf_scroll_tick(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        count = int(getattr(self, "_perf_scroll_events", 0) or 0)
-        total = float(getattr(self, "_perf_scroll_total", 0.0) or 0.0)
-        max_one = float(getattr(self, "_perf_scroll_max", 0.0) or 0.0)
-        self._perf_scroll_events = 0
-        self._perf_scroll_total = 0.0
-        self._perf_scroll_max = 0.0
-        if count > 0:
-            print(f"[PERF] scroll events/sec={count} total={total * 1000.0:.1f}ms max={max_one * 1000.0:.1f}ms", flush=True)
-        return True
-
-    def _perf_model_value(self, model, name: str):
-        if model is None:
-            return None
-        getter = f"get_{name}"
-        try:
-            fn = getattr(model, getter, None)
-            if callable(fn):
-                return fn()
-        except Exception:
-            pass
-        try:
-            return model.get_property(name)
-        except Exception:
-            return None
-
-    def _perf_model_pending_tick(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        sort_pending = self._perf_model_value(getattr(self, "sort_model", None), "pending")
-        filter_pending = self._perf_model_value(getattr(self, "filter_model", None), "pending")
-        sort_incremental = self._perf_model_value(getattr(self, "sort_model", None), "incremental")
-        filter_incremental = self._perf_model_value(getattr(self, "filter_model", None), "incremental")
-        values = {
-            "sort_pending": sort_pending,
-            "filter_pending": filter_pending,
-            "sort_incremental": sort_incremental,
-            "filter_incremental": filter_incremental,
-        }
-        if any(v not in (None, 0, False) for v in values.values()):
-            parts = [f"{k}={v}" for k, v in values.items() if v is not None]
-            print(f"[PERF] model state: {' '.join(parts)}", flush=True)
-        return True
+        add(int(GLib.timeout_add(PERF_STALL_INTERVAL_MS, perf.main_loop_stall_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, perf.row_bind_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, perf.sort_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, perf.scroll_tick) or 0))
+        add(int(GLib.timeout_add_seconds(1, perf.model_pending_tick) or 0))
 
     # ----------------------------
     # Titlebar counts
@@ -2669,10 +2612,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 counts = self._scroll_drag_deferred_applied
                 counts[category] = int(counts.get(category, 0) or 0) + 1
 
-    @staticmethod
-    def _scroll_drag_value_text(value) -> str:
-        return "-" if value is None else f"{float(value):.1f}"
-
     def _print_scroll_drag_summary(self, settlement, final_value, settle_latency) -> None:
         if not SCROLL_DRAG_PERF_ENABLED:
             return
@@ -2682,140 +2621,25 @@ class DZLLWindow(Gtk.ApplicationWindow):
             - int(getattr(self, "_scroll_drag_popup_suppression_start", 0) or 0),
         )
         applied = sum(self._scroll_drag_deferred_applied.values())
-        watchdog = int(settlement.reason == "watchdog")
-        last_event_gap = settlement.last_adjustment_to_settle
-        last_event_gap_ms = -1.0 if last_event_gap is None else last_event_gap * 1000.0
         print(
-            "[SCROLL-DRAG] "
-            f"id={settlement.generation} duration_ms={settlement.duration * 1000.0:.1f} "
-            f"reason={settlement.reason} events={settlement.adjustment_events} "
-            f"first={self._scroll_drag_value_text(settlement.first_adjustment_value)} "
-            f"latest={self._scroll_drag_value_text(settlement.latest_adjustment_value)} "
-            f"final={self._scroll_drag_value_text(final_value)} "
-            f"deferred={settlement.deferred_requests} coalesced={settlement.coalesced_requests} "
-            f"deferred_categories={len(settlement.deferred_work)} applied={applied} "
-            "model_rebuild_deferred=0 model_rebuild_applied=0 "
-            "model_reconcile_deferred=0 model_reconcile_applied=0 "
-            f"popup_closed={self._scroll_drag_popup_closed} popup_suppressed={suppressed} "
-            f"adjustment_total_ms={self._scroll_drag_adjustment_total * 1000.0:.3f} "
-            f"adjustment_max_ms={self._scroll_drag_adjustment_max * 1000.0:.3f} "
-            f"settle_latency_ms={settle_latency * 1000.0:.3f} watchdog={watchdog}",
-            f"last_adjustment_to_settle_ms={last_event_gap_ms:.1f} "
-            f"release_observed={int(settlement.reason == 'release')} "
-            f"cancel_observed={int(settlement.reason == 'cancel')} "
-            f"unpaired_release_observed={int(settlement.reason == 'unpaired-release')}",
+            format_scroll_drag_summary(
+                settlement,
+                final_value,
+                settle_latency,
+                applied=applied,
+                popup_closed=self._scroll_drag_popup_closed,
+                popup_suppressed=suppressed,
+                adjustment_total=self._scroll_drag_adjustment_total,
+                adjustment_max=self._scroll_drag_adjustment_max,
+            ),
             flush=True,
         )
-        factory_line = self._format_scroll_drag_factory_summary(
-            getattr(self, "_scroll_drag_factory_snapshot", None)
+        factory_line = format_scroll_drag_factory_summary(
+            getattr(self, "_scroll_drag_factory_snapshot", None),
+            light_enabled=SCROLL_DRAG_LIGHT_BIND_ENABLED,
         )
         if factory_line:
             print(factory_line, flush=True)
-
-    @staticmethod
-    def _format_scroll_drag_factory_summary(snapshot) -> str:
-        if snapshot is None:
-            return ""
-        factories = snapshot.factories
-        total_setup = sum(item.setup_count for item in factories.values())
-        total_bind = sum(item.bind_count for item in factories.values())
-        total_unbind = sum(item.unbind_count for item in factories.values())
-        total_bind_ns = sum(item.bind_total_ns for item in factories.values())
-        total_unbind_ns = sum(item.unbind_total_ns for item in factories.values())
-        max_bind_name, max_bind = max(
-            factories.items(), key=lambda item: item[1].bind_max_ns
-        )
-        max_unbind_name, max_unbind = max(
-            factories.items(), key=lambda item: item[1].unbind_max_ns
-        )
-        factory_parts = []
-        for name in SCROLLBAR_FACTORY_NAMES:
-            item = factories[name]
-            factory_parts.append(
-                f"{name}=s{item.setup_count}/b{item.bind_count}:"
-                f"{item.bind_total_ns / 1_000_000.0:.3f}:"
-                f"{item.bind_max_ns / 1_000_000.0:.3f}/u{item.unbind_count}:"
-                f"{item.unbind_total_ns / 1_000_000.0:.3f}:"
-                f"{item.unbind_max_ns / 1_000_000.0:.3f}/"
-                f"l{item.light_bind_count}/f{item.full_bind_count}"
-            )
-        operations = snapshot.operations
-        name_ops = (
-            f"text:{operations.get('name_text_writes', 0)},"
-            f"tip:{operations.get('name_tooltip_writes', 0)},"
-            f"css:{operations.get('name_css_changes', 0)},"
-            f"vis:{operations.get('name_visibility_changes', 0)},"
-            f"owner:{operations.get('name_popover_owner_checks', 0)},"
-            f"popdown:{operations.get('name_popover_popdowns', 0)},"
-            f"prep:{operations.get('name_mod_prepare_calls', 0)},"
-            f"content:{operations.get('name_popover_content_work', 0)},"
-            f"format:{operations.get('name_flag_address_format_calls', 0)}"
-        )
-        action_bound = sum(
-            operations.get(f"{name}_bound_assignments", 0)
-            for name in ("fav", "monitor", "join")
-        )
-        action_tip = sum(
-            operations.get(f"{name}_tooltip_writes", 0)
-            for name in ("fav", "monitor", "join")
-        )
-        action_css = sum(
-            operations.get(f"{name}_css_changes", 0)
-            for name in ("fav", "monitor", "join")
-        )
-        action_image = sum(
-            operations.get(f"{name}_image_state_changes", 0)
-            for name in ("fav", "monitor", "join")
-        )
-        action_label = operations.get("fav_label_writes", 0)
-        light_bind_total_ns = sum(
-            item.light_bind_total_ns for item in factories.values()
-        )
-        settle_cells = ",".join(
-            f"{name}:{operations.get(f'{name}_settle_cells_refreshed', 0)}"
-            for name in SCROLLBAR_FACTORY_NAMES
-        )
-        skipped = (
-            f"text:{operations.get('drag_skipped_text_writes', 0)},"
-            f"tip:{operations.get('drag_skipped_tooltip_writes', 0)},"
-            f"css:{operations.get('drag_skipped_css_writes', 0)},"
-            f"vis:{operations.get('drag_skipped_visibility_writes', 0)},"
-            f"notify_c:{operations.get('drag_skipped_notify_connects', 0)},"
-            f"notify_d:{operations.get('drag_skipped_notify_disconnects', 0)},"
-            f"popup:{operations.get('drag_skipped_popup_preparation', 0)}"
-        )
-        return (
-            f"[SCROLL-DRAG-FACTORIES] id={snapshot.generation} "
-            f"light_enabled={int(SCROLL_DRAG_LIGHT_BIND_ENABLED)} "
-            f"totals=s{total_setup}/b{total_bind}/u{total_unbind} "
-            f"bind_ms={total_bind_ns / 1_000_000.0:.3f} "
-            f"unbind_ms={total_unbind_ns / 1_000_000.0:.3f} "
-            f"max_bind={max_bind_name}:{max_bind.bind_max_ns / 1_000_000.0:.3f} "
-            f"max_unbind={max_unbind_name}:{max_unbind.unbind_max_ns / 1_000_000.0:.3f} "
-            f"light_bind_ms={light_bind_total_ns / 1_000_000.0:.3f} "
-            f"settle_passes={operations.get('settle_full_refresh_passes', 0)} "
-            f"settle_refresh={snapshot.settle_refresh_count}:"
-            f"{snapshot.settle_refresh_total_ns / 1_000_000.0:.3f}:"
-            f"{snapshot.settle_refresh_max_factory}:"
-            f"{snapshot.settle_refresh_max_ns / 1_000_000.0:.3f} "
-            f"registry_before_settle={operations.get('registry_before_settle', 0)} "
-            f"registry_live={operations.get('registry_live', 0)} "
-            f"registry_stale={operations.get('registry_stale', 0)} "
-            f"registry_after_settle={operations.get('registry_after_settle', 0)} "
-            + " ".join(factory_parts)
-            + f" name_ops=({name_ops}) "
-            f"notify={operations.get('notify_connects', 0)}/"
-            f"{operations.get('notify_disconnects', 0)} "
-            f"players_ops=format:{operations.get('players_format_calls', 0)},"
-            f"write:{operations.get('players_label_writes', 0)} "
-            f"ping_ops=format:{operations.get('ping_format_calls', 0)},"
-            f"write:{operations.get('ping_label_writes', 0)} "
-            f"light_visuals=flag:{operations.get('light_flag_updates', 0)},"
-            f"ping_color:{operations.get('light_ping_colour_updates', 0)} "
-            f"action_ops=bound:{action_bound},tip:{action_tip},css:{action_css},"
-            f"image:{action_image},label:{action_label} "
-            f"settle_cells=({settle_cells}) skipped=({skipped})"
-        )
 
     def _settle_browser_scrollbar_interaction(
         self,
@@ -2900,10 +2724,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         self._scroll_drag_adjustment_max,
                         duration,
                     )
-                self._perf_scroll_events = int(getattr(self, "_perf_scroll_events", 0) or 0) + 1
-                self._perf_scroll_total = float(getattr(self, "_perf_scroll_total", 0.0) or 0.0) + duration
-                if duration > float(getattr(self, "_perf_scroll_max", 0.0) or 0.0):
-                    self._perf_scroll_max = duration
+                self._perf_diagnostics.note_scroll(duration)
 
     def _queue_fast_scroll_full_refresh(self):
         if int(getattr(self, "_fast_scroll_render_refresh_id", 0) or 0):
@@ -2984,7 +2805,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 count = 0
             if not (0 <= pos < count):
-                self._debug_sort_note_scroll_to_skipped(pos, count, "out_of_range")
+                self._sort_debug.note_scroll_to_skipped(pos, count, "out_of_range")
                 self._set_scroller_to_top()
                 try:
                     self._scroll_to_top_idle_id = GLib.idle_add(
@@ -5727,7 +5548,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             sorter = getattr(self, "sorter", None)
             if sorter is not None:
-                self._debug_sort_note_model_event("manual_db_sorter_changed")
+                self._sort_debug.note_model_event("manual_db_sorter_changed")
                 sorter.changed(Gtk.SorterChange.DIFFERENT)
         except Exception:
             pass
@@ -6290,7 +6111,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         obj.filter_key = k
         obj.is_likely_test_server = self._is_likely_test_server_name(obj.name_lc)
         obj.mod_search_index = mod_index
-        self._debug_sort_attach_notify_probe(obj)
+        self._sort_debug.attach_notify_probe(obj)
         state["objects"].append(obj)
         state["obj_by_key"][k] = obj
         state["live_defaults"].setdefault(
@@ -6384,7 +6205,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             try:
                 sorter = getattr(self, "sorter", None)
                 if sorter is not None:
-                    self._debug_sort_note_model_event("load_sorter_changed")
+                    self._sort_debug.note_model_event("load_sorter_changed")
                     sorter.changed(Gtk.SorterChange.DIFFERENT)
             except Exception:
                 pass
@@ -6948,7 +6769,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             obj.filter_key = k
             obj.is_likely_test_server = self._is_likely_test_server_name(obj.name_lc)
             obj.mod_search_index = mod_index
-            self._debug_sort_attach_notify_probe(obj)
+            self._sort_debug.attach_notify_probe(obj)
             if PERF_LOG_ENABLED:
                 sidecar_ns += time.monotonic_ns() - sidecar_start_ns
 
@@ -7030,7 +6851,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             sorter = getattr(self, "sorter", None)
             if sorter is not None:
-                self._debug_sort_note_model_event("load_sorter_changed")
+                self._sort_debug.note_model_event("load_sorter_changed")
                 sorter.changed(Gtk.SorterChange.DIFFERENT)
         except Exception:
             pass
@@ -7162,10 +6983,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _rebuild_column_view_store(self, timing_ctx: dict | None = None, reorder_reason: str | None = None):
         if DEBUG_FILTER_TIMING and timing_ctx is None:
-            current_ctx = getattr(self, "_filter_timing_current_ctx", None)
+            current_ctx = getattr(getattr(self, "_filter_timing", None), "current_ctx", None)
             if isinstance(current_ctx, dict):
                 timing_ctx = current_ctx
-        self._debug_sort_note_model_event("column_view_rebuild")
+        self._sort_debug.note_model_event("column_view_rebuild")
         display_store = getattr(self, "column_view_store", None)
         if display_store is None:
             return
@@ -7193,10 +7014,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 before_count = int(display_store.get_n_items())
             except Exception:
                 before_count = 0
-            before_keys = self._browser_reorder_visible_keys(5)
-            before_scroll_key = self._browser_reorder_scroll_key()
-            live_filter_state = self._browser_reorder_live_filter_state()
-            self._debug_browser_reorder(
+            before_keys = self._browser_reorder.visible_keys(5)
+            before_scroll_key = self._browser_reorder.scroll_key()
+            live_filter_state = self._browser_reorder.live_filter_state()
+            self._browser_reorder.log(
                 "rebuild-start",
                 mode="rebuild_sorted",
                 reason=reason,
@@ -7319,7 +7140,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
             finally:
                 if key_start is not None:
-                    self._debug_sort_note_key_build(time.perf_counter() - key_start)
+                    self._sort_debug.note_key_build(time.perf_counter() - key_start)
 
         rows.sort(key=row_sort_key)
         sort_elapsed = (time.perf_counter() - sort_start) if sort_start is not None else 0.0
@@ -7349,7 +7170,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             prepare_elapsed = (time.perf_counter() - prepare_start) if prepare_start is not None else 0.0
             splice_call_start = time.perf_counter() if timing_enabled else None
             try:
-                self._debug_browser_reorder(
+                self._browser_reorder.log(
                     "splice-call",
                     mode="rebuild_sorted",
                     reason=reason,
@@ -7457,7 +7278,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 after_count = int(display_store.get_n_items())
             except Exception:
                 after_count = len(rows)
-            self._debug_browser_reorder(
+            self._browser_reorder.log(
                 "rebuild-finish",
                 mode="rebuild_sorted",
                 reason=reason,
@@ -7471,9 +7292,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 delta=after_count - before_count,
                 update=store_update,
                 first_before=before_keys,
-                first_after=self._browser_reorder_visible_keys(5),
+                first_after=self._browser_reorder.visible_keys(5),
                 scroll_before=before_scroll_key,
-                scroll_after=self._browser_reorder_scroll_key(),
+                scroll_after=self._browser_reorder.scroll_key(),
                 **live_filter_state,
             )
 
@@ -7502,15 +7323,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if display_store is None or source_store is None:
             return
 
-        before_keys = self._browser_reorder_visible_keys(5)
-        before_scroll_key = self._browser_reorder_scroll_key()
-        live_filter_state = self._browser_reorder_live_filter_state() if DEBUG_BROWSER_REORDER else {}
+        before_keys = self._browser_reorder.visible_keys(5)
+        before_scroll_key = self._browser_reorder.scroll_key()
+        live_filter_state = self._browser_reorder.live_filter_state() if DEBUG_BROWSER_REORDER else {}
         try:
             old_count = int(display_store.get_n_items())
         except Exception:
             old_count = 0
 
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "membership-reconcile-start",
             mode="membership_reconcile_preserve_order",
             reason=reason,
@@ -7576,7 +7397,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         splice = getattr(display_store, "splice", None)
         if callable(splice):
-            self._debug_browser_reorder(
+            self._browser_reorder.log(
                 "splice-call",
                 mode="membership_reconcile_preserve_order",
                 reason=reason,
@@ -7613,7 +7434,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             new_count = int(display_store.get_n_items())
         except Exception:
             new_count = len(rows)
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "membership-reconcile-finish",
             mode="membership_reconcile_preserve_order",
             reason=reason,
@@ -7629,9 +7450,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             visible_after=new_count,
             delta=new_count - old_count,
             first_before=before_keys,
-            first_after=self._browser_reorder_visible_keys(5),
+            first_after=self._browser_reorder.visible_keys(5),
             scroll_before=before_scroll_key,
-            scroll_after=self._browser_reorder_scroll_key(),
+            scroll_after=self._browser_reorder.scroll_key(),
             **live_filter_state,
         )
 
@@ -8405,7 +8226,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             combined_filter = getattr(self, "combined_filter", None)
             if combined_filter is not None:
-                self._debug_sort_note_model_event("status_filter_changed")
+                self._sort_debug.note_model_event("status_filter_changed")
                 combined_filter.changed(Gtk.FilterChange.DIFFERENT)
         except Exception:
             pass
@@ -8413,11 +8234,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         try:
             sorter = getattr(self, "sorter", None)
             if sorter is not None:
-                self._debug_sort_note_model_event("status_sorter_changed")
+                self._sort_debug.note_model_event("status_sorter_changed")
                 sorter.changed(Gtk.SorterChange.DIFFERENT)
         except Exception:
             pass
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "status-refresh-finish",
             calls_rebuild=True,
             calls_filter_changed=False,
@@ -8819,7 +8640,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
 
     def _offline_recheck_tick(self):
-        self._debug_browser_reorder("offline-recheck-tick", fired=True)
+        self._browser_reorder.log("offline-recheck-tick", fired=True)
         offline_items = []
 
         for k, obj in self._obj_by_key.items():
@@ -8830,7 +8651,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 continue
 
         if not offline_items:
-            self._debug_browser_reorder(
+            self._browser_reorder.log(
                 "offline-recheck-tick",
                 offline_rows=0,
                 submits_recheck=False,
@@ -8846,7 +8667,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         ordered = offline_items[start:] + offline_items[:start]
         batch = ordered[:batch_size]
         self._offline_recheck_cursor = (start + len(batch)) % max(1, len(offline_items))
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "offline-recheck-submit",
             offline_rows=len(offline_items),
             batch=len(batch),
@@ -8869,7 +8690,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         debug_row_notifications = 0
         debug_ping_updates = 0
         debug_player_updates = 0
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "live-results-start",
             reason=reason,
             result_count=len(results or []),
@@ -9227,7 +9048,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             called_filter_changed = True
             self._on_filter_changed(reason="live")
 
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "live-results-finish",
             reason=reason,
             changed_any=changed_any,
@@ -9245,7 +9066,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             player_updates=debug_player_updates,
             sort=f"{self.sort_key}:{'asc' if self.sort_asc else 'desc'}",
         )
-        self._debug_sort_note_live_update(reason, row_notifications=debug_row_notifications, ping_updates=debug_ping_updates)
+        self._sort_debug.note_live_update(reason, row_notifications=debug_row_notifications, ping_updates=debug_ping_updates)
         self._apply_titlebar_counts()
         return False
 
@@ -10492,95 +10313,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _filter_refresh_is_suppressed(self) -> bool:
         return int(getattr(self, "_filter_refresh_suppress_depth", 0) or 0) > 0
 
-    def _filter_timing_context(self, action: str, total_start: float | None = None) -> dict | None:
-        if not DEBUG_FILTER_TIMING:
-            return None
-        return {
-            "action": str(action or "unknown"),
-            "total_start": float(total_start if total_start is not None else time.perf_counter()),
-        }
-
-    def _filter_timing_log(self, ctx: dict | None) -> None:
-        if not DEBUG_FILTER_TIMING or not isinstance(ctx, dict):
-            return
-        now = time.perf_counter()
-        total_start = float(ctx.get("total_start", now) or now)
-        rebuild = ctx.get("rebuild") if isinstance(ctx.get("rebuild"), dict) else {}
-        parts = [
-            "[filter-timing]",
-            f"action={ctx.get('action', 'unknown')}",
-            f"total={(now - total_start) * 1000.0:.1f}ms",
-        ]
-        for key, label in (
-            ("callback_entry_ms", "callback_entry"),
-            ("on_filter_ms", "on_filter"),
-            ("build_state_ms", "build_state"),
-            ("apply_ms", "apply"),
-            ("sort_set_ms", "set_sort"),
-            ("sorter_invalidation_ms", "sorter_invalidation"),
-            ("settings_save_ms", "settings_save"),
-            ("runtime_effects_ms", "runtime_effects"),
-        ):
-            if key in ctx:
-                parts.append(f"{label}={float(ctx.get(key, 0.0) or 0.0):.1f}ms")
-        if "gtk_filter" in ctx:
-            value = str(ctx.get("gtk_filter") or "")
-            if "gtk_filter_ms" in ctx:
-                value = f"{value}:{float(ctx.get('gtk_filter_ms', 0.0) or 0.0):.1f}ms"
-            parts.append(f"gtk_filter={value}")
-        if rebuild:
-            scan_ms = float(rebuild.get("scan_ms", 0.0) or 0.0)
-            filter_func_ms = float(rebuild.get("filter_func_ms", 0.0) or 0.0)
-            iter_overhead_ms = max(0.0, scan_ms - filter_func_ms)
-            parts.extend(
-                (
-                    f"rebuild={float(rebuild.get('total_ms', 0.0) or 0.0):.1f}ms",
-                    f"scan={scan_ms:.1f}ms",
-                    f"filter_func={filter_func_ms:.1f}ms",
-                    f"iter_overhead={iter_overhead_ms:.1f}ms",
-                    f"sort_ms={float(rebuild.get('sort_ms', 0.0) or 0.0):.1f}ms",
-                    f"sort_skipped={str(bool(rebuild.get('sort_skipped', False))).lower()}",
-                    f"splice={float(rebuild.get('splice_ms', 0.0) or 0.0):.1f}ms",
-                    f"old_count_ms={float(rebuild.get('store_old_count_ms', 0.0) or 0.0):.1f}ms",
-                    f"prepare={float(rebuild.get('store_prepare_ms', 0.0) or 0.0):.1f}ms",
-                    f"splice_call={float(rebuild.get('store_splice_call_ms', 0.0) or 0.0):.1f}ms",
-                    f"post_splice={float(rebuild.get('store_post_splice_ms', 0.0) or 0.0):.1f}ms",
-                    f"update={rebuild.get('store_update', 'unknown')}",
-                    f"replace_all={str(bool(rebuild.get('replace_all', False))).lower()}",
-                    f"rows={int(rebuild.get('source_rows', 0) or 0)}",
-                    f"matched={int(rebuild.get('matched_rows', 0) or 0)}",
-                    f"rejected={int(rebuild.get('rejected_rows', 0) or 0)}",
-                    f"spliced={int(rebuild.get('spliced_rows', 0) or 0)}",
-                    f"old={int(rebuild.get('old_count', 0) or 0)}",
-                    f"new={int(rebuild.get('new_count', 0) or 0)}",
-                    f"delta={int(rebuild.get('delta_count', 0) or 0)}",
-                    f"removed={int(rebuild.get('removed_count', 0) or 0)}",
-                    f"inserted={int(rebuild.get('inserted_count', 0) or 0)}",
-                )
-            )
-        if ctx.get("scroll_queued"):
-            parts.append("scroll=queued")
-        parts.append(f"sort={self.sort_key}:{'asc' if self.sort_asc else 'desc'}")
-        print(" ".join(parts), flush=True)
-
-    def _debug_browser_reorder(self, message: str, **fields) -> None:
-        if not DEBUG_BROWSER_REORDER:
-            return
-
-        def fmt(value) -> str:
-            if isinstance(value, bool):
-                return "true" if value else "false"
-            if isinstance(value, (list, tuple)):
-                return "[" + ",".join(fmt(v) for v in value) + "]"
-            text = str(value)
-            if not text:
-                return "-"
-            return text.replace("\n", "\\n").replace(" ", "_")
-
-        parts = [f"[browser-reorder] {message}"]
-        parts.extend(f"{key}={fmt(value)}" for key, value in fields.items())
-        print(" ".join(parts), flush=True)
-
     def _browser_reorder_key_for_obj(self, obj) -> str:
         if not isinstance(obj, ServerObject):
             return "-"
@@ -10594,66 +10326,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             qport = 0
         return f"{ip}:{gport}:{qport}"
-
-    def _browser_reorder_visible_keys(self, limit: int = 5) -> list[str]:
-        if not DEBUG_BROWSER_REORDER:
-            return []
-        store = getattr(self, "column_view_store", None)
-        if store is None:
-            return []
-        try:
-            count = min(max(0, int(limit)), int(store.get_n_items()))
-        except Exception:
-            count = 0
-        keys = []
-        for i in range(count):
-            try:
-                keys.append(self._browser_reorder_key_for_obj(store.get_item(i)))
-            except Exception:
-                keys.append("-")
-        return keys
-
-    def _browser_reorder_scroll_key(self) -> str:
-        if not DEBUG_BROWSER_REORDER:
-            return "-"
-        store = getattr(self, "column_view_store", None)
-        if store is None:
-            return "-"
-        try:
-            vadj = self.scroller.get_vadjustment()
-            if not vadj:
-                return "-"
-            row_h = max(1, int(BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX))
-            index = int(max(0.0, float(vadj.get_value())) // row_h)
-            count = int(store.get_n_items())
-            if index >= count:
-                index = max(0, count - 1)
-            if index < 0 or count <= 0:
-                return "-"
-            return self._browser_reorder_key_for_obj(store.get_item(index))
-        except Exception:
-            return "-"
-
-    def _browser_reorder_live_filter_state(self) -> dict:
-        state = getattr(self, "_filter_state", None)
-        if not isinstance(state, dict):
-            state = {}
-        try:
-            ping_cutoff = int(getattr(self, "_ping_cutoff_ms", 0) or 0)
-        except Exception:
-            ping_cutoff = 0
-        try:
-            max_players_cutoff = int(state.get("max_players_cutoff", 0) or 0)
-        except Exception:
-            max_players_cutoff = 0
-        return {
-            "online_only": bool(state.get("online_only", False)),
-            "no_password": bool(state.get("no_password", False)),
-            "ping_cutoff": ping_cutoff,
-            "ping_cutoff_active": ping_cutoff > 0,
-            "max_players_cutoff": max_players_cutoff,
-            "max_players_active": max_players_cutoff > 0,
-        }
 
     def _browser_reorder_is_background_reason(self, reason: str) -> bool:
         return str(reason or "") in {"batch", "live", "browser-live", "offline-recheck"}
@@ -10670,7 +10342,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         ctx = timing_ctx
         on_filter_start = time.perf_counter() if DEBUG_FILTER_TIMING else None
         if DEBUG_FILTER_TIMING and ctx is None:
-            current_ctx = getattr(self, "_filter_timing_current_ctx", None)
+            current_ctx = getattr(getattr(self, "_filter_timing", None), "current_ctx", None)
             if isinstance(current_ctx, dict):
                 ctx = current_ctx
         if DEBUG_FILTER_TIMING and isinstance(ctx, dict):
@@ -10681,7 +10353,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 except Exception:
                     pass
         if self._filter_refresh_is_suppressed() and not force:
-            self._debug_browser_reorder(
+            self._browser_reorder.log(
                 "filter-changed",
                 reason=reason,
                 skip_gtk_filter=skip_gtk_filter,
@@ -10695,7 +10367,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 ctx["on_filter_ms"] = (time.perf_counter() - on_filter_start) * 1000.0
                 ctx["gtk_filter"] = "suppressed"
                 if not bool(ctx.get("defer_log")):
-                    self._filter_timing_log(ctx)
+                    self._filter_timing.log(ctx)
             return
         build_start = time.perf_counter() if DEBUG_FILTER_TIMING else None
         new_state = self._build_filter_state()
@@ -10706,7 +10378,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             and bool(getattr(self, "_filter_state", None))
             and new_state == getattr(self, "_filter_state", None)
         )
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "filter-changed",
             reason=reason,
             skip_gtk_filter=skip_gtk_filter,
@@ -10729,7 +10401,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 ctx["on_filter_ms"] = (time.perf_counter() - on_filter_start) * 1000.0
                 ctx["gtk_filter"] = "unchanged-skipped"
                 if not bool(ctx.get("defer_log")):
-                    self._filter_timing_log(ctx)
+                    self._filter_timing.log(ctx)
             return
         self._apply_filter_changed(
             Gtk.FilterChange.DIFFERENT,
@@ -10743,7 +10415,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if DEBUG_FILTER_TIMING and isinstance(ctx, dict):
             ctx["on_filter_ms"] = (time.perf_counter() - on_filter_start) * 1000.0
             if not bool(ctx.get("defer_log")):
-                self._filter_timing_log(ctx)
+                self._filter_timing.log(ctx)
 
     def _apply_search_filter_changed(self, scroll: bool = False, reason: str = "search"):
         old_query = str(getattr(self, "_filter_query", "") or "")
@@ -10791,7 +10463,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             try:
                 combined_filter = getattr(self, "combined_filter", None)
                 if combined_filter is not None:
-                    self._debug_sort_note_model_event(f"filter_changed_{hint_name}")
+                    self._sort_debug.note_model_event(f"filter_changed_{hint_name}")
                     combined_filter.changed(change)
             except Exception:
                 pass
@@ -10801,11 +10473,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         else:
             # The visible ColumnView is driven by column_view_store, rebuilt below.
             # Sidebar checkbox/map filters skip redundant GTK filter invalidation.
-            self._debug_sort_note_model_event(f"filter_changed_{hint_name}_visible_store")
+            self._sort_debug.note_model_event(f"filter_changed_{hint_name}_visible_store")
             if DEBUG_FILTER_TIMING and isinstance(timing_ctx, dict):
                 timing_ctx["gtk_filter"] = "skipped"
                 timing_ctx["gtk_filter_ms"] = 0.0
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "apply-filter",
             reason=reason,
             invalidate_gtk_filter=invalidate_gtk_filter,
@@ -10879,196 +10551,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     # Sorting
     # ----------------------------
-    def _debug_sort_row_count(self) -> int:
-        try:
-            if getattr(self, "column_view_store", None) is not None:
-                return int(self.column_view_store.get_n_items())
-        except Exception:
-            pass
-        try:
-            if getattr(self, "filter_model", None) is not None:
-                return int(self.filter_model.get_n_items())
-        except Exception:
-            pass
-        try:
-            if getattr(self, "store", None) is not None:
-                return int(self.store.get_n_items())
-        except Exception:
-            pass
-        return 0
-
-    def _debug_sort_begin(self, key: str, direction: str, rows: int):
-        if not DEBUG_SORT:
-            return
-        self._debug_sort_stats = {
-            "active": True,
-            "key": str(key or ""),
-            "direction": str(direction or ""),
-            "rows": int(rows or 0),
-            "started_at": time.perf_counter(),
-            "calls": 0,
-            "total_time": 0.0,
-            "max_call": 0.0,
-            "cached_numeric": 0,
-            "parsed_text": 0,
-            "offline": 0,
-            "live_ping_updates": 0,
-            "row_notifications": 0,
-            "notify_props": {},
-            "row_binds": 0,
-            "bind_kinds": {},
-            "model_events": {},
-            "scroll_to_skipped": 0,
-            "visible_sort": "",
-            "key_builds": 0,
-            "key_time": 0.0,
-        }
-        print(f"[SORT] requested column={key} direction={direction} rows={int(rows or 0)}", flush=True)
-
-    def _debug_sort_note_notify(self, prop_name: str):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        name = str(prop_name or "unknown")
-        props = stats.setdefault("notify_props", {})
-        props[name] = int(props.get(name, 0) or 0) + 1
-        stats["row_notifications"] = int(stats.get("row_notifications", 0) or 0) + 1
-
-    def _debug_sort_attach_notify_probe(self, obj: ServerObject):
-        if not DEBUG_SORT or not isinstance(obj, ServerObject):
-            return
-        if bool(getattr(obj, "_dzll_sort_debug_notify_attached", False)):
-            return
-        try:
-            def on_notify(_obj, pspec):
-                try:
-                    name = pspec.name
-                except Exception:
-                    name = "unknown"
-                self._debug_sort_note_notify(name)
-
-            obj.connect("notify", on_notify)
-            obj._dzll_sort_debug_notify_attached = True
-        except Exception:
-            pass
-
-    def _debug_sort_note_bind(self, kind: str):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        stats["row_binds"] = int(stats.get("row_binds", 0) or 0) + 1
-        kinds = stats.setdefault("bind_kinds", {})
-        name = str(kind or "unknown")
-        kinds[name] = int(kinds.get(name, 0) or 0) + 1
-
-    def _debug_sort_note_model_event(self, event: str):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        events = stats.setdefault("model_events", {})
-        name = str(event or "unknown")
-        events[name] = int(events.get(name, 0) or 0) + 1
-
-    def _debug_sort_note_scroll_to_skipped(self, pos: int, count: int, reason: str):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if isinstance(stats, dict):
-            stats["scroll_to_skipped"] = int(stats.get("scroll_to_skipped", 0) or 0) + 1
-        print(f"[SORT] skip_scroll_to pos={int(pos)} count={int(count)} reason={reason}", flush=True)
-
-    def _debug_sort_note_key_build(self, duration: float):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        stats["visible_sort"] = "key_tuple"
-        stats["key_builds"] = int(stats.get("key_builds", 0) or 0) + 1
-        stats["key_time"] = float(stats.get("key_time", 0.0) or 0.0) + float(duration or 0.0)
-
-    def _debug_sort_note_compare(self, key: str, duration: float, a: ServerObject, b: ServerObject):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        if str(stats.get("key") or "") != str(key or ""):
-            return
-        stats["calls"] = int(stats.get("calls", 0) or 0) + 1
-        stats["total_time"] = float(stats.get("total_time", 0.0) or 0.0) + float(duration or 0.0)
-        if duration > float(stats.get("max_call", 0.0) or 0.0):
-            stats["max_call"] = float(duration or 0.0)
-        if key == "ping":
-            stats["cached_numeric"] = int(stats.get("cached_numeric", 0) or 0) + 1
-            try:
-                if int(getattr(a, "ping", -1)) < 0 or int(getattr(b, "ping", -1)) < 0:
-                    stats["offline"] = int(stats.get("offline", 0) or 0) + 1
-            except Exception:
-                pass
-        elif key == "players":
-            stats["cached_numeric"] = int(stats.get("cached_numeric", 0) or 0) + 1
-
-    def _debug_sort_note_live_update(self, reason: str, row_notifications: int = 0, ping_updates: int = 0):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        if reason == "browser-live":
-            stats["live_ping_updates"] = int(stats.get("live_ping_updates", 0) or 0) + int(ping_updates or 0)
-
-    def _debug_sort_finish(self):
-        if not DEBUG_SORT:
-            return
-        stats = getattr(self, "_debug_sort_stats", None)
-        if not isinstance(stats, dict) or not stats.get("active"):
-            return
-        stats["active"] = False
-        key = str(stats.get("key") or "")
-        calls = int(stats.get("calls", 0) or 0)
-        total_time = float(stats.get("total_time", 0.0) or 0.0)
-        max_call = float(stats.get("max_call", 0.0) or 0.0)
-        elapsed = time.perf_counter() - float(stats.get("started_at", time.perf_counter()) or time.perf_counter())
-        print(
-            f"[SORT] {key} calls={calls} total_key_time={total_time:.3f}s "
-            f"max_call={max_call:.4f}s cached_numeric={int(stats.get('cached_numeric', 0) or 0)} "
-            f"parsed_text={int(stats.get('parsed_text', 0) or 0)} offline={int(stats.get('offline', 0) or 0)}",
-            flush=True,
-        )
-        props = dict(stats.get("notify_props", {}) or {})
-        prop_text = " ".join(f"{name}={props[name]}" for name in sorted(props)) or "none=0"
-        events = dict(stats.get("model_events", {}) or {})
-        event_text = " ".join(f"{name}={events[name]}" for name in sorted(events)) or "none=0"
-        bind_kinds = dict(stats.get("bind_kinds", {}) or {})
-        bind_text = " ".join(f"{name}={bind_kinds[name]}" for name in sorted(bind_kinds)) or "none=0"
-        visible_sort = str(stats.get("visible_sort") or "unknown")
-        print(f"[SORT] notify_props {prop_text}", flush=True)
-        print(
-            f"[SORT] visible_sort={visible_sort} key_builds={int(stats.get('key_builds', 0) or 0)} "
-            f"key_time={float(stats.get('key_time', 0.0) or 0.0):.3f}s "
-            f"visible_comparator_calls=0 total_comparator_calls={calls}",
-            flush=True,
-        )
-        print(
-            f"[SORT] row_binds_during_sort={int(stats.get('row_binds', 0) or 0)} "
-            f"bind_kinds {bind_text} scroll_to_skipped={int(stats.get('scroll_to_skipped', 0) or 0)}",
-            flush=True,
-        )
-        print(f"[SORT] model_events {event_text}", flush=True)
-        print(
-            f"[SORT] apply_elapsed={elapsed:.3f}s "
-            f"live_ping_updates_during_sort={int(stats.get('live_ping_updates', 0) or 0)} "
-            f"row_notifications={int(stats.get('row_notifications', 0) or 0)}",
-            flush=True,
-        )
-
     def _sort_func(self, a: ServerObject, b: ServerObject, _data=None):
         debug_key = str(getattr(self, "sort_key", "") or "")
         start = time.perf_counter() if (PERF_LOG_ENABLED or DEBUG_SORT) else None
@@ -11078,11 +10560,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if start is not None:
                 duration = time.perf_counter() - start
                 if PERF_LOG_ENABLED:
-                    self._perf_sort_calls = int(getattr(self, "_perf_sort_calls", 0) or 0) + 1
-                    self._perf_sort_total = float(getattr(self, "_perf_sort_total", 0.0) or 0.0) + duration
-                    if duration > float(getattr(self, "_perf_sort_max", 0.0) or 0.0):
-                        self._perf_sort_max = duration
-                self._debug_sort_note_compare(debug_key, duration, a, b)
+                    self._perf_diagnostics.note_sort(duration)
+                self._sort_debug.note_compare(debug_key, duration, a, b)
 
     def _sort_func_impl(self, a: ServerObject, b: ServerObject, _data=None):
         def cmp_int(x: int, y: int) -> int:
@@ -11195,7 +10674,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         sort_generation = self._sort_generation
         self._update_sort_indicators()
 
-        self._debug_browser_reorder(
+        self._browser_reorder.log(
             "set-sort",
             old=f"{old_sort_key}:{'asc' if old_sort_asc else 'desc'}",
             new=f"{self.sort_key}:{'asc' if self.sort_asc else 'desc'}",
@@ -11204,7 +10683,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
 
         direction = "asc" if self.sort_asc else "desc"
-        self._debug_sort_begin(key, direction, self._debug_sort_row_count())
+        self._sort_debug.begin(key, direction)
         try:
             if key == "played":
                 self._snapshot_all_sort_keys()
@@ -11212,7 +10691,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             try:
                 sorter = getattr(self, "sorter", None)
                 if sorter is not None:
-                    self._debug_sort_note_model_event("sorter_changed")
+                    self._sort_debug.note_model_event("sorter_changed")
                     sorter.changed(Gtk.SorterChange.DIFFERENT)
             except Exception:
                 pass
@@ -11220,7 +10699,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 timing_ctx["sorter_invalidation_ms"] = (time.perf_counter() - sorter_start) * 1000.0
             self._rebuild_column_view_store(timing_ctx=timing_ctx, reorder_reason=f"sort:{key}")
         finally:
-            self._debug_sort_finish()
+            self._sort_debug.finish()
 
         if DEBUG_FILTER_TIMING and isinstance(timing_ctx, dict):
             timing_ctx["sort_set_ms"] = (time.perf_counter() - sort_set_start) * 1000.0
@@ -11230,7 +10709,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
 
     def _on_column_view_sort_header_clicked(self, key_or_title):
-        ctx = self._filter_timing_context("sort", time.perf_counter()) if DEBUG_FILTER_TIMING else None
+        ctx = self._filter_timing.context("sort", time.perf_counter()) if DEBUG_FILTER_TIMING else None
         key = str(key_or_title or "").strip().lower()
         title_to_key = {
             "played": "played",
@@ -11242,7 +10721,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if DEBUG_FILTER_TIMING and isinstance(ctx, dict):
                 ctx["action"] = f"sort:{key}"
             self._set_sort(key, timing_ctx=ctx)
-            self._filter_timing_log(ctx)
+            self._filter_timing.log(ctx)
 
     def _auto_sort_lowest_ping_after_startup(self):
         if self._sort_changed_by_user or self.sort_key != "ping" or self.sort_asc:

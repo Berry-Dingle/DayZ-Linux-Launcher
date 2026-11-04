@@ -192,10 +192,12 @@ def rebuild_host(rows, *, pin, state):
         column_view_store=visible,
         sort_key="ping",
         sort_asc=True,
-        _debug_sort_note_model_event=lambda *_args: None,
+        _sort_debug=SimpleNamespace(
+            note_model_event=lambda *_args: None,
+            note_key_build=lambda *_args: None,
+        ),
         _browser_reorder_is_background_reason=lambda *_args: False,
-        _debug_browser_reorder=lambda *_args, **_kwargs: None,
-        _debug_sort_note_key_build=lambda *_args: None,
+        _browser_reorder=SimpleNamespace(log=lambda *_args, **_kwargs: None),
         _active_filter_depends_on_live_values=lambda: True,
     )
     host._combined_filter_func = MethodType(DZLLWindow._combined_filter_func, host)
@@ -257,9 +259,9 @@ def test_offline_online_reconciliation_keeps_one_pinned_favourite():
     state = base_state(favourite)
     state["online_only"] = True
     host, visible = rebuild_host([favourite], pin=True, state=state)
-    host._browser_reorder_visible_keys = lambda *_args: []
-    host._browser_reorder_scroll_key = lambda: "-"
-    host._browser_reorder_live_filter_state = lambda: {}
+    host._browser_reorder.visible_keys = lambda *_args: []
+    host._browser_reorder.scroll_key = lambda: "-"
+    host._browser_reorder.live_filter_state = lambda: {}
     host._browser_reorder_key_for_obj = lambda obj: fav_key(obj.ip, obj.gport)
     DZLLWindow._rebuild_column_view_store(host, reorder_reason="initial")
     for ping in (-1, 25, -1, 30):

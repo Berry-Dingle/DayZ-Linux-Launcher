@@ -454,10 +454,12 @@ def test_detected_rejoin_updates_replaced_row_persistence_and_active_order(monke
     host._combined_filter_func = lambda _obj: True
     host._set_int_property_if_changed = MethodType(DZLLWindow._set_int_property_if_changed, host)
     host._update_row_sort_played_days = MethodType(DZLLWindow._update_row_sort_played_days, host)
-    host._debug_sort_note_model_event = lambda *_args: None
+    host._sort_debug = SimpleNamespace(
+        note_model_event=lambda *_args: None,
+        note_key_build=lambda *_args: None,
+    )
     host._browser_reorder_is_background_reason = lambda *_args: False
-    host._debug_browser_reorder = lambda *_args, **_kwargs: None
-    host._debug_sort_note_key_build = lambda *_args: None
+    host._browser_reorder = SimpleNamespace(log=lambda *_args, **_kwargs: None)
     host._active_filter_depends_on_live_values = lambda: False
     rebuilds = []
 

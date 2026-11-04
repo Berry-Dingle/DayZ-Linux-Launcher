@@ -1093,14 +1093,13 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
             suppressed = bool(window._filter_refresh_is_suppressed())
         except Exception:
             suppressed = False
-        start = time.perf_counter() if getattr(window, "_filter_timing_enabled", False) and not suppressed else None
+        timing = getattr(window, "_filter_timing", None)
+        start = time.perf_counter() if timing is not None and timing.enabled and not suppressed else None
         ctx = None
         if start is not None:
-            make_ctx = getattr(window, "_filter_timing_context", None)
-            if callable(make_ctx):
-                ctx = make_ctx(action, start)
-                if isinstance(ctx, dict):
-                    ctx["callback_start"] = start
+            ctx = timing.context(action, start)
+            if isinstance(ctx, dict):
+                ctx["callback_start"] = start
         window._on_filter_changed(scroll=True, reason=reason, skip_gtk_filter=True, timing_ctx=ctx)
 
     def timed_perspective_callback(*_args):
@@ -1247,12 +1246,11 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
 
     def apply_sidebar_setting(key):
         ctx = None
-        if getattr(window, "_filter_timing_enabled", False):
-            make_ctx = getattr(window, "_filter_timing_context", None)
-            if callable(make_ctx):
-                ctx = make_ctx(f"sidebar-setting:{key}", time.perf_counter())
-                if isinstance(ctx, dict):
-                    ctx["defer_log"] = True
+        timing = getattr(window, "_filter_timing", None)
+        if timing is not None and timing.enabled:
+            ctx = timing.context(f"sidebar-setting:{key}", time.perf_counter())
+            if isinstance(ctx, dict):
+                ctx["defer_log"] = True
         save_start = time.perf_counter() if ctx is not None else None
         try:
             save_settings(window.settings)
@@ -1262,22 +1260,20 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
             ctx["settings_save_ms"] = (time.perf_counter() - save_start) * 1000.0
         sync_settings_widget(key)
         runtime_start = time.perf_counter() if ctx is not None else None
-        old_timing_ctx = getattr(window, "_filter_timing_current_ctx", None)
+        old_timing_ctx = timing.current_ctx if ctx is not None else None
         try:
             if ctx is not None:
-                window._filter_timing_current_ctx = ctx
+                timing.current_ctx = ctx
             window._apply_setting_runtime_effects(key)
         except Exception:
             pass
         finally:
             if ctx is not None:
-                window._filter_timing_current_ctx = old_timing_ctx
+                timing.current_ctx = old_timing_ctx
         if ctx is not None:
             ctx["runtime_effects_ms"] = (time.perf_counter() - runtime_start) * 1000.0
             ctx.pop("defer_log", None)
-            log_timing = getattr(window, "_filter_timing_log", None)
-            if callable(log_timing):
-                log_timing(ctx)
+            timing.log(ctx)
 
     def compact_int_setting_entry(key, label, tooltip=None):
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)

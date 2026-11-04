@@ -128,10 +128,12 @@ def browser_host(rows, history, *, sort_key="ping", played_only=False):
         store=source, column_view_store=visible, sort_key=sort_key, sort_asc=True,
         settings={"pin_favorite_servers": False, "prioritise_trusted_servers": False},
         favorites={}, _filter_state=state, _last_played_presentation_token=None,
-        _debug_sort_note_model_event=lambda *_args: None,
+        _sort_debug=SimpleNamespace(
+            note_model_event=lambda *_args: None,
+            note_key_build=lambda *_args: None,
+        ),
         _browser_reorder_is_background_reason=lambda *_args: False,
-        _debug_browser_reorder=lambda *_args, **_kwargs: None,
-        _debug_sort_note_key_build=lambda *_args: None,
+        _browser_reorder=SimpleNamespace(log=lambda *_args, **_kwargs: None),
         _active_filter_depends_on_live_values=lambda: False,
     )
     host._combined_filter_func = MethodType(DZLLWindow._combined_filter_func, host)

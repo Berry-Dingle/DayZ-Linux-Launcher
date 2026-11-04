@@ -3,11 +3,13 @@ from types import SimpleNamespace
 
 from dzll_launcher import column_view
 from dzll_launcher import window as window_module
+from dzll_launcher.browser_diagnostics import BrowserPerfDiagnostics
 from dzll_launcher.scrollbar_interaction import (
     SCROLLBAR_FACTORY_NAMES,
     ScrollbarDragLightController,
     ScrollbarFactoryMetrics,
     ScrollbarInteractionState,
+    format_scroll_drag_factory_summary,
 )
 from dzll_launcher.window import DZLLWindow
 
@@ -53,9 +55,12 @@ def make_host(value=10.0):
         _browser_live_target_keys=set(),
         _scroll_to_top_idle_id=0,
         _programmatic_scroll_to_top_active_until=0.0,
-        _perf_scroll_events=0,
-        _perf_scroll_total=0.0,
-        _perf_scroll_max=0.0,
+        _perf_diagnostics=BrowserPerfDiagnostics(
+            origin_ns=0,
+            is_shut_down=lambda: False,
+            sort_model=lambda: None,
+            filter_model=lambda: None,
+        ),
         _shutdown_cleanup_done=False,
     )
     for name in (
@@ -282,9 +287,9 @@ def test_factory_summary_is_one_concise_line_with_all_factory_names():
         metrics.record_setup(name)
     snapshot = metrics.settle(12)
 
-    line = DZLLWindow._format_scroll_drag_factory_summary(snapshot)
+    line = format_scroll_drag_factory_summary(snapshot, light_enabled=False)
 
-    assert line.startswith("[SCROLL-DRAG-FACTORIES] id=12 ")
+    assert line.startswith("[SCROLL-DRAG-FACTORIES] id=12 light_enabled=0 ")
     assert "\n" not in line
     assert len(line) < 1800
     for name in SCROLLBAR_FACTORY_NAMES:
@@ -382,10 +387,6 @@ def test_drag_output_is_two_lines_and_distinguishes_release_from_watchdog(
         _scroll_drag_adjustment_total=0.0,
         _scroll_drag_adjustment_max=0.0,
         _scroll_drag_factory_snapshot=snapshot,
-    )
-    host._scroll_drag_value_text = DZLLWindow._scroll_drag_value_text
-    host._format_scroll_drag_factory_summary = (
-        DZLLWindow._format_scroll_drag_factory_summary
     )
 
     state = ScrollbarInteractionState()
