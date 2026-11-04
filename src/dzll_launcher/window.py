@@ -728,9 +728,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.threading = threading
 
         # Shared UGC overlay state; legacy widget names are retained for now.
-        self._steam_ugc_progress_timer_id = 0
         self._steam_ugc_active_event = None
-        self._steam_ugc_percent_label = None
 
         # NEW: Cancel support
         self._join_preparation_cancel_event = threading.Event()
@@ -824,7 +822,14 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # ----------------------------
         # Shared mod-preparation overlay (legacy module/widget names retained).
         # ----------------------------
-        self._join_preparation_overlay_ui = JoinPreparationOverlayUI(self)
+        self._join_preparation_overlay_ui = JoinPreparationOverlayUI(
+            self,
+            pulse_active=lambda: (
+                getattr(self, "_mod_download_backend_active", "") == "steam_client"
+                and bool(getattr(self, "_steam_ugc_worker_in_progress", False))
+            ),
+            active_download=lambda: getattr(self, "_steam_ugc_active_event", None),
+        )
         self._join_preparation_overlay_ui.build(overlay)
 
         # ----------------------------
@@ -1304,7 +1309,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._steam_client_stop_waiting_event = threading.Event()
         self._steam_client_set_cancel_buttons(safe_cancel=False)
         self._set_server_companion_join_status("Checking/Updating Required Mods", flash=True)
-        return self._show_steam_ugc_download_overlay(status)
+        self._join_preparation_overlay_ui.show_preparing()
+        self._join_popup_request(
+            JoinPopupPhase.CHECKING,
+            "Checking & Preparing Mods for Join...",
+            backend="steam_client",
+        )
+        return False
 
     def _join_popup_attempt_id(self) -> int:
         pending_id = int(getattr(self, "_pending_join_attempt_id", 0) or 0)
@@ -1319,7 +1330,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _commit_join_popup_presentation(self, state: JoinPopupPresentation) -> None:
         if state.phase in (JoinPopupPhase.DOWNLOADING, JoinPopupPhase.UPDATING):
-            self._steam_ugc_render_active_text(state.text)
+            self._join_preparation_overlay_ui.render_active_text(state.text)
         else:
             self._steam_ugc_render_status(state.text)
 
@@ -1498,38 +1509,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return self._join_popup_presentation.request(state)
 
     def _show_join_progress_overlay(self, status: str = ""):
-        raw_text = str(status or "").strip()
-        if raw_text.startswith("Waiting for Steam"):
-            phase = JoinPopupPhase.WAITING_STEAM
-            text = "Waiting for Steam…"
-            immediate = True
-        elif raw_text.startswith("All Mods Downloaded"):
-            phase = JoinPopupPhase.LAUNCHING
-            text = "All Mods Downloaded, Launching DayZ, Please Wait..."
-            immediate = True
-        elif raw_text.startswith("All Mods Ready"):
-            phase = JoinPopupPhase.LAUNCHING
-            text = "All Mods Ready, Launching DayZ, Please Wait..."
-            immediate = True
-        else:
-            phase = JoinPopupPhase.CHECKING
-            text = "Checking & Preparing Mods for Join..."
-            immediate = True
+        phase, text, immediate = JoinPreparationOverlayUI.join_progress_phase(status)
         try:
             self._set_updating(False)
         except Exception:
             pass
-        try:
-            self.join_preparation_cancel_button.set_label("Cancel")
-            self.join_preparation_cancel_button.set_tooltip_text(
-                "Cancel this Join preparation."
-            )
-            self.join_preparation_cancel_button.set_sensitive(True)
-            self.join_preparation_cancel_button.set_visible(True)
-            self.join_preparation_scrim.set_visible(True)
-            self.join_preparation_card.set_visible(True)
-        except Exception:
-            pass
+        self._join_preparation_overlay_ui.show_join_progress()
         try:
             self._join_popup_request(phase, text, backend="join", immediate=immediate)
         except Exception:
@@ -1538,8 +1523,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _hide_join_preparation_overlay(self):
         try:
-            self._steam_ugc_stop_progress_timer()
-            self._steam_ugc_set_layout_active(False)
             return self._join_preparation_overlay_ui._hide_join_preparation_overlay()
         finally:
             self._set_server_companion_join_status(None)
@@ -1572,8 +1555,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     def _reset_join_preparation_overlay(self):
         try:
-            self._steam_ugc_stop_progress_timer()
-            self._steam_ugc_set_layout_active(False)
+            self._join_preparation_overlay_ui.stop_progress_timer()
+            self._join_preparation_overlay_ui.set_layout_active(False)
             self._steam_ugc_active_event = None
             self._steam_client_safe_cancel_requested = False
             try:
@@ -1657,99 +1640,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return f"{float(total_bytes) / float(gib):.1f} GB"
         return f"{round(float(total_bytes) / float(mib)):.0f} MB"
 
-    def _steam_ugc_title(self) -> str:
-        return "Checking/updating the required mods for this server"
-
-    def _show_steam_ugc_download_overlay(self, status: str = ""):
-        try:
-            self.join_preparation_cancel_button.set_visible(True)
-            self.join_preparation_scrim.set_visible(True)
-            self.join_preparation_card.set_visible(True)
-        except Exception:
-            pass
-        return self._steam_ugc_render_preparing(status)
-
-    def _steam_ugc_get_percent_label(self):
-        label = getattr(self, "_steam_ugc_percent_label", None)
-        if label is not None:
-            return label
-        try:
-            label = Gtk.Label(label="0%")
-            label.set_halign(Gtk.Align.CENTER)
-            label.set_xalign(0.5)
-            attrs = Pango.AttrList()
-            attrs.insert(Pango.attr_foreground_new(0xC8C8, 0xC8C8, 0xC8C8))
-            label.set_attributes(attrs)
-            label.set_visible(False)
-            parent = self.join_preparation_progress_bar.get_parent()
-            if parent is not None:
-                parent.append(label)
-            self._steam_ugc_percent_label = label
-            return label
-        except Exception:
-            self._steam_ugc_percent_label = None
-            return None
-
-    def _steam_ugc_set_layout_active(self, active: bool):
-        try:
-            self.join_preparation_detail_label.set_visible(not active)
-        except Exception:
-            pass
-        try:
-            self.join_preparation_progress_bar.set_margin_top(10 if active else 0)
-        except Exception:
-            pass
-        try:
-            btn_parent = self.join_preparation_cancel_button.get_parent()
-            if btn_parent is not None:
-                btn_parent.set_margin_top(10 if active else 0)
-        except Exception:
-            pass
-        label = self._steam_ugc_get_percent_label() if active else getattr(self, "_steam_ugc_percent_label", None)
-        if label is not None:
-            try:
-                if active:
-                    label.set_text(label.get_text() or "0%")
-                    label.set_visible(True)
-                else:
-                    label.set_text("0%")
-                    label.set_visible(False)
-            except Exception:
-                pass
-
-    def _steam_ugc_render_preparing(self, status: str = ""):
-        try:
-            self._steam_ugc_set_layout_active(True)
-            self.join_preparation_heading.set_text(self._steam_ugc_title())
-            self.join_preparation_detail_label.set_text("")
-        except Exception:
-            pass
-        try:
-            self.join_preparation_spinner.set_visible(True)
-            self.join_preparation_spinner.set_spinning(True)
-        except Exception:
-            pass
-        try:
-            self.join_preparation_progress_bar.set_visible(True)
-            self.join_preparation_progress_bar.set_show_text(False)
-            self.join_preparation_progress_bar.set_fraction(0.0)
-        except Exception:
-            pass
-        label = self._steam_ugc_get_percent_label()
-        if label is not None:
-            try:
-                label.set_text("0%")
-                label.set_visible(True)
-            except Exception:
-                pass
-        self._steam_ugc_start_progress_timer()
-        self._join_popup_request(
-            JoinPopupPhase.CHECKING,
-            "Checking & Preparing Mods for Join...",
-            backend="steam_client",
-        )
-        return False
-
     def _steam_ugc_render_cancelling(self):
         try:
             attempt_id = self._join_popup_attempt_id()
@@ -1761,24 +1651,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._join_popup_presentation.invalidate_pending()
         except Exception:
             pass
-        try:
-            self._steam_ugc_set_layout_active(True)
-            self.join_preparation_heading.set_text(self._steam_ugc_title())
-            self.join_preparation_detail_label.set_text("")
-            self.join_preparation_status_label.set_text("Cancelling download and cleaning up...")
-        except Exception:
-            pass
-        try:
-            self.join_preparation_spinner.set_visible(True)
-            self.join_preparation_spinner.set_spinning(True)
-        except Exception:
-            pass
-        try:
-            self.join_preparation_progress_bar.set_visible(True)
-            self.join_preparation_progress_bar.set_show_text(False)
-        except Exception:
-            pass
-        return False
+        return self._join_preparation_overlay_ui.render_cancelling()
 
     def _steam_ugc_render_status(self, message: str, *, error: bool = False):
         text = str(message or "").strip()
@@ -1795,97 +1668,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._join_popup_presentation.invalidate_pending()
             except Exception:
                 pass
-        try:
-            self._steam_ugc_set_layout_active(True)
-            self.join_preparation_heading.set_text(self._steam_ugc_title())
-            self.join_preparation_detail_label.set_text("")
-            self.join_preparation_status_label.set_text(text)
-        except Exception:
-            pass
-        try:
-            self.join_preparation_spinner.set_visible(not bool(error))
-            self.join_preparation_spinner.set_spinning(not bool(error))
-        except Exception:
-            pass
-        try:
-            self.join_preparation_progress_bar.set_visible(True)
-            self.join_preparation_progress_bar.set_show_text(False)
-            self.join_preparation_progress_bar.set_fraction(0.0)
-            if not error:
-                self._steam_ugc_start_progress_timer()
-            else:
-                self._steam_ugc_stop_progress_timer()
-        except Exception:
-            pass
-        label = self._steam_ugc_get_percent_label()
-        if label is not None:
-            try:
-                label.set_text("0%")
-                label.set_visible(True)
-            except Exception:
-                pass
+        self._join_preparation_overlay_ui.render_status(text, error=error)
         try:
             self._set_server_companion_join_status(text, flash=bool(error))
         except Exception:
             pass
         return False
-
-    def _steam_ugc_render_active_text(self, text: str):
-        """Update only the established active-transfer text, never its progress."""
-        try:
-            self._steam_ugc_set_layout_active(True)
-            self.join_preparation_heading.set_text(self._steam_ugc_title())
-            self.join_preparation_detail_label.set_text("")
-            self.join_preparation_status_label.set_text(str(text or ""))
-        except Exception:
-            pass
-        try:
-            self.join_preparation_spinner.set_visible(True)
-            self.join_preparation_spinner.set_spinning(True)
-        except Exception:
-            pass
-        return False
-
-    def _steam_ugc_start_progress_timer(self):
-        try:
-            if int(getattr(self, "_steam_ugc_progress_timer_id", 0) or 0):
-                return
-            self._steam_ugc_progress_timer_id = GLib.timeout_add(500, self._steam_ugc_progress_pulse)
-        except Exception:
-            self._steam_ugc_progress_timer_id = 0
-
-    def _steam_ugc_stop_progress_timer(self):
-        try:
-            tid = int(getattr(self, "_steam_ugc_progress_timer_id", 0) or 0)
-            if tid:
-                try:
-                    GLib.source_remove(tid)
-                except Exception:
-                    pass
-            self._steam_ugc_progress_timer_id = 0
-        except Exception:
-            self._steam_ugc_progress_timer_id = 0
-
-    def _steam_ugc_progress_pulse(self):
-        try:
-            if (
-                getattr(self, "_mod_download_backend_active", "") != "steam_client"
-                or not bool(getattr(self, "_steam_ugc_worker_in_progress", False))
-            ):
-                self._steam_ugc_progress_timer_id = 0
-                return False
-            active = getattr(self, "_steam_ugc_active_event", None) or {}
-            total_bytes = int(active.get("total_bytes") or 0) if isinstance(active, dict) else 0
-            if total_bytes <= 0:
-                try:
-                    self.join_preparation_progress_bar.set_visible(True)
-                    self.join_preparation_progress_bar.set_show_text(False)
-                    self.join_preparation_progress_bar.pulse()
-                except Exception:
-                    pass
-            return True
-        except Exception:
-            return True
 
     def _steam_ugc_progress_from_worker(self, event: dict):
         try:
@@ -1980,32 +1768,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 immediate=snapshot.phase in (JoinPopupPhase.WAITING_STEAM, JoinPopupPhase.ERROR),
                 attempt_id=snapshot.operation_id,
             )
-        try:
-            self.join_preparation_spinner.set_visible(True)
-            self.join_preparation_spinner.set_spinning(True)
-        except Exception:
-            pass
-        percent_label = self._steam_ugc_get_percent_label()
-        if snapshot.progress_mode is PreparationProgressMode.DETERMINATE:
-            self._steam_ugc_stop_progress_timer()
-            fraction = float(snapshot.fraction or 0.0)
-            try:
-                self.join_preparation_progress_bar.set_visible(True)
-                self.join_preparation_progress_bar.set_show_text(False)
-                self.join_preparation_progress_bar.set_fraction(fraction)
-            except Exception:
-                pass
-            if percent_label is not None:
-                percent_label.set_text(f"{int(fraction * 100)}%")
-                percent_label.set_visible(True)
-        elif snapshot.progress_mode is PreparationProgressMode.INDETERMINATE:
-            try:
-                self.join_preparation_progress_bar.set_visible(True)
-                self.join_preparation_progress_bar.set_show_text(False)
-                self.join_preparation_progress_bar.set_fraction(0.0)
-            except Exception:
-                pass
-            self._steam_ugc_start_progress_timer()
+        self._join_preparation_overlay_ui.render_progress(snapshot)
 
     def _open_steam_downloads(self):
         try:

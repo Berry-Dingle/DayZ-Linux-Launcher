@@ -5,6 +5,7 @@ import pytest
 
 from dzll_launcher import window as window_module
 from dzll_launcher.join_attempt import JoinAttemptTracker
+from dzll_launcher.join_preparation_overlay_ui import JoinPreparationOverlayUI
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,11 @@ class LifecycleHarness:
         self.errors = []
         self.close_count = 0
         self.join_preparation_cancel_button = FakeButton()
+        # The overlay renderer shares the window's Cancel button, as build() wires it.
+        self._join_preparation_overlay_ui = JoinPreparationOverlayUI(
+            self, pulse_active=lambda: False, active_download=lambda: None,
+        )
+        self._join_preparation_overlay_ui.join_preparation_cancel_button = self.join_preparation_cancel_button
         self._join_attempts = JoinAttemptTracker(log_sink=self.logs.append)
         self._join_popup_item_activity = type("Activity", (), {"clear_attempt": lambda *_: None})()
         self._pending_join_attempt_id = 0

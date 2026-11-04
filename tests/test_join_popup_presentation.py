@@ -269,8 +269,11 @@ class JoinPopupPresentationTests(unittest.TestCase):
 
     def test_real_work_progress_percentage_path_remains(self):
         reducer = (ROOT / "src/dzll_launcher/preparation_presentation.py").read_text()
-        renderer = WINDOW_SOURCE.split("def _render_join_preparation_snapshot", 1)[1]
-        renderer = renderer.split("def _open_steam_downloads", 1)[0]
+        window_renderer = WINDOW_SOURCE.split("def _render_join_preparation_snapshot", 1)[1]
+        window_renderer = window_renderer.split("def _open_steam_downloads", 1)[0]
+        self.assertIn("self._join_preparation_overlay_ui.render_progress(snapshot)", window_renderer)
+        renderer = STEAMCMD_UI_SOURCE.split("def render_progress", 1)[1]
+        renderer = renderer.split("\n    def ", 1)[0]
         self.assertIn("float(download_bytes) / float(total_bytes)", reducer)
         self.assertIn("join_preparation_progress_bar.set_fraction(fraction)", renderer)
         self.assertIn('percent_label.set_text(f"{int(fraction * 100)}%")', renderer)

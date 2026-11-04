@@ -12,6 +12,7 @@ from dzll_launcher.join_popup_presentation import (
 )
 from dzll_launcher.steam_ugc_backend import UGCModSession
 from dzll_launcher.join_attempt import JoinAttemptTracker
+from dzll_launcher.join_preparation_overlay_ui import JoinPreparationOverlayUI
 
 
 class FakeGLib:
@@ -79,6 +80,18 @@ class RendererHarness:
         self.join_preparation_spinner = FakeWidget("spinner", self.writes)
         self.join_preparation_progress_bar = FakeWidget("progress", self.writes)
         self.percent_label = FakeWidget("percent", self.writes)
+        # The real overlay renderer drawing into the fake widgets, with layout,
+        # percent-label creation and the pulse timer stubbed as before.
+        overlay = JoinPreparationOverlayUI(
+            self, pulse_active=lambda: True, active_download=lambda: self._steam_ugc_active_event,
+        )
+        for name in ("heading", "detail_label", "status_label", "spinner", "progress_bar"):
+            setattr(overlay, f"join_preparation_{name}", getattr(self, f"join_preparation_{name}"))
+        overlay.get_percent_label = lambda: self.percent_label
+        overlay.set_layout_active = lambda _active: None
+        overlay.start_progress_timer = lambda: None
+        overlay.stop_progress_timer = lambda: None
+        self._join_preparation_overlay_ui = overlay
         self._join_popup_item_activity = JoinPopupActivityTracker()
         self._join_popup_presentation = JoinPopupPresentationController(
             schedule=lambda callback: self.glib.idle_add(callback),
@@ -95,21 +108,6 @@ class RendererHarness:
     def _join_log(self, attempt_id, event, **fields):
         self.logs.append((attempt_id, event, fields))
         return True
-
-    def _steam_ugc_get_percent_label(self):
-        return self.percent_label
-
-    def _steam_ugc_set_layout_active(self, _active):
-        return None
-
-    def _steam_ugc_title(self):
-        return "Checking/updating the required mods for this server"
-
-    def _steam_ugc_start_progress_timer(self):
-        return None
-
-    def _steam_ugc_stop_progress_timer(self):
-        return None
 
     def _set_server_companion_join_status(self, *_args, **_kwargs):
         return None
@@ -128,7 +126,6 @@ for _method_name in (
     "_join_popup_request",
     "_commit_join_popup_presentation",
     "_steam_ugc_render_status",
-    "_steam_ugc_render_active_text",
     "_steam_ugc_format_size",
     "_join_popup_active_download_text",
     "_join_popup_note_genuine_transfer",

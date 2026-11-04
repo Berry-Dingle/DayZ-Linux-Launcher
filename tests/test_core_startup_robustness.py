@@ -236,6 +236,37 @@ def test_real_window_constructs_from_fresh_isolated_state(isolated_window_state)
         _close_window(app, window)
 
 
+def test_real_window_wires_preparation_overlay_renderer_to_its_widgets_and_download_state(
+    isolated_window_state,
+):
+    app = _new_app()
+    window = window_module.DZLLWindow(app)
+    try:
+        ui = window._join_preparation_overlay_ui
+        for name in ("scrim", "card", "heading", "spinner", "detail_label",
+                     "status_label", "progress_bar", "cancel_button"):
+            assert getattr(ui, f"join_preparation_{name}") is getattr(window, f"join_preparation_{name}")
+        assert (ui.progress_timer_id, ui.percent_label) == (0, None)
+        for name in ("_steam_ugc_progress_timer_id", "_steam_ugc_percent_label"):
+            assert not hasattr(window, name)
+
+        window._mod_download_backend_active = "steam_client"
+        window._steam_ugc_worker_in_progress = True
+        assert ui._pulse_active() is True
+        window._steam_ugc_worker_in_progress = False
+        assert ui._pulse_active() is False
+        window._steam_ugc_worker_in_progress = True
+        window._mod_download_backend_active = "join"
+        assert ui._pulse_active() is False
+        window._steam_ugc_active_event = {"id": 7, "total_bytes": 9}
+        assert ui._active_download() is window._steam_ugc_active_event
+        window._mod_download_backend_active = ""
+        window._steam_ugc_worker_in_progress = False
+        window._steam_ugc_active_event = None
+    finally:
+        _close_window(app, window)
+
+
 def test_a2s_warmup_opt_in_perf_activation_constructs_and_presents_real_window(
     isolated_window_state, monkeypatch,
 ):
