@@ -30,7 +30,7 @@ from dzll_launcher.workshop_mods import (
     parse_mods_from_db,
     symlink_name_for_mod,
 )
-from dzll_launcher.window import parse_mods_preview
+from dzll_launcher.mod_parsed import parse_mods_preview
 
 
 @pytest.mark.parametrize(

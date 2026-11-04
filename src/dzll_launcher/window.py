@@ -2,17 +2,14 @@
 
 #!/usr/bin/env python3
 import os
-import json
 import logging
 import time
 import subprocess
-import urllib.request
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, wait
 import threading
 import re
 import gi
-import shutil
 import traceback
 import weakref
 import resource
@@ -66,10 +63,7 @@ from .config import (
     IMAGES_DIR,
     DISCLAIMER_TEXT,
     DEAD_MAX_FAILS,
-    APP_VERSION,
     RELEASES_URL,
-    GITHUB_LATEST_API,
-    STEAM_CURRENT_PLAYERS_URL,
     GLOBAL_PLAYERS_POLL_SECS,
     COMPANION_POLL_ONLINE_SECONDS,
     COMPANION_POLL_OFFLINE_SECONDS,
@@ -96,6 +90,8 @@ from .storage import (
     clear_last_companion_server,
     load_dead_cache,
     save_dead_cache,
+    prune_expired_dead_entries,
+    clamp_dead_cache_entries,
 )
 from .launcher_user_config import set_launcher_shutdown_mode
 from .db import fetch_db_overwrite_local, read_servers_from_db
@@ -188,7 +184,10 @@ from .background_prepare_queue import (
     BackgroundServerState,
 )
 from .background_prepare_browser import BrowserPreparationPresenter
-from .server_companion_ui import ServerCompanionPanel
+from .server_companion_ui import ServerCompanionPanel, companion_display_confidence_summary
+from .desktop_integration import ensure_user_desktop_integration
+from .steam_global_players import SteamGlobalPlayersPoller
+from .update_check import manual_update_check, startup_update_info
 from . import server_companion_audio, server_companion_state
 from .launch_utils import launch_direct_steam_url
 from .join_attempt import JoinAttemptTracker
@@ -210,7 +209,7 @@ from .preparation_presentation import (
     PreparationProgressMode,
 )
 from .mod_metadata import clean_display_mod_name, mark_mods_used
-from .mod_parsed import ParsedServerMods
+from .mod_parsed import ParsedServerMods, parse_mods_preview
 from .atomic_json import _fsync_directory_best_effort
 from . import server_mod_cache
 from .mod_suggestion_cache import (
@@ -254,47 +253,6 @@ from .companion_restart_phase2_runtime import (
     phase2_learning_summary,
 )
 
-
-def companion_display_confidence_summary(
-    summary: dict | None, candidate: tuple[int, float] | None, *, period_seconds: int | None
-) -> dict | None:
-    """Label selected confidence or show a learning candidate in the UI only."""
-
-    learning = summary is None or (
-        period_seconds is None
-        and (
-            summary.get("presentation_key") in {"none", "pattern_only"}
-            or summary.get("cycle_text") in {"Still Learning", "Learning Restart Pattern"}
-        )
-    )
-    if summary is None and candidate is None:
-        return None
-    result = dict(summary or {})
-    named_cycle = period_seconds is not None and (
-        result.get("presentation_key")
-        in {"likely_cycle", "confirmed_cycle", "likely_new_cycle", "confirmed_new_cycle"}
-        or str(result.get("cycle_text") or "").startswith("Every ")
-    )
-    if named_cycle:
-        result["confidence_label"] = "Cycle Confidence:"
-        return result
-    if not learning:
-        return result
-    result["cycle_text"] = "Learning Restart Pattern"
-    result.setdefault("next_visible", False)
-    result.setdefault("countdown_visible", False)
-    result.setdefault("prediction_usable", False)
-    if candidate is None:
-        result["confidence_visible"] = False
-        return result
-    result.update(
-        confidence_percent=int(round(candidate[1] * 100)),
-        confidence_kind="period",
-        confidence_label="Learning Confidence:",
-        confidence_visible=True,
-    )
-    result.pop("confidence_severity", None)
-    return result
 
 BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET = 10
 BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING = 8
@@ -422,152 +380,6 @@ def enable_incremental_model_if_available(model, label: str) -> None:
             print(f"[PERF] incremental {label} model unavailable", flush=True)
 
 
-def ensure_user_desktop_integration(
-    *,
-    app_id: str,
-    app_name: str,
-    icon_src_path: str,
-    categories: str = "Game;",
-) -> None:
-    """
-    Best-effort desktop integration for source/venv usage via: python -m dzll_launcher
-
-    Behavior:
-      - installs icon to ~/.local/share/icons/hicolor/512x512/apps/com.bdingle.dzll.png
-      - creates ~/.local/share/applications/<app_id>.desktop
-      - launches via project venv python if available
-      - supports src-layout projects
-      - derives paths from the actual installed package location
-
-    SAFETY:
-      - will NOT overwrite an existing desktop file unless it contains the DZLL marker
-      - intended for non-packaged runs; packaged installs should ship their own .desktop/icon
-    """
-    try:
-        home = Path.home()
-        user_apps = home / ".local/share/applications"
-        user_icons = home / ".local/share/icons/hicolor/512x512/apps"
-        desktop_path = user_apps / f"{app_id}.desktop"
-        marker = "X-DZLL-AutoCreated=true"
-        system_desktop_path = Path("/usr/share/applications") / f"{app_id}.desktop"
-
-        if system_desktop_path.exists():
-            try:
-                if desktop_path.exists():
-                    txt = desktop_path.read_text(encoding="utf-8", errors="replace")
-                    if marker in txt:
-                        desktop_path.unlink()
-            except Exception:
-                pass
-            return
-
-        user_apps.mkdir(parents=True, exist_ok=True)
-        user_icons.mkdir(parents=True, exist_ok=True)
-
-        # ----- icon -----
-        icon_name = app_id
-        icon_dst = user_icons / f"{icon_name}.png"
-        src = Path(icon_src_path).expanduser().resolve()
-
-        if src.is_file():
-            need_copy = not icon_dst.exists()
-            if not need_copy:
-                try:
-                    need_copy = (
-                        icon_dst.stat().st_size != src.stat().st_size
-                        or int(icon_dst.stat().st_mtime) != int(src.stat().st_mtime)
-                    )
-                except Exception:
-                    need_copy = True
-
-            if need_copy:
-                try:
-                    shutil.copy2(src, icon_dst)
-                except Exception as e:
-                    print(f"[DZLL] Failed to copy desktop icon: {e}")
-
-        # ----- desktop entry -----
-        # Do not overwrite non-DZLL desktop entries (e.g. packaged installs)
-        if desktop_path.exists():
-            try:
-                txt = desktop_path.read_text(encoding="utf-8", errors="replace")
-                if marker not in txt:
-                    return
-            except Exception:
-                return
-
-        package_dir = Path(__file__).resolve().parent
-
-        # src layout:
-        #   /some/path/project/src/dzll_launcher
-        # normal layout:
-        #   /some/path/project/dzll_launcher
-        if package_dir.parent.name == "src":
-            run_path = package_dir.parent  # .../project/src
-            project_root = run_path.parent  # .../project
-        else:
-            run_path = package_dir.parent  # .../project
-            project_root = run_path
-
-        # Prefer project-local venv python
-        venv_python = project_root / ".venv" / "bin" / "python3"
-        if venv_python.is_file():
-            python_exe = venv_python
-        else:
-            python_exe = Path(sys.executable) if sys.executable else Path("/usr/bin/python3")
-
-        exec_line = f'"{python_exe}" -m dzll_launcher'
-
-        desktop_text = (
-            "[Desktop Entry]\n"
-            "Version=1.0\n"
-            "Type=Application\n"
-            f"Name={app_name}\n"
-            f"Comment={app_name}\n"
-            f"Exec={exec_line}\n"
-            f"Path={run_path}\n"
-            f"Icon={icon_name}\n"
-            "Terminal=false\n"
-            f"Categories={categories}\n"
-            "StartupNotify=true\n"
-            f"{marker}\n"
-        )
-
-        try:
-            old = ""
-            if desktop_path.exists():
-                old = desktop_path.read_text(encoding="utf-8", errors="replace")
-            if old != desktop_text:
-                desktop_path.write_text(desktop_text, encoding="utf-8")
-                os.chmod(desktop_path, 0o755)
-        except Exception as e:
-            print(f"[DZLL] Failed to write desktop entry: {e}")
-            return
-
-        # Refresh desktop/icon caches best-effort
-        try:
-            subprocess.run(
-                ["update-desktop-database", str(user_apps)],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception:
-            pass
-
-        try:
-            subprocess.run(
-                ["gtk-update-icon-cache", "-f", "-t", str(home / ".local/share/icons/hicolor")],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        except Exception:
-            pass
-
-    except Exception as e:
-        print(f"[DZLL] Desktop integration skipped: {e}")
-
 def fav_key(ip: str, gport: int) -> str:
     return f"{ip}:{int(gport)}"
 
@@ -587,46 +399,6 @@ def _a2s_live_field_snapshot(obj) -> dict:
 
 def _a2s_changed_live_fields(before: dict, proposed: dict) -> list[str]:
     return [name for name in proposed if before.get(name) != proposed.get(name)]
-
-
-def parse_mods_preview(
-    mods_json: str, max_names: int = 8, *, parsed_mods: ParsedServerMods | None = None,
-) -> tuple[int, str]:
-    """
-    Returns:
-      (total_mod_count, preview_string)
-
-    preview_string:
-      - up to max_names mod names
-      - adds ", ..." if truncated
-    """
-    if parsed_mods is None and not mods_json:
-        return 0, ""
-    try:
-        arr = parsed_mods.items if parsed_mods is not None else json.loads(mods_json)
-        if not isinstance(arr, list):
-            return 0, ""
-
-        names = []
-        for it in arr:
-            if isinstance(it, dict):
-                sid = str(it.get("steamWorkshopId") or "").strip()
-                name_id = sid if sid.isdigit() else None
-                nm = (parsed_mods.clean_name(it, name_id) if parsed_mods is not None else
-                      clean_display_mod_name(it.get("name"), name_id, fallback=False))
-                if nm:
-                    names.append(nm)
-
-        total = len(names)
-        if total == 0:
-            return 0, ""
-
-        preview = ", ".join(names[:max_names])
-        if total > max_names:
-            preview += ", ..."
-        return total, preview
-    except Exception:
-        return 0, ""
 
 
 def _db_advisory_text(value) -> str:
@@ -790,14 +562,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._ping_cutoff_ms = int(self.settings.get("high_ping_cutoff_ms", 250) or 250)
 
         # Steam global players state
-        self._steam_global_players = None
+        self._global_players_poller = SteamGlobalPlayersPoller(
+            settings=lambda: self.settings,
+            is_shut_down=lambda: bool(getattr(self, "_shutdown_cleanup_done", False)),
+            submit=lambda work: self._executor.submit(work),
+            schedule_idle=GLib.idle_add,
+            on_updated=lambda: self._apply_titlebar_counts(),
+        )
         self._steam_global_players_startup_source_id = int(
             GLib.timeout_add_seconds(2, self._steam_global_players_startup_tick) or 0
         )
         self._steam_global_players_poll_source_id = int(
             GLib.timeout_add_seconds(
                 GLOBAL_PLAYERS_POLL_SECS,
-                self._steam_global_players_tick,
+                self._global_players_poller.tick,
             ) or 0
         )
 
@@ -903,8 +681,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
 
         self.dead = load_dead_cache()
-        self._prune_expired_dead()
-        self._clamp_dead_cache()
+        if prune_expired_dead_entries(self.dead, now=int(time.time())):
+            try:
+                save_dead_cache(self.dead)
+            except Exception:
+                pass
+        if clamp_dead_cache_entries(self.dead, now=int(time.time()), max_fails=DEAD_MAX_FAILS):
+            try:
+                save_dead_cache(self.dead)
+            except Exception:
+                pass
 
         self._dead_session = set()
 
@@ -1480,8 +1266,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 parts.append("Servers: 0")
 
         if show_global:
-            if isinstance(getattr(self, "_steam_global_players", None), int):
-                parts.append(f"Global Players: {int(self._steam_global_players)}")
+            global_players = getattr(getattr(self, "_global_players_poller", None), "count", None)
+            if isinstance(global_players, int):
+                parts.append(f"Global Players: {int(global_players)}")
             else:
                 parts.append("Global Players: --")
 
@@ -1493,52 +1280,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     def _steam_global_players_startup_tick(self):
         self._steam_global_players_startup_source_id = 0
-        self._steam_global_players_tick()
-        return False
-
-    def _steam_global_players_tick(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        if not bool(self.settings.get("show_counts_in_title_bar", False)):
-            return True
-        if not bool(self.settings.get("show_counts_global_players", True)):
-            return True
-
-        def worker():
-            val = self._fetch_steam_global_players()
-            GLib.idle_add(self._apply_steam_global_players, val)
-
-        try:
-            self._executor.submit(worker)
-        except Exception:
-            pass
-
-        return True
-
-    def _fetch_steam_global_players(self):
-        try:
-            req = urllib.request.Request(
-                STEAM_CURRENT_PLAYERS_URL,
-                headers={"User-Agent": "DZLL"},
-            )
-            with urllib.request.urlopen(req, timeout=3.0) as r:
-                raw = r.read().decode("utf-8", "replace")
-            data = json.loads(raw)
-            resp = data.get("response") if isinstance(data, dict) else None
-            if isinstance(resp, dict):
-                pc = resp.get("player_count")
-                return int(pc)
-        except Exception:
-            pass
-        return None
-
-    def _apply_steam_global_players(self, val):
-        if isinstance(val, int) and val >= 0:
-            self._steam_global_players = val
-        try:
-            self._apply_titlebar_counts()
-        except Exception:
-            pass
+        self._global_players_poller.tick()
         return False
 
     # ----------------------------
@@ -5275,7 +5017,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if PERF_LOG_ENABLED:
                 log_startup_phase(self._startup_perf_origin_ns, "db_worker_start", worker_start_ns)
             try:
-                self._check_updates_worker()
+                update_info = startup_update_info(self.settings, save_settings=save_settings)
+                if update_info is not None:
+                    self._update_info = update_info
             except Exception:
                 pass
 
@@ -5369,55 +5113,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._db_executor.submit(worker)
 
-    def _check_updates_worker(self):
-        if not bool(self.settings.get("auto_check_updates", True)):
-            return
-
-        test_tag = os.environ.get("DZLL_TEST_UPDATE_TAG", "").strip()
-        if test_tag:
-            test_url = os.environ.get("DZLL_TEST_UPDATE_URL", "").strip() or RELEASES_URL
-            self._update_info = {"tag": test_tag, "url": test_url}
-            return
-
-        forced = os.environ.get("DZLL_FORCE_LATEST_TAG", "").strip()
-        if forced:
-            self._update_info = {"tag": forced, "url": RELEASES_URL}
-            return
-
-        now = int(time.time())
-        last = int(self.settings.get("last_update_check_ts", 0) or 0)
-
-        if last and (now - last) < 86400:
-            tag = str(self.settings.get("latest_release_tag") or "").strip()
-            url = str(self.settings.get("latest_release_url") or RELEASES_URL).strip()
-            if tag:
-                self._update_info = {"tag": tag, "url": url}
-            return
-
-        tag = ""
-        url = ""
-        try:
-            req = urllib.request.Request(GITHUB_LATEST_API, headers={"User-Agent": "DZLL"})
-            with urllib.request.urlopen(req, timeout=3.0) as r:
-                raw = r.read().decode("utf-8", "replace")
-            data = json.loads(raw)
-            tag = str(data.get("tag_name") or "").strip()
-            url = str(data.get("html_url") or RELEASES_URL).strip()
-        except Exception:
-            tag = ""
-            url = ""
-
-        try:
-            self.settings["last_update_check_ts"] = now
-            self.settings["latest_release_tag"] = tag
-            self.settings["latest_release_url"] = url
-            save_settings(self.settings)
-        except Exception:
-            pass
-
-        if tag:
-            self._update_info = {"tag": tag, "url": url}
-
     def _manual_check_for_updates(self, status_callback=None):
         def set_status(text: str):
             if status_callback:
@@ -5445,41 +5140,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return False
 
         def worker():
-            test_tag = os.environ.get("DZLL_TEST_UPDATE_TAG", "").strip()
-            if test_tag:
-                test_url = os.environ.get("DZLL_TEST_UPDATE_URL", "").strip() or RELEASES_URL
-                GLib.idle_add(finish, "available", test_tag, test_url)
-                return
-
-            try:
-                req = urllib.request.Request(GITHUB_LATEST_API, headers={"User-Agent": "DZLL"})
-                with urllib.request.urlopen(req, timeout=3.0) as r:
-                    raw = r.read().decode("utf-8", "replace")
-                data = json.loads(raw)
-                tag = str(data.get("tag_name") or "").strip()
-                url = str(data.get("html_url") or RELEASES_URL).strip()
-            except urllib.error.HTTPError as e:
-                if getattr(e, "code", None) == 404:
-                    GLib.idle_add(finish, "no_stable_release", "", "")
-                else:
-                    GLib.idle_add(finish, "failed", "", "")
-                return
-            except Exception:
-                GLib.idle_add(finish, "failed", "", "")
-                return
-
-            try:
-                self.settings["last_update_check_ts"] = int(time.time())
-                self.settings["latest_release_tag"] = tag
-                self.settings["latest_release_url"] = url
-                save_settings(self.settings)
-            except Exception:
-                pass
-
-            if tag and str(APP_VERSION).strip() not in ("", "dev") and tag != str(APP_VERSION).strip():
-                GLib.idle_add(finish, "available", tag, url)
-            else:
-                GLib.idle_add(finish, "latest", "", "")
+            GLib.idle_add(finish, *manual_update_check(self.settings, save_settings=save_settings))
 
         self._update_executor.submit(worker)
 
@@ -12894,57 +12555,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._show_join_preparation_error(attempt_id, f"Could not start Join preparation: {exc}")
             self._cleanup_join_attempt(attempt_id, "worker submission failure")
             self._release_join_preparation_lease(attempt_id)
-
-    # ----------------------------
-    # Dead cache prune / clamp
-    # ----------------------------
-    def _prune_expired_dead(self):
-        now = int(time.time())
-        changed = False
-        for k in list(self.dead.keys()):
-            d = self.dead.get(k, {})
-            dead_until = int(d.get("dead_until", 0) or 0)
-            if dead_until and dead_until < (now - 7 * 86400):
-                self.dead.pop(k, None)
-                changed = True
-        if changed:
-            try:
-                save_dead_cache(self.dead)
-            except Exception:
-                pass
-
-    def _clamp_dead_cache(self):
-        now = int(time.time())
-        cutoff = now - (30 * 86400)
-        changed = False
-
-        for k in list(self.dead.keys()):
-            d = self.dead.get(k, {})
-            try:
-                lf = int(d.get("last_fail", 0) or 0)
-            except Exception:
-                lf = 0
-
-            if lf and lf < cutoff:
-                self.dead.pop(k, None)
-                changed = True
-                continue
-
-            try:
-                fc = int(d.get("fail_count", 0) or 0)
-            except Exception:
-                fc = 0
-
-            if fc > DEAD_MAX_FAILS:
-                d["fail_count"] = DEAD_MAX_FAILS
-                self.dead[k] = d
-                changed = True
-
-        if changed:
-            try:
-                save_dead_cache(self.dead)
-            except Exception:
-                pass
 
     # ----------------------------
     # Settings helpers (required by settings_ui.py)

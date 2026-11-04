@@ -10,11 +10,11 @@ from dzll_launcher.companion_restart_phase2_consumers import ConsumerModelStatus
 from dzll_launcher.companion_restart_phase2_runtime import phase2_learning_summary
 from dzll_launcher.server_companion_ui import (
     ServerCompanionPanel,
+    companion_display_confidence_summary,
     format_restart_cycle_text,
     format_restart_local_time,
     restart_learning_presentation,
 )
-from dzll_launcher.window import companion_display_confidence_summary
 
 
 NOW = 1_800_000_000.0

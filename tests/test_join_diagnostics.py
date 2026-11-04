@@ -478,7 +478,7 @@ def test_no_automatic_retry_delay_or_second_handoff_added():
     assert "retry" not in launch_source.lower()
     join_section = window_source.split("def _join_server_for_obj", 1)[1]
     assert "Join already in progress" in join_section
-    assert "time.sleep" not in join_section.split("def _prune_expired_dead", 1)[0]
+    assert "time.sleep" not in join_section.split("def _set_widget_sensitive", 1)[0]
 
 
 class QueuedGLib:
@@ -746,7 +746,7 @@ def test_cancelled_join_worker_future_is_not_an_exception_error():
 def test_join_submission_attaches_identity_captured_future_observer():
     source = Path("src/dzll_launcher/window.py").read_text(encoding="utf-8")
     submission = source.split("def _join_server_for_obj", 1)[1].split(
-        "def _prune_expired_dead", 1,
+        "def _set_widget_sensitive", 1,
     )[0]
     assert "future = self._hi_executor.submit(do_prepare_and_launch)" in submission
     assert "future.add_done_callback(" in submission

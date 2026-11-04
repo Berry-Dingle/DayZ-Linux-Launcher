@@ -10,14 +10,14 @@ OLD_ICON_SIZE_DIR = "hicolor/" + "256x256/apps"
 
 def test_rpm_and_source_desktop_icon_paths_use_canonical_size():
     spec = (ROOT / "dzll_launcher.spec").read_text(encoding="utf-8")
-    window = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
+    desktop_integration = (ROOT / "src/dzll_launcher/desktop_integration.py").read_text(encoding="utf-8")
 
     assert ICON_RELATIVE_PATH in spec
     assert f"%{{_datadir}}/icons/{ICON_SIZE_DIR}/{ICON_NAME}" in spec
     assert f"%{{_datadir}}/icons/{OLD_ICON_SIZE_DIR}/{ICON_NAME}" not in spec
 
-    assert f".local/share/icons/{ICON_SIZE_DIR}" in window
-    assert f".local/share/icons/{OLD_ICON_SIZE_DIR}" not in window
+    assert f".local/share/icons/{ICON_SIZE_DIR}" in desktop_integration
+    assert f".local/share/icons/{OLD_ICON_SIZE_DIR}" not in desktop_integration
 
 
 def test_debian_icon_path_remains_canonical_and_old_path_is_absent():

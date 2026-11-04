@@ -18,6 +18,7 @@ from dzll_launcher.companion_restart_phase2_runtime import (
 )
 from dzll_launcher.companion_restart_phase2_detection import EventOutcome
 from dzll_launcher import window as window_module
+from dzll_launcher import server_companion_ui
 from dzll_launcher.server_companion_ui import restart_learning_presentation
 from dzll_launcher.window import DZLLWindow
 
@@ -1119,7 +1120,7 @@ def test_transition_keeps_existing_confidence_label_and_value():
         "confidence_percent": 81,
         "confidence_label": "Confidence:",
     }
-    summary = window_module.companion_display_confidence_summary(
+    summary = server_companion_ui.companion_display_confidence_summary(
         original, (4 * 3600, 0.12), period_seconds=3 * 3600
     )
     assert summary == original

@@ -149,6 +149,48 @@ def restart_learning_presentation(summary: dict | None) -> dict | None:
     return presentation
 
 
+def companion_display_confidence_summary(
+    summary: dict | None, candidate: tuple[int, float] | None, *, period_seconds: int | None
+) -> dict | None:
+    """Label selected confidence or show a learning candidate in the UI only."""
+
+    learning = summary is None or (
+        period_seconds is None
+        and (
+            summary.get("presentation_key") in {"none", "pattern_only"}
+            or summary.get("cycle_text") in {"Still Learning", "Learning Restart Pattern"}
+        )
+    )
+    if summary is None and candidate is None:
+        return None
+    result = dict(summary or {})
+    named_cycle = period_seconds is not None and (
+        result.get("presentation_key")
+        in {"likely_cycle", "confirmed_cycle", "likely_new_cycle", "confirmed_new_cycle"}
+        or str(result.get("cycle_text") or "").startswith("Every ")
+    )
+    if named_cycle:
+        result["confidence_label"] = "Cycle Confidence:"
+        return result
+    if not learning:
+        return result
+    result["cycle_text"] = "Learning Restart Pattern"
+    result.setdefault("next_visible", False)
+    result.setdefault("countdown_visible", False)
+    result.setdefault("prediction_usable", False)
+    if candidate is None:
+        result["confidence_visible"] = False
+        return result
+    result.update(
+        confidence_percent=int(round(candidate[1] * 100)),
+        confidence_kind="period",
+        confidence_label="Learning Confidence:",
+        confidence_visible=True,
+    )
+    result.pop("confidence_severity", None)
+    return result
+
+
 class ServerCompanionPanel(Gtk.Box):
     WIDTH = 280
     UNDOCKED_COMPACT_HEIGHT = 470

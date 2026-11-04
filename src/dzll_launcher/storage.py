@@ -13,6 +13,7 @@ from .config import (
     LAST_COMPANION_SERVER_PATH,
     COMPANION_RESTART_LEARNING_PATH,
     DEAD_PATH,
+    DEAD_MAX_FAILS,
     CACHE_DIR,
 )
 
@@ -143,3 +144,48 @@ def load_dead_cache() -> dict:
 def save_dead_cache(dead: dict) -> None:
     os.makedirs(CACHE_DIR, exist_ok=True)
     save_json_dict(DEAD_PATH, dead or {})
+
+DEAD_EXPIRED_RETENTION_SECONDS = 7 * 86400
+DEAD_LAST_FAIL_MAX_AGE_SECONDS = 30 * 86400
+
+
+def prune_expired_dead_entries(dead: dict, *, now: int) -> bool:
+    """Drop entries whose dead period ended over a week ago. Mutates ``dead``; returns True if changed."""
+    changed = False
+    for k in list(dead.keys()):
+        d = dead.get(k, {})
+        dead_until = int(d.get("dead_until", 0) or 0)
+        if dead_until and dead_until < (now - DEAD_EXPIRED_RETENTION_SECONDS):
+            dead.pop(k, None)
+            changed = True
+    return changed
+
+
+def clamp_dead_cache_entries(dead: dict, *, now: int, max_fails: int = DEAD_MAX_FAILS) -> bool:
+    """Drop entries with no failure in 30 days and cap ``fail_count``. Mutates ``dead``; returns True if changed."""
+    cutoff = now - DEAD_LAST_FAIL_MAX_AGE_SECONDS
+    changed = False
+
+    for k in list(dead.keys()):
+        d = dead.get(k, {})
+        try:
+            lf = int(d.get("last_fail", 0) or 0)
+        except Exception:
+            lf = 0
+
+        if lf and lf < cutoff:
+            dead.pop(k, None)
+            changed = True
+            continue
+
+        try:
+            fc = int(d.get("fail_count", 0) or 0)
+        except Exception:
+            fc = 0
+
+        if fc > max_fails:
+            d["fail_count"] = max_fails
+            dead[k] = d
+            changed = True
+
+    return changed

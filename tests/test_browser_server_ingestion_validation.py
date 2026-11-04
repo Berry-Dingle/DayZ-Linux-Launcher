@@ -133,8 +133,8 @@ class _IndexedBrowserHost(_BrowserHost):
 ])
 def test_load_local_mod_index_paths_match_original_public_builders(payload):
     parsed = mod_parsed.ParsedServerMods.from_json(payload)
-    assert window.parse_mods_preview(payload, parsed_mods=parsed) == window.parse_mods_preview(payload)
-    assert window.parse_mods_preview(payload, max_names=0, parsed_mods=parsed) == window.parse_mods_preview(payload, max_names=0)
+    assert mod_parsed.parse_mods_preview(payload, parsed_mods=parsed) == mod_parsed.parse_mods_preview(payload)
+    assert mod_parsed.parse_mods_preview(payload, max_names=0, parsed_mods=parsed) == mod_parsed.parse_mods_preview(payload, max_names=0)
     assert mod_search.build_server_mod_index(payload, parsed_mods=parsed) == mod_search.build_server_mod_index(payload)
     old_index = mod_suggestions.build_mod_suggestion_index((payload, payload))
     new_index = mod_suggestions.build_mod_suggestion_index((), parsed_mods_values=(parsed, parsed))
@@ -187,7 +187,7 @@ def test_load_local_name_cleaning_is_shared_without_merging_distinct_id_rules(mo
     monkeypatch.setattr(mod_parsed, "clean_display_mod_name", count_clean)
 
     parsed = mod_parsed.ParsedServerMods.from_json(payload)
-    window.parse_mods_preview(payload, parsed_mods=parsed)
+    mod_parsed.parse_mods_preview(payload, parsed_mods=parsed)
     mod_search.build_server_mod_index(payload, parsed_mods=parsed)
     mod_suggestions.build_mod_suggestion_index((), parsed_mods_values=(parsed,))
 

@@ -1301,7 +1301,7 @@ def test_window_has_one_central_startup_completion_contract():
     assert "def _complete_startup_presentation" in source
     assert "GLib.idle_add(self.update_ui.maybe_show)" not in source
     assert source.count("self._complete_startup_presentation()") >= 6
-    manual = source[source.index("def _manual_update_server_database"):source.index("def _check_updates_worker")]
+    manual = source[source.index("def _manual_update_server_database"):source.index("def _manual_check_for_updates")]
     assert "_complete_startup_presentation" not in manual
 
 
