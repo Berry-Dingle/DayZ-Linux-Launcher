@@ -1018,35 +1018,6 @@ def test_schema4_shadow_comparison_is_pure_and_read_only():
     assert schema4.canonical_json_bytes(state) == before
 
 
-def test_schema4_runtime_shadow_does_not_change_production_decision(tmp_path):
-    schema3 = _source_bytes()
-    schema4_state = _migrated()
-    disabled_active = tmp_path / "disabled.json"
-    enabled_active = tmp_path / "enabled.json"
-    disabled_active.write_bytes(schema3)
-    enabled_active.write_bytes(schema3)
-    disabled = runtime.Phase2RestartRuntime.initialize(
-        active_path=disabled_active, legacy_path=tmp_path / "disabled-legacy.json",
-        now=BASE + 10 * scoring.HOUR, app_session_id="schema4-disabled",
-    )
-    enabled = runtime.Phase2RestartRuntime.initialize(
-        active_path=enabled_active, legacy_path=tmp_path / "enabled-legacy.json",
-        now=BASE + 10 * scoring.HOUR, app_session_id="schema4-enabled",
-        continuity_authority_shadow_enabled=True,
-        schema4_authority_shadow_enabled=True,
-        schema4_authority_shadow_state=schema4_state,
-    )
-    disabled._server(SERVER).regime_generation = "shared-regime"
-    enabled._server(SERVER).regime_generation = "shared-regime"
-    disabled_decision = disabled.decision(SERVER, now=BASE + 10 * scoring.HOUR)
-    enabled.decision(SERVER, now=BASE + 10 * scoring.HOUR)
-    enabled_decision = enabled.decision(SERVER, now=BASE + 10 * scoring.HOUR)
-    assert enabled._server(SERVER).score == disabled._server(SERVER).score
-    assert enabled_decision == disabled_decision
-    assert enabled.schema4_authority_shadow_snapshot(SERVER) is not None
-    assert json.loads(enabled_active.read_text())["schema_version"] == 3
-
-
 def test_no_schema4_collection_is_written_to_schema3_runtime_state(tmp_path):
     active = tmp_path / "active.json"
     legacy = tmp_path / "legacy.json"

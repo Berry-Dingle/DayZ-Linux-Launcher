@@ -561,7 +561,7 @@ def test_bob_shaped_row_without_positive_proof_remains_untouched():
     assert reconcile((original,), (classification,)) == (original,)
 
 
-def make_runtime(tmp_path, *, shadow=False):
+def make_runtime(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     return runtime.Phase2RestartRuntime.initialize(
         active_path=tmp_path / "active.json",
@@ -569,7 +569,6 @@ def make_runtime(tmp_path, *, shadow=False):
         now=BASE,
         app_session_id=APP,
         generation_id="11111111-1111-4111-8111-111111111111",
-        expected_window_v2_shadow_enabled=shadow,
     )
 
 
@@ -602,53 +601,27 @@ def prepare_expected_window_runtime(value):
     return server, completed_at
 
 
-def test_v2_shadow_disabled_creates_no_result_or_diagnostic(tmp_path, caplog):
-    value = make_runtime(tmp_path, shadow=False)
+def test_runtime_expected_windows_have_no_v2_shadow_result_or_diagnostic(tmp_path, caplog):
+    value = make_runtime(tmp_path)
     server, completed_at = prepare_expected_window_runtime(value)
     with caplog.at_level("DEBUG"):
         value._evaluate_expected_windows(server, now=completed_at)
-    assert value.expected_window_v2_shadow_snapshot(SERVER) is None
+    assert not hasattr(value, "expected_window_v2_shadow_snapshot")
+    assert not hasattr(value, "_expected_window_v2_shadow_ledgers")
     assert not any("expected-window v2 shadow" in item.message for item in caplog.records)
 
 
-def test_v2_shadow_enabled_does_not_change_v1_score_or_misses(tmp_path):
-    disabled = make_runtime(tmp_path / "disabled", shadow=False)
-    enabled = make_runtime(tmp_path / "enabled", shadow=True)
-    disabled_server, disabled_at = prepare_expected_window_runtime(disabled)
-    enabled_server, enabled_at = prepare_expected_window_runtime(enabled)
-    disabled_before = asdict(disabled_server.score)
-    enabled_before = asdict(enabled_server.score)
-    disabled._evaluate_expected_windows(disabled_server, now=disabled_at)
-    enabled._evaluate_expected_windows(enabled_server, now=enabled_at)
-    assert asdict(disabled_server.score) == disabled_before
-    assert asdict(enabled_server.score) == enabled_before == disabled_before
-    assert enabled_server.expected_misses == disabled_server.expected_misses
-    snapshot = enabled.expected_window_v2_shadow_snapshot(SERVER)
-    assert snapshot is not None
-    assert any(
-        item.candidate_period_seconds == PERIOD
-        and item.outcome is windows.ExpectedWindowOutcome.GENUINE_MISS
-        for item in snapshot
-    )
+def test_v1_expected_window_evaluation_keeps_score_and_records_covered_miss(tmp_path):
+    value = make_runtime(tmp_path)
+    server, completed_at = prepare_expected_window_runtime(value)
+    before = asdict(server.score)
+    value._evaluate_expected_windows(server, now=completed_at)
+    assert asdict(server.score) == before
+    assert any(item.period_seconds == PERIOD for item in server.expected_misses)
 
 
-def test_v2_shadow_does_not_change_current_consumer_output(tmp_path):
-    disabled = make_runtime(tmp_path / "disabled", shadow=False)
-    enabled = make_runtime(tmp_path / "enabled", shadow=True)
-    disabled_server, disabled_at = prepare_expected_window_runtime(disabled)
-    enabled_server, enabled_at = prepare_expected_window_runtime(enabled)
-    disabled._evaluate_expected_windows(disabled_server, now=disabled_at)
-    enabled._evaluate_expected_windows(enabled_server, now=enabled_at)
-    disabled_decision = disabled._evaluate(disabled_server, now=disabled_at)
-    enabled_decision = enabled._evaluate(enabled_server, now=enabled_at)
-    assert asdict(enabled_decision) == asdict(disabled_decision)
-    assert runtime.phase2_learning_summary(
-        enabled_decision, now=enabled_at
-    ) == runtime.phase2_learning_summary(disabled_decision, now=disabled_at)
-
-
-def test_v2_shadow_is_not_serialized_as_schema_authority(tmp_path):
-    value = make_runtime(tmp_path, shadow=True)
+def test_runtime_expected_windows_are_not_serialized_as_schema_authority(tmp_path):
+    value = make_runtime(tmp_path)
     server, completed_at = prepare_expected_window_runtime(value)
     value._evaluate_expected_windows(server, now=completed_at)
     server.dirty = True

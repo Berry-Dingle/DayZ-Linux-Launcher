@@ -872,7 +872,7 @@ def test_normal_and_high_ledgers_are_explicitly_separate():
     assert "incumbent_independent_high_evidence" in value.high_ledger.reason_codes
 
 
-def make_runtime(tmp_path, *, shadow=False):
+def make_runtime(tmp_path):
     tmp_path.mkdir(parents=True, exist_ok=True)
     return runtime.Phase2RestartRuntime.initialize(
         active_path=tmp_path / "active.json",
@@ -880,41 +880,22 @@ def make_runtime(tmp_path, *, shadow=False):
         now=BASE,
         app_session_id="authority-runtime-app",
         generation_id="22222222-2222-4222-8222-222222222222",
-        continuity_authority_shadow_enabled=shadow,
     )
 
 
-def test_runtime_authority_shadow_disabled_has_no_snapshot_or_log(tmp_path, caplog):
-    value = make_runtime(tmp_path / "disabled", shadow=False)
+def test_runtime_decision_has_no_continuity_authority_shadow(tmp_path, caplog):
+    value = make_runtime(tmp_path / "runtime")
     with caplog.at_level("DEBUG"):
         value.decision(SERVER, now=BASE)
-    assert value.continuity_authority_shadow_snapshot(SERVER) is None
+    assert not hasattr(value, "continuity_authority_shadow_snapshot")
+    assert not hasattr(value, "_continuity_authority_shadow_decisions")
     assert "restart authority shadow" not in caplog.text
 
 
-def test_runtime_authority_shadow_enabled_does_not_change_current_score_or_consumer(tmp_path):
-    disabled = make_runtime(tmp_path / "disabled", shadow=False)
-    enabled = make_runtime(tmp_path / "enabled", shadow=True)
-    disabled_server = disabled._server(SERVER)
-    enabled_server = enabled._server(SERVER)
-    disabled_server.regime_generation = "shared-current-regime"
-    enabled_server.regime_generation = "shared-current-regime"
-
-    disabled_decision = disabled.decision(SERVER, now=BASE)
-    enabled_decision = enabled.decision(SERVER, now=BASE)
-
-    assert disabled_server.score == enabled_server.score
-    assert disabled_decision == enabled_decision
-    snapshot = enabled.continuity_authority_shadow_snapshot(SERVER)
-    assert snapshot is not None
-    assert snapshot.state is authority.RegimeState.UNKNOWN
-
-
-def test_authority_shadow_is_never_serialized_into_schema_three(tmp_path):
-    value = make_runtime(tmp_path / "enabled", shadow=True)
+def test_authority_is_never_serialized_into_schema_three(tmp_path):
+    value = make_runtime(tmp_path / "runtime")
     server = value._server(SERVER)
     value.decision(SERVER, now=BASE)
     serialized = runtime._serialize_server(server)
-    assert value.continuity_authority_shadow_snapshot(SERVER) is not None
     assert not any("authority" in key for key in serialized)
     assert serialized["runtime_state_version"] == runtime.RUNTIME_STATE_VERSION

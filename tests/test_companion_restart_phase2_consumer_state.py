@@ -12,6 +12,7 @@ import pytest
 from dzll_launcher import companion_restart_phase2_authority as authority
 from dzll_launcher import companion_restart_phase2_authority_consumers as consumers
 from dzll_launcher import companion_restart_phase2_consumer_state as state4
+from dzll_launcher import companion_restart_phase2_consumers as consumers3
 from dzll_launcher import companion_restart_phase2_continuity as continuity
 from dzll_launcher import companion_restart_phase2_detection as detection
 from dzll_launcher import companion_restart_phase2_runtime as runtime
@@ -429,6 +430,43 @@ def test_shadow_only_and_cutover_false_invoke_no_action(tmp_path):
     result = value.dispatch_authority_consumer_action(SERVER, kind="scheduled_warning", now=BASE, action=lambda: calls.append(1) or True)
     assert not result.attempted and calls == []
     value.shutdown(wall_at=BASE + 1, monotonic_at=2)
+
+
+def test_shadow_only_mode_evaluates_backend_schema4_consumer_but_returns_schema3(tmp_path):
+    """Backend-fixture coverage formerly reached through the in-memory authority shadow."""
+
+    value, path = _cutover_runtime(tmp_path, cutover=False)
+    backend = value._authoritative_schema4_backend
+    auth = backend.authority_decision(SERVER)
+    regime = auth.selected_shadow_regime
+    due = consumers.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE,
+    ) - 300
+    file_before = path.read_bytes()
+    ledger_before = copy.deepcopy(backend.state["servers"][SERVER]["consumer_state"])
+
+    current = value.decision(SERVER, now=due, restart_alert_enabled=True)
+
+    assert isinstance(current, consumers3.ConsumerDecision)
+    resolution = value.authority_consumer_resolution(SERVER)
+    assert resolution.source is consumers.CutoverSource.SCHEMA3
+    assert resolution.diagnostic == "schema4_production_cutover_disabled"
+    assert resolution.selected_output is current
+    assert isinstance(resolution.schema4_decision, consumers.AuthorityConsumerDecision)
+    assert resolution.schema4_decision.authority_decision_id == auth.decision_id
+    assert resolution.schema4_decision.scheduled_pre_restart_alert_eligible
+    assert value.authority_consumer_shadow_snapshot(SERVER) is not None
+    assert value.authority_consumer_cutover_summary(SERVER, now=due) is None
+    calls = []
+    result = value.dispatch_authority_consumer_action(
+        SERVER, kind="scheduled_warning", now=due, action=lambda: calls.append(1) or True
+    )
+    assert not result.attempted and result.source == "schema3" and calls == []
+    assert backend.state["servers"][SERVER]["consumer_state"] == ledger_before
+    assert path.read_bytes() == file_before
+    value.shutdown(wall_at=due + 1, monotonic_at=2)
 
 
 def test_cutover_warning_action_is_single_source_and_once(tmp_path):

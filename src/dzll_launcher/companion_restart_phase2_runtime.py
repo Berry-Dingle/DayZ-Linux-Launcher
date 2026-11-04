@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import logging
 import math
 import time
@@ -8,14 +7,10 @@ import uuid
 from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable
 
 from . import companion_restart_phase2_detection as detection_module
-from .companion_restart_phase2_authority import (
-    AuthorityDecision,
-    RegimeState,
-    evaluate_authority,
-)
+from .companion_restart_phase2_authority import RegimeState
 from .companion_restart_phase2_consumers import (
     CONSUMER_ADAPTER_VERSION,
     AlertKeyKind,
@@ -50,24 +45,9 @@ from .companion_restart_phase2_detection import (
 )
 from .companion_restart_phase2_continuity import (
     CONTINUITY_PROVENANCE_VERSION,
-    build_cadence_streaks,
-    build_continuity_chains,
     continuity_span_terminates_chain,
     deterministic_continuity_chain_id,
-    extract_interval_relationships,
-    observed_transition_spans_from_events,
-    reconstruct_historical_event_provenance,
     span_from_observations,
-)
-from .companion_restart_phase2_expected_windows import (
-    ExpectedWindowEpisodeEvidence,
-    ExpectedWindowLedgerRecord,
-    ExpectedWindowOutcome,
-    ExpectedWindowRevision,
-    classify_expected_window,
-    continuity_spans_from_coverage,
-    deterministic_model_revision_id,
-    reconcile_expected_window_ledger,
 )
 from .a2s_status_diagnostics import result_classification
 from .companion_restart_phase2_scoring import (
@@ -320,10 +300,6 @@ class Phase2RestartRuntime:
         now: float | None = None,
         app_session_id: str | None = None,
         detection_config: DetectionConfig | None = None,
-        expected_window_v2_shadow_enabled: bool = False,
-        continuity_authority_shadow_enabled: bool = False,
-        schema4_authority_shadow_enabled: bool = False,
-        schema4_authority_shadow_state: Mapping[str, object] | None = None,
         authoritative_schema4_runtime_enabled: bool = False,
         schema4_authority_consumer_shadow_enabled: bool = False,
         schema4_authority_production_cutover_enabled: bool = False,
@@ -336,24 +312,6 @@ class Phase2RestartRuntime:
         self.app_session_id = app_session_id or str(uuid.uuid4())
         self.detection_config = detection_config or DetectionConfig()
         self.scorer = RestartScheduleScorer()
-        self.expected_window_v2_shadow_enabled = bool(
-            expected_window_v2_shadow_enabled
-        )
-        self._expected_window_v2_shadow_ledgers: dict[
-            str, list[ExpectedWindowLedgerRecord]
-        ] = {}
-        self._expected_window_v2_shadow_logged_ids: set[str] = set()
-        self.continuity_authority_shadow_enabled = bool(
-            continuity_authority_shadow_enabled
-        )
-        self._continuity_authority_shadow_decisions: dict[str, AuthorityDecision] = {}
-        self._continuity_authority_shadow_logged_ids: set[str] = set()
-        self.schema4_authority_shadow_enabled = bool(
-            schema4_authority_shadow_enabled
-        )
-        self._schema4_authority_shadow_state = schema4_authority_shadow_state
-        self._schema4_authority_shadow_comparisons: dict[str, object] = {}
-        self._schema4_authority_shadow_logged_ids: set[str] = set()
         self.authoritative_schema4_runtime_enabled = bool(
             authoritative_schema4_runtime_enabled
         )
@@ -390,10 +348,6 @@ class Phase2RestartRuntime:
         app_session_id: str | None = None,
         generation_id: str | None = None,
         detection_config: DetectionConfig | None = None,
-        expected_window_v2_shadow_enabled: bool = False,
-        continuity_authority_shadow_enabled: bool = False,
-        schema4_authority_shadow_enabled: bool = False,
-        schema4_authority_shadow_state: Mapping[str, object] | None = None,
         authoritative_schema4_runtime_enabled: bool = False,
         schema4_authority_consumer_shadow_enabled: bool = False,
         schema4_authority_production_cutover_enabled: bool = False,
@@ -454,10 +408,6 @@ class Phase2RestartRuntime:
                 now=now,
                 app_session_id=app_session_id,
                 detection_config=detection_config,
-                expected_window_v2_shadow_enabled=expected_window_v2_shadow_enabled,
-                continuity_authority_shadow_enabled=continuity_authority_shadow_enabled,
-                schema4_authority_shadow_enabled=schema4_authority_shadow_enabled,
-                schema4_authority_shadow_state=schema4_authority_shadow_state,
                 authoritative_schema4_runtime_enabled=(
                     authoritative_schema4_runtime_enabled
                 ),
@@ -1237,31 +1187,6 @@ class Phase2RestartRuntime:
             ),
         )
 
-    def expected_window_v2_shadow_snapshot(
-        self, server_key: str
-    ) -> tuple[ExpectedWindowLedgerRecord, ...] | None:
-        """Expose non-authoritative v2 results only when explicitly enabled."""
-
-        if not self.expected_window_v2_shadow_enabled:
-            return None
-        return tuple(self._expected_window_v2_shadow_ledgers.get(str(server_key), ()))
-
-    def continuity_authority_shadow_snapshot(
-        self, server_key: str
-    ) -> AuthorityDecision | None:
-        """Expose the immutable non-authoritative Stage 2B1 decision."""
-
-        if not self.continuity_authority_shadow_enabled:
-            return None
-        return self._continuity_authority_shadow_decisions.get(str(server_key))
-
-    def schema4_authority_shadow_snapshot(self, server_key: str) -> object | None:
-        """Expose persisted/in-memory comparison only when explicitly enabled."""
-
-        if not self.schema4_authority_shadow_enabled:
-            return None
-        return self._schema4_authority_shadow_comparisons.get(str(server_key))
-
     def _ingest_sample(
         self,
         server: _ServerRuntime,
@@ -1671,8 +1596,6 @@ class Phase2RestartRuntime:
             )
         )
         server.decision = decision
-        if self.continuity_authority_shadow_enabled:
-            self._evaluate_continuity_authority_shadow(server)
         if (
             self.schema4_authority_consumer_shadow_enabled
             or self.schema4_authority_production_cutover_enabled
@@ -1713,10 +1636,10 @@ class Phase2RestartRuntime:
             if valid:
                 authority_decision = backend.authority_decision(server.key)
         if authority_decision is None:
-            authority_decision = self._continuity_authority_shadow_decisions.get(
-                server.key
-            )
-            valid = authority_decision is not None
+            # No valid backend authority: no schema-4 consumer decision, so the
+            # resolver selects the whole schema-3 decision (SCHEMA3_SAFE_FALLBACK).
+            # No other authority source may substitute here.
+            valid = False
 
         consumer = None
         if authority_decision is not None:
@@ -1837,116 +1760,6 @@ class Phase2RestartRuntime:
             )
         )
 
-    def _evaluate_continuity_authority_shadow(
-        self, server: _ServerRuntime
-    ) -> None:
-        """Reconstruct and evaluate authority without changing production state."""
-
-        if server.score is None:
-            return
-        reconstructed_events = tuple(
-            reconstruct_historical_event_provenance(
-                item, server.monitoring_sessions
-            ).event
-            for item in server.events
-        )
-        spans = continuity_spans_from_coverage(
-            server.coverage,
-            server_key=server.key,
-            monitoring_sessions=server.monitoring_sessions,
-        )
-        transition_spans = observed_transition_spans_from_events(
-            reconstructed_events
-        )
-        span_values = tuple(
-            {
-                item.reference_id: item for item in (*spans, *transition_spans)
-            }.values()
-        )
-        chains = build_continuity_chains(span_values)
-        relationships = extract_interval_relationships(
-            reconstructed_events, span_values
-        )
-        streaks = build_cadence_streaks(relationships, chains=chains)
-        previous = self._continuity_authority_shadow_decisions.get(server.key)
-        decision = evaluate_authority(
-            server_key=server.key,
-            normal_score=server.score,
-            relationships=relationships,
-            streaks=streaks,
-            expected_window_ledger=self._expected_window_v2_shadow_ledgers.get(
-                server.key, ()
-            ),
-            events=reconstructed_events,
-            prior_decision=previous,
-        )
-        self._continuity_authority_shadow_decisions[server.key] = decision
-        if self.schema4_authority_shadow_enabled:
-            self._compare_schema4_authority_shadow(
-                server,
-                decision=decision,
-                relationship_count=len(relationships),
-                streak_count=len(streaks),
-            )
-        if decision.decision_id in self._continuity_authority_shadow_logged_ids:
-            return
-        self._continuity_authority_shadow_logged_ids.add(decision.decision_id)
-        selected = decision.selected_shadow_regime
-        challenger = decision.strongest_challenger
-        logger.debug(
-            "restart authority shadow decision=%s state=%s selected=%s period=%s "
-            "challenger=%s high_relationships=%s streaks=%s reasons=%s",
-            decision.decision_id,
-            decision.state.value,
-            selected.regime_id if selected is not None else "none",
-            selected.candidate_period_seconds if selected is not None else "none",
-            challenger.context_id if challenger is not None else "none",
-            ",".join(decision.high_ledger.high_relationship_ids),
-            ",".join(decision.high_ledger.maximal_streak_ids),
-            ",".join(decision.reason_codes),
-        )
-
-    def _compare_schema4_authority_shadow(
-        self,
-        server: _ServerRuntime,
-        *,
-        decision: AuthorityDecision,
-        relationship_count: int,
-        streak_count: int,
-    ) -> None:
-        from .companion_restart_phase2_schema4 import compare_persisted_authority
-
-        root = self._schema4_authority_shadow_state
-        servers = root.get("servers") if isinstance(root, Mapping) else None
-        record = servers.get(server.key) if isinstance(servers, Mapping) else None
-        comparison = compare_persisted_authority(
-            record=record if isinstance(record, Mapping) else None,
-            in_memory_decision=decision,
-            in_memory_relationship_count=relationship_count,
-            in_memory_streak_count=streak_count,
-            in_memory_expected_window_count=len(
-                self._expected_window_v2_shadow_ledgers.get(server.key, ())
-            ),
-        )
-        self._schema4_authority_shadow_comparisons[server.key] = comparison
-        identity = (
-            f"{comparison.in_memory_decision_id}:"
-            f"{comparison.persisted_decision_id}:"
-            f"{comparison.object_counts_equal}"
-        )
-        if identity in self._schema4_authority_shadow_logged_ids:
-            return
-        self._schema4_authority_shadow_logged_ids.add(identity)
-        logger.debug(
-            "restart schema4 authority shadow server=%s decision_equal=%s "
-            "counts_equal=%s warnings=%s reasons=%s",
-            server.key,
-            comparison.decision_id_equal,
-            comparison.object_counts_equal,
-            ",".join(comparison.migration_warnings),
-            ",".join(comparison.reason_codes),
-        )
-
     @staticmethod
     def _record_player_observation(
         server: _ServerRuntime, sample: ObservationSample
@@ -2054,141 +1867,6 @@ class Phase2RestartRuntime:
                 self._fold_expected_misses(server, ordered[:-60])
             server.expected_misses[:] = ordered[-60:]
             server.dirty = True
-        if (
-            self.expected_window_v2_shadow_enabled
-            or self.continuity_authority_shadow_enabled
-        ):
-            self._evaluate_expected_windows_v2_shadow(server, now=now)
-
-    def _evaluate_expected_windows_v2_shadow(
-        self, server: _ServerRuntime, *, now: float
-    ) -> None:
-        """Evaluate the same completed windows without affecting v1 authority."""
-
-        score = server.score
-        if score is None or not server.coverage:
-            return
-        ledger = self._expected_window_v2_shadow_ledgers.setdefault(server.key, [])
-        spans = continuity_spans_from_coverage(
-            server.coverage,
-            server_key=server.key,
-            monitoring_sessions=server.monitoring_sessions,
-        )
-        episodes = _expected_window_v2_episode_evidence(server)
-        coverage_start = min(item.start_at for item in server.coverage)
-        for candidate in score.candidates:
-            if (
-                candidate.fundamental_relationship_count < 2
-                or candidate.phase_offset is None
-                or candidate.phase_confidence <= 0
-            ):
-                continue
-            period = candidate.period_seconds
-            tolerance = candidate_phase_tolerance(period)
-            start = max(coverage_start, now - 7 * 24 * 3600)
-            multiplier = math.ceil((start - candidate.phase_offset) / period)
-            expected = candidate.phase_offset + multiplier * period
-            model_revision_id = deterministic_model_revision_id(
-                server.key,
-                period,
-                candidate.phase_offset,
-                (
-                    f"normal-scorer-v{SCORING_SEMANTICS_VERSION}:"
-                    f"relationships={candidate.fundamental_relationship_count}:"
-                    f"phase={candidate.phase_confidence:.6f}"
-                ),
-            )
-            checked = 0
-            while expected + tolerance <= now and checked < 64:
-                checked += 1
-                result = classify_expected_window(
-                    server_key=server.key,
-                    candidate_period_seconds=period,
-                    expected_phase_offset=candidate.phase_offset,
-                    window_start_at=max(0.0, expected - tolerance),
-                    expected_at=expected,
-                    window_end_at=expected + tolerance,
-                    model_revision_id=model_revision_id,
-                    regime_interpretation_id=None,
-                    events=server.events,
-                    spans=spans,
-                    episodes=episodes,
-                    population_transition_observable=(
-                        _query_visible_population_transition_observable(
-                            server,
-                            candidate,
-                            window_start=max(0.0, expected - tolerance),
-                            window_end=expected + tolerance,
-                        )
-                    ),
-                )
-                window_key = (server.key, period, int(round(expected)))
-                existing_for_window = [
-                    item
-                    for item in ledger
-                    if (
-                        item.server_key,
-                        item.candidate_period_seconds,
-                        int(round(item.expected_at)),
-                    )
-                    == window_key
-                ]
-                new_records: tuple[ExpectedWindowLedgerRecord, ...] = ()
-                if not existing_for_window:
-                    ledger.append(result)
-                    new_records = (result,)
-                else:
-                    reconciled = reconcile_expected_window_ledger(
-                        ledger,
-                        (result,),
-                        reconciled_at=now,
-                        evidence_revision_id=_expected_window_v2_evidence_revision(
-                            server, result
-                        ),
-                    )
-                    if len(reconciled) > len(ledger):
-                        new_records = tuple(reconciled[len(ledger):])
-                        ledger[:] = reconciled
-                for record in new_records:
-                    self._log_expected_window_v2_shadow(server, record)
-                expected += period
-
-    def _log_expected_window_v2_shadow(
-        self,
-        server: _ServerRuntime,
-        record: ExpectedWindowLedgerRecord,
-    ) -> None:
-        if record.result_id in self._expected_window_v2_shadow_logged_ids:
-            return
-        self._expected_window_v2_shadow_logged_ids.add(record.result_id)
-        v1_miss = any(
-            item.period_seconds == record.candidate_period_seconds
-            and int(round(item.expected_at)) == int(round(record.expected_at))
-            for item in server.expected_misses
-        )
-        if isinstance(record, ExpectedWindowRevision):
-            comparison = "proposed_retraction"
-        elif v1_miss and record.outcome is ExpectedWindowOutcome.AMBIGUOUS:
-            comparison = "v1_miss_v2_ambiguous"
-        elif v1_miss and record.outcome is ExpectedWindowOutcome.UNKNOWN:
-            comparison = "v1_miss_v2_unknown"
-        elif v1_miss and record.outcome is ExpectedWindowOutcome.GENUINE_MISS:
-            comparison = "v1_v2_genuine_miss_agreement"
-        elif record.outcome is ExpectedWindowOutcome.HIT:
-            comparison = "v2_hit"
-        else:
-            comparison = "v2_completed_window"
-        logger.debug(
-            "restart expected-window v2 shadow comparison=%s id=%s period=%s "
-            "expected=%s outcome=%s evidence=%s reasons=%s",
-            comparison,
-            record.result_id,
-            record.candidate_period_seconds,
-            record.expected_at,
-            record.outcome.value,
-            ",".join(record.overlapping_outage_episode_ids),
-            ",".join(record.reason_codes),
-        )
 
     def _fold_expected_misses(
         self, server: _ServerRuntime, misses: list[CoveredExpectedMiss]
@@ -3391,83 +3069,6 @@ def _active_episode_monotonic_watermark(episode: object) -> float | None:
         if parsed is not None and parsed >= 0:
             values.append(parsed)
     return max(values) if values else None
-
-
-def _expected_window_v2_episode_evidence(
-    server: _ServerRuntime,
-) -> tuple[ExpectedWindowEpisodeEvidence, ...]:
-    values = []
-    active = server.engine.active_episode
-    if active is not None:
-        end_at = (
-            active.stable_recovery_wall
-            or active.info_return_wall
-            or None
-        )
-        values.append(
-            ExpectedWindowEpisodeEvidence(
-                evidence_id=active.event_id,
-                start_at=active.started_wall,
-                end_at=end_at,
-                outage_observed=bool(
-                    active.failure_count > 0
-                    or active.confirmed_offline_wall is not None
-                ),
-                recovery_observed=bool(
-                    active.info_return_wall is not None
-                    or active.stable_recovery_wall is not None
-                ),
-                unresolved=True,
-                restart_like=bool(
-                    active.failure_count > 0
-                    or active.drain_wall is not None
-                    or active.low_sample_count > 0
-                ),
-                reason_codes=("runtime_active_physical_episode",),
-            )
-        )
-    for item in server.incomplete_episodes or ():
-        if not isinstance(item, dict):
-            continue
-        evidence_id = str(item.get("event_id") or item.get("fingerprint") or "")
-        started_at = _optional_nonnegative_float(item.get("started_at"))
-        if not evidence_id or started_at is None:
-            continue
-        values.append(
-            ExpectedWindowEpisodeEvidence(
-                evidence_id=evidence_id,
-                start_at=started_at,
-                end_at=_optional_nonnegative_float(item.get("finalized_at")),
-                outage_observed=False,
-                recovery_observed=False,
-                unresolved=True,
-                restart_like=True,
-                reason_codes=("persisted_incomplete_episode_diagnostic",),
-            )
-        )
-    return tuple(values)
-
-
-def _expected_window_v2_evidence_revision(
-    server: _ServerRuntime,
-    record: ExpectedWindowLedgerRecord,
-) -> str:
-    parts = [
-        "expected-window-v2-shadow-evidence",
-        server.key,
-        str(record.candidate_period_seconds),
-        str(int(round(record.expected_at))),
-    ]
-    parts.extend(sorted(item.event_id for item in server.events))
-    parts.extend(
-        sorted(
-            f"{item.kind.value}:{item.start_at:.6f}:{item.end_at:.6f}"
-            for item in server.coverage
-            if item.end_at >= record.window_start_at
-            and item.start_at <= record.window_end_at
-        )
-    )
-    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _next_prediction(score: ScheduleScore, now: float) -> float | None:

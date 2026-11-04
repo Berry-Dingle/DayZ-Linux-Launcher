@@ -1376,7 +1376,6 @@ def test_shadow_mode_keeps_returned_production_decision_schema3(tmp_path):
         active_path=active,
         legacy_path=legacy,
         now=BASE,
-        continuity_authority_shadow_enabled=True,
         schema4_authority_consumer_shadow_enabled=True,
     )
     runtime.begin_monitoring(SERVER, wall_at=BASE, monotonic_at=1, poll_generation=1)
