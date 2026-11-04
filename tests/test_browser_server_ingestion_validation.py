@@ -12,6 +12,7 @@ import pytest
 
 from dzll_launcher import db, window
 from dzll_launcher import mod_parsed, mod_search, mod_suggestion_cache, mod_suggestions, server_mod_cache
+from dzll_launcher import server_companion_state
 from dzll_launcher.ui_row import ServerObject
 
 
@@ -873,14 +874,17 @@ def test_valid_favorites_and_history_attach_but_malformed_keys_create_no_row():
 def test_companion_persisted_endpoint_uses_same_validation():
     host = _BrowserHost()
 
-    invalid = window.DZLLWindow._server_companion_obj_from_persisted(
-        host,
-        {"ip": "example.com", "gport": 2302, "qport": 2303},
-    )
-    valid = window.DZLLWindow._server_companion_obj_from_persisted(
-        host,
-        {"ip": " 1.2.3.4 ", "gport": 2302, "qport": None, "name": "Valid"},
-    )
+    def restore(data):
+        return server_companion_state.obj_from_persisted(
+            data,
+            key_for=window.fav_key,
+            objects_by_key=host._obj_by_key,
+            favorites=host.favorites,
+            last_played=host.last_played,
+        )
+
+    invalid = restore({"ip": "example.com", "gport": 2302, "qport": 2303})
+    valid = restore({"ip": " 1.2.3.4 ", "gport": 2302, "qport": None, "name": "Valid"})
 
     assert invalid is None
     assert isinstance(valid, ServerObject)
@@ -903,9 +907,6 @@ def test_invalid_companion_restore_does_not_activate_or_schedule_polling():
                 "qport": 2303,
             }
             self.activations = []
-
-        def _server_companion_obj_from_persisted(self, data):
-            return window.DZLLWindow._server_companion_obj_from_persisted(self, data)
 
         def set_server_companion_server(self, obj, persist=False):
             self.activations.append((obj, persist))

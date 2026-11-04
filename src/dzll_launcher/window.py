@@ -189,6 +189,7 @@ from .background_prepare_queue import (
 )
 from .background_prepare_browser import BrowserPreparationPresenter
 from .server_companion_ui import ServerCompanionPanel
+from . import server_companion_audio, server_companion_state
 from .launch_utils import launch_direct_steam_url
 from .join_attempt import JoinAttemptTracker
 from .join_popup_presentation import (
@@ -299,18 +300,6 @@ BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET = 10
 BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING = 8
 
 
-SERVER_COMPANION_ALERT_SOUNDS = {
-    "online": {
-        "female": "OnlineF.mp3",
-        "male": "OnlineM.mp3",
-        "beep": "serverOnlineBeep.mp3",
-    },
-    "restart_warning": {
-        "female": "RestartF.mp3",
-        "male": "RestartM.mp3",
-        "beep": "serverOnlineBeep.mp3",
-    },
-}
 MOD_SUGGESTION_RESULT_LIMIT = 50
 PERF_LOG_ENABLED = os.environ.get("DZLL_PERF_LOG") == "1"
 
@@ -1422,7 +1411,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_alert_sound = str(
             self.settings.get("server_companion_alert_sound", "female") or "female"
         )
-        if self._server_companion_alert_sound not in SERVER_COMPANION_ALERT_SOUNDS["online"]:
+        if self._server_companion_alert_sound not in server_companion_audio.SERVER_COMPANION_ALERT_SOUNDS["online"]:
             self._server_companion_alert_sound = "female"
 
         self.server_companion_panel = ServerCompanionPanel()
@@ -3476,126 +3465,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
 
-    def _server_companion_persisted_from_obj(self, obj: ServerObject) -> dict:
-        ip, gport, qport = normalize_server_endpoint(
-            getattr(obj, "ip", None),
-            getattr(obj, "gport", None),
-            getattr(obj, "qport", None),
-        )
-        try:
-            mod_count = int(getattr(obj, "mod_count", 0) or 0)
-        except Exception:
-            mod_count = 0
-        try:
-            players = int(getattr(obj, "players", 0) or 0)
-        except Exception:
-            players = 0
-        try:
-            max_players = int(getattr(obj, "max_players", 0) or 0)
-        except Exception:
-            max_players = 0
-        try:
-            ping = int(getattr(obj, "ping", -1) or -1)
-        except Exception:
-            ping = -1
-        try:
-            bm_rank = int(getattr(obj, "bm_rank", 999999999) or 999999999)
-        except Exception:
-            bm_rank = 999999999
-        try:
-            timewarp = float(getattr(obj, "timewarp", 1.0) or 1.0)
-        except Exception:
-            timewarp = 1.0
-
-        return {
-            "ip": ip,
-            "gport": gport,
-            "qport": qport,
-            "name": str(getattr(obj, "name", "") or ""),
-            "map_name": str(getattr(obj, "map_name", "") or ""),
-            "map": str(getattr(obj, "map_name", "") or ""),
-            "mods_json": str(getattr(obj, "mods_json", "") or ""),
-            "mod_count": mod_count,
-            "mods_preview": str(getattr(obj, "mods_preview", "") or ""),
-            "password": bool(getattr(obj, "password", False)),
-            "third_person": bool(getattr(obj, "third_person", False)),
-            "country": str(getattr(obj, "country", "") or ""),
-            "time": str(getattr(obj, "time", "") or ""),
-            "timewarp": timewarp,
-            "players": players,
-            "max_players": max_players,
-            "ping": ping,
-            "bm_rank": bm_rank,
-        }
-
-    def _server_companion_obj_from_persisted(self, data: dict):
-        if not isinstance(data, dict):
-            return None
-        try:
-            ip, gport, qport = normalize_server_endpoint(
-                data.get("ip"),
-                data.get("gport"),
-                data.get("qport"),
-                allow_missing_query_port=True,
-            )
-        except ServerEndpointValidationError:
-            return None
-
-        key = fav_key(ip, gport)
-        current = self._obj_by_key.get(key)
-        if isinstance(current, ServerObject):
-            return current
-
-        try:
-            mod_count = int(data.get("mod_count", 0) or 0)
-        except Exception:
-            mod_count = 0
-        try:
-            players = int(data.get("players", 0) or 0)
-        except Exception:
-            players = 0
-        try:
-            max_players = int(data.get("max_players", 0) or 0)
-        except Exception:
-            max_players = 0
-        try:
-            ping = int(data.get("ping", -1) or -1)
-        except Exception:
-            ping = -1
-        try:
-            bm_rank = int(data.get("bm_rank", 999999999) or 999999999)
-        except Exception:
-            bm_rank = 999999999
-        try:
-            timewarp = float(data.get("timewarp", 1.0) or 1.0)
-        except Exception:
-            timewarp = 1.0
-
-        lp_ts = self.last_played.get(key)
-        played_disp = human_last_played(lp_ts) if lp_ts else ""
-
-        return ServerObject(
-            fav=bool(self.favorites.get(key, False)),
-            password=bool(data.get("password", False)),
-            third_person=bool(data.get("third_person", False)),
-            name=str(data.get("name") or "Unknown Server"),
-            country=str(data.get("country") or ""),
-            ip=ip,
-            gport=gport,
-            qport=qport,
-            mod_count=mod_count,
-            mods_preview=str(data.get("mods_preview") or ""),
-            mods_json=str(data.get("mods_json") or ""),
-            time=str(data.get("time") or "--:--"),
-            timewarp=timewarp,
-            played=played_disp,
-            map_name=str(data.get("map_name") or data.get("map") or ""),
-            players=players,
-            max_players=max_players,
-            ping=ping,
-            bm_rank=bm_rank,
-        )
-
     def _restore_server_companion_if_enabled(self):
         if not bool(getattr(self, "_server_companion_rows_loaded", False)):
             return
@@ -3609,53 +3478,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
         data = getattr(self, "_last_server_companion_saved", None)
         if not data:
             return
-        obj = self._server_companion_obj_from_persisted(data)
+        obj = server_companion_state.obj_from_persisted(
+            data,
+            key_for=fav_key,
+            objects_by_key=self._obj_by_key,
+            favorites=self.favorites,
+            last_played=self.last_played,
+        )
         if obj is None:
             return
         self.set_server_companion_server(obj, persist=False)
-
-    def _server_companion_snapshot_from_obj(self, obj: ServerObject) -> dict:
-        try:
-            ping = int(getattr(obj, "ping", -1))
-        except Exception:
-            ping = -1
-        try:
-            players = int(getattr(obj, "players", 0))
-        except Exception:
-            players = 0
-        try:
-            max_players = int(getattr(obj, "max_players", 0))
-        except Exception:
-            max_players = 0
-        try:
-            queue = int(getattr(obj, "queue", -1))
-        except Exception:
-            queue = -1
-        try:
-            mod_count = int(getattr(obj, "mod_count", 0))
-        except Exception:
-            mod_count = 0
-
-        mode_parts = []
-        mode_parts.append("3PP" if bool(getattr(obj, "third_person", False)) else "1PP")
-        mode_parts.append("Password" if bool(getattr(obj, "password", False)) else "No password")
-        mode_parts.append(f"Mods: {mod_count}")
-
-        snapshot = {
-            "name": str(getattr(obj, "name", "") or ""),
-            "map": str(getattr(obj, "map_name", "") or ""),
-            "ping": ping,
-            "players": players,
-            "max_players": max_players,
-            "time": str(getattr(obj, "time", "") or ""),
-            "online": ping >= 0,
-            "mode": " / ".join(mode_parts),
-            "ip": str(getattr(obj, "ip", "") or ""),
-            "qport": int(getattr(obj, "qport", 0) or 0),
-        }
-        if queue >= 0:
-            snapshot["queue"] = queue
-        return snapshot
 
     def _server_companion_restart_learning_key(self):
         obj = getattr(self, "_server_companion_obj", None)
@@ -4475,7 +4307,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         obj.gport = gport
         obj.qport = qport
         old_key = self._server_companion_restart_learning_key()
-        snapshot = self._server_companion_snapshot_from_obj(obj)
+        snapshot = server_companion_state.snapshot_from_obj(obj)
         new_key = f"{ip}:{gport}" if ip and gport > 0 else None
         self._cancel_server_companion_recovery_confirmation()
         self._cancel_server_companion_pending_recovery_alert()
@@ -4499,7 +4331,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_snapshot = snapshot
         self._record_server_companion_monitor_started(new_key)
         if persist:
-            data = self._server_companion_persisted_from_obj(obj)
+            data = server_companion_state.persisted_from_obj(obj)
             self._last_server_companion_saved = data
             try:
                 save_last_companion_server(data)
@@ -5150,7 +4982,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def set_server_companion_alert_sound(self, sound: str):
         sound = str(sound or "female")
-        if sound not in SERVER_COMPANION_ALERT_SOUNDS["online"]:
+        if sound not in server_companion_audio.SERVER_COMPANION_ALERT_SOUNDS["online"]:
             sound = "female"
         self._server_companion_alert_sound = sound
         self.settings["server_companion_alert_sound"] = sound
@@ -5176,7 +5008,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         )
         ok, message = self._play_server_companion_online_sound()
         self._set_server_companion_alert_audio_status(None if ok else message)
-        self._notify_server_companion_back_online(snapshot)
+        server_companion_audio.send_back_online_notification(self.get_application, snapshot)
 
     def _play_server_companion_online_sound(self):
         return self._play_server_companion_alert_sound("online")
@@ -5185,65 +5017,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return self._play_server_companion_alert_sound("restart_warning")
 
     def _play_server_companion_alert_sound(self, event: str):
-        try:
-            volume = max(0, min(100, int(getattr(self, "_server_companion_alert_volume", 80))))
-        except Exception:
-            volume = 80
-        if volume <= 0:
-            self._debug_server_companion_alert(f"audio skipped: event={event!r} volume={volume}")
-            return True, None
-        sound = str(getattr(self, "_server_companion_alert_sound", "female") or "female")
-        event_sounds = SERVER_COMPANION_ALERT_SOUNDS.get(str(event or "online"), SERVER_COMPANION_ALERT_SOUNDS["online"])
-        audio_name = event_sounds.get(sound, event_sounds["female"])
-        audio_path = os.path.join(os.path.dirname(__file__), "audio", audio_name)
-        self._debug_server_companion_alert(
-            f"audio selected: event={str(event or 'online')!r} sound={sound!r} "
-            f"filename={audio_name!r} path={audio_path!r} exists={os.path.exists(audio_path)}"
+        return server_companion_audio.play_alert_sound(
+            event,
+            volume=getattr(self, "_server_companion_alert_volume", 80),
+            sound=getattr(self, "_server_companion_alert_sound", "female"),
+            debug=self._debug_server_companion_alert,
         )
-        if not os.path.exists(audio_path):
-            audio_path = os.path.join(os.path.dirname(__file__), "audio", event_sounds["female"])
-            self._debug_server_companion_alert(
-                f"audio fallback selected: filename={event_sounds['female']!r} "
-                f"path={audio_path!r} exists={os.path.exists(audio_path)}"
-            )
-        if not os.path.exists(audio_path):
-            self._debug_server_companion_alert("audio unavailable: selected/fallback file missing")
-            return False, "Alert audio file missing"
-        player = shutil.which("ffplay")
-        cmd = None
-        if player:
-            cmd = [player, "-nodisp", "-autoexit", "-loglevel", "quiet", "-af", f"volume={volume / 100:.2f}", audio_path]
-        else:
-            player = shutil.which("mpg123")
-            if player:
-                cmd = [player, "-g", str(volume), audio_path]
-        if not cmd:
-            self._debug_server_companion_alert("audio unavailable: no ffplay or mpg123 found")
-            return False, "Alert audio unavailable: install FFmpeg / ffplay"
-        try:
-            subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            self._debug_server_companion_alert(f"audio process launched: player={cmd[0]!r} event={str(event or 'online')!r}")
-            return True, None
-        except Exception as exc:
-            self._debug_server_companion_alert(f"audio process launch failed: {exc!r}")
-            return False, "Alert audio unavailable: install FFmpeg / ffplay"
-
-    def _notify_server_companion_back_online(self, snapshot: dict):
-        try:
-            app = self.get_application()
-            if app is None:
-                return
-            notification = Gio.Notification.new("Server back online")
-            name = str((snapshot or {}).get("name") or "").strip()
-            if name:
-                notification.set_body(name)
-            app.send_notification("dzll-server-companion-back-online", notification)
-        except Exception:
-            pass
 
     # ----------------------------
     # Startup sequence
