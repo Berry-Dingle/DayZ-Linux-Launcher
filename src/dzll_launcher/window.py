@@ -185,6 +185,7 @@ from .background_prepare_queue import (
 )
 from .background_prepare_browser import BrowserPreparationPresenter
 from .server_companion_ui import ServerCompanionPanel, companion_display_confidence_summary
+from .server_companion_dock import ServerCompanionDockController
 from .desktop_integration import ensure_user_desktop_integration
 from .steam_global_players import SteamGlobalPlayersPoller
 from .update_check import manual_update_check, startup_update_info
@@ -293,7 +294,6 @@ DEBUG_MOD_SUGGESTIONS = os.environ.get("DZLL_DEBUG_MOD_SUGGESTIONS") == "1"
 DEBUG_UI = os.environ.get("DZLL_DEBUG_UI") == "1"
 DEBUG_BROWSER_REORDER = os.environ.get("DZLL_DEBUG_BROWSER_REORDER") == "1"
 ENABLE_LEGACY_GTK_SORT_MODEL = os.environ.get("DZLL_ENABLE_LEGACY_GTK_SORT_MODEL") == "1"
-DEBUG_SC_DOCK = os.environ.get("DZLL_DEBUG_SC_DOCK") == "1"
 DEBUG_SC_ALERTS = os.environ.get("DZLL_DEBUG_SC_ALERTS") == "1"
 DEBUG_STARTUP_LIVE = os.environ.get("DZLL_DEBUG_STARTUP_LIVE") == "1"
 
@@ -357,7 +357,6 @@ INCREMENTAL_MODELS_ENABLED = not INCREMENTAL_MODELS_DISABLED
 
 BROWSER_LIVE_SCROLL_PAUSE_SECONDS = 1.0
 SCROLLBAR_INTERACTION_WATCHDOG_MS = 15000
-SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS = 200
 STATUS_REFRESH_PROGRESS_UPDATE_MS = 125
 
 
@@ -1180,11 +1179,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_phase2_first_accept_session_id = ""
         self._server_companion_phase2_logged_rejections = set()
         self._pending_server_companion_obj = None
-        self._server_companion_docked = True
-        self._server_companion_undocked_window = None
-        self._server_companion_undocked_close_handler_id = 0
-        self._server_companion_reparenting = False
-        self._server_companion_undock_shrink_source_id = 0
+        self._server_companion_dock = ServerCompanionDockController(
+            panel=lambda: getattr(self, "server_companion_panel", None),
+            revealer=lambda: getattr(self, "server_companion_revealer", None),
+            main_browser_box=lambda: self.main_browser_box,
+            get_application=self.get_application,
+            get_window_height=self.get_height,
+            set_window_default_size=self.set_default_size,
+            is_enabled=lambda: bool(self.settings.get("show_server_companion", False)),
+            start_polling=lambda: self._start_server_companion_polling(),
+            refresh_power_controls=lambda: self._refresh_server_companion_power_controls(),
+            refresh_monitor_highlight=lambda: self._refresh_server_companion_monitor_highlight(),
+        )
         self._server_companion_restart_alert_enabled = bool(
             self.settings.get("server_companion_restart_alert_enabled", False)
         )
@@ -1211,7 +1217,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.server_companion_panel.set_on_alert_sound_changed(self.set_server_companion_alert_sound)
         self.server_companion_panel.set_on_alert_volume_changed(self.set_server_companion_alert_volume)
         self.server_companion_panel.set_on_alert_test_clicked(self.test_server_companion_alert_sound)
-        self.server_companion_panel.set_on_dock_toggle(self.toggle_server_companion_dock)
+        self.server_companion_panel.set_on_dock_toggle(self._server_companion_dock.toggle)
         self.server_companion_panel.set_on_power_off(lambda *_: self.set_server_companion_enabled(False))
         self.server_companion_panel.set_docked(True)
         self.server_companion_panel.set_restart_alert_enabled(self._server_companion_restart_alert_enabled)
@@ -2804,7 +2810,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
-            self._destroy_server_companion_undocked_window(reattach=False)
+            self._server_companion_dock.destroy_undocked_window(reattach=False)
         except Exception:
             pass
 
@@ -2835,8 +2841,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     def set_server_companion_visible(self, visible: bool):
         visible = bool(visible)
+        dock = self._server_companion_dock
         if visible:
-            self._dock_server_companion()
+            dock.dock()
             try:
                 self.main_browser_box.set_size_request(int(WINDOW_DEFAULT_SIZE[0]) - int(SIDEBAR_WIDTH), -1)
             except Exception:
@@ -2846,12 +2853,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._restore_server_companion_if_enabled()
             self._start_server_companion_polling()
         else:
-            self._cancel_server_companion_post_undock_shrink()
-            if not bool(getattr(self, "_server_companion_docked", True)):
-                self._destroy_server_companion_undocked_window(reattach=True)
+            dock.cancel_post_undock_shrink()
+            if not bool(dock.docked):
+                dock.destroy_undocked_window(reattach=True)
             self.server_companion_revealer.set_reveal_child(False)
             self.server_companion_revealer.set_visible(False)
-            self._collapse_server_companion_dock_space()
+            dock.collapse_dock_space()
             self._record_server_companion_monitor_ended(
                 "paused", source="companion_visibility_hidden"
             )
@@ -2865,7 +2872,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
 
         enabled = bool(self.settings.get("show_server_companion", False))
-        undocked = enabled and not bool(getattr(self, "_server_companion_docked", True))
+        undocked = enabled and not bool(self._server_companion_dock.docked)
         show_btn.set_visible((not enabled) or undocked)
 
         icon = getattr(self, "server_companion_show_icon", None)
@@ -2882,11 +2889,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 show_btn.set_child(icon)
 
     def _on_server_companion_title_button_clicked(self, *_args):
-        if bool(getattr(self, "_server_companion_reparenting", False)):
+        dock = self._server_companion_dock
+        if bool(dock.reparenting):
             return
         if bool(self.settings.get("show_server_companion", False)):
-            if not bool(getattr(self, "_server_companion_docked", True)):
-                self._dock_server_companion()
+            if not bool(dock.docked):
+                dock.dock()
             return
         self.set_server_companion_enabled(True)
 
@@ -2938,21 +2946,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             pass
 
-    def toggle_server_companion_dock(self):
-        self._debug_server_companion_dock("dock toggle callback invoked")
-        if bool(getattr(self, "_server_companion_docked", True)):
-            self._undock_server_companion()
-        else:
-            self._dock_server_companion()
-
-    def _debug_server_companion_dock(self, message: str):
-        if not DEBUG_SC_DOCK:
-            return
-        try:
-            print(f"[SC-DOCK] {message}", flush=True)
-        except Exception:
-            pass
-
     def _debug_server_companion_alert(self, message: str):
         if not DEBUG_SC_ALERTS:
             return
@@ -2970,242 +2963,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         qport = str(snapshot.get("qport") or "").strip()
         address = f"{ip}:{qport}" if ip and qport else (ip or "<unknown>")
         return f"{name} ({address})"
-
-    def _recover_server_companion_dock_after_undock_failure(self, panel=None, revealer=None, failed_window=None, error=None):
-        print(f"[SC-DOCK] WARNING: undock failed; restoring docked Server Companion: {error!r}", flush=True)
-        panel = panel or getattr(self, "server_companion_panel", None)
-        revealer = revealer or getattr(self, "server_companion_revealer", None)
-        win = failed_window or getattr(self, "_server_companion_undocked_window", None)
-
-        if win is not None:
-            handler_id = int(getattr(self, "_server_companion_undocked_close_handler_id", 0) or 0)
-            if handler_id:
-                try:
-                    win.disconnect(handler_id)
-                except Exception:
-                    pass
-            try:
-                win.set_child(None)
-            except Exception:
-                pass
-            try:
-                win.destroy()
-            except Exception:
-                pass
-
-        self._server_companion_undocked_window = None
-        self._server_companion_undocked_close_handler_id = 0
-        self._server_companion_docked = True
-        if panel is not None:
-            try:
-                panel.set_docked(True)
-            except Exception:
-                pass
-        if panel is not None and revealer is not None:
-            try:
-                revealer.set_child(panel)
-            except Exception as exc:
-                print(f"[SC-DOCK] WARNING: failed to reattach Server Companion panel: {exc!r}", flush=True)
-            if bool(self.settings.get("show_server_companion", False)):
-                try:
-                    revealer.set_visible(True)
-                    revealer.set_reveal_child(True)
-                    self.main_browser_box.set_size_request(int(WINDOW_DEFAULT_SIZE[0]) - int(SIDEBAR_WIDTH), -1)
-                except Exception:
-                    pass
-        self._refresh_server_companion_monitor_highlight()
-        self._refresh_server_companion_power_controls()
-
-    def _undock_server_companion(self):
-        self._debug_server_companion_dock("starting undock")
-        if not bool(self.settings.get("show_server_companion", False)):
-            self._debug_server_companion_dock("undock skipped: Server Companion disabled")
-            return
-        if not bool(getattr(self, "_server_companion_docked", True)):
-            win = getattr(self, "_server_companion_undocked_window", None)
-            if win is not None:
-                try:
-                    self._debug_server_companion_dock("undock requested while already undocked; presenting existing window")
-                    win.present()
-                except Exception:
-                    pass
-            return
-
-        panel = getattr(self, "server_companion_panel", None)
-        revealer = getattr(self, "server_companion_revealer", None)
-        if panel is None or revealer is None:
-            self._debug_server_companion_dock("undock skipped: missing panel or revealer")
-            return
-
-        self._server_companion_reparenting = True
-        win = None
-        try:
-            revealer.set_reveal_child(False)
-            revealer.set_child(None)
-            revealer.set_visible(False)
-
-            win = Gtk.Window(application=self.get_application(), title="DZLL Server Companion")
-            self._debug_server_companion_dock("detached window created")
-            win.set_resizable(False)
-            win.set_child(panel)
-            handler_id = win.connect("close-request", self._on_server_companion_undocked_close_request)
-
-            self._server_companion_undocked_window = win
-            self._server_companion_undocked_close_handler_id = handler_id
-            self._server_companion_docked = False
-            panel.set_docked(False)
-            self._update_server_companion_undocked_size()
-            win.present()
-            self._debug_server_companion_dock("present called")
-            self._schedule_server_companion_post_undock_shrink()
-            self._start_server_companion_polling()
-        except Exception as exc:
-            self._debug_server_companion_dock(f"undock exception/fallback: {exc!r}")
-            self._recover_server_companion_dock_after_undock_failure(panel=panel, revealer=revealer, failed_window=win, error=exc)
-        finally:
-            self._server_companion_reparenting = False
-            self._refresh_server_companion_power_controls()
-
-    def _dock_server_companion(self):
-        self._debug_server_companion_dock("docking/reattaching")
-        self._cancel_server_companion_post_undock_shrink()
-        if bool(getattr(self, "_server_companion_docked", True)):
-            self._debug_server_companion_dock("dock skipped: already docked")
-            self._refresh_server_companion_power_controls()
-            return
-
-        panel = getattr(self, "server_companion_panel", None)
-        revealer = getattr(self, "server_companion_revealer", None)
-        if panel is None or revealer is None:
-            self._debug_server_companion_dock("dock skipped: missing panel or revealer")
-            return
-
-        self._destroy_server_companion_undocked_window(reattach=False)
-        self._server_companion_reparenting = True
-        try:
-            revealer.set_child(panel)
-            self._server_companion_docked = True
-            panel.set_docked(True)
-            if bool(self.settings.get("show_server_companion", False)):
-                revealer.set_visible(True)
-                revealer.set_reveal_child(True)
-                try:
-                    self.main_browser_box.set_size_request(int(WINDOW_DEFAULT_SIZE[0]) - int(SIDEBAR_WIDTH), -1)
-                except Exception:
-                    pass
-            else:
-                revealer.set_reveal_child(False)
-                revealer.set_visible(False)
-        finally:
-            self._server_companion_reparenting = False
-            self._refresh_server_companion_power_controls()
-
-    def _cancel_server_companion_post_undock_shrink(self) -> None:
-        source_id = int(getattr(self, "_server_companion_undock_shrink_source_id", 0) or 0)
-        self._server_companion_undock_shrink_source_id = 0
-        if source_id:
-            try:
-                GLib.source_remove(source_id)
-            except Exception:
-                pass
-
-    def _schedule_server_companion_post_undock_shrink(self) -> None:
-        if int(getattr(self, "_server_companion_undock_shrink_source_id", 0) or 0):
-            return
-        try:
-            self._server_companion_undock_shrink_source_id = GLib.timeout_add(
-                SERVER_COMPANION_UNDOCK_SHRINK_DELAY_MS,
-                self._apply_server_companion_post_undock_shrink,
-            )
-        except Exception:
-            self._server_companion_undock_shrink_source_id = 0
-
-    def _apply_server_companion_post_undock_shrink(self) -> bool:
-        self._server_companion_undock_shrink_source_id = 0
-        if bool(getattr(self, "_server_companion_docked", True)):
-            return False
-        if not bool(getattr(self, "settings", {}).get("show_server_companion", False)):
-            return False
-        if getattr(self, "_server_companion_undocked_window", None) is None:
-            return False
-        self._collapse_server_companion_dock_space()
-        return False
-
-    def _collapse_server_companion_dock_space(self):
-        try:
-            self.main_browser_box.set_size_request(-1, -1)
-        except Exception:
-            pass
-        try:
-            width = int(WINDOW_DEFAULT_SIZE[0])
-            try:
-                height = int(self.get_height())
-            except Exception:
-                height = int(WINDOW_DEFAULT_SIZE[1])
-            if height <= 0:
-                height = int(WINDOW_DEFAULT_SIZE[1])
-            self.set_default_size(width, height)
-        except Exception:
-            pass
-
-    def _on_server_companion_undocked_close_request(self, *_args):
-        if bool(getattr(self, "_server_companion_reparenting", False)):
-            return False
-        self._debug_server_companion_dock("undocked window close requested")
-        self._dock_server_companion()
-        return True
-
-    def _update_server_companion_undocked_size(self) -> None:
-        if bool(getattr(self, "_server_companion_docked", True)):
-            return
-        win = getattr(self, "_server_companion_undocked_window", None)
-        panel = getattr(self, "server_companion_panel", None)
-        if win is None or panel is None:
-            return
-        height = (
-            ServerCompanionPanel.UNDOCKED_EXPANDED_HEIGHT
-            if panel.restart_learning_visible()
-            else ServerCompanionPanel.UNDOCKED_COMPACT_HEIGHT
-        )
-        try:
-            win.set_default_size(ServerCompanionPanel.WIDTH, height)
-            win.set_size_request(ServerCompanionPanel.WIDTH, height)
-            win.queue_resize()
-        except Exception:
-            pass
-
-    def _destroy_server_companion_undocked_window(self, reattach: bool = True):
-        self._debug_server_companion_dock(f"destroy undocked window reattach={bool(reattach)}")
-        win = getattr(self, "_server_companion_undocked_window", None)
-        panel = getattr(self, "server_companion_panel", None)
-        revealer = getattr(self, "server_companion_revealer", None)
-
-        if win is not None:
-            handler_id = int(getattr(self, "_server_companion_undocked_close_handler_id", 0) or 0)
-            if handler_id:
-                try:
-                    win.disconnect(handler_id)
-                except Exception:
-                    pass
-            try:
-                win.set_child(None)
-            except Exception:
-                pass
-            try:
-                win.destroy()
-            except Exception:
-                pass
-
-        self._server_companion_undocked_window = None
-        self._server_companion_undocked_close_handler_id = 0
-        self._server_companion_docked = True
-        if panel is not None:
-            panel.set_docked(True)
-        if reattach and panel is not None and revealer is not None:
-            try:
-                revealer.set_child(panel)
-            except Exception:
-                pass
 
     def _restore_server_companion_if_enabled(self):
         if not bool(getattr(self, "_server_companion_rows_loaded", False)):
@@ -3429,7 +3186,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             panel.set_restart_learning_summary(self._server_companion_restart_learning_summary())
             if hasattr(panel, "set_restart_alert_usability"):
                 panel.set_restart_alert_usability(self._server_companion_restart_alert_usability_summary())
-            self._update_server_companion_undocked_size()
+            self._server_companion_dock.update_undocked_size()
 
     def _surface_restart_learning_persistence_notice(self) -> bool:
         runtime = getattr(self, "_companion_restart_phase2", None)
@@ -4143,10 +3900,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         panel = getattr(self, "server_companion_panel", None)
         if panel is not None and panel.get_root() is not None:
             self._debug_server_companion_alert(
-                f"poll allowed: panel has root docked={bool(getattr(self, '_server_companion_docked', True))}"
+                f"poll allowed: panel has root docked={bool(self._server_companion_dock.docked)}"
             )
             return True
-        docked_revealed = bool(getattr(self, "_server_companion_docked", True)) and bool(
+        docked_revealed = bool(self._server_companion_dock.docked) and bool(
             getattr(getattr(self, "server_companion_revealer", None), "get_reveal_child", lambda: False)()
         )
         self._debug_server_companion_alert(f"poll {'allowed' if docked_revealed else 'skipped'}: docked revealer visible={docked_revealed}")

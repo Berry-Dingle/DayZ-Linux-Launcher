@@ -59,7 +59,7 @@ class _FakeLabel:
 def _companion_control_host(*, enabled: bool, docked: bool):
     return SimpleNamespace(
         settings={"show_server_companion": enabled},
-        _server_companion_docked=docked,
+        _server_companion_dock=SimpleNamespace(docked=docked),
         server_companion_show_btn=_FakeButton(),
         server_companion_show_icon=_FakeIcon(),
         server_companion_redock_icon=_FakeLabel("↙"),
@@ -85,8 +85,7 @@ def test_companion_redock_click_uses_existing_path_once_and_preserves_state():
     snapshot = {"name": "Preserved server", "queue": 3}
     host = SimpleNamespace(
         settings={"show_server_companion": True},
-        _server_companion_docked=False,
-        _server_companion_reparenting=False,
+        _server_companion_dock=SimpleNamespace(docked=False, reparenting=False),
         _server_companion_obj=monitored,
         _server_companion_snapshot=snapshot,
     )
@@ -94,9 +93,9 @@ def test_companion_redock_click_uses_existing_path_once_and_preserves_state():
 
     def dock():
         calls.append("dock")
-        host._server_companion_docked = True
+        host._server_companion_dock.docked = True
 
-    host._dock_server_companion = dock
+    host._server_companion_dock.dock = dock
     DZLLWindow._on_server_companion_title_button_clicked(host)
     DZLLWindow._on_server_companion_title_button_clicked(host)
 
@@ -104,15 +103,16 @@ def test_companion_redock_click_uses_existing_path_once_and_preserves_state():
     assert host._server_companion_obj is monitored
     assert host._server_companion_snapshot is snapshot
 
-    host._server_companion_docked = False
-    host._server_companion_reparenting = True
+    host._server_companion_dock.docked = False
+    host._server_companion_dock.reparenting = True
     DZLLWindow._on_server_companion_title_button_clicked(host)
     assert calls == ["dock"]
 
-    window_source = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
-    dock_block = window_source.split("    def _dock_server_companion(self):", 1)[1].split(
-        "    def _collapse_server_companion_dock_space", 1
+    dock_source = (ROOT / "src/dzll_launcher/server_companion_dock.py").read_text(encoding="utf-8")
+    dock_block = dock_source.split("    def dock(self):", 1)[1].split(
+        "    def collapse_dock_space", 1
     )[0]
+    assert "_start_polling()" not in dock_block
     assert "_start_server_companion_polling()" not in dock_block
 
 

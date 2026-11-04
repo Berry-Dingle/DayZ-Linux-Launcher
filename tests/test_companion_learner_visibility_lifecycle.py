@@ -150,14 +150,16 @@ def visibility_host(tmp_path):
         _companion_restart_phase2=learner,
         _server_companion_snapshot={"ip": "83.147.29.57", "qport": 2503},
         _server_companion_poll_token=8,
-        _server_companion_docked=True,
         server_companion_revealer=Widget(),
         main_browser_box=SimpleNamespace(set_size_request=lambda *_args: None),
         _server_companion_restart_learning_key=lambda: A,
-        _dock_server_companion=lambda: calls.append("dock"),
+        _server_companion_dock=SimpleNamespace(
+            docked=True,
+            dock=lambda: calls.append("dock"),
+            cancel_post_undock_shrink=lambda: None,
+            collapse_dock_space=lambda: None,
+        ),
         _restore_server_companion_if_enabled=lambda: calls.append("restore"),
-        _cancel_server_companion_post_undock_shrink=lambda: None,
-        _collapse_server_companion_dock_space=lambda: None,
         _refresh_server_companion_monitor_highlight=lambda: None,
         _refresh_server_companion_power_controls=lambda: None,
         _debug_server_companion_alert=lambda message: calls.append(message),
@@ -226,8 +228,8 @@ def test_pause_resume_and_dock_neutrality_do_not_duplicate_session(tmp_path):
     DZLLWindow.set_server_companion_visible(host, True)
     session = learner.active_monitoring_session_id(A)
 
-    host._dock_server_companion()
-    host._dock_server_companion()
+    host._server_companion_dock.dock()
+    host._server_companion_dock.dock()
     assert learner.active_monitoring_session_id(A) == session
     assert len(learner._servers[A].monitoring_sessions) == 1
     assert calls.count("dock") >= 3

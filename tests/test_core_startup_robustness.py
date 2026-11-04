@@ -320,6 +320,50 @@ def test_official_sidebar_toggle_restores_saves_and_refreshes_real_window(
         _close_window(app, window)
 
 
+def test_real_window_companion_undock_close_redock_and_shutdown(isolated_window_state):
+    from gi.repository import Gtk
+
+    path = isolated_window_state["config"] / "settings.json"
+    path.write_text(
+        '{"discord_rich_presence":false,"auto_check_updates":false,"show_server_companion":true}',
+        encoding="utf-8",
+    )
+    app = _new_app()
+    window = window_module.DZLLWindow(app)
+    try:
+        dock = window._server_companion_dock
+        panel = window.server_companion_panel
+        revealer = window.server_companion_revealer
+        assert dock.docked is True
+        assert revealer.get_child() is panel
+
+        dock.undock()
+        undocked = dock.undocked_window
+        assert dock.docked is False
+        assert isinstance(undocked, Gtk.Window)
+        assert undocked.get_child() is panel
+        assert revealer.get_child() is None
+        assert dock.shrink_source_id
+        assert window.server_companion_show_btn.get_visible()
+        assert window.server_companion_show_btn.get_tooltip_text() == "Redock Server Companion"
+
+        undocked.close()  # real close-request: redocks and keeps the window alive
+        assert dock.docked is True
+        assert dock.undocked_window is None
+        assert dock.shrink_source_id == 0
+        assert revealer.get_child() is panel
+        assert revealer.get_reveal_child() is True
+        assert not window.server_companion_show_btn.get_visible()
+
+        dock.undock()
+        assert dock.docked is False
+        window._shutdown_cleanup()
+        assert dock.docked is True
+        assert dock.undocked_window is None
+    finally:
+        _close_window(app, window)
+
+
 def test_real_window_accepts_invalid_persisted_numeric_setting(
     isolated_window_state,
 ):
