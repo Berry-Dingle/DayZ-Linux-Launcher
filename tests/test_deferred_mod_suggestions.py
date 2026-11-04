@@ -47,9 +47,7 @@ def make_host(tmp_path, executor=None):
             "1.1.1.1:2302": SimpleNamespace(mods_json=PAYLOADS[0]),
             "2.2.2.2:2302": SimpleNamespace(mods_json=PAYLOADS[1]),
         },
-        _mod_suggestion_last_rows=(),
         _update_executor=executor,
-        _queue_mod_suggestions_refresh=lambda: None,
         _startup_perf_origin_ns=time.monotonic_ns(),
         _startup_perf_db_apply_context={"load_id": 8, "input_rows": 2, "valid_rows": 2},
     )
@@ -60,6 +58,8 @@ def make_host(tmp_path, executor=None):
         restore_allowed=True,
         cache_path=tmp_path / "mod_suggestions_v1.json",
     )
+    # Production-wired popover with no search entry bound, so a queued refresh is a no-op.
+    host._mod_suggestion_popover = DZLLWindow._build_mod_suggestion_popover(host)
     return host
 
 
@@ -113,7 +113,7 @@ def test_successful_deferred_result_publishes_on_main_callback_and_refreshes_ope
     host = make_host(tmp_path, executor)
     queued = []
     refreshes = []
-    host._queue_mod_suggestions_refresh = lambda: refreshes.append("refresh")
+    host._mod_suggestion_popover.queue_refresh = lambda: refreshes.append("refresh")
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
     monkeypatch.setattr(
         window.GLib, "idle_add",
@@ -149,21 +149,25 @@ def test_early_autocomplete_is_unavailable_without_sync_rebuild_and_selected_chi
             index=mod_suggestions.build_mod_suggestion_index(PAYLOADS),
             rebuild_index=lambda: events.append("sync_rebuild"),
         ),
-        _mod_suggestion_selecting=False,
-        _mod_suggestion_dismissed=None,
-        _selected_mod_chips=[{"display_name": "Code Lock", "query_term": "42"}],
-        mod_suggestion_panel=SimpleNamespace(),
-        mod_suggestion_list=SimpleNamespace(),
-        search_entry=SimpleNamespace(get_text=lambda: "Code"),
-        _current_mod_suggestion_token=lambda: ("Code", 0, 4, "code"),
-        _mod_suggestion_dismiss_key=lambda *_args: ("Code", 0, "code"),
-        _hide_mod_suggestions=lambda reason: events.append(reason),
-        _log_mod_suggest=lambda _message: None,
     )
-    DZLLWindow._refresh_mod_suggestions(host)
+    popover = DZLLWindow._build_mod_suggestion_popover(host)
+    popover.bind_widgets(
+        entry=SimpleNamespace(get_text=lambda: "Code"),
+        panel=SimpleNamespace(),
+        suggestion_list=SimpleNamespace(),
+        scroller=None,
+        refresh_chips=None,
+        sync_mode_ui=None,
+    )
+    popover.selected_chips = [{"display_name": "Code Lock", "query_term": "42"}]
+    popover.current_token = lambda: ("Code", 0, 4, "code")
+    popover._dismiss_key = lambda *_args: ("Code", 0, "code")
+    popover.hide = lambda reason: events.append(reason)
+    popover.log = lambda _message: None
+    popover.refresh()
     assert events == ["catalogue_not_ready"]
-    assert DZLLWindow._resolve_exact_mod_chip(host, "Code Lock") is None
-    assert DZLLWindow._selected_mod_chip_query_terms(host) == ("42",)
+    assert popover.resolve_exact_chip("Code Lock") is None
+    assert popover.chip_query_terms() == ("42",)
 
 
 def test_submission_failure_stays_unavailable_and_retryable(tmp_path, monkeypatch):

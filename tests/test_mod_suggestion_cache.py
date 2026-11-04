@@ -14,9 +14,10 @@ from dzll_launcher.window import DZLLWindow
 
 
 def catalogue_host(window_fields=None, **state):
-    """A window-like host with the production-wired suggestion coordinator; returns (host, coordinator)."""
+    """A window-like host with the production-wired suggestion coordinator and popover; returns (host, coordinator)."""
     host = SimpleNamespace(**(window_fields or {}))
     host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    host._mod_suggestion_popover = DZLLWindow._build_mod_suggestion_popover(host)
     for name, value in state.items():
         assert hasattr(host._mod_suggestions, name), name
         setattr(host._mod_suggestions, name, value)
@@ -384,14 +385,16 @@ def test_refresh_completion_fsyncs_directory_after_atomic_replace(tmp_path, monk
         mod_suggestion_coordinator, "_fsync_directory_best_effort",
         lambda directory: operations.append(("fsync", Path(directory))),
     )
-    _host, catalogue = catalogue_host(
+    host, catalogue = catalogue_host(
         dict(_shutdown_cleanup_done=False),
         cache_path=path, generation=3, refresh_inflight=True,
     )
+    host._mod_suggestion_popover.last_rows = ("stale",)
 
     assert catalogue._on_refresh_done(3, 0, completed) is False
     assert catalogue.refresh_inflight is False
     assert catalogue.index is replacement
+    assert host._mod_suggestion_popover.last_rows == ()
 
     assert path.read_bytes() == b"replacement"
     assert operations == [

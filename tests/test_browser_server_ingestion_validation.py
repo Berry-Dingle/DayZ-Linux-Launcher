@@ -113,11 +113,12 @@ def _load(host, rows):
 
 
 class _IndexedBrowserHost(_BrowserHost):
-    """Host with the production-wired suggestion coordinator."""
+    """Host with the production-wired suggestion coordinator and popover."""
 
     def __init__(self):
         super().__init__()
         self._mod_suggestions = window.DZLLWindow._build_mod_suggestion_coordinator(self)
+        self._mod_suggestion_popover = window.DZLLWindow._build_mod_suggestion_popover(self)
 
 
 @pytest.mark.parametrize("payload", [
@@ -199,9 +200,10 @@ def test_load_local_name_cleaning_is_shared_without_merging_distinct_id_rules(mo
 
 def test_empty_load_rebuilds_empty_suggestion_index_without_parsed_sidecar():
     host = _IndexedBrowserHost()
+    host._mod_suggestion_popover.last_rows = ("stale",)
     assert _load(host, []) is False
     assert host._mod_suggestions.index == mod_suggestions.build_mod_suggestion_index(())
-    assert host._mod_suggestion_last_rows == ()
+    assert host._mod_suggestion_popover.last_rows == ()
 
 
 def test_replacement_load_reuses_monthly_catalogue_and_later_fallback_does_not_rebuild():
@@ -1004,14 +1006,14 @@ def test_server_mod_cache_warm_output_matches_uncached_builders_without_row_deco
 
 def test_server_mod_cache_warm_selected_chips_filter_like_cold(tmp_path):
     class ChipHost(_BrowserHost):
-        _selected_mod_chip_query_terms = window.DZLLWindow._selected_mod_chip_query_terms
         _build_filter_state = window.DZLLWindow._build_filter_state
-        _normal_search_filter_text = lambda self: ""
 
         def __init__(self):
             super().__init__()
             self.settings = {"hide_test_servers": False}
-            self._selected_mod_chips = [
+            # No search entry is bound, so the normal search text is empty.
+            self._mod_suggestion_popover = window.DZLLWindow._build_mod_suggestion_popover(self)
+            self._mod_suggestion_popover.selected_chips = [
                 {"query_term": "42"},
                 {"query_term": "code lock"},
             ]

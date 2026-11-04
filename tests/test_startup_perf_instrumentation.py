@@ -50,13 +50,14 @@ def test_cache_load_stages_join_existing_phase_only_when_enabled(tmp_path, monke
         _startup_perf_origin_ns=time.monotonic_ns(),
         _startup_perf_db_apply_context={"load_id": 9, "input_rows": 12},
         _obj_by_key={},
-        _mod_suggestion_last_rows=("stale",),
     )
     host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    host._mod_suggestion_popover = DZLLWindow._build_mod_suggestion_popover(host)
+    host._mod_suggestion_popover.last_rows = ("stale",)
     host._mod_suggestions.cache_path = path
     host._mod_suggestions.rebuild_index()
     assert host._mod_suggestions.index == index
-    assert host._mod_suggestion_last_rows == ()
+    assert host._mod_suggestion_popover.last_rows == ()
     if enabled:
         assert len(phases) == 1 and phases[0][0] == "mod_suggestion_cache_load"
         fields = phases[0][1]

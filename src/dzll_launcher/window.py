@@ -215,19 +215,12 @@ from .mod_parsed import ParsedServerMods, parse_mods_preview
 from . import server_mod_cache
 from .mod_suggestion_cache import suggestion_cache_path
 from .mod_suggestion_coordinator import ModSuggestionCacheCoordinator
+from .mod_suggestion_popover import ModSuggestionPopover
 from .mod_search import (
     build_server_mod_index,
-    compact_mod_text,
-    normalize_mod_text,
     parse_required_mod_query,
     server_matches_mod_query,
     split_mod_search_operator,
-)
-from .mod_suggestions import (
-    SUGGESTION_SHORTHANDS,
-    current_comma_token,
-    replace_comma_token,
-    suggest_mods,
 )
 from .companion_restart_phase2_consumers import AlertKeyKind, RecoveryAction
 from .companion_restart_phase2_detection import (
@@ -251,7 +244,6 @@ BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET = 10
 BACKGROUND_PREPARE_ACTIVE_BOTTOM_SPACING = 8
 
 
-MOD_SUGGESTION_RESULT_LIMIT = 50
 PERF_LOG_ENABLED = os.environ.get("DZLL_PERF_LOG") == "1"
 
 
@@ -594,14 +586,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_mod_cache_file_bytes = 0
         self._suggestion_sweep_complete = False
         self._suggestion_sweep_fallback_ready = False
-        self._mod_suggestion_selecting = False
-        self._mod_suggestion_dismissed = None
-        self._mod_suggestion_refresh_id = 0
-        self._mod_suggestion_last_rows = ()
-        self._mod_search_mode_active = False
-        self._mod_search_saved_normal_text = ""
-        self._mod_search_entry_update_guard = False
-        self._selected_mod_chips = []
+        self._mod_suggestion_popover = self._build_mod_suggestion_popover()
 
         self.favorites = load_favorites()
         self.last_played = load_last_played()
@@ -7977,9 +7962,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 return False
 
-        raw_query = (self._normal_search_filter_text() or "").strip().lower()
+        mod_search = self._mod_suggestion_popover
+        raw_query = (mod_search.normal_filter_text() or "").strip().lower()
         normal_query, raw_mod_query, mod_query_mode = split_mod_search_operator(raw_query)
-        selected_mod_terms = self._selected_mod_chip_query_terms()
+        selected_mod_terms = mod_search.chip_query_terms()
         if selected_mod_terms:
             raw_mod_query = ",".join(selected_mod_terms)
             mod_query_mode = True
@@ -8027,222 +8013,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         return False
 
-    def _normal_search_filter_text(self) -> str:
-        entry = getattr(self, "search_entry", None)
-        if not entry:
-            return ""
-        if bool(getattr(self, "_mod_search_mode_active", False)):
-            return str(getattr(self, "_mod_search_saved_normal_text", "") or "")
-        return entry.get_text() or ""
-
-    def _selected_mod_chip_query_terms(self) -> tuple[str, ...]:
-        terms = []
-        for chip in getattr(self, "_selected_mod_chips", []) or []:
-            if not isinstance(chip, dict):
-                continue
-            term = str(chip.get("query_term") or "").strip()
-            if term:
-                terms.append(term)
-        return tuple(terms)
-
-    def _refresh_selected_mod_chip_ui(self):
-        refresh = getattr(self, "_refresh_mod_search_chips", None)
-        if callable(refresh):
-            try:
-                refresh()
-            except Exception:
-                pass
-
-    def _selected_mod_chip_key(self, chip: dict) -> str:
-        workshop_id = str(chip.get("workshop_id") or "").strip()
-        if workshop_id:
-            return f"id:{workshop_id}"
-        return f"name:{normalize_mod_text(chip.get('query_term') or chip.get('display_name') or '')}"
-
-    def _resolve_exact_mod_chip(self, text: str) -> dict | None:
-        raw = str(text or "").strip()
-        if not raw:
-            return None
-        catalogue = self._mod_suggestions
-        if (not bool(catalogue.ready) and
-                (bool(catalogue.restore_pending) or bool(catalogue.restore_inflight))):
-            return None
-        normalized = normalize_mod_text(raw)
-        compact = compact_mod_text(raw)
-        index = catalogue.index
-        mods = index.get("mods", ()) if isinstance(index, dict) else ()
-        exact_matches = []
-        for entry in mods or ():
-            if not isinstance(entry, dict):
-                continue
-            values = [
-                entry.get("display_name") or "",
-                entry.get("name") or "",
-                *(entry.get("raw_names", ()) or ()),
-            ]
-            for value in values:
-                if normalize_mod_text(value) == normalized or compact_mod_text(value) == compact:
-                    exact_matches.append(entry)
-                    break
-        if not exact_matches:
-            suggestions = suggest_mods(index, raw, limit=1)
-            if suggestions:
-                candidate = suggestions[0]
-                values = [
-                    candidate.get("display_name") or "",
-                    candidate.get("name") or "",
-                    *(candidate.get("raw_names", ()) or ()),
-                ]
-                if any(normalize_mod_text(value) == normalized or compact_mod_text(value) == compact for value in values):
-                    exact_matches.append(candidate)
-        if not exact_matches:
-            return None
-        entry = exact_matches[0]
-        display_name = str(entry.get("display_name") or entry.get("name") or raw).strip() or raw
-        workshop_id = str(entry.get("workshop_id") or "").strip()
-        return {
-            "display_name": display_name,
-            "workshop_id": workshop_id,
-            "query_term": workshop_id or display_name,
-        }
-
-    def _mod_chip_from_suggestion(self, name: str, suggestion_entry: dict | None = None) -> dict:
-        raw = str(name or "").strip()
-        entry = suggestion_entry if isinstance(suggestion_entry, dict) else None
-        if entry is None:
-            resolved = self._resolve_exact_mod_chip(raw)
-            if resolved is not None:
-                return resolved
-            return {}
-        display_name = str(entry.get("display_name") or entry.get("name") or raw).strip() or raw
-        workshop_id = str(entry.get("workshop_id") or "").strip()
-        return {
-            "display_name": display_name,
-            "workshop_id": workshop_id,
-            "query_term": workshop_id or display_name,
-        }
-
-    def _add_selected_mod_chip(self, chip: dict) -> bool:
-        if not isinstance(chip, dict):
-            return False
-        display_name = str(chip.get("display_name") or chip.get("query_term") or "").strip()
-        query_term = str(chip.get("query_term") or display_name).strip()
-        if not display_name:
-            return False
-        if not query_term:
-            return False
-        normalized_chip = {
-            "display_name": display_name or query_term,
-            "workshop_id": str(chip.get("workshop_id") or "").strip(),
-            "query_term": query_term,
-        }
-        new_key = self._selected_mod_chip_key(normalized_chip)
-        chips = []
-        replaced = False
-        for existing in getattr(self, "_selected_mod_chips", []) or []:
-            if not isinstance(existing, dict):
-                continue
-            if self._selected_mod_chip_key(existing) == new_key:
-                chips.append(normalized_chip)
-                replaced = True
-            else:
-                chips.append(existing)
-        if not replaced:
-            chips.append(normalized_chip)
-        self._selected_mod_chips = chips
-        self._refresh_selected_mod_chip_ui()
-        self._cancel_search_filter_debounce()
-        self._apply_search_filter_changed(scroll=True, reason="search")
-        return True
-
-    def _remove_selected_mod_chip(self, chip_index: int) -> bool:
-        try:
-            index = int(chip_index)
-        except Exception:
-            return False
-        chips = [chip for chip in (getattr(self, "_selected_mod_chips", []) or []) if isinstance(chip, dict)]
-        if index < 0 or index >= len(chips):
-            return False
-        del chips[index]
-        self._selected_mod_chips = chips
-        self._refresh_selected_mod_chip_ui()
-        self._cancel_search_filter_debounce()
-        self._apply_search_filter_changed(scroll=True, reason="search")
-        return True
-
-    def _commit_mod_search_input_as_chip(self) -> bool:
-        entry = getattr(self, "search_entry", None)
-        if not entry or not bool(getattr(self, "_mod_search_mode_active", False)):
-            return False
-        text = (entry.get_text() or "").strip()
-        if not text:
-            return False
-        chip = self._resolve_exact_mod_chip(text)
-        if chip is None:
-            try:
-                self._mod_suggestion_dismissed = None
-                self._refresh_mod_suggestions()
-            except Exception:
-                pass
-            return True
-        if not self._add_selected_mod_chip(chip):
-            return False
-        self._mod_search_entry_update_guard = True
-        try:
-            entry.set_text("")
-            entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
-        finally:
-            self._mod_search_entry_update_guard = False
-        try:
-            self._cancel_mod_suggestion_refresh()
-            self._hide_mod_suggestions("mod_search_commit")
-        except Exception:
-            pass
-        self._restore_search_entry_cursor(0)
-        GLib.idle_add(self._restore_search_entry_cursor, 0)
-        return True
-
-    def _exit_mod_search_mode_restore(self) -> bool:
-        if not bool(getattr(self, "_mod_search_mode_active", False)):
-            return False
-
-        entry = getattr(self, "search_entry", None)
-        saved_text = str(getattr(self, "_mod_search_saved_normal_text", "") or "")
-        self._mod_search_mode_active = False
-        self._mod_search_entry_update_guard = True
-        try:
-            if entry:
-                entry.set_text(saved_text)
-                entry.set_placeholder_text("Filter by name or IP. Click MOD for required mods.")
-                icon = "edit-clear-symbolic" if saved_text else None
-                entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, icon)
-                try:
-                    entry.remove_css_class("mod-search-entry-active")
-                except Exception:
-                    pass
-        finally:
-            self._mod_search_entry_update_guard = False
-
-        sync_mod_search_ui = getattr(self, "_sync_mod_search_mode_ui", None)
-        if callable(sync_mod_search_ui):
-            sync_mod_search_ui(False)
-
-        try:
-            self._cancel_mod_suggestion_refresh()
-            self._hide_mod_suggestions("mod_search_escape")
-        except Exception:
-            pass
-        if entry:
-            cursor_pos = len(saved_text)
-            self._restore_search_entry_cursor(cursor_pos)
-            GLib.idle_add(self._restore_search_entry_cursor, cursor_pos)
-        try:
-            self._cancel_search_filter_debounce()
-            self._apply_search_filter_changed(scroll=True, reason="search")
-        except Exception:
-            pass
-        return True
-
     def _cancel_search_filter_debounce(self):
         tid = int(getattr(self, "_search_filter_debounce_id", 0) or 0)
         if tid:
@@ -8267,8 +8037,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             ),
             is_shut_down=lambda: bool(getattr(self, "_shutdown_cleanup_done", False)),
             submit=lambda *args, **kwargs: self._update_executor.submit(*args, **kwargs),
-            on_index_replaced=lambda: setattr(self, "_mod_suggestion_last_rows", ()),
-            on_restored=lambda: self._queue_mod_suggestions_refresh(),
+            on_index_replaced=lambda: self._mod_suggestion_popover.forget_rows(),
+            on_restored=lambda: self._mod_suggestion_popover.queue_refresh(),
             perf_enabled=lambda: PERF_LOG_ENABLED,
             perf_context=lambda: getattr(self, "_startup_perf_db_apply_context", None),
             log_apply_phase=lambda phase, start_ns, **fields: _log_startup_apply_phase(
@@ -8279,424 +8049,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             ),
         )
 
-    def _log_mod_suggest(self, message: str):
-        if not DEBUG_MOD_SUGGESTIONS:
-            return
-        try:
-            print(f"[MODSUGGEST] {message}", flush=True)
-        except Exception:
-            pass
-
-    def _cancel_mod_suggestion_refresh(self):
-        tid = int(getattr(self, "_mod_suggestion_refresh_id", 0) or 0)
-        if tid:
-            try:
-                GLib.source_remove(tid)
-            except Exception:
-                pass
-        self._mod_suggestion_refresh_id = 0
-
-    def _queue_mod_suggestions_refresh(self):
-        entry = getattr(self, "search_entry", None)
-        if not entry:
-            return
-        self._cancel_mod_suggestion_refresh()
-        text = entry.get_text() or ""
-
-        def run_refresh():
-            self._mod_suggestion_refresh_id = 0
-            current_entry = getattr(self, "search_entry", None)
-            if not current_entry:
-                return False
-            if (current_entry.get_text() or "") != text:
-                return False
-            self._refresh_mod_suggestions()
-            return False
-
-        self._mod_suggestion_refresh_id = GLib.timeout_add(35, run_refresh)
-
-    def _clear_mod_suggestion_rows(self):
-        suggestion_list = getattr(self, "mod_suggestion_list", None)
-        if not suggestion_list:
-            return
-        child = suggestion_list.get_first_child()
-        while child is not None:
-            next_child = child.get_next_sibling()
-            suggestion_list.remove(child)
-            child = next_child
-
-    def _hide_mod_suggestions(self, reason: str = "other"):
-        panel = getattr(self, "mod_suggestion_panel", None)
-        visible_before = False
-        if panel:
-            try:
-                visible_before = bool(panel.get_visible())
-            except Exception:
-                visible_before = False
-            panel.set_visible(False)
-        self._clear_mod_suggestion_rows()
-        self._mod_suggestion_last_rows = ()
-        if visible_before or reason not in ("ineligible_token", "no_operator", "empty_token"):
-            self._log_mod_suggest(f"hide reason={reason} visible_before={visible_before}")
-        return False
-
-    def _mod_suggestions_visible(self) -> bool:
-        try:
-            return bool(self.mod_suggestion_panel.get_visible())
-        except Exception:
-            return False
-
-    def _restore_search_entry_cursor(self, cursor_pos: int):
-        entry = getattr(self, "search_entry", None)
-        if not entry:
-            return False
-        try:
-            entry.grab_focus()
-        except Exception:
-            pass
-        try:
-            entry.set_position(int(cursor_pos))
-        except Exception:
-            pass
-        try:
-            entry.select_region(int(cursor_pos), int(cursor_pos))
-        except Exception:
-            pass
-        return False
-
-    def _mod_suggestion_row_count(self) -> int:
-        suggestion_list = getattr(self, "mod_suggestion_list", None)
-        if not suggestion_list:
-            return 0
-        count = 0
-        child = suggestion_list.get_first_child()
-        while child is not None:
-            count += 1
-            child = child.get_next_sibling()
-        return count
-
-    def _scroll_mod_suggestion_row_into_view(self, row):
-        if row is None:
-            return False
-        try:
-            row.grab_focus()
-        except Exception:
-            pass
-        scroller = getattr(self, "mod_suggestion_scroller", None)
-        if not scroller:
-            return False
-        try:
-            vadjustment = scroller.get_vadjustment()
-        except Exception:
-            vadjustment = None
-        if vadjustment is None:
-            return False
-        try:
-            row_top = float(row.get_allocation().y)
-            row_bottom = row_top + float(row.get_allocated_height())
-            visible_top = float(vadjustment.get_value())
-            visible_bottom = visible_top + float(vadjustment.get_page_size())
-            upper = float(vadjustment.get_upper())
-            page_size = float(vadjustment.get_page_size())
-        except Exception:
-            return False
-        new_value = visible_top
-        if row_top < visible_top:
-            new_value = row_top
-        elif row_bottom > visible_bottom:
-            new_value = row_bottom - page_size
-        new_value = max(0.0, min(new_value, max(0.0, upper - page_size)))
-        if new_value != visible_top:
-            try:
-                vadjustment.set_value(new_value)
-            except Exception:
-                pass
-        return False
-
-    def _select_mod_suggestion_delta(self, delta: int):
-        suggestion_list = getattr(self, "mod_suggestion_list", None)
-        if not suggestion_list:
-            return
-        count = self._mod_suggestion_row_count()
-        if count <= 0:
-            return
-        selected = suggestion_list.get_selected_row()
-        if selected is None:
-            index = 0 if delta >= 0 else count - 1
-        else:
-            index = max(0, min(count - 1, selected.get_index() + delta))
-        row = suggestion_list.get_row_at_index(index)
-        if row is not None:
-            suggestion_list.select_row(row)
-            self._scroll_mod_suggestion_row_into_view(row)
-            GLib.idle_add(self._scroll_mod_suggestion_row_into_view, row)
-
-    def _activate_selected_mod_suggestion(self) -> bool:
-        suggestion_list = getattr(self, "mod_suggestion_list", None)
-        if not suggestion_list:
-            return False
-        row = suggestion_list.get_selected_row()
-        if row is None:
-            row = suggestion_list.get_row_at_index(0)
-        if row is None:
-            return False
-        name = str(getattr(row, "_mod_suggestion_name", "") or "").strip()
-        if not name:
-            return False
-        self._apply_mod_suggestion(name)
-        return True
-
-    def _mod_suggestion_dismiss_key(self, text: str, start: int, compact_token: str) -> tuple[str, int, str]:
-        return (str(text or "")[:start], int(start), str(compact_token or ""))
-
-    def _current_mod_suggestion_token(self):
-        entry = getattr(self, "search_entry", None)
-        if not entry:
-            return None
-        text = entry.get_text() or ""
-        cursor = entry.get_position()
-        if bool(getattr(self, "_mod_search_mode_active", False)):
-            try:
-                cursor = int(cursor)
-            except Exception:
-                cursor = len(text)
-            cursor = max(0, min(cursor, len(text)))
-            start = 0
-            end = len(text)
-            token = text.strip()
-            while start < end and text[start].isspace():
-                start += 1
-            while end > start and text[end - 1].isspace():
-                end -= 1
-            compact_token = compact_mod_text(token)
-            if not compact_token:
-                return None
-            if len(compact_token) < 2 and compact_token not in SUGGESTION_SHORTHANDS:
-                return None
-            return token, start, end, compact_token
-
-        normal_query, raw_mod_query, mod_query_mode = split_mod_search_operator(text)
-        if not mod_query_mode:
-            return None
-        mod_start = len(text) - len(raw_mod_query)
-        if cursor < mod_start:
-            return None
-        token_bounds = current_comma_token(raw_mod_query, cursor - mod_start)
-        token, start, end = token_bounds
-        start += mod_start
-        end += mod_start
-        compact_token = compact_mod_text(token)
-        if not compact_token:
-            return None
-        if len(compact_token) < 2 and compact_token not in SUGGESTION_SHORTHANDS:
-            return None
-        return token, start, end, compact_token
-
-    def _refresh_mod_suggestions(self):
-        panel = getattr(self, "mod_suggestion_panel", None)
-        suggestion_list = getattr(self, "mod_suggestion_list", None)
-        entry = getattr(self, "search_entry", None)
-        if not panel or not suggestion_list or not entry:
-            self._log_mod_suggest(
-                f"refresh abort missing_widgets panel={bool(panel)} list={bool(suggestion_list)} entry={bool(entry)}"
-            )
-            return
-        if bool(getattr(self, "_mod_suggestion_selecting", False)):
-            return
-
-        token_info = self._current_mod_suggestion_token()
-        if token_info is None:
-            self._hide_mod_suggestions("ineligible_token")
-            return
-        token, start, end, compact_token = token_info
-        text = entry.get_text() or ""
-        dismissed = self._mod_suggestion_dismiss_key(text, start, compact_token)
-        if dismissed == getattr(self, "_mod_suggestion_dismissed", None):
-            self._hide_mod_suggestions("dismissed_token")
-            return
-
-        catalogue = self._mod_suggestions
-        if (not bool(catalogue.ready) and
-                (bool(catalogue.restore_pending) or bool(catalogue.restore_inflight))):
-            self._log_mod_suggest("catalogue not ready; suggestions temporarily unavailable")
-            self._hide_mod_suggestions("catalogue_not_ready")
-            return
-
-        try:
-            if (not bool(catalogue.ready) and
-                    len(catalogue.index or {}) <= 0 and getattr(self, "_obj_by_key", None)):
-                self._log_mod_suggest("index empty; rebuilding from loaded rows")
-                catalogue.rebuild_index()
-        except Exception:
-            pass
-        index = catalogue.index
-        try:
-            index_count = len(index) if index is not None else -1
-        except Exception:
-            index_count = -1
-        suggestions = suggest_mods(catalogue.index, token, limit=MOD_SUGGESTION_RESULT_LIMIT)
-        if not suggestions:
-            self._log_mod_suggest(f"no suggestions token={token!r} index_count={index_count}")
-            self._hide_mod_suggestions("no_suggestions")
-            return
-        first_names = [str(suggestion.get("display_name") or suggestion.get("name") or "") for suggestion in suggestions[:3]]
-        row_entries = tuple(
-            (str(suggestion.get("display_name") or suggestion.get("name") or "").strip(), suggestion)
-            for suggestion in suggestions
+    def _build_mod_suggestion_popover(self) -> ModSuggestionPopover:
+        """Wire the mod-search popover to the catalogue and this window's search filter."""
+        return ModSuggestionPopover(
+            catalogue=self._mod_suggestions,
+            has_rows=lambda: getattr(self, "_obj_by_key", None),
+            apply_search_filter=lambda **kwargs: self._apply_search_filter_changed(**kwargs),
+            cancel_search_filter_debounce=lambda: self._cancel_search_filter_debounce(),
+            debug_enabled=lambda: DEBUG_MOD_SUGGESTIONS,
         )
-        row_entries = tuple((name, suggestion) for name, suggestion in row_entries if name)
-        row_names = tuple(name for name, _suggestion in row_entries)
-        visible_before = bool(panel.get_visible())
-        if row_names == getattr(self, "_mod_suggestion_last_rows", ()):
-            if suggestion_list.get_first_child() is None:
-                self._mod_suggestion_last_rows = ()
-            else:
-                if suggestion_list.get_selected_row() is None:
-                    first_row = suggestion_list.get_row_at_index(0)
-                    if first_row is not None:
-                        suggestion_list.select_row(first_row)
-                panel.set_visible(True)
-                self._log_mod_suggest(
-                    f"show token={token!r} count={len(row_names)} first={first_names!r} rows=unchanged visible_before={visible_before} visible_after={panel.get_visible()} "
-                    f"panel_parent={bool(panel.get_parent())} panel_mapped={panel.get_mapped()} list_rows={self._mod_suggestion_row_count()}"
-                )
-                return
-
-        self._clear_mod_suggestion_rows()
-
-        for name, suggestion in row_entries:
-            label = Gtk.Label(label=name, xalign=0.0)
-            label.set_can_focus(False)
-            label.set_margin_top(6)
-            label.set_margin_bottom(6)
-            label.set_margin_start(8)
-            label.set_margin_end(8)
-            label.set_ellipsize(Pango.EllipsizeMode.END)
-
-            row = Gtk.ListBoxRow()
-            row.set_can_focus(False)
-            row._mod_suggestion_name = name
-            row._mod_suggestion_entry = suggestion
-            row.set_child(label)
-            suggestion_list.append(row)
-
-        if suggestion_list.get_first_child() is None:
-            self._hide_mod_suggestions("empty_rows_after_build")
-            return
-
-        first_row = suggestion_list.get_row_at_index(0)
-        if first_row is not None:
-            suggestion_list.select_row(first_row)
-        self._mod_suggestion_last_rows = row_names
-        panel.set_visible(True)
-        self._log_mod_suggest(
-            f"show token={token!r} count={len(row_names)} first={first_names!r} rows=rebuilt visible_before={visible_before} visible_after={panel.get_visible()} "
-            f"panel_parent={bool(panel.get_parent())} panel_mapped={panel.get_mapped()} list_rows={self._mod_suggestion_row_count()}"
-        )
-
-    def _apply_mod_suggestion(self, name: str):
-        entry = getattr(self, "search_entry", None)
-        if not entry:
-            return
-
-        self._mod_suggestion_selecting = True
-        try:
-            text = entry.get_text() or ""
-            cursor = entry.get_position()
-            if bool(getattr(self, "_mod_search_mode_active", False)):
-                suggestion_entry = None
-                suggestion_list = getattr(self, "mod_suggestion_list", None)
-                row = suggestion_list.get_selected_row() if suggestion_list else None
-                if row is not None and str(getattr(row, "_mod_suggestion_name", "") or "") == name:
-                    suggestion_entry = getattr(row, "_mod_suggestion_entry", None)
-                chip = self._mod_chip_from_suggestion(name, suggestion_entry)
-                if self._add_selected_mod_chip(chip):
-                    self._mod_search_entry_update_guard = True
-                    try:
-                        entry.set_text("")
-                        entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
-                    finally:
-                        self._mod_search_entry_update_guard = False
-                    self._restore_search_entry_cursor(0)
-                    GLib.idle_add(self._restore_search_entry_cursor, 0)
-            else:
-                _, raw_mod_query, mod_query_mode = split_mod_search_operator(text)
-                if not mod_query_mode:
-                    return
-                mod_start = len(text) - len(raw_mod_query)
-                if cursor < mod_start:
-                    return
-                token, token_start, token_end = current_comma_token(raw_mod_query, cursor - mod_start)
-                append_next_separator = not raw_mod_query[token_end:].strip()
-                new_mod_query, mod_cursor = replace_comma_token(raw_mod_query, cursor - mod_start, name)
-                if append_next_separator:
-                    new_mod_query = f"{new_mod_query}, "
-                    mod_cursor += 2
-                new_text = f"{text[:mod_start]}{new_mod_query}"
-                new_cursor = mod_start + mod_cursor
-                entry.set_text(new_text)
-                self._restore_search_entry_cursor(new_cursor)
-                GLib.idle_add(self._restore_search_entry_cursor, new_cursor)
-                _, new_raw_mod_query, new_mod_query_mode = split_mod_search_operator(new_text)
-                if new_mod_query_mode:
-                    new_mod_start = len(new_text) - len(new_raw_mod_query)
-                    next_token, start, _end = current_comma_token(new_raw_mod_query, new_cursor - new_mod_start)
-                    start += new_mod_start
-                    self._mod_suggestion_dismissed = self._mod_suggestion_dismiss_key(
-                        new_text,
-                        start,
-                        compact_mod_text(next_token),
-                    )
-        finally:
-            self._mod_suggestion_selecting = False
-        self._hide_mod_suggestions("selection")
-
-    def _on_mod_suggestion_row_activated(self, _listbox, row):
-        if not row:
-            return
-        name = str(getattr(row, "_mod_suggestion_name", "") or "").strip()
-        if name and bool(getattr(self, "_mod_search_mode_active", False)):
-            chip = self._mod_chip_from_suggestion(name, getattr(row, "_mod_suggestion_entry", None))
-            if self._add_selected_mod_chip(chip):
-                entry = getattr(self, "search_entry", None)
-                if entry:
-                    self._mod_search_entry_update_guard = True
-                    try:
-                        entry.set_text("")
-                        entry.set_icon_from_icon_name(Gtk.EntryIconPosition.SECONDARY, None)
-                    finally:
-                        self._mod_search_entry_update_guard = False
-                    self._restore_search_entry_cursor(0)
-                    GLib.idle_add(self._restore_search_entry_cursor, 0)
-                self._hide_mod_suggestions("selection")
-        elif name:
-            self._apply_mod_suggestion(name)
-
-    def _on_mod_suggestion_key_pressed(self, _controller, keyval, _keycode, _state):
-        visible = self._mod_suggestions_visible()
-        if bool(getattr(self, "_mod_search_mode_active", False)) and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            if visible:
-                self._activate_selected_mod_suggestion()
-                return True
-            return self._commit_mod_search_input_as_chip()
-        if visible and keyval == Gdk.KEY_Down:
-            self._select_mod_suggestion_delta(1)
-            return True
-        if visible and keyval == Gdk.KEY_Up:
-            self._select_mod_suggestion_delta(-1)
-            return True
-        if visible and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
-            self._activate_selected_mod_suggestion()
-            return True
-        if visible and keyval == Gdk.KEY_Escape:
-            token_info = self._current_mod_suggestion_token()
-            if token_info is not None:
-                _, start, end, compact_token = token_info
-                text = self.search_entry.get_text() or ""
-                self._mod_suggestion_dismissed = self._mod_suggestion_dismiss_key(text, start, compact_token)
-            self._hide_mod_suggestions("escape")
-            return True
-        return False
 
     def _on_search_changed_debounced(self):
         self._cancel_search_filter_debounce()
@@ -8926,18 +8287,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     pass
             except Exception:
                 pass
-            self._mod_search_mode_active = False
-            self._mod_search_saved_normal_text = ""
-            self._selected_mod_chips = []
-            sync_mod_search_ui = getattr(self, "_sync_mod_search_mode_ui", None)
-            if callable(sync_mod_search_ui):
-                sync_mod_search_ui(False)
-            self._refresh_selected_mod_chip_ui()
-            try:
-                self._cancel_mod_suggestion_refresh()
-                self._hide_mod_suggestions("reset")
-            except Exception:
-                pass
+            self._mod_suggestion_popover.reset()
             self._cancel_search_filter_debounce()
             try:
                 self.map_dropdown.set_selected(0)

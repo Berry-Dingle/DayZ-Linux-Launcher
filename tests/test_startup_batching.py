@@ -115,6 +115,7 @@ def make_host(rows, events, *, source_store=None, filter_func=None):
     host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
     host._mod_suggestions.ready = True
     host._mod_suggestions.rebuild_index = lambda: events.append("suggestions")
+    host._mod_suggestion_popover = DZLLWindow._build_mod_suggestion_popover(host)
     bind(
         host, "_start_startup_row_batches", "_build_startup_batched_row",
         "_run_startup_row_batch", "_publish_startup_row_batches",
@@ -672,8 +673,8 @@ def test_post_publication_exceptions_release_ownership_and_restore_autocomplete(
     catalogue.restore_retry_after = 0.0
     catalogue.cache_path = tmp_path / "mod_suggestions_v1.json"
     catalogue.index = {"mods": (), "count": 0}
-    host._mod_suggestion_last_rows = ()
-    host._queue_mod_suggestions_refresh = lambda: events.append("suggestions_ready")
+    host._mod_suggestion_popover.last_rows = ("stale",)
+    host._mod_suggestion_popover.queue_refresh = lambda: events.append("suggestions_ready")
     host._startup_presentation = SimpleNamespace(
         startup_completed=False,
         complete_startup=lambda: events.append("recovery_overlay_complete"),

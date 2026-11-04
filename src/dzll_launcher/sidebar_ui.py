@@ -111,6 +111,7 @@ def connect_mutually_exclusive_checkbuttons(cb_a, cb_b, on_change):
     cb_b.connect("toggled", _wrap(cb_b, cb_a))
 
 def build_search_area(window) -> Gtk.Widget:
+    mod_search = window._mod_suggestion_popover
     search_frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
     search_frame.add_css_class("dzll-search-area")
     search_frame.set_hexpand(True)
@@ -236,24 +237,23 @@ def build_search_area(window) -> Gtk.Widget:
                 window.search_entry.remove_css_class("mod-search-entry-active")
             except Exception:
                 pass
-    window._sync_mod_search_mode_ui = set_mod_search_mode_ui
 
     def enter_mod_search_mode_from_toggle():
-        if bool(getattr(window, "_mod_search_mode_active", False)):
+        if bool(mod_search.mode_active):
             return
         saved_normal_text = window.search_entry.get_text() or ""
-        window._mod_search_saved_normal_text = saved_normal_text.strip()
-        window._mod_search_mode_active = True
+        mod_search.saved_normal_text = saved_normal_text.strip()
+        mod_search.mode_active = True
         set_mod_search_mode_ui(True)
-        window._mod_search_entry_update_guard = True
+        mod_search.entry_update_guard = True
         try:
             window.search_entry.set_text("")
         finally:
-            window._mod_search_entry_update_guard = False
+            mod_search.entry_update_guard = False
         update_search_clear_icon()
         try:
-            window._cancel_mod_suggestion_refresh()
-            window._hide_mod_suggestions("mod_search_toggle")
+            mod_search.cancel_refresh()
+            mod_search.hide("mod_search_toggle")
         except Exception:
             pass
         try:
@@ -267,15 +267,15 @@ def build_search_area(window) -> Gtk.Widget:
     def on_mod_search_toggle_clicked(_button):
         if bool(getattr(window, "_mod_search_toggle_update_guard", False)):
             return
-        if bool(getattr(window, "_mod_search_mode_active", False)):
-            window._exit_mod_search_mode_restore()
+        if bool(mod_search.mode_active):
+            mod_search.exit_mod_search_mode()
         else:
             enter_mod_search_mode_from_toggle()
 
     window.mod_search_toggle_badge.connect("clicked", on_mod_search_toggle_clicked)
 
     def try_activate_mod_search_mode(raw_text: str) -> bool:
-        if bool(getattr(window, "_mod_search_mode_active", False)):
+        if bool(mod_search.mode_active):
             return False
         match = _MOD_SEARCH_MODE_OPERATOR_RE.search(str(raw_text or ""))
         if not match:
@@ -288,15 +288,15 @@ def build_search_area(window) -> Gtk.Widget:
             parts = mod_input_text.split(",")
             complete_terms = [part.strip() for part in parts[:-1] if part.strip()]
             mod_input_text = parts[-1].lstrip()
-        window._mod_search_saved_normal_text = saved_normal_text
-        window._mod_search_mode_active = True
+        mod_search.saved_normal_text = saved_normal_text
+        mod_search.mode_active = True
         set_mod_search_mode_ui(True)
         unresolved_terms = []
         for term in complete_terms:
             try:
-                chip = window._resolve_exact_mod_chip(term)
+                chip = mod_search.resolve_exact_chip(term)
                 if chip is not None:
-                    window._add_selected_mod_chip(chip)
+                    mod_search.add_chip(chip)
                 else:
                     unresolved_terms.append(term)
             except Exception:
@@ -304,11 +304,11 @@ def build_search_area(window) -> Gtk.Widget:
         if unresolved_terms:
             unresolved_terms.append(mod_input_text.strip())
             mod_input_text = ", ".join(term for term in unresolved_terms if term)
-        window._mod_search_entry_update_guard = True
+        mod_search.entry_update_guard = True
         try:
             window.search_entry.set_text(mod_input_text)
         finally:
-            window._mod_search_entry_update_guard = False
+            mod_search.entry_update_guard = False
         update_search_clear_icon()
         try:
             window.search_entry.grab_focus()
@@ -316,7 +316,7 @@ def build_search_area(window) -> Gtk.Widget:
         except Exception:
             pass
         try:
-            GLib.idle_add(window._restore_search_entry_cursor, len(mod_input_text))
+            GLib.idle_add(mod_search.restore_entry_cursor, len(mod_input_text))
         except Exception:
             pass
         return True
@@ -566,9 +566,9 @@ def build_search_area(window) -> Gtk.Widget:
         return min(natural_width, MOD_CHIP_NAME_READABLE_MIN_WIDTH)
 
     def remove_mod_chip(chip_index: int):
-        if getattr(window, "_selected_mod_chips", None):
+        if mod_search.selected_chips:
             try:
-                window._remove_selected_mod_chip(chip_index)
+                mod_search.remove_chip(chip_index)
             except Exception:
                 pass
             return
@@ -788,7 +788,7 @@ def build_search_area(window) -> Gtk.Widget:
         window._mod_search_chip_width_watch_id = GLib.timeout_add(150, width_watch_tick)
 
     def refresh_mod_search_chips():
-        selected_chips = [chip for chip in (getattr(window, "_selected_mod_chips", []) or []) if isinstance(chip, dict)]
+        selected_chips = [chip for chip in (mod_search.selected_chips or []) if isinstance(chip, dict)]
         if selected_chips:
             terms = tuple(str(chip.get("display_name") or chip.get("query_term") or "").strip() for chip in selected_chips)
             terms = tuple(term for term in terms if term)
@@ -801,7 +801,7 @@ def build_search_area(window) -> Gtk.Widget:
             schedule_mod_chip_reflow()
             return
 
-        if bool(getattr(window, "_mod_search_mode_active", False)):
+        if bool(mod_search.mode_active):
             terms = ()
             if terms == getattr(window, "_mod_search_chip_terms", ()):
                 stop_mod_chip_width_watch()
@@ -848,21 +848,21 @@ def build_search_area(window) -> Gtk.Widget:
             pass
 
     def on_search_changed(*_):
-        if bool(getattr(window, "_mod_search_entry_update_guard", False)):
+        if bool(mod_search.entry_update_guard):
             return
         activated_mod_search = try_activate_mod_search_mode(window.search_entry.get_text() or "")
         update_search_clear_icon()
         refresh_mod_search_chips()
         try:
             if activated_mod_search:
-                window._cancel_mod_suggestion_refresh()
-                window._hide_mod_suggestions("mod_search_activation")
-            elif bool(getattr(window, "_mod_search_mode_active", False)):
-                window._cancel_mod_suggestion_refresh()
-                window._mod_suggestion_dismissed = None
-                window._refresh_mod_suggestions()
+                mod_search.cancel_refresh()
+                mod_search.hide("mod_search_activation")
+            elif bool(mod_search.mode_active):
+                mod_search.cancel_refresh()
+                mod_search.dismissed = None
+                mod_search.refresh()
             else:
-                window._queue_mod_suggestions_refresh()
+                mod_search.queue_refresh()
         except Exception:
             pass
         window._on_search_changed_debounced()
@@ -871,8 +871,8 @@ def build_search_area(window) -> Gtk.Widget:
         if position == Gtk.EntryIconPosition.SECONDARY:
             window.search_entry.set_text("")
             try:
-                window._cancel_mod_suggestion_refresh()
-                window._hide_mod_suggestions("clear_icon")
+                mod_search.cancel_refresh()
+                mod_search.hide("clear_icon")
             except Exception:
                 pass
             window._cancel_search_filter_debounce()
@@ -880,27 +880,26 @@ def build_search_area(window) -> Gtk.Widget:
 
     def on_search_cursor_position_changed(*_):
         try:
-            window._cancel_mod_suggestion_refresh()
-            window._refresh_mod_suggestions()
+            mod_search.cancel_refresh()
+            mod_search.refresh()
         except Exception:
             pass
 
     update_search_clear_icon()
-    window._refresh_mod_search_chips = refresh_mod_search_chips
     window.search_entry.connect("changed", on_search_changed)
     window.search_entry.connect("notify::cursor-position", on_search_cursor_position_changed)
     window.search_entry.connect("icon-press", on_search_icon_press)
     search_key = Gtk.EventControllerKey.new()
     search_key.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
     def on_search_key_pressed(controller, keyval, keycode, state):
-        if keyval == Gdk.KEY_Escape and bool(getattr(window, "_mod_search_mode_active", False)):
-            return window._exit_mod_search_mode_restore()
-        return window._on_mod_suggestion_key_pressed(controller, keyval, keycode, state)
+        if keyval == Gdk.KEY_Escape and bool(mod_search.mode_active):
+            return mod_search.exit_mod_search_mode()
+        return mod_search.on_key_pressed(controller, keyval, keycode, state)
 
     search_key.connect("key-pressed", on_search_key_pressed)
     window.search_entry.add_controller(search_key)
     search_focus = Gtk.EventControllerFocus.new()
-    search_focus.connect("leave", lambda *_: GLib.idle_add(window._hide_mod_suggestions, "focus_lost"))
+    search_focus.connect("leave", lambda *_: GLib.idle_add(mod_search.hide, "focus_lost"))
     window.search_entry.add_controller(search_focus)
     search_row.append(window.mod_search_toggle_badge)
     window.mod_search_control.append(window.search_entry)
@@ -937,11 +936,19 @@ def build_search_area(window) -> Gtk.Widget:
     window.mod_suggestion_list.set_can_focus(False)
     window.mod_suggestion_list.set_selection_mode(Gtk.SelectionMode.SINGLE)
     window.mod_suggestion_list.set_activate_on_single_click(True)
-    window.mod_suggestion_list.connect("row-activated", window._on_mod_suggestion_row_activated)
+    window.mod_suggestion_list.connect("row-activated", mod_search.on_row_activated)
     window.mod_suggestion_scroller.set_child(window.mod_suggestion_list)
     window.mod_suggestion_panel.append(window.mod_suggestion_scroller)
     suggestion_overlay = getattr(window, "_search_area_overlay", None) or window._main_overlay
     suggestion_overlay.add_overlay(window.mod_suggestion_panel)
+    mod_search.bind_widgets(
+        entry=window.search_entry,
+        panel=window.mod_suggestion_panel,
+        suggestion_list=window.mod_suggestion_list,
+        scroller=window.mod_suggestion_scroller,
+        refresh_chips=refresh_mod_search_chips,
+        sync_mode_ui=set_mod_search_mode_ui,
+    )
 
     return search_frame
 
