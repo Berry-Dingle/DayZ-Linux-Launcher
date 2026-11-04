@@ -50,8 +50,6 @@ from .companion_restart_phase2_detection import (
 )
 from .companion_restart_phase2_continuity import (
     CONTINUITY_PROVENANCE_VERSION,
-    ContinuityShadowSnapshot,
-    ContinuityShadowTracker,
     build_cadence_streaks,
     build_continuity_chains,
     continuity_span_terminates_chain,
@@ -322,7 +320,6 @@ class Phase2RestartRuntime:
         now: float | None = None,
         app_session_id: str | None = None,
         detection_config: DetectionConfig | None = None,
-        continuity_shadow_enabled: bool = False,
         expected_window_v2_shadow_enabled: bool = False,
         continuity_authority_shadow_enabled: bool = False,
         schema4_authority_shadow_enabled: bool = False,
@@ -339,9 +336,6 @@ class Phase2RestartRuntime:
         self.app_session_id = app_session_id or str(uuid.uuid4())
         self.detection_config = detection_config or DetectionConfig()
         self.scorer = RestartScheduleScorer()
-        self.continuity_shadow_enabled = bool(continuity_shadow_enabled)
-        self._continuity_shadow_trackers: dict[str, ContinuityShadowTracker] = {}
-        self._continuity_shadow_logged_ids: set[str] = set()
         self.expected_window_v2_shadow_enabled = bool(
             expected_window_v2_shadow_enabled
         )
@@ -396,7 +390,6 @@ class Phase2RestartRuntime:
         app_session_id: str | None = None,
         generation_id: str | None = None,
         detection_config: DetectionConfig | None = None,
-        continuity_shadow_enabled: bool = False,
         expected_window_v2_shadow_enabled: bool = False,
         continuity_authority_shadow_enabled: bool = False,
         schema4_authority_shadow_enabled: bool = False,
@@ -461,7 +454,6 @@ class Phase2RestartRuntime:
                 now=now,
                 app_session_id=app_session_id,
                 detection_config=detection_config,
-                continuity_shadow_enabled=continuity_shadow_enabled,
                 expected_window_v2_shadow_enabled=expected_window_v2_shadow_enabled,
                 continuity_authority_shadow_enabled=continuity_authority_shadow_enabled,
                 schema4_authority_shadow_enabled=schema4_authority_shadow_enabled,
@@ -1245,19 +1237,6 @@ class Phase2RestartRuntime:
             ),
         )
 
-    def continuity_shadow_snapshot(
-        self, server_key: str
-    ) -> ContinuityShadowSnapshot | None:
-        """Expose diagnostics only when the development shadow is enabled."""
-
-        if not self.continuity_shadow_enabled:
-            return None
-        server = self._servers.get(str(server_key))
-        tracker = self._continuity_shadow_trackers.get(str(server_key))
-        if server is None or tracker is None:
-            return ContinuityShadowSnapshot((), (), ())
-        return tracker.snapshot(server.events)
-
     def expected_window_v2_shadow_snapshot(
         self, server_key: str
     ) -> tuple[ExpectedWindowLedgerRecord, ...] | None:
@@ -1290,12 +1269,6 @@ class Phase2RestartRuntime:
         *,
         persist_immediately: bool = False,
     ) -> RuntimeUpdate:
-        tracker = None
-        if self.continuity_shadow_enabled:
-            tracker = self._continuity_shadow_trackers.setdefault(
-                server.key, ContinuityShadowTracker(self.detection_config)
-            )
-            tracker.observe(sample)
         previous_sample = server.previous_sample
         if (
             previous_sample is not None
@@ -1334,14 +1307,6 @@ class Phase2RestartRuntime:
                         chain_ids.append(server.continuity_chain_id)
                     session["continuity_chain_ids"] = chain_ids
                     break
-                if tracker is not None:
-                    tracker.begin_chain(sample)
-                    logger.debug(
-                        "restart continuity shadow chain boundary kind=%s old=%s new=%s",
-                        edge.kind.value,
-                        prior_chain_id,
-                        server.continuity_chain_id,
-                    )
                 server.dirty = True
         previous_state = server.engine.state
         previous_active_episode = server.engine.active_episode
@@ -1385,10 +1350,6 @@ class Phase2RestartRuntime:
         server.previous_sample = sample if sample.lifecycle is LifecycleMarker.NORMAL else None
         if events:
             events = self._route_finalized(server, events, now=sample.wall_at)
-        if self.continuity_shadow_enabled and (
-            events or sample.lifecycle is not LifecycleMarker.NORMAL
-        ):
-            self._log_continuity_shadow(server, events)
         if state_changed:
             server.dirty = True
         self._evaluate_expected_windows(server, now=sample.wall_at)
@@ -1423,57 +1384,6 @@ class Phase2RestartRuntime:
             state_changed=state_changed or misses_changed,
             persisted=persisted,
         )
-
-    def _log_continuity_shadow(
-        self,
-        server: _ServerRuntime,
-        events: Iterable[PhysicalRestartEvent],
-    ) -> None:
-        tracker = self._continuity_shadow_trackers.get(server.key)
-        if tracker is None:
-            return
-        snapshot = tracker.snapshot(server.events)
-        for chain in snapshot.chains:
-            identity = f"chain:{chain.chain_id}:{chain.termination_reason}"
-            if identity in self._continuity_shadow_logged_ids:
-                continue
-            self._continuity_shadow_logged_ids.add(identity)
-            logger.debug(
-                "restart continuity shadow chain id=%s lifecycle=%s termination=%s reasons=%s",
-                chain.chain_id,
-                chain.lifecycle.value,
-                chain.termination_reason,
-                ",".join(chain.reason_codes),
-            )
-        event_ids = {item.event_id for item in events}
-        for relationship in snapshot.relationships:
-            if not event_ids.intersection(
-                {relationship.left_event_id, relationship.right_event_id}
-            ):
-                continue
-            identity = f"relationship:{relationship.relationship_id}"
-            if identity in self._continuity_shadow_logged_ids:
-                continue
-            self._continuity_shadow_logged_ids.add(identity)
-            logger.debug(
-                "restart continuity shadow relationship id=%s high=%s reasons=%s",
-                relationship.relationship_id,
-                relationship.high_authority_eligible,
-                ",".join(relationship.reason_codes),
-            )
-        for streak in snapshot.streaks:
-            if not event_ids.intersection(streak.event_ids):
-                continue
-            identity = f"streak:{streak.streak_id}"
-            if identity in self._continuity_shadow_logged_ids:
-                continue
-            self._continuity_shadow_logged_ids.add(identity)
-            logger.debug(
-                "restart continuity shadow streak id=%s intervals=%s reasons=%s",
-                streak.streak_id,
-                streak.interval_count,
-                ",".join(streak.reason_codes),
-            )
 
     def _extend_coverage(
         self,

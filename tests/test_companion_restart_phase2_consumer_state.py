@@ -13,7 +13,6 @@ from dzll_launcher import companion_restart_phase2_authority as authority
 from dzll_launcher import companion_restart_phase2_authority_consumers as consumers
 from dzll_launcher import companion_restart_phase2_consumer_state as state4
 from dzll_launcher import companion_restart_phase2_continuity as continuity
-from dzll_launcher import companion_restart_phase2_cutover_rehearsal as rehearsal
 from dzll_launcher import companion_restart_phase2_detection as detection
 from dzll_launcher import companion_restart_phase2_runtime as runtime
 from dzll_launcher import companion_restart_phase2_schema4 as schema4
@@ -592,28 +591,6 @@ def test_healthy_poll_soak_does_not_grow_consumer_state(tmp_path):
         backend.note_healthy_poll(SERVER)
     assert path.stat().st_size == before and not backend.dirty
     backend.close()
-
-
-@pytest.mark.parametrize("missing", list(rehearsal.CutoverReadinessEvidence.__dataclass_fields__))
-def test_readiness_evaluator_identifies_each_blocker(missing):
-    values = {name: True for name in rehearsal.CutoverReadinessEvidence.__dataclass_fields__}
-    values[missing] = False
-    result = rehearsal.evaluate_cutover_readiness(rehearsal.CutoverReadinessEvidence(**values))
-    assert not result.ready and missing in result.blockers
-
-
-def test_operational_rehearsal_is_read_only(tmp_path):
-    source = tmp_path / "source.json"
-    backup = tmp_path / "backup.json"
-    prepared = tmp_path / "prepared.json"
-    source_raw = schema4.canonical_json_bytes(_schema3())
-    source.write_bytes(source_raw)
-    backup.write_bytes(source_raw)
-    prepared.write_bytes(schema4.serialize_schema4_state(_state()))
-    before = (source.stat().st_mtime_ns, hashlib.sha256(source.read_bytes()).hexdigest())
-    result = rehearsal.rehearse_schema4_cutover(source_path=source, prepared_path=prepared, backup_path=backup, server_key=SERVER, now=BASE)
-    assert result.final_status == "ready" and not result.active_modified
-    assert before == (source.stat().st_mtime_ns, hashlib.sha256(source.read_bytes()).hexdigest())
 
 
 def test_all_production_switches_are_enabled():

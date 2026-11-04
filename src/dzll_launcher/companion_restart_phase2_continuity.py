@@ -229,13 +229,6 @@ class HistoricalProvenanceResult:
     reason_codes: tuple[str, ...]
 
 
-@dataclass(frozen=True)
-class ContinuityShadowSnapshot:
-    chains: tuple[ContinuityChain, ...]
-    relationships: tuple[IntervalRelationship, ...]
-    streaks: tuple[CadenceStreak, ...]
-
-
 def deterministic_continuity_chain_id(
     server_key: str,
     app_session_id: str,
@@ -1079,39 +1072,6 @@ def observed_transition_spans_from_events(
                 )
                 values[span.reference_id] = span
     return tuple(sorted(values.values(), key=lambda item: (item.start_at, item.reference_id)))
-
-
-class ContinuityShadowTracker:
-    """Optional in-memory adapter. It has no persistence or policy authority."""
-
-    def __init__(self, config: DetectionConfig | None = None) -> None:
-        self.config = config or DetectionConfig()
-        self._last_sample: ObservationSample | None = None
-        self._spans: list[ContinuitySpan] = []
-
-    @property
-    def spans(self) -> tuple[ContinuitySpan, ...]:
-        return tuple(self._spans)
-
-    def observe(self, sample: ObservationSample) -> None:
-        if self._last_sample is not None:
-            self._spans.append(
-                span_from_observations(self._last_sample, sample, config=self.config)
-            )
-        self._last_sample = sample if sample.lifecycle is LifecycleMarker.NORMAL else None
-
-    def begin_chain(self, sample: ObservationSample) -> None:
-        """Start after a recorded boundary without inventing an observed edge."""
-
-        self._last_sample = sample
-
-    def snapshot(
-        self, events: Iterable[PhysicalRestartEvent]
-    ) -> ContinuityShadowSnapshot:
-        chains = build_continuity_chains(self._spans)
-        relationships = extract_interval_relationships(events, self._spans)
-        streaks = build_cadence_streaks(relationships, chains=chains)
-        return ContinuityShadowSnapshot(chains, relationships, streaks)
 
 
 def _chain_from_spans(

@@ -699,7 +699,7 @@ def test_runtime_additive_provenance_rolls_chain_on_sleep_without_shadow(tmp_pat
         poll_generation=POLL,
     )
     initial_chain = value._servers[SERVER].continuity_chain_id
-    assert value.continuity_shadow_snapshot(SERVER) is None
+    assert not hasattr(value, "continuity_shadow_snapshot")
     value.ingest_live_result(
         SERVER,
         poll_generation=POLL,
@@ -723,41 +723,6 @@ def test_runtime_additive_provenance_rolls_chain_on_sleep_without_shadow(tmp_pat
     stored_session = persisted["servers"][SERVER]["monitoring_sessions"][-1]
     assert stored_session["provenance_version"] == 1
     assert stored_session["continuity_chain_ids"] == [initial_chain, rolled_chain]
-
-
-def test_optional_shadow_builds_diagnostics_but_has_no_policy_output(tmp_path):
-    active = tmp_path / "active.json"
-    legacy = tmp_path / "legacy.json"
-    value = runtime.Phase2RestartRuntime.initialize(
-        active_path=active,
-        legacy_path=legacy,
-        now=BASE,
-        app_session_id=APP,
-        generation_id="11111111-1111-4111-8111-111111111111",
-        continuity_shadow_enabled=True,
-    )
-    value.begin_monitoring(
-        SERVER,
-        wall_at=BASE,
-        monotonic_at=0,
-        poll_generation=POLL,
-    )
-    before = value.compatibility(SERVER, now=BASE)
-    for offset in (0, 10):
-        value.ingest_live_result(
-            SERVER,
-            poll_generation=POLL,
-            info={"ok": True, "players": 10, "max_players": 60},
-            wall_at=BASE + offset,
-            monotonic_at=offset,
-        )
-    snapshot = value.continuity_shadow_snapshot(SERVER)
-    after = value.compatibility(SERVER, now=BASE)
-    assert snapshot is not None
-    assert len(snapshot.chains) == 1
-    assert snapshot.relationships == ()
-    assert snapshot.streaks == ()
-    assert asdict(after) == asdict(before)
 
 
 def test_new_physical_event_persists_explicit_continuity_provenance(tmp_path):
