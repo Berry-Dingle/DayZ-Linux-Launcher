@@ -76,7 +76,7 @@ def make_host(rows, events, *, source_store=None, filter_func=None):
         favorites=favorites, last_played=last_played, settings={},
         sort_key="ping", sort_asc=True,
         _shutdown_cleanup_done=False, _startup_db_provisional=False,
-        _suggestion_provisional_load=False, _suggestion_cache_generation=0,
+        _suggestion_provisional_load=False,
         _server_mod_cache_generation=0, _server_mod_cache_records={},
         _server_mod_cache_persisted={}, _server_mod_cache_candidate={},
         _server_mod_cache_needs_repair=False, _server_mod_cache_file_bytes=0,
@@ -84,13 +84,11 @@ def make_host(rows, events, *, source_store=None, filter_func=None):
         _startup_row_batch_state=None, _startup_live_generation=0,
         _server_companion_rows_loaded=False, _startup_perf_origin_ns=time.monotonic_ns(),
         _startup_perf_db_apply_id=0, _startup_perf_db_apply_context={},
-        _suggestion_cache_ready=True, _suggestion_cache_expired=False,
         _suggestion_sweep_complete=False, _suggestion_sweep_fallback_ready=False,
         _server_db_update_inflight=True,
         _set_map_choices=lambda _choices: events.append("maps"),
         _is_likely_test_server_name=lambda _name: False,
         _sort_debug=SimpleNamespace(attach_notify_probe=lambda _obj: None),
-        _rebuild_mod_suggestion_index=lambda: events.append("suggestions"),
         _snapshot_all_sort_keys=lambda: events.append("snapshot"),
         _restore_server_companion_if_enabled=lambda: events.append("companion"),
         _set_updating=lambda *_args: events.append("updating"),
@@ -113,6 +111,10 @@ def make_host(rows, events, *, source_store=None, filter_func=None):
         events.append(("visible", reason))
 
     host._on_filter_changed = rebuild
+    # Production-wired catalogue with a warm cache; synchronous rebuilds are recorded as events.
+    host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    host._mod_suggestions.ready = True
+    host._mod_suggestions.rebuild_index = lambda: events.append("suggestions")
     bind(
         host, "_start_startup_row_batches", "_build_startup_batched_row",
         "_run_startup_row_batch", "_publish_startup_row_batches",
@@ -180,7 +182,7 @@ def test_explicit_batching_opt_out_is_synchronous_and_default_path_is_idle_batch
     assert queued == []
     assert [obj.name for obj in host.store.rows] == ["One"]
     assert "suggestions" in events
-    assert host._deferred_suggestion_restore_pending is False
+    assert host._mod_suggestions.restore_pending is False
 
     monkeypatch.setattr(window, "STARTUP_BATCHING_ENABLED", True)
     events = []
@@ -517,16 +519,16 @@ def test_suggestion_catalogue_is_deferred_while_visible_commit_and_a2s_proceed(m
     monkeypatch.setattr(window, "STARTUP_BATCHING_ENABLED", True)
     events = []
     host = make_host(rows, events)
-    host._mod_suggestion_index = {"mods": ()}
-    host._suggestion_cache_ready = False
+    host._mod_suggestions.index = {"mods": ()}
+    host._mod_suggestions.ready = False
 
     DZLLWindow._apply_db_rows(host, rows, True, allow_startup_batching=True)
     assert "suggestions" not in events and "a2s" not in events
     drain(queued[-1])
     assert events.index(("visible", "load")) < events.index("a2s")
     assert "suggestions" not in events
-    assert host._deferred_suggestion_restore_pending is True
-    assert host._deferred_suggestion_restore_allowed is False
+    assert host._mod_suggestions.restore_pending is True
+    assert host._mod_suggestions.restore_allowed is False
 
 
 @pytest.mark.parametrize(
@@ -602,7 +604,7 @@ def test_accidental_empty_batch_publication_recovers_without_cache_or_suggestion
     host._server_mod_cache_persisted = {
         key: record[0] for key, record in warm_records.items()
     }
-    host._suggestion_cache_ready = False
+    host._mod_suggestions.ready = False
     outcomes = []
 
     assert DZLLWindow._start_startup_row_batches(
@@ -616,7 +618,7 @@ def test_accidental_empty_batch_publication_recovers_without_cache_or_suggestion
     assert host._server_companion_rows_loaded is False
     assert host._server_mod_cache_records == warm_records
     assert host._server_mod_cache_candidate == {}
-    assert host._deferred_suggestion_restore_pending is False
+    assert host._mod_suggestions.restore_pending is False
     assert "a2s" not in events and "companion" not in events
     assert not any(seconds == 25 for seconds, _callback, _args in timers)
     assert ("empty_text", "No Servers Found.") in events
@@ -655,20 +657,21 @@ def test_post_publication_exceptions_release_ownership_and_restore_autocomplete(
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
     events = []
     host = make_host(rows, events)
-    host._suggestion_cache_ready = False
-    host._suggestion_cache_expired = False
-    host._suggestion_cache_created_at = 0.0
-    host._suggestion_cache_migration_pending = False
-    host._suggestion_cache_migration_created_at = 0.0
-    host._suggestion_cache_migration_inflight = False
-    host._suggestion_refresh_inflight = False
-    host._deferred_suggestion_restore_pending = False
-    host._deferred_suggestion_restore_allowed = False
-    host._deferred_suggestion_restore_inflight = False
-    host._deferred_suggestion_restore_generation = 0
-    host._deferred_suggestion_restore_retry_after = 0.0
-    host._suggestion_cache_path = tmp_path / "mod_suggestions_v1.json"
-    host._mod_suggestion_index = {"mods": (), "count": 0}
+    catalogue = host._mod_suggestions
+    catalogue.ready = False
+    catalogue.expired = False
+    catalogue.created_at = 0.0
+    catalogue.migration_pending = False
+    catalogue.migration_created_at = 0.0
+    catalogue.migration_inflight = False
+    catalogue.refresh_inflight = False
+    catalogue.restore_pending = False
+    catalogue.restore_allowed = False
+    catalogue.restore_inflight = False
+    catalogue.restore_generation = 0
+    catalogue.restore_retry_after = 0.0
+    catalogue.cache_path = tmp_path / "mod_suggestions_v1.json"
+    catalogue.index = {"mods": (), "count": 0}
     host._mod_suggestion_last_rows = ()
     host._queue_mod_suggestions_refresh = lambda: events.append("suggestions_ready")
     host._startup_presentation = SimpleNamespace(
@@ -677,7 +680,6 @@ def test_post_publication_exceptions_release_ownership_and_restore_autocomplete(
     )
     update_executor = _RecordingExecutor()
     host._update_executor = update_executor
-    bind(host, "_maybe_schedule_deferred_suggestion_restore")
 
     def fail(message):
         raise RuntimeError(message)
@@ -706,17 +708,17 @@ def test_post_publication_exceptions_release_ownership_and_restore_autocomplete(
     assert [obj.name for obj in host.store.rows] == ["One"]
     assert [obj.name for obj in host.column_view_store.rows] == ["One"]
     assert host._suggestion_sweep_fallback_ready is True
-    assert host._deferred_suggestion_restore_pending is True
-    assert host._deferred_suggestion_restore_allowed is True
-    assert host._deferred_suggestion_restore_inflight is True
+    assert host._mod_suggestions.restore_pending is True
+    assert host._mod_suggestions.restore_allowed is True
+    assert host._mod_suggestions.restore_inflight is True
     assert len(update_executor.calls) == 1
 
     fn, args, kwargs = update_executor.calls[0]
     update_executor.futures[0].set_result(fn(*args, **kwargs))
     callback, callback_args = queued[-1]
     assert callback(*callback_args) is False
-    assert host._suggestion_cache_ready is True
-    assert host._mod_suggestion_index["count"] == 1
+    assert host._mod_suggestions.ready is True
+    assert host._mod_suggestions.index["count"] == 1
     assert "suggestions_ready" in events
 
     db_executor = _RecordingExecutor()

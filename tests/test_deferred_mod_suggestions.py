@@ -29,36 +29,38 @@ class CapturingExecutor:
         return self.future
 
 
+def attach_catalogue(host, **state):
+    """Give a test host the production-wired suggestion coordinator, then set its state."""
+    host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    for name, value in state.items():
+        assert hasattr(host._mod_suggestions, name), name
+        setattr(host._mod_suggestions, name, value)
+    return host._mod_suggestions
+
+
 def make_host(tmp_path, executor=None):
     executor = executor or CapturingExecutor()
-    return SimpleNamespace(
+    host = SimpleNamespace(
         _shutdown_cleanup_done=False,
-        _suggestion_cache_ready=False,
-        _suggestion_cache_expired=False,
-        _suggestion_cache_created_at=0.0,
-        _suggestion_cache_generation=4,
-        _suggestion_cache_migration_pending=False,
-        _suggestion_cache_migration_created_at=0.0,
-        _suggestion_cache_migration_inflight=False,
-        _suggestion_refresh_inflight=False,
         _server_db_update_inflight=False,
-        _deferred_suggestion_restore_pending=True,
-        _deferred_suggestion_restore_allowed=True,
-        _deferred_suggestion_restore_inflight=False,
-        _deferred_suggestion_restore_generation=0,
-        _deferred_suggestion_restore_retry_after=0.0,
-        _suggestion_cache_path=tmp_path / "mod_suggestions_v1.json",
         _obj_by_key={
             "1.1.1.1:2302": SimpleNamespace(mods_json=PAYLOADS[0]),
             "2.2.2.2:2302": SimpleNamespace(mods_json=PAYLOADS[1]),
         },
-        _mod_suggestion_index=mod_suggestions.build_mod_suggestion_index(()),
         _mod_suggestion_last_rows=(),
         _update_executor=executor,
         _queue_mod_suggestions_refresh=lambda: None,
         _startup_perf_origin_ns=time.monotonic_ns(),
         _startup_perf_db_apply_context={"load_id": 8, "input_rows": 2, "valid_rows": 2},
     )
+    attach_catalogue(
+        host,
+        generation=4,
+        restore_pending=True,
+        restore_allowed=True,
+        cache_path=tmp_path / "mod_suggestions_v1.json",
+    )
+    return host
 
 
 def test_deferred_worker_loads_valid_cache_as_plain_data(tmp_path):
@@ -93,15 +95,15 @@ def test_missing_or_corrupt_cache_rebuilds_without_publishing_from_worker(tmp_pa
 def test_overlay_completion_is_the_deferred_submission_boundary(tmp_path, monkeypatch):
     executor = CapturingExecutor()
     host = make_host(tmp_path, executor)
-    host._deferred_suggestion_restore_allowed = False
+    host._mod_suggestions.restore_allowed = False
     host._set_updating = lambda *_args: None
     host._apply_titlebar_counts = lambda: None
     host._startup_presentation = None
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
-    assert DZLLWindow._maybe_schedule_deferred_suggestion_restore(host) is False
+    assert host._mod_suggestions.schedule_deferred_restore() is False
     assert executor.calls == []
     DZLLWindow._complete_startup_presentation(host)
-    assert host._deferred_suggestion_restore_allowed is True
+    assert host._mod_suggestions.restore_allowed is True
     assert len(executor.calls) == 1
 
 
@@ -117,35 +119,38 @@ def test_successful_deferred_result_publishes_on_main_callback_and_refreshes_ope
         window.GLib, "idle_add",
         lambda callback, *args: queued.append((callback, args)) or 1,
     )
-    DZLLWindow._maybe_schedule_deferred_suggestion_restore(host)
-    DZLLWindow._maybe_schedule_deferred_suggestion_restore(host)
+    host._mod_suggestions.schedule_deferred_restore()
+    host._mod_suggestions.schedule_deferred_restore()
     assert len(executor.calls) == 1
     fn, args, kwargs = executor.calls[0]
     assert fn is mod_suggestion_cache.prepare_deferred_suggestions
-    assert args[0] == host._suggestion_cache_path
+    assert args[0] == host._mod_suggestions.cache_path
     assert args[1] == PAYLOADS
     assert all(isinstance(value, str) for value in args[1])
     assert args[1][0] is host._obj_by_key["1.1.1.1:2302"].mods_json
     executor.future.set_result(fn(*args, **kwargs))
-    assert host._suggestion_cache_ready is False
+    assert host._mod_suggestions.ready is False
     callback, callback_args = queued.pop()
     assert callback(*callback_args) is False
-    assert host._suggestion_cache_ready is True
-    assert host._deferred_suggestion_restore_pending is False
-    assert host._mod_suggestion_index["count"] == 2
-    assert host._suggestion_cache_migration_pending is True
+    assert host._mod_suggestions.ready is True
+    assert host._mod_suggestions.restore_pending is False
+    assert host._mod_suggestions.index["count"] == 2
+    assert host._mod_suggestions.migration_pending is True
     assert refreshes == ["refresh"]
 
 
 def test_early_autocomplete_is_unavailable_without_sync_rebuild_and_selected_chips_work():
     events = []
     host = SimpleNamespace(
-        _suggestion_cache_ready=False,
-        _deferred_suggestion_restore_pending=True,
-        _deferred_suggestion_restore_inflight=False,
+        _mod_suggestions=SimpleNamespace(
+            ready=False,
+            restore_pending=True,
+            restore_inflight=False,
+            index=mod_suggestions.build_mod_suggestion_index(PAYLOADS),
+            rebuild_index=lambda: events.append("sync_rebuild"),
+        ),
         _mod_suggestion_selecting=False,
         _mod_suggestion_dismissed=None,
-        _mod_suggestion_index=mod_suggestions.build_mod_suggestion_index(PAYLOADS),
         _selected_mod_chips=[{"display_name": "Code Lock", "query_term": "42"}],
         mod_suggestion_panel=SimpleNamespace(),
         mod_suggestion_list=SimpleNamespace(),
@@ -154,7 +159,6 @@ def test_early_autocomplete_is_unavailable_without_sync_rebuild_and_selected_chi
         _mod_suggestion_dismiss_key=lambda *_args: ("Code", 0, "code"),
         _hide_mod_suggestions=lambda reason: events.append(reason),
         _log_mod_suggest=lambda _message: None,
-        _rebuild_mod_suggestion_index=lambda: events.append("sync_rebuild"),
     )
     DZLLWindow._refresh_mod_suggestions(host)
     assert events == ["catalogue_not_ready"]
@@ -165,11 +169,11 @@ def test_early_autocomplete_is_unavailable_without_sync_rebuild_and_selected_chi
 def test_submission_failure_stays_unavailable_and_retryable(tmp_path, monkeypatch):
     host = make_host(tmp_path, CapturingExecutor(fail=True))
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
-    DZLLWindow._maybe_schedule_deferred_suggestion_restore(host)
-    assert host._suggestion_cache_ready is False
-    assert host._deferred_suggestion_restore_pending is True
-    assert host._deferred_suggestion_restore_inflight is False
-    assert host._deferred_suggestion_restore_retry_after > time.monotonic()
+    host._mod_suggestions.schedule_deferred_restore()
+    assert host._mod_suggestions.ready is False
+    assert host._mod_suggestions.restore_pending is True
+    assert host._mod_suggestions.restore_inflight is False
+    assert host._mod_suggestions.restore_retry_after > time.monotonic()
 
 
 def test_empty_published_endpoint_map_cannot_schedule_deferred_persistence(
@@ -179,11 +183,11 @@ def test_empty_published_endpoint_map_cannot_schedule_deferred_persistence(
     host._obj_by_key = {}
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
 
-    assert DZLLWindow._maybe_schedule_deferred_suggestion_restore(host) is False
+    assert host._mod_suggestions.schedule_deferred_restore() is False
 
     assert executor.calls == []
-    assert host._deferred_suggestion_restore_inflight is False
-    assert host._suggestion_cache_ready is False
+    assert host._mod_suggestions.restore_inflight is False
+    assert host._mod_suggestions.ready is False
 
 
 def test_worker_failure_stays_unavailable_and_retryable(tmp_path, monkeypatch):
@@ -195,14 +199,14 @@ def test_worker_failure_stays_unavailable_and_retryable(tmp_path, monkeypatch):
         window.GLib, "idle_add",
         lambda callback, *args: queued.append((callback, args)) or 1,
     )
-    DZLLWindow._maybe_schedule_deferred_suggestion_restore(host)
+    host._mod_suggestions.schedule_deferred_restore()
     executor.future.set_exception(RuntimeError("decode worker failed"))
     callback, callback_args = queued.pop()
     callback(*callback_args)
-    assert host._suggestion_cache_ready is False
-    assert host._deferred_suggestion_restore_pending is True
-    assert host._deferred_suggestion_restore_inflight is False
-    assert host._deferred_suggestion_restore_retry_after > time.monotonic()
+    assert host._mod_suggestions.ready is False
+    assert host._mod_suggestions.restore_pending is True
+    assert host._mod_suggestions.restore_inflight is False
+    assert host._mod_suggestions.restore_retry_after > time.monotonic()
 
 
 def test_shutdown_and_generation_replacement_reject_worker_results(tmp_path, monkeypatch):
@@ -215,20 +219,20 @@ def test_shutdown_and_generation_replacement_reject_worker_results(tmp_path, mon
             window.GLib, "idle_add",
             lambda callback, *args: queued.append((callback, args)) or 1,
         )
-        DZLLWindow._maybe_schedule_deferred_suggestion_restore(host)
+        host._mod_suggestions.schedule_deferred_restore()
         fn, args, kwargs = executor.calls[0]
         executor.future.set_result(fn(*args, **kwargs))
         if mode == "shutdown":
             host._shutdown_cleanup_done = True
         else:
-            host._suggestion_cache_generation += 1
-            host._mod_suggestion_index = mod_suggestions.build_mod_suggestion_index(
+            host._mod_suggestions.generation += 1
+            host._mod_suggestions.index = mod_suggestions.build_mod_suggestion_index(
                 ('[{"steamWorkshopId":"99","name":"Newer"}]',)
             )
         callback, callback_args = queued.pop()
         callback(*callback_args)
-        assert host._suggestion_cache_ready is False
-        assert host._mod_suggestion_index["count"] == (0 if mode == "shutdown" else 1)
+        assert host._mod_suggestions.ready is False
+        assert host._mod_suggestions.index["count"] == (0 if mode == "shutdown" else 1)
 
 
 def test_deferred_perf_phases_keep_load_identity(tmp_path, monkeypatch):
@@ -245,7 +249,7 @@ def test_deferred_perf_phases_keep_load_identity(tmp_path, monkeypatch):
         window.GLib, "idle_add",
         lambda callback, *args: queued.append((callback, args)) or 1,
     )
-    DZLLWindow._maybe_schedule_deferred_suggestion_restore(host)
+    host._mod_suggestions.schedule_deferred_restore()
     fn, args, kwargs = executor.calls[0]
     executor.future.set_result(fn(*args, **kwargs))
     callback, callback_args = queued.pop()
@@ -288,27 +292,27 @@ def test_deferred_cache_publication_instrumentation_distinguishes_kind(
     completed = Future()
     completed.set_result(result)
 
-    assert DZLLWindow._on_deferred_suggestion_restore_done(
-        host, host._suggestion_cache_generation, time.monotonic_ns(), {}, completed,
+    assert host._mod_suggestions._on_deferred_restore_done(
+        host._mod_suggestions.generation, time.monotonic_ns(), {}, completed,
     ) is False
-    assert host._suggestion_cache_migration_kind == expected_kind
-    assert host._suggestion_cache_migration_pending is (format_version in (0, 1))
+    assert host._mod_suggestions.migration_kind == expected_kind
+    assert host._mod_suggestions.migration_pending is (format_version in (0, 1))
 
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    host._mod_suggestions.schedule_migration()
+    host._mod_suggestions.schedule_migration()
     if format_version == 2:
         assert executor.calls == []
         return
     assert len(executor.calls) == 1
     staged = mod_suggestion_cache.build_staged_suggestion_migration(
-        host._suggestion_cache_path, host._mod_suggestion_index,
-        host._suggestion_cache_migration_created_at,
+        host._mod_suggestions.cache_path, host._mod_suggestions.index,
+        host._mod_suggestions.migration_created_at,
     )
     executor.future.set_result(staged)
-    assert DZLLWindow._on_mod_suggestion_migration_done(
-        host, host._suggestion_cache_generation, time.monotonic_ns(), executor.future,
+    assert host._mod_suggestions._on_migration_done(
+        host._mod_suggestions.generation, time.monotonic_ns(), executor.future,
     ) is False
-    assert host._suggestion_cache_migration_pending is False
+    assert host._mod_suggestions.migration_pending is False
 
     by_name = {phase: fields for phase, fields in phases}
     assert by_name["mod_suggestion_cache_migration_start"]["kind"] == expected_kind

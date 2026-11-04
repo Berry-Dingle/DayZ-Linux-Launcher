@@ -234,13 +234,18 @@ def test_map_and_eligible_live_tick_check_rollover(monkeypatch):
     calls = []
     host = SimpleNamespace(
         _refresh_last_played_calendar=lambda: calls.append("refresh"),
-        _maybe_schedule_mod_suggestion_refresh=lambda: calls.append("suggestion"),
+        _mod_suggestions=SimpleNamespace(
+            schedule_deferred_restore=lambda: calls.append("restore"),
+            schedule_refresh=lambda: calls.append("suggestion"),
+            schedule_migration=lambda: calls.append("migration"),
+        ),
         _browser_live_should_pause=lambda: False,
         _browser_live_inflight=True,
     )
     DZLLWindow._on_last_played_map(host)
     assert DZLLWindow._browser_live_tick(host) is True
-    assert calls == ["refresh", "suggestion", "refresh"]
+    assert calls == ["refresh", "restore", "suggestion", "migration", "refresh"]
     host._browser_live_should_pause = lambda: True
     assert DZLLWindow._browser_live_tick(host) is True
-    assert calls == ["refresh", "suggestion", "refresh"]
+    # A paused tick still offers the deferred restore but skips refresh, migration and rollover.
+    assert calls == ["refresh", "restore", "suggestion", "migration", "refresh", "restore"]

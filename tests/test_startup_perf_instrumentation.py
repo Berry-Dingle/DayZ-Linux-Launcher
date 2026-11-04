@@ -47,14 +47,15 @@ def test_cache_load_stages_join_existing_phase_only_when_enabled(tmp_path, monke
     monkeypatch.setattr(window, "log_startup_phase",
                         lambda _origin, phase, _start, **fields: phases.append((phase, fields)))
     host = SimpleNamespace(
-        _suggestion_cache_path=path,
         _startup_perf_origin_ns=time.monotonic_ns(),
         _startup_perf_db_apply_context={"load_id": 9, "input_rows": 12},
         _obj_by_key={},
         _mod_suggestion_last_rows=("stale",),
     )
-    DZLLWindow._rebuild_mod_suggestion_index(host)
-    assert host._mod_suggestion_index == index
+    host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    host._mod_suggestions.cache_path = path
+    host._mod_suggestions.rebuild_index()
+    assert host._mod_suggestions.index == index
     assert host._mod_suggestion_last_rows == ()
     if enabled:
         assert len(phases) == 1 and phases[0][0] == "mod_suggestion_cache_load"
@@ -83,6 +84,7 @@ def test_db_apply_instrumentation_preserves_cached_and_fetched_flow(monkeypatch,
         _startup_live_generation=0,
         _server_companion_rows_loaded=False,
         _obj_by_key={"10.0.0.1:2302": SimpleNamespace(bm_rank=50)},
+        _mod_suggestions=SimpleNamespace(ready=False),  # cold catalogue
         _set_map_choices=lambda _choices: events.append("maps"),
         _load_rows_into_store=lambda _rows: events.append("load") or True,
         _restore_server_companion_if_enabled=lambda: events.append("restore"),
@@ -160,6 +162,7 @@ def test_db_apply_load_id_increments_for_replacement_load(monkeypatch):
         _startup_perf_origin_ns=time.monotonic_ns(),
         _set_map_choices=lambda _choices: None,
         _load_rows_into_store=lambda _rows: False,
+        _mod_suggestions=SimpleNamespace(ready=False),  # cold catalogue
         _complete_startup_presentation=lambda: None,
         empty_label=SimpleNamespace(set_text=lambda *_: None, set_visible=lambda *_: None),
     )
@@ -187,11 +190,12 @@ def test_row_phase_instrumentation_keeps_same_source_rows(monkeypatch, enabled):
         live={}, favorites={}, last_played={},
         _is_likely_test_server_name=lambda *_: False,
         _sort_debug=SimpleNamespace(attach_notify_probe=lambda *_: None),
-        _rebuild_mod_suggestion_index=lambda: events.append("mod_index"),
         _snapshot_all_sort_keys=lambda: events.append("snapshot"),
         _on_filter_changed=lambda **_kw: events.append("filter"),
         _apply_titlebar_counts=lambda: events.append("title"),
     )
+    host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    host._mod_suggestions.rebuild_index = lambda: events.append("mod_index")
     row = {"ip": "10.0.0.1", "gport": 2302, "qport": 2303, "name": "One",
            "map": "Chernarus", "mods": "[]", "players": 2, "ping": 50}
     assert DZLLWindow._load_rows_into_store(host, [row]) is True

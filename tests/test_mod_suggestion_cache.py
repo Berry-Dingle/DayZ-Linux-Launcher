@@ -9,8 +9,18 @@ from types import SimpleNamespace
 
 import pytest
 
-from dzll_launcher import mod_suggestion_cache, mod_suggestions, window
+from dzll_launcher import mod_suggestion_cache, mod_suggestion_coordinator, mod_suggestions, window
 from dzll_launcher.window import DZLLWindow
+
+
+def catalogue_host(window_fields=None, **state):
+    """A window-like host with the production-wired suggestion coordinator; returns (host, coordinator)."""
+    host = SimpleNamespace(**(window_fields or {}))
+    host._mod_suggestions = DZLLWindow._build_mod_suggestion_coordinator(host)
+    for name, value in state.items():
+        assert hasattr(host._mod_suggestions, name), name
+        setattr(host._mod_suggestions, name, value)
+    return host, host._mod_suggestions
 
 
 PAYLOADS = (
@@ -333,28 +343,26 @@ def test_migration_completion_replaces_v1_once_without_changing_active_index(tmp
         operations.append(("replace", Path(source), Path(destination)))
     monkeypatch.setattr(window.os, "replace", replace)
     monkeypatch.setattr(
-        window, "_fsync_directory_best_effort",
+        mod_suggestion_coordinator, "_fsync_directory_best_effort",
         lambda directory: operations.append(("fsync", Path(directory))),
     )
-    host = SimpleNamespace(
-        _suggestion_cache_path=path, _mod_suggestion_index=loaded.index,
-        _suggestion_cache_created_at=loaded.created_at,
-        _suggestion_cache_migration_pending=True, _suggestion_cache_generation=2,
-        _suggestion_sweep_complete=True, _suggestion_cache_expired=False,
-        _update_executor=Executor(), _shutdown_cleanup_done=False,
+    host, catalogue = catalogue_host(
+        dict(_suggestion_sweep_complete=True, _update_executor=Executor(), _shutdown_cleanup_done=False),
+        cache_path=path, index=loaded.index, created_at=loaded.created_at,
+        migration_pending=True, generation=2, expired=False,
     )
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    catalogue.schedule_migration()
     assert len(submissions) == 1
     pending.set_result(stage)
-    assert DZLLWindow._on_mod_suggestion_migration_done(host, 2, 0, pending) is False
-    assert host._mod_suggestion_index is loaded.index
-    assert not host._suggestion_cache_migration_pending
+    assert catalogue._on_migration_done(2, 0, pending) is False
+    assert catalogue.index is loaded.index
+    assert not catalogue.migration_pending
     assert operations == [
         ("replace", stage, path),
         ("fsync", tmp_path),
     ]
     assert mod_suggestion_cache.load_suggestion_cache(path, now=1_000_000_001).format_version == 2
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    catalogue.schedule_migration()
     assert len(submissions) == 1
 
 
@@ -373,17 +381,17 @@ def test_refresh_completion_fsyncs_directory_after_atomic_replace(tmp_path, monk
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
     monkeypatch.setattr(window.os, "replace", replace)
     monkeypatch.setattr(
-        window, "_fsync_directory_best_effort",
+        mod_suggestion_coordinator, "_fsync_directory_best_effort",
         lambda directory: operations.append(("fsync", Path(directory))),
     )
-    host = SimpleNamespace(
-        _suggestion_cache_path=path,
-        _suggestion_cache_generation=3,
-        _suggestion_refresh_inflight=True,
-        _shutdown_cleanup_done=False,
+    _host, catalogue = catalogue_host(
+        dict(_shutdown_cleanup_done=False),
+        cache_path=path, generation=3, refresh_inflight=True,
     )
 
-    assert DZLLWindow._on_mod_suggestion_refresh_done(host, 3, 0, completed) is False
+    assert catalogue._on_refresh_done(3, 0, completed) is False
+    assert catalogue.refresh_inflight is False
+    assert catalogue.index is replacement
 
     assert path.read_bytes() == b"replacement"
     assert operations == [
@@ -405,26 +413,25 @@ def test_migration_waits_for_sweep_and_rejects_stale_or_shutdown_worker(tmp_path
             return pending
     monkeypatch.setattr(window.GLib, "idle_add", lambda *_: 1)
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
-    host = SimpleNamespace(
-        _suggestion_cache_path=path, _mod_suggestion_index=index,
-        _suggestion_cache_created_at=1_000_000_000, _suggestion_cache_migration_pending=True,
-        _suggestion_cache_generation=4, _suggestion_sweep_complete=False,
-        _suggestion_sweep_fallback_ready=False, _suggestion_cache_expired=False,
-        _update_executor=Executor(), _shutdown_cleanup_done=False,
+    host, catalogue = catalogue_host(
+        dict(_suggestion_sweep_complete=False, _suggestion_sweep_fallback_ready=False,
+             _update_executor=Executor(), _shutdown_cleanup_done=False),
+        cache_path=path, index=index, created_at=1_000_000_000, migration_pending=True,
+        generation=4, expired=False,
     )
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    catalogue.schedule_migration()
     assert submitted == []
     host._suggestion_sweep_complete = True
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    catalogue.schedule_migration()
+    catalogue.schedule_migration()
     assert len(submitted) == 1
     stage = mod_suggestion_cache.build_staged_suggestion_migration(path, index, 1_000_000_000)
     pending.set_result(stage)
-    host._suggestion_cache_generation += 1
-    assert DZLLWindow._on_mod_suggestion_migration_done(host, 4, 0, pending) is False
+    catalogue.generation += 1
+    assert catalogue._on_migration_done(4, 0, pending) is False
     assert not stage.exists() and path.read_bytes() == old
     host._shutdown_cleanup_done = True
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    catalogue.schedule_migration()
     assert len(submitted) == 1
 
 
@@ -435,14 +442,14 @@ def test_migration_failure_preserves_v1_and_allows_retry(tmp_path, monkeypatch):
     old = path.read_bytes()
     failed = Future()
     failed.set_exception(OSError("worker failed"))
-    host = SimpleNamespace(_suggestion_cache_path=path, _mod_suggestion_index=index,
-                           _suggestion_cache_migration_pending=True,
-                           _suggestion_cache_migration_inflight=True,
-                           _suggestion_cache_expired=False, _shutdown_cleanup_done=False)
+    _host, catalogue = catalogue_host(
+        dict(_shutdown_cleanup_done=False),
+        cache_path=path, index=index, migration_pending=True, migration_inflight=True, expired=False,
+    )
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
-    assert DZLLWindow._on_mod_suggestion_migration_done(host, 0, 0, failed) is False
-    assert host._suggestion_cache_migration_pending and not host._suggestion_cache_migration_inflight
-    assert host._suggestion_cache_migration_retry_after > 0 and path.read_bytes() == old
+    assert catalogue._on_migration_done(0, 0, failed) is False
+    assert catalogue.migration_pending and not catalogue.migration_inflight
+    assert catalogue.migration_retry_after > 0 and path.read_bytes() == old
 
 
 def test_shutdown_discards_completed_migration_without_replacing_v1(tmp_path, monkeypatch):
@@ -454,12 +461,11 @@ def test_shutdown_discards_completed_migration_without_replacing_v1(tmp_path, mo
     completed = Future()
     completed.set_result(stage)
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
-    host = SimpleNamespace(
-        _suggestion_cache_path=path, _suggestion_cache_generation=1,
-        _suggestion_cache_migration_inflight=True,
-        _suggestion_cache_migration_pending=True, _shutdown_cleanup_done=True,
+    _host, catalogue = catalogue_host(
+        dict(_shutdown_cleanup_done=True),
+        cache_path=path, generation=1, migration_inflight=True, migration_pending=True,
     )
-    assert DZLLWindow._on_mod_suggestion_migration_done(host, 1, 0, completed) is False
+    assert catalogue._on_migration_done(1, 0, completed) is False
     assert not stage.exists() and path.read_bytes() == before
 
 
@@ -474,17 +480,14 @@ def test_expired_v1_migration_precedes_monthly_refresh_without_db_rebuild(tmp_pa
             return Future()
     monkeypatch.setattr(window.GLib, "idle_add", lambda *_: 1)
     monkeypatch.setattr(window, "PERF_LOG_ENABLED", False)
-    host = SimpleNamespace(
-        _suggestion_cache_path=path, _mod_suggestion_index=index,
-        _suggestion_cache_created_at=1_000_000_000,
-        _suggestion_cache_migration_pending=True,
-        _suggestion_cache_expired=True, _suggestion_cache_ready=True,
-        _suggestion_cache_generation=1, _suggestion_sweep_complete=True,
-        _obj_by_key={"server": SimpleNamespace(mods_json="[]")},
-        _update_executor=Executor(), _shutdown_cleanup_done=False,
+    _host, catalogue = catalogue_host(
+        dict(_suggestion_sweep_complete=True, _obj_by_key={"server": SimpleNamespace(mods_json="[]")},
+             _update_executor=Executor(), _shutdown_cleanup_done=False),
+        cache_path=path, index=index, created_at=1_000_000_000, migration_pending=True,
+        expired=True, ready=True, generation=1,
     )
-    DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    catalogue.schedule_refresh()
     assert jobs == []
-    DZLLWindow._maybe_schedule_mod_suggestion_migration(host)
+    catalogue.schedule_migration()
     assert len(jobs) == 1 and jobs[0][0] is mod_suggestion_cache.build_staged_suggestion_migration
-    assert host._mod_suggestion_index is index and path.read_bytes().startswith(b"{")
+    assert catalogue.index is index and path.read_bytes().startswith(b"{")

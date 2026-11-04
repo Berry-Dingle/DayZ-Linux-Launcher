@@ -212,17 +212,9 @@ from .preparation_presentation import (
 )
 from .mod_metadata import clean_display_mod_name, mark_mods_used
 from .mod_parsed import ParsedServerMods, parse_mods_preview
-from .atomic_json import _fsync_directory_best_effort
 from . import server_mod_cache
-from .mod_suggestion_cache import (
-    build_staged_suggestion_migration,
-    REFRESH_SECONDS as MOD_SUGGESTION_REFRESH_SECONDS,
-    build_staged_suggestion_cache,
-    load_suggestion_cache,
-    prepare_deferred_suggestions,
-    save_suggestion_cache,
-    suggestion_cache_path,
-)
+from .mod_suggestion_cache import suggestion_cache_path
+from .mod_suggestion_coordinator import ModSuggestionCacheCoordinator
 from .mod_search import (
     build_server_mod_index,
     compact_mod_text,
@@ -233,7 +225,6 @@ from .mod_search import (
 )
 from .mod_suggestions import (
     SUGGESTION_SHORTHANDS,
-    build_mod_suggestion_index,
     current_comma_token,
     replace_comma_token,
     suggest_mods,
@@ -593,12 +584,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._filter_state = {}
         self._filter_query = ""
         self._filter_refresh_suppress_depth = 0
-        self._mod_suggestion_index = build_mod_suggestion_index(())
-        self._suggestion_cache_path = suggestion_cache_path()
-        self._suggestion_cache_ready = False
-        self._suggestion_cache_expired = False
-        self._suggestion_cache_created_at = 0.0
-        self._suggestion_cache_generation = 0
+        self._mod_suggestions = self._build_mod_suggestion_coordinator()
         self._server_mod_cache_path = server_mod_cache.cache_path()
         self._server_mod_cache_generation = 0
         self._server_mod_cache_records = None
@@ -606,18 +592,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_mod_cache_candidate = {}
         self._server_mod_cache_needs_repair = False
         self._server_mod_cache_file_bytes = 0
-        self._suggestion_refresh_inflight = False
-        self._suggestion_refresh_retry_after = 0.0
-        self._suggestion_cache_migration_pending = False
-        self._suggestion_cache_migration_inflight = False
-        self._suggestion_cache_migration_retry_after = 0.0
-        self._suggestion_cache_migration_created_at = 0.0
-        self._suggestion_cache_migration_kind = None
-        self._deferred_suggestion_restore_pending = False
-        self._deferred_suggestion_restore_allowed = False
-        self._deferred_suggestion_restore_inflight = False
-        self._deferred_suggestion_restore_generation = 0
-        self._deferred_suggestion_restore_retry_after = 0.0
         self._suggestion_sweep_complete = False
         self._suggestion_sweep_fallback_ready = False
         self._mod_suggestion_selecting = False
@@ -2688,10 +2662,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         self._shutdown_cleanup_done = True
         DZLLWindow._cancel_startup_row_batches(self, "shutdown")
-        self._suggestion_cache_generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0) + 1
-        self._deferred_suggestion_restore_pending = False
-        self._deferred_suggestion_restore_allowed = False
-        self._deferred_suggestion_restore_inflight = False
+        mod_suggestions = getattr(self, "_mod_suggestions", None)
+        if mod_suggestions is not None:  # absent if construction failed before it was built
+            mod_suggestions.invalidate()
         self._server_mod_cache_generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0) + 1
         try:
             self._dayz_watch_shutdown_event.set()
@@ -4619,9 +4592,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self, "startup_overlay_dismissal", overlay_start_ns,
                 timer_scope="exclusive", visible_rows=visible_rows,
             )
-        if bool(getattr(self, "_deferred_suggestion_restore_pending", False)):
-            self._deferred_suggestion_restore_allowed = True
-            DZLLWindow._maybe_schedule_deferred_suggestion_restore(self)
+        if self._mod_suggestions.allow_pending_restore():
+            self._mod_suggestions.schedule_deferred_restore()
         return False
 
     def _begin_startup_update_from_idle(self):
@@ -4912,7 +4884,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     else "disk_load"
                 ),
                 "suggestion_cache_state": (
-                    "memory_hit" if bool(getattr(self, "_suggestion_cache_ready", False))
+                    "memory_hit" if bool(self._mod_suggestions.ready)
                     else "disk_lookup_pending"
                 ),
             }
@@ -5098,12 +5070,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _start_startup_row_batches(
             self, rows: list, batched_complete, *, db_ready_ns: int | None = None,
             previous_map_state=None):
-        self._suggestion_cache_generation = int(
-            getattr(self, "_suggestion_cache_generation", 0) or 0
-        ) + 1
-        self._deferred_suggestion_restore_pending = False
-        self._deferred_suggestion_restore_allowed = False
-        self._deferred_suggestion_restore_inflight = False
+        self._mod_suggestions.invalidate()
         self._server_mod_cache_generation = int(
             getattr(self, "_server_mod_cache_generation", 0) or 0
         ) + 1
@@ -5345,8 +5312,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._startup_row_batch_generation = generation + 1
             self._startup_row_batch_state = None
             self._startup_row_batch_idle_id = 0
-            self._deferred_suggestion_restore_pending = False
-            self._deferred_suggestion_restore_allowed = False
+            self._mod_suggestions.drop_pending_restore()
             try:
                 self._finish_db_rows_application(False, True)
             except Exception:
@@ -5399,9 +5365,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 pass
             state["published"] = True
-            if state["objects"] and not bool(getattr(self, "_suggestion_cache_ready", False)):
-                self._deferred_suggestion_restore_pending = True
-                self._deferred_suggestion_restore_allowed = False
+            if state["objects"] and not bool(self._mod_suggestions.ready):
+                self._mod_suggestions.mark_restore_pending()
         except Exception:
             logger.exception("Experimental startup row batching failed during publication")
             self._rollback_startup_row_publication(state)
@@ -5540,8 +5505,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     self._set_updating(False)
                 except Exception:
                     pass
-            if bool(getattr(self, "_deferred_suggestion_restore_pending", False)):
-                self._deferred_suggestion_restore_allowed = True
+            if self._mod_suggestions.allow_pending_restore():
                 recover_deferred_suggestions = True
         finally:
             self._server_db_update_inflight = False
@@ -5552,7 +5516,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     logger.exception("Startup row completion callback failed")
         if recover_deferred_suggestions:
             try:
-                DZLLWindow._maybe_schedule_deferred_suggestion_restore(self)
+                self._mod_suggestions.schedule_deferred_restore()
             except Exception:
                 logger.exception("Deferred suggestions could not resume after startup coordination failure")
         return False
@@ -5763,10 +5727,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return False
 
     def _load_rows_into_store(self, rows: list) -> bool:
-        self._suggestion_cache_generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0) + 1
-        self._deferred_suggestion_restore_pending = False
-        self._deferred_suggestion_restore_allowed = False
-        self._deferred_suggestion_restore_inflight = False
+        self._mod_suggestions.invalidate()
         self._server_mod_cache_generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0) + 1
         cache_path = getattr(self, "_server_mod_cache_path", None) or server_mod_cache.cache_path()
         cache_load_stages = {} if PERF_LOG_ENABLED else None
@@ -5814,7 +5775,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if PERF_LOG_ENABLED:
                 DZLLWindow._log_server_mod_cache_apply(self, cache_start_ns, cache_load_stages, 0, 0, 0, 0, 0, 0)
             index_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
-            self._rebuild_mod_suggestion_index()
+            self._mod_suggestions.rebuild_index()
             if PERF_LOG_ENABLED:
                 _log_startup_apply_phase(
                     self, "global_mod_suggestion_index", index_start_ns,
@@ -6020,7 +5981,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if len(records) > server_mod_cache.MAX_ENTRIES:
             self._server_mod_cache_records = dict(cache_candidate)
         try:
-            self._rebuild_mod_suggestion_index()
+            self._mod_suggestions.rebuild_index()
         finally:
             self._load_parsed_mods_by_key = None
         if PERF_LOG_ENABLED:
@@ -7241,11 +7202,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         return visible_rows, ahead_rows
 
     def _browser_live_tick(self):
-        DZLLWindow._maybe_schedule_deferred_suggestion_restore(self)
+        self._mod_suggestions.schedule_deferred_restore()
         if self._browser_live_should_pause():
             return True
-        self._maybe_schedule_mod_suggestion_refresh()
-        DZLLWindow._maybe_schedule_mod_suggestion_migration(self)
+        self._mod_suggestions.schedule_refresh()
+        self._mod_suggestions.schedule_migration()
         self._refresh_last_played_calendar()
         if bool(getattr(self, "_browser_live_inflight", False)):
             return True
@@ -8102,13 +8063,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         raw = str(text or "").strip()
         if not raw:
             return None
-        if (not bool(getattr(self, "_suggestion_cache_ready", False)) and
-                (bool(getattr(self, "_deferred_suggestion_restore_pending", False)) or
-                 bool(getattr(self, "_deferred_suggestion_restore_inflight", False)))):
+        catalogue = self._mod_suggestions
+        if (not bool(catalogue.ready) and
+                (bool(catalogue.restore_pending) or bool(catalogue.restore_inflight))):
             return None
         normalized = normalize_mod_text(raw)
         compact = compact_mod_text(raw)
-        index = getattr(self, "_mod_suggestion_index", None)
+        index = catalogue.index
         mods = index.get("mods", ()) if isinstance(index, dict) else ()
         exact_matches = []
         for entry in mods or ():
@@ -8291,400 +8252,32 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 pass
         self._search_filter_debounce_id = 0
 
-    def _rebuild_mod_suggestion_index(self):
-        if bool(getattr(self, "_suggestion_cache_ready", False)):
-            if PERF_LOG_ENABLED:
-                context = getattr(self, "_startup_perf_db_apply_context", None)
-                if isinstance(context, dict):
-                    context["suggestion_cache_state"] = "memory_hit"
-                _log_startup_apply_phase(
-                    self, "mod_suggestion_cache_hit", time.monotonic_ns(),
-                    timer_scope="nested", parent="global_mod_suggestion_index",
-                    source="memory", expired=bool(getattr(self, "_suggestion_cache_expired", False)),
-                )
-            self._mod_suggestion_last_rows = ()
-            return
-
-        cache_path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
-        load_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
-        load_stages = {} if PERF_LOG_ENABLED else None
-        cached = load_suggestion_cache(
-            cache_path, perf_report=(load_stages.update if load_stages is not None else None),
+    def _build_mod_suggestion_coordinator(self) -> ModSuggestionCacheCoordinator:
+        """Wire the autocomplete catalogue to this window's rows, load state and perf instrumentation."""
+        return ModSuggestionCacheCoordinator(
+            cache_path=suggestion_cache_path(),
+            servers=lambda: getattr(self, "_obj_by_key", None),
+            parsed_mods_by_key=lambda: getattr(self, "_load_parsed_mods_by_key", None),
+            db_fetched_ok=lambda: bool(getattr(self, "_suggestion_current_db_fetched_ok", False)),
+            provisional_load=lambda: bool(getattr(self, "_suggestion_provisional_load", False)),
+            db_update_inflight=lambda: bool(getattr(self, "_server_db_update_inflight", False)),
+            sweep_ready=lambda: (
+                bool(getattr(self, "_suggestion_sweep_complete", False))
+                or bool(getattr(self, "_suggestion_sweep_fallback_ready", False))
+            ),
+            is_shut_down=lambda: bool(getattr(self, "_shutdown_cleanup_done", False)),
+            submit=lambda *args, **kwargs: self._update_executor.submit(*args, **kwargs),
+            on_index_replaced=lambda: setattr(self, "_mod_suggestion_last_rows", ()),
+            on_restored=lambda: self._queue_mod_suggestions_refresh(),
+            perf_enabled=lambda: PERF_LOG_ENABLED,
+            perf_context=lambda: getattr(self, "_startup_perf_db_apply_context", None),
+            log_apply_phase=lambda phase, start_ns, **fields: _log_startup_apply_phase(
+                self, phase, start_ns, **fields,
+            ),
+            log_phase=lambda phase, start_ns, **fields: log_startup_phase(
+                self._startup_perf_origin_ns, phase, start_ns, **fields,
+            ),
         )
-        if PERF_LOG_ENABLED:
-            stage_fields = {
-                key.removesuffix("_ns") + "_ms": f"{value / 1_000_000:.3f}"
-                for key, value in load_stages.items() if key.endswith("_ns")
-            }
-            stage_fields["bytes_read"] = load_stages.get("bytes_read", 0)
-            context = getattr(self, "_startup_perf_db_apply_context", None)
-            if isinstance(context, dict):
-                context["suggestion_cache_state"] = "disk_hit" if cached is not None else "disk_miss"
-            _log_startup_apply_phase(
-                self, "mod_suggestion_cache_load", load_start_ns,
-                timer_scope="nested", parent="global_mod_suggestion_index",
-                result=("hit" if cached is not None else "miss"),
-                format=load_stages.get("format", "unknown"),
-                expired=(cached.expired if cached is not None else False),
-                entries=(len(cached.index) if cached is not None else 0),
-                **stage_fields,
-            )
-        if cached is not None:
-            self._mod_suggestion_index = cached.index
-            self._mod_suggestion_last_rows = ()
-            self._suggestion_cache_ready = True
-            self._suggestion_cache_expired = cached.expired
-            self._suggestion_cache_created_at = time.time() - cached.age_seconds
-            self._suggestion_cache_migration_pending = cached.format_version == 1
-            self._suggestion_cache_migration_created_at = cached.created_at
-            self._suggestion_cache_migration_kind = (
-                "v1_migration" if cached.format_version == 1 else None
-            )
-            return
-
-        parsed_mods_by_key = getattr(self, "_load_parsed_mods_by_key", None)
-        if parsed_mods_by_key is not None:
-            self._mod_suggestion_index = build_mod_suggestion_index(
-                (), parsed_mods_values=(parsed_mods_by_key[key] for key in self._obj_by_key),
-            )
-        else:
-            mods_json_values = []
-            try:
-                for obj in self._obj_by_key.values():
-                    mods_json_values.append(getattr(obj, "mods_json", "") or "")
-            except Exception:
-                mods_json_values = []
-            self._mod_suggestion_index = build_mod_suggestion_index(mods_json_values)
-        self._mod_suggestion_last_rows = ()
-        if (self._obj_by_key or bool(getattr(self, "_suggestion_current_db_fetched_ok", False))) and not bool(getattr(self, "_suggestion_provisional_load", False)):
-            try:
-                save_suggestion_cache(cache_path, self._mod_suggestion_index)
-                self._suggestion_cache_ready = True
-                self._suggestion_cache_expired = False
-                self._suggestion_cache_created_at = time.time()
-                self._suggestion_cache_migration_pending = False
-                self._suggestion_cache_migration_kind = None
-                if PERF_LOG_ENABLED:
-                    _log_startup_apply_phase(
-                        self, "mod_suggestion_cache_save", load_start_ns,
-                        timer_scope="nested", parent="global_mod_suggestion_index",
-                        entries=len(self._mod_suggestion_index),
-                    )
-            except (OSError, ValueError, TypeError):
-                # The in-memory catalogue remains usable; a later load may retry persistence.
-                pass
-
-    def _maybe_schedule_deferred_suggestion_restore(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return False
-        if bool(getattr(self, "_suggestion_cache_ready", False)):
-            self._deferred_suggestion_restore_pending = False
-            self._deferred_suggestion_restore_allowed = False
-            return False
-        if (not bool(getattr(self, "_deferred_suggestion_restore_pending", False)) or
-                not bool(getattr(self, "_deferred_suggestion_restore_allowed", False)) or
-                bool(getattr(self, "_deferred_suggestion_restore_inflight", False))):
-            return False
-        if not getattr(self, "_obj_by_key", None):
-            return False
-        if (bool(getattr(self, "_suggestion_refresh_inflight", False)) or
-                bool(getattr(self, "_suggestion_cache_migration_inflight", False)) or
-                bool(getattr(self, "_server_db_update_inflight", False)) or
-                time.monotonic() < float(
-                    getattr(self, "_deferred_suggestion_restore_retry_after", 0.0) or 0.0
-                )):
-            return False
-
-        schedule_start_ns = time.monotonic_ns()
-        generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0)
-        perf_context = dict(getattr(self, "_startup_perf_db_apply_context", {}) or {})
-        cache_path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
-        payloads = tuple(
-            getattr(obj, "mods_json", "") or "" for obj in self._obj_by_key.values()
-        )
-        self._deferred_suggestion_restore_inflight = True
-        self._deferred_suggestion_restore_generation = generation
-        try:
-            future = self._update_executor.submit(
-                prepare_deferred_suggestions, cache_path, payloads,
-                measure=PERF_LOG_ENABLED,
-            )
-            future.add_done_callback(
-                lambda done, gen=generation, started=schedule_start_ns: GLib.idle_add(
-                    DZLLWindow._on_deferred_suggestion_restore_done,
-                    self, gen, started, perf_context, done,
-                )
-            )
-        except Exception:
-            if self._deferred_suggestion_restore_generation == generation:
-                self._deferred_suggestion_restore_inflight = False
-            self._deferred_suggestion_restore_retry_after = time.monotonic() + 60.0
-            if PERF_LOG_ENABLED:
-                _log_startup_apply_phase(
-                    self, "deferred_suggestion_schedule", schedule_start_ns,
-                    timer_scope="exclusive", result="submit_failed",
-                    suggestion_generation=generation, rows=len(payloads),
-                )
-            return False
-        if PERF_LOG_ENABLED:
-            _log_startup_apply_phase(
-                self, "deferred_suggestion_schedule", schedule_start_ns,
-                timer_scope="exclusive", result="submitted",
-                suggestion_generation=generation, rows=len(payloads),
-            )
-        return False
-
-    def _on_deferred_suggestion_restore_done(
-            self, generation: int, schedule_start_ns: int,
-            perf_context: dict, future):
-        owns_inflight = (
-            bool(getattr(self, "_deferred_suggestion_restore_inflight", False)) and
-            generation == int(
-                getattr(self, "_deferred_suggestion_restore_generation", 0) or 0
-            )
-        )
-        if owns_inflight:
-            self._deferred_suggestion_restore_inflight = False
-        try:
-            result = future.result()
-        except Exception:
-            if (not bool(getattr(self, "_shutdown_cleanup_done", False)) and
-                    generation == int(getattr(self, "_suggestion_cache_generation", 0) or 0)):
-                self._deferred_suggestion_restore_retry_after = time.monotonic() + 60.0
-            if PERF_LOG_ENABLED:
-                _log_startup_apply_phase(
-                    self, "deferred_suggestion_worker", schedule_start_ns,
-                    timer_scope="worker_duration_unavailable", result="worker_failed",
-                    suggestion_generation=generation, **perf_context,
-                )
-            return False
-
-        stages = dict(getattr(result, "stages", {}) or {})
-        if PERF_LOG_ENABLED:
-            stage_fields = {
-                key.removesuffix("_ns") + "_ms": f"{value / 1_000_000:.3f}"
-                for key, value in stages.items()
-                if key.endswith("_ns") and isinstance(value, int)
-            }
-            _log_startup_apply_phase(
-                self, "deferred_suggestion_worker", schedule_start_ns,
-                duration_ns=int(stages.get("worker_total_ns", 0) or 0),
-                timer_scope="worker_duration_reported_on_main",
-                execution_thread="worker", result=result.outcome,
-                suggestion_generation=generation,
-                entries=int(result.index.get("count", 0) or 0),
-                bytes_read=int(stages.get("bytes_read", 0) or 0),
-                format=stages.get("format", "unknown"),
-                **stage_fields, **perf_context,
-            )
-        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
-                generation != int(getattr(self, "_suggestion_cache_generation", 0) or 0)):
-            if PERF_LOG_ENABLED:
-                _log_startup_apply_phase(
-                    self, "deferred_suggestion_apply", time.monotonic_ns(),
-                    duration_ns=0, timer_scope="main_thread", result="stale",
-                    suggestion_generation=generation, **perf_context,
-                )
-            return False
-
-        apply_start_ns = time.monotonic_ns()
-        self._mod_suggestion_index = result.index
-        self._mod_suggestion_last_rows = ()
-        self._suggestion_cache_ready = True
-        self._suggestion_cache_expired = bool(result.expired)
-        self._suggestion_cache_created_at = float(result.created_at or 0.0)
-        self._suggestion_cache_migration_pending = result.format_version in (0, 1)
-        self._suggestion_cache_migration_created_at = float(result.created_at or 0.0)
-        self._suggestion_cache_migration_kind = {
-            0: "first_save", 1: "v1_migration",
-        }.get(result.format_version)
-        self._deferred_suggestion_restore_pending = False
-        self._deferred_suggestion_restore_allowed = False
-        self._deferred_suggestion_restore_retry_after = 0.0
-        try:
-            self._queue_mod_suggestions_refresh()
-        except Exception:
-            pass
-        apply_ns = time.monotonic_ns() - apply_start_ns
-        if PERF_LOG_ENABLED:
-            _log_startup_apply_phase(
-                self, "deferred_suggestion_apply", apply_start_ns,
-                duration_ns=apply_ns, timer_scope="main_thread",
-                result="committed", source=result.outcome,
-                suggestion_generation=generation,
-                entries=int(result.index.get("count", 0) or 0),
-                **perf_context,
-            )
-            _log_startup_apply_phase(
-                self, "autocomplete_ready", time.monotonic_ns(), duration_ns=0,
-                timer_scope="marker", suggestion_generation=generation,
-                entries=int(result.index.get("count", 0) or 0),
-                source=result.outcome,
-                **perf_context,
-            )
-        return False
-
-    def _maybe_schedule_mod_suggestion_refresh(self):
-        if bool(getattr(self, "_shutdown_cleanup_done", False)):
-            return
-        created_at = float(getattr(self, "_suggestion_cache_created_at", 0.0) or 0.0)
-        if created_at and time.time() - created_at >= MOD_SUGGESTION_REFRESH_SECONDS:
-            self._suggestion_cache_expired = True
-        if not bool(getattr(self, "_suggestion_cache_ready", False)) or not bool(getattr(self, "_suggestion_cache_expired", False)):
-            return
-        if (bool(getattr(self, "_suggestion_cache_migration_pending", False)) or
-                bool(getattr(self, "_suggestion_refresh_inflight", False)) or
-                bool(getattr(self, "_suggestion_cache_migration_inflight", False)) or
-                bool(getattr(self, "_server_db_update_inflight", False))):
-            return
-        if not (bool(getattr(self, "_suggestion_sweep_complete", False)) or
-                bool(getattr(self, "_suggestion_sweep_fallback_ready", False))):
-            return
-        if not getattr(self, "_obj_by_key", None) or time.monotonic() < float(getattr(self, "_suggestion_refresh_retry_after", 0.0) or 0.0):
-            return
-
-        generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0)
-        payloads = tuple(getattr(obj, "mods_json", "") or "" for obj in self._obj_by_key.values())
-        cache_path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
-        start_ns = time.monotonic_ns()
-        self._suggestion_refresh_inflight = True
-        try:
-            future = self._update_executor.submit(build_staged_suggestion_cache, cache_path, payloads)
-            future.add_done_callback(lambda done, gen=generation, started=start_ns: GLib.idle_add(
-                self._on_mod_suggestion_refresh_done, gen, started, done,
-            ))
-        except Exception:
-            self._suggestion_refresh_inflight = False
-            self._suggestion_refresh_retry_after = time.monotonic() + 60.0
-            return
-        if PERF_LOG_ENABLED:
-            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_start", start_ns,
-                              generation=generation, rows=len(payloads))
-
-    def _on_mod_suggestion_refresh_done(self, generation: int, start_ns: int, future):
-        self._suggestion_refresh_inflight = False
-        try:
-            replacement, staged_path = future.result()
-        except Exception:
-            self._suggestion_refresh_retry_after = time.monotonic() + 60.0
-            if PERF_LOG_ENABLED:
-                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_complete", start_ns,
-                                  result="worker_failed")
-            return False
-        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
-                generation != int(getattr(self, "_suggestion_cache_generation", 0) or 0)):
-            try:
-                staged_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return False
-        try:
-            destination = Path(
-                getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
-            )
-            os.replace(staged_path, destination)
-            _fsync_directory_best_effort(destination.parent)
-        except OSError:
-            try:
-                staged_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._suggestion_refresh_retry_after = time.monotonic() + 60.0
-            if PERF_LOG_ENABLED:
-                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_complete", start_ns,
-                                  result="publish_failed")
-            return False
-        self._mod_suggestion_index = replacement
-        self._mod_suggestion_last_rows = ()
-        self._suggestion_cache_created_at = time.time()
-        self._suggestion_cache_expired = False
-        self._suggestion_cache_migration_pending = False
-        self._suggestion_cache_migration_kind = None
-        if PERF_LOG_ENABLED:
-            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_refresh_complete", start_ns,
-                              result="committed", entries=len(replacement))
-        return False
-
-    def _maybe_schedule_mod_suggestion_migration(self):
-        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
-                not bool(getattr(self, "_suggestion_cache_migration_pending", False)) or
-                bool(getattr(self, "_suggestion_cache_migration_inflight", False)) or
-                bool(getattr(self, "_suggestion_refresh_inflight", False)) or
-                bool(getattr(self, "_server_db_update_inflight", False))):
-            return
-        if not (bool(getattr(self, "_suggestion_sweep_complete", False)) or
-                bool(getattr(self, "_suggestion_sweep_fallback_ready", False))):
-            return
-        if time.monotonic() < float(getattr(self, "_suggestion_cache_migration_retry_after", 0.0) or 0.0):
-            return
-        generation = int(getattr(self, "_suggestion_cache_generation", 0) or 0)
-        path = getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
-        index = self._mod_suggestion_index
-        created_at = float(getattr(self, "_suggestion_cache_migration_created_at", 0.0) or
-                           getattr(self, "_suggestion_cache_created_at", 0.0) or 0.0)
-        kind = getattr(self, "_suggestion_cache_migration_kind", None) or "v1_migration"
-        start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
-        self._suggestion_cache_migration_inflight = True
-        try:
-            future = self._update_executor.submit(build_staged_suggestion_migration, path, index, created_at)
-            future.add_done_callback(lambda done, gen=generation, started=start_ns: GLib.idle_add(
-                self._on_mod_suggestion_migration_done, gen, started, done,
-            ))
-        except Exception:
-            self._suggestion_cache_migration_inflight = False
-            self._suggestion_cache_migration_retry_after = time.monotonic() + 60.0
-            if bool(getattr(self, "_suggestion_cache_expired", False)):
-                self._suggestion_cache_migration_pending = False
-            return
-        if PERF_LOG_ENABLED:
-            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_start", start_ns,
-                              generation=generation, entries=len(index), kind=kind)
-
-    def _on_mod_suggestion_migration_done(self, generation: int, start_ns: int, future):
-        self._suggestion_cache_migration_inflight = False
-        kind = getattr(self, "_suggestion_cache_migration_kind", None) or "v1_migration"
-        try:
-            staged_path = future.result()
-        except Exception:
-            self._suggestion_cache_migration_retry_after = time.monotonic() + 60.0
-            if bool(getattr(self, "_suggestion_cache_expired", False)):
-                self._suggestion_cache_migration_pending = False
-            if PERF_LOG_ENABLED:
-                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_complete", start_ns,
-                                  result="worker_failed", kind=kind)
-            return False
-        if (bool(getattr(self, "_shutdown_cleanup_done", False)) or
-                generation != int(getattr(self, "_suggestion_cache_generation", 0) or 0) or
-                not bool(getattr(self, "_suggestion_cache_migration_pending", False))):
-            try:
-                staged_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            return False
-        try:
-            destination = Path(
-                getattr(self, "_suggestion_cache_path", None) or suggestion_cache_path()
-            )
-            os.replace(staged_path, destination)
-            _fsync_directory_best_effort(destination.parent)
-        except OSError:
-            try:
-                staged_path.unlink(missing_ok=True)
-            except OSError:
-                pass
-            self._suggestion_cache_migration_retry_after = time.monotonic() + 60.0
-            if bool(getattr(self, "_suggestion_cache_expired", False)):
-                self._suggestion_cache_migration_pending = False
-            if PERF_LOG_ENABLED:
-                log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_complete", start_ns,
-                                  result="publish_failed", kind=kind)
-            return False
-        self._suggestion_cache_migration_pending = False
-        self._suggestion_cache_migration_kind = None
-        if PERF_LOG_ENABLED:
-            log_startup_phase(self._startup_perf_origin_ns, "mod_suggestion_cache_migration_complete", start_ns,
-                              result="committed", entries=len(self._mod_suggestion_index), kind=kind)
-        return False
 
     def _log_mod_suggest(self, message: str):
         if not DEBUG_MOD_SUGGESTIONS:
@@ -8922,26 +8515,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._hide_mod_suggestions("dismissed_token")
             return
 
-        if (not bool(getattr(self, "_suggestion_cache_ready", False)) and
-                (bool(getattr(self, "_deferred_suggestion_restore_pending", False)) or
-                 bool(getattr(self, "_deferred_suggestion_restore_inflight", False)))):
+        catalogue = self._mod_suggestions
+        if (not bool(catalogue.ready) and
+                (bool(catalogue.restore_pending) or bool(catalogue.restore_inflight))):
             self._log_mod_suggest("catalogue not ready; suggestions temporarily unavailable")
             self._hide_mod_suggestions("catalogue_not_ready")
             return
 
         try:
-            if (not bool(getattr(self, "_suggestion_cache_ready", False)) and
-                    len(getattr(self, "_mod_suggestion_index", {}) or {}) <= 0 and getattr(self, "_obj_by_key", None)):
+            if (not bool(catalogue.ready) and
+                    len(catalogue.index or {}) <= 0 and getattr(self, "_obj_by_key", None)):
                 self._log_mod_suggest("index empty; rebuilding from loaded rows")
-                self._rebuild_mod_suggestion_index()
+                catalogue.rebuild_index()
         except Exception:
             pass
-        index = getattr(self, "_mod_suggestion_index", None)
+        index = catalogue.index
         try:
             index_count = len(index) if index is not None else -1
         except Exception:
             index_count = -1
-        suggestions = suggest_mods(getattr(self, "_mod_suggestion_index", None), token, limit=MOD_SUGGESTION_RESULT_LIMIT)
+        suggestions = suggest_mods(catalogue.index, token, limit=MOD_SUGGESTION_RESULT_LIMIT)
         if not suggestions:
             self._log_mod_suggest(f"no suggestions token={token!r} index_count={index_count}")
             self._hide_mod_suggestions("no_suggestions")

@@ -12,7 +12,7 @@ import pytest
 
 from dzll_launcher import db, window
 from dzll_launcher import mod_parsed, mod_search, mod_suggestion_cache, mod_suggestions, server_mod_cache
-from dzll_launcher import server_companion_state
+from dzll_launcher import mod_suggestion_coordinator, server_companion_state
 from dzll_launcher.ui_row import ServerObject
 
 
@@ -41,9 +41,12 @@ class _BrowserHost:
         self.sorter = None
         self._discord = None
         self.map_choices = []
-
-    def _rebuild_mod_suggestion_index(self):
-        pass
+        # Rows-only host: the autocomplete catalogue is inert, as the old no-op rebuild stub was.
+        self._mod_suggestions = SimpleNamespace(
+            ready=False,
+            invalidate=lambda: None,
+            rebuild_index=lambda: None,
+        )
 
     def _snapshot_all_sort_keys(self):
         pass
@@ -110,11 +113,11 @@ def _load(host, rows):
 
 
 class _IndexedBrowserHost(_BrowserHost):
-    def _rebuild_mod_suggestion_index(self):
-        return window.DZLLWindow._rebuild_mod_suggestion_index(self)
+    """Host with the production-wired suggestion coordinator."""
 
-    def _on_mod_suggestion_refresh_done(self, generation, start_ns, future):
-        return window.DZLLWindow._on_mod_suggestion_refresh_done(self, generation, start_ns, future)
+    def __init__(self):
+        super().__init__()
+        self._mod_suggestions = window.DZLLWindow._build_mod_suggestion_coordinator(self)
 
 
 @pytest.mark.parametrize("payload", [
@@ -169,8 +172,8 @@ def test_full_load_decodes_once_per_accepted_row_and_indexes_final_endpoint(monk
     assert host.store.items[-1].mod_count == 17
     assert host.store.items[-1].mods_json == other["mods"]
     expected = mod_suggestions.build_mod_suggestion_index((last["mods"], other["mods"]))
-    assert host._mod_suggestion_index == expected
-    assert host._mod_suggestion_index["mods"][0]["server_count"] == 2
+    assert host._mod_suggestions.index == expected
+    assert host._mod_suggestions.index["mods"][0]["server_count"] == 2
     assert host._load_parsed_mods_by_key is None
 
 
@@ -197,7 +200,7 @@ def test_load_local_name_cleaning_is_shared_without_merging_distinct_id_rules(mo
 def test_empty_load_rebuilds_empty_suggestion_index_without_parsed_sidecar():
     host = _IndexedBrowserHost()
     assert _load(host, []) is False
-    assert host._mod_suggestion_index == mod_suggestions.build_mod_suggestion_index(())
+    assert host._mod_suggestions.index == mod_suggestions.build_mod_suggestion_index(())
     assert host._mod_suggestion_last_rows == ()
 
 
@@ -211,10 +214,10 @@ def test_replacement_load_reuses_monthly_catalogue_and_later_fallback_does_not_r
     assert _load(host, [first]) is True
     expected = mod_suggestions.build_mod_suggestion_index((first["mods"],))
     assert _load(host, [replacement]) is True
-    assert host._mod_suggestion_index == expected
+    assert host._mod_suggestions.index == expected
     assert host.store.items[-1].mod_search_index["ids"] == frozenset({"200"})
-    host._rebuild_mod_suggestion_index()
-    assert host._mod_suggestion_index == expected
+    host._mod_suggestions.rebuild_index()
+    assert host._mod_suggestions.index == expected
 
 
 def test_warm_cache_and_empty_cache_skip_global_rebuild_on_db_reload(tmp_path, monkeypatch):
@@ -222,25 +225,38 @@ def test_warm_cache_and_empty_cache_skip_global_rebuild_on_db_reload(tmp_path, m
     cached = mod_suggestions.build_mod_suggestion_index(('[{"name":"Cached"}]',))
     mod_suggestion_cache.save_suggestion_cache(path, cached)
     monkeypatch.setattr(window, "suggestion_cache_path", lambda: path)
-    monkeypatch.setattr(window, "build_mod_suggestion_index", lambda *_args, **_kwargs: pytest.fail("global rebuild"))
+    real_build = mod_suggestion_coordinator.build_mod_suggestion_index
+    guard = {"active": False}
+
+    def no_global_rebuild(*args, **kwargs):
+        # Constructing a coordinator builds its initial empty index, as DZLLWindow.__init__ always has;
+        # the guard only polices loads and explicit rebuilds.
+        if guard["active"]:
+            pytest.fail("global rebuild")
+        return real_build(*args, **kwargs)
+
+    monkeypatch.setattr(mod_suggestion_coordinator, "build_mod_suggestion_index", no_global_rebuild)
 
     host = _IndexedBrowserHost()
     row = _row("1.2.3.4")
     row["mods"] = '[{"name":"Current"}]'
+    guard["active"] = True
     assert _load(host, [row]) is True
     assert _load(host, [row]) is True
-    assert host._mod_suggestion_index == cached
+    assert host._mod_suggestions.index == cached
     assert host.store.items[0].mods_preview == "Current"
+    guard["active"] = False
 
     empty_path = tmp_path / "empty.json"
     empty = mod_suggestions.build_mod_suggestion_index(())
     mod_suggestion_cache.save_suggestion_cache(empty_path, empty)
     monkeypatch.setattr(window, "suggestion_cache_path", lambda: empty_path)
     second = _IndexedBrowserHost()
+    guard["active"] = True
     assert _load(second, [row]) is True
-    assert second._mod_suggestion_index == empty
-    second._rebuild_mod_suggestion_index()
-    assert second._mod_suggestion_index == empty
+    assert second._mod_suggestions.index == empty
+    second._mod_suggestions.rebuild_index()
+    assert second._mod_suggestions.index == empty
 
 
 def test_expired_disk_cache_is_usable_and_corrupt_cache_rebuilds(tmp_path, monkeypatch):
@@ -254,15 +270,15 @@ def test_expired_disk_cache_is_usable_and_corrupt_cache_rebuilds(tmp_path, monke
     row["mods"] = '[{"name":"Current"}]'
     host = _IndexedBrowserHost()
     assert _load(host, [row]) is True
-    assert host._mod_suggestion_index == cached
-    assert host._suggestion_cache_expired is True
+    assert host._mod_suggestions.index == cached
+    assert host._mod_suggestions.expired is True
     assert mod_suggestion_cache.load_suggestion_cache(path).expired is True
 
     path.write_text("corrupt")
     replacement = _IndexedBrowserHost()
     assert _load(replacement, [row]) is True
     expected = mod_suggestions.build_mod_suggestion_index((row["mods"],))
-    assert replacement._mod_suggestion_index == expected
+    assert replacement._mod_suggestions.index == expected
     assert mod_suggestion_cache.load_suggestion_cache(path).index == expected
 
 
@@ -296,29 +312,29 @@ def test_expired_catalogue_waits_for_full_sweep_then_swaps_after_worker(tmp_path
     new = _row("1.2.3.4")
     new["mods"] = '[{"name":"New"}]'
     assert _load(host, [old]) is True
-    old_index = host._mod_suggestion_index
+    old_index = host._mod_suggestions.index
     assert _load(host, [new]) is True
-    host._suggestion_cache_created_at = time.time() - mod_suggestion_cache.REFRESH_SECONDS - 1
+    host._mod_suggestions.created_at = time.time() - mod_suggestion_cache.REFRESH_SECONDS - 1
     host._suggestion_sweep_complete = False
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    host._mod_suggestions.schedule_refresh()
     assert not host._update_executor.jobs
     host._suggestion_sweep_complete = True
     host._server_db_update_inflight = True
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    host._mod_suggestions.schedule_refresh()
     assert not host._update_executor.jobs
     host._server_db_update_inflight = False
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    host._mod_suggestions.schedule_refresh()
+    host._mod_suggestions.schedule_refresh()
     assert len(host._update_executor.jobs) == 1
-    assert host._mod_suggestion_index is old_index
+    assert host._mod_suggestions.index is old_index
     host._update_executor.finish()
-    assert host._mod_suggestion_index is old_index
+    assert host._mod_suggestions.index is old_index
     callback, args = idle.pop()
     assert callback(*args) is False
     expected = mod_suggestions.build_mod_suggestion_index((new["mods"],))
-    assert host._mod_suggestion_index == expected
+    assert host._mod_suggestions.index == expected
     assert mod_suggestion_cache.load_suggestion_cache(path).index == expected
-    assert mod_suggestions.suggest_mods(host._mod_suggestion_index, "new") == mod_suggestions.suggest_mods(expected, "new")
+    assert mod_suggestions.suggest_mods(host._mod_suggestions.index, "new") == mod_suggestions.suggest_mods(expected, "new")
 
 
 def test_refresh_failure_generation_change_and_shutdown_keep_old_cache(tmp_path, monkeypatch):
@@ -332,35 +348,35 @@ def test_refresh_failure_generation_change_and_shutdown_keep_old_cache(tmp_path,
     row = _row("1.2.3.4")
     row["mods"] = '[{"name":"Old"}]'
     assert _load(host, [row]) is True
-    old_index = host._mod_suggestion_index
-    host._suggestion_cache_created_at = time.time() - mod_suggestion_cache.REFRESH_SECONDS - 1
+    old_index = host._mod_suggestions.index
+    host._mod_suggestions.created_at = time.time() - mod_suggestion_cache.REFRESH_SECONDS - 1
     host._suggestion_sweep_complete = True
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    host._mod_suggestions.schedule_refresh()
     host._update_executor.finish(error=RuntimeError("worker failed"))
     callback, args = idle.pop()
     assert callback(*args) is False
-    assert host._mod_suggestion_index is old_index
-    assert host._suggestion_refresh_retry_after > time.monotonic()
+    assert host._mod_suggestions.index is old_index
+    assert host._mod_suggestions.refresh_retry_after > time.monotonic()
 
-    host._suggestion_refresh_retry_after = 0
+    host._mod_suggestions.refresh_retry_after = 0
     host._suggestion_sweep_complete = False
     host._suggestion_sweep_fallback_ready = True
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    host._mod_suggestions.schedule_refresh()
     assert _load(host, [row]) is True  # A new DB generation invalidates the pending result.
     host._update_executor.finish()
     callback, args = idle.pop()
     assert callback(*args) is False
-    assert host._mod_suggestion_index is old_index
+    assert host._mod_suggestions.index is old_index
     assert len(list(tmp_path.glob("*.pending"))) == 0
 
-    window.DZLLWindow._maybe_schedule_mod_suggestion_refresh(host)
+    host._mod_suggestions.schedule_refresh()
     assert len(host._update_executor.jobs) == 1
     host._shutdown_cleanup_done = True
-    host._suggestion_cache_generation += 1
+    host._mod_suggestions.generation += 1
     host._update_executor.finish()
     callback, args = idle.pop()
     assert callback(*args) is False
-    assert host._mod_suggestion_index is old_index
+    assert host._mod_suggestions.index is old_index
 
 
 def _write_server_database(path, rows, *, include_official=False, include_night=False):
@@ -1272,7 +1288,7 @@ def test_server_mod_cache_hit_preserves_cold_global_suggestion_fallback(tmp_path
     host = _IndexedBrowserHost()
     host._server_mod_cache_path = path
     assert _load(host, [row]) is True
-    assert host._mod_suggestion_index == mod_suggestions.build_mod_suggestion_index((row["mods"],))
+    assert host._mod_suggestions.index == mod_suggestions.build_mod_suggestion_index((row["mods"],))
 
 
 def test_server_mod_cache_aggregate_profile_reports_warm_hit(tmp_path, monkeypatch):
