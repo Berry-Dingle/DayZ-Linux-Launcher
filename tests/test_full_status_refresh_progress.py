@@ -1,19 +1,21 @@
 from __future__ import annotations
 
+import re
 from collections import deque
 from pathlib import Path
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 
 import pytest
 
 from dzll_launcher import config
-from dzll_launcher import window as window_module
-from dzll_launcher.window import DZLLWindow
+from dzll_launcher import status_refresh_controller
+from dzll_launcher.status_refresh_controller import StatusRefreshController, StatusRefreshWidgets
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SIDEBAR_SOURCE = ROOT / "src/dzll_launcher/sidebar_ui.py"
 WINDOW_SOURCE = ROOT / "src/dzll_launcher/window.py"
+CONTROLLER_SOURCE = ROOT / "src/dzll_launcher/status_refresh_controller.py"
 STYLES_SOURCE = ROOT / "src/dzll_launcher/styles.py"
 
 
@@ -69,49 +71,53 @@ class FakeFuture:
         return self.value
 
 
-def bind(host, *names):
-    for name in names:
-        setattr(host, name, MethodType(getattr(DZLLWindow, name), host))
-    return host
-
-
 def progress_host(*, total=10, completed=0, generation=1, running=True):
+    """A controller with fake sidebar widgets. ``host.c`` is the controller."""
     refresh_btn = FakeBox()
     refresh_btn.visible = True
-    progress_box = FakeBox()
     prefix_label = FakeLabel()
     prefix_label.text = "Refreshing:"
     host = SimpleNamespace(
-        _status_refresh_generation=generation,
-        _status_refresh_running=running,
-        _status_refresh_total=total,
-        _status_refresh_completed=completed,
-        _status_refresh_progress_last_rendered=0,
-        _status_refresh_progress_update_id=0,
-        _shutdown_cleanup_done=False,
         refresh_status_btn=refresh_btn,
         status_refresh_slot=FakeStack(),
-        status_refresh_progress_box=progress_box,
+        status_refresh_progress_box=FakeBox(),
         status_refresh_progress_prefix_label=prefix_label,
         status_refresh_progress_count_label=FakeLabel(),
         status_refresh_progress_bar=FakeProgressBar(),
+        shutdown=False,
+        servers={},
+        scroller=SimpleNamespace(get_vadjustment=lambda: None),
+        executor=None,
+        applied=[],
+        browser_refreshes=[],
     )
-    return bind(
-        host,
-        "_cancel_status_refresh_progress_update",
-        "_set_status_refresh_progress_visible",
-        "_render_status_refresh_progress",
-        "_schedule_status_refresh_progress_update",
-        "_clear_status_refresh_progress",
+    host.c = StatusRefreshController(
+        widgets=lambda: StatusRefreshWidgets(
+            button=host.refresh_status_btn,
+            progress_box=host.status_refresh_progress_box,
+            count_label=host.status_refresh_progress_count_label,
+            progress_bar=host.status_refresh_progress_bar,
+            slot=host.status_refresh_slot,
+        ),
+        server_keys=lambda: list(host.servers),
+        lookup_server=lambda key: host.servers.get(key),
+        submit=lambda *args: host.executor.submit(*args),
+        apply_live_results=lambda results, **kwargs: host.applied.append((results, kwargs)),
+        refresh_browser=lambda: host.browser_refreshes.append(True),
+        scroller=lambda: host.scroller,
+        model_id=lambda: 0,
+        is_shut_down=lambda: host.shutdown,
     )
+    host.c.generation = generation
+    host.c.running = running
+    host.c.total = total
+    host.c.completed = completed
+    return host
 
 
 def completion_host(*, total=1):
     host = progress_host(total=total)
-    host._status_refresh_buffer = []
-    host._status_refresh_flush_id = 0
-    host._flush_status_refresh_results = lambda _generation: False
-    bind(host, "_status_refresh_attempt_finished")
+    host.c._flush_results = lambda _generation: False
     return host
 
 
@@ -173,8 +179,8 @@ def test_toolbar_spacing_is_tightened_locally_without_global_spacing_changes():
 
 def test_refresh_and_progress_share_one_slot_without_spinner_or_button_recreation():
     sidebar = SIDEBAR_SOURCE.read_text(encoding="utf-8")
-    source = WINDOW_SOURCE.read_text(encoding="utf-8")
-    slot_state = source[source.index("def _set_status_refresh_slot_running"):source.index("def _on_refresh_status_clicked")]
+    source = CONTROLLER_SOURCE.read_text(encoding="utf-8")
+    slot_state = source[source.index("def _set_slot_running"):source.index("def _attempt_finished")]
     refresh = sidebar[sidebar.index("window.refresh_status_btn = Gtk.Button()"):
                       sidebar.index("window.status_refresh_progress_box = Gtk.Box")]
     assert "Gtk.Spinner" not in slot_state
@@ -185,7 +191,7 @@ def test_refresh_and_progress_share_one_slot_without_spinner_or_button_recreatio
     assert "slot.set_visible_child(btn)" in slot_state
     assert "refresh_status_btn.set_size_request" not in refresh
     assert "refresh_status_btn.set_child(Gtk.Image.new_from_icon_name" in refresh
-    assert "refresh_status_btn.connect(\"clicked\", window._on_refresh_status_clicked)" in refresh
+    assert "refresh_status_btn.connect(\"clicked\", window._status_refresh.start)" in refresh
 
 
 def test_idle_progress_is_hidden_and_reset():
@@ -195,7 +201,7 @@ def test_idle_progress_is_hidden_and_reset():
     host.status_refresh_progress_count_label.text = "old"
     host.status_refresh_progress_bar.fraction = 0.7
 
-    host._clear_status_refresh_progress(1)
+    host.c._clear_progress(1)
 
     assert host.status_refresh_progress_box.visible is False
     assert host.status_refresh_progress_prefix_label.text == "Refreshing:"
@@ -207,39 +213,29 @@ def test_idle_progress_is_hidden_and_reset():
 
 def test_slot_switches_between_original_refresh_and_progress_exclusively():
     host = progress_host()
-    host._ensure_status_refresh_cursor_controller = lambda _btn: False
-    host._apply_status_refresh_cursor_for_state = lambda _btn: False
-    bind(host, "_set_status_refresh_slot_running")
+    host.c._ensure_cursor_controller = lambda _btn: False
+    host.c._apply_cursor_for_state = lambda _btn: False
 
     original_refresh = host.refresh_status_btn
-    host._set_status_refresh_slot_running(True, generation=1)
+    host.c._set_slot_running(True, generation=1)
     assert host.status_refresh_slot.visible_child is host.status_refresh_progress_box
 
-    host._set_status_refresh_slot_running(False, generation=1)
+    host.c._set_slot_running(False, generation=1)
     assert host.status_refresh_slot.visible_child is original_refresh
     assert host.refresh_status_btn is original_refresh
 
 
 def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
     host = progress_host(total=0, running=False)
-    host._obj_by_key = {index: object() for index in range(8_900)}
-    host._status_refresh_queue = deque()
-    host._status_refresh_inflight = 0
-    host._status_refresh_buffer = []
-    host._status_refresh_flush_id = 0
-    host._status_refresh_started_at = 0.0
-    host._status_refresh_last_log_completed = 0
-    host._status_refresh_scroll_value = None
-    host.scroller = SimpleNamespace(get_vadjustment=lambda: None)
-    host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
-    host._pump_status_refresh = lambda _generation: False
-    bind(host, "_on_refresh_status_clicked")
+    host.servers = {index: object() for index in range(8_900)}
+    host.c._set_slot_running = lambda *_args, **_kwargs: False
+    host.c._pump = lambda _generation: False
 
-    host._on_refresh_status_clicked()
-    host._obj_by_key["later"] = object()
+    host.c.start()
+    host.servers["later"] = object()
 
-    assert host._status_refresh_total == 8_900
-    assert len(host._status_refresh_queue) == 8_900
+    assert host.c.total == 8_900
+    assert len(host.c.queue) == 8_900
     assert host.status_refresh_progress_count_label.text == "0 / 8,900"
     assert host.status_refresh_progress_bar.fraction == 0.0
     assert host.status_refresh_progress_box.visible is True
@@ -247,83 +243,82 @@ def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
 
 def test_zero_target_sweep_never_enters_busy_or_shows_progress():
     host = progress_host(total=0, running=False)
-    host._obj_by_key = {}
+    host.servers = {}
     slot_calls = []
-    host._set_status_refresh_slot_running = lambda running, **_kwargs: slot_calls.append(running)
-    bind(host, "_on_refresh_status_clicked")
+    host.c._set_slot_running = lambda running, **_kwargs: slot_calls.append(running)
 
-    host._on_refresh_status_clicked()
+    host.c.start()
 
     assert slot_calls == []
-    assert host._status_refresh_running is False
+    assert host.c.running is False
     assert host.status_refresh_progress_box.visible is False
 
 
 @pytest.mark.parametrize("classification", ["success", "timeout", "failure", "neutral"])
 def test_every_future_terminal_classification_increments_exactly_once(classification):
     host = completion_host()
-    host._status_refresh_inflight = 1
-    host._pump_status_refresh = lambda _generation: False
-    bind(host, "_on_status_refresh_future_done")
+    host.c.inflight = 1
+    host.c._pump = lambda _generation: False
     info = {"classification": classification}
 
-    host._on_status_refresh_future_done(1, FakeFuture((1, ("server", info))))
+    host.c._on_future_done(1, FakeFuture((1, ("server", info))))
 
-    assert host._status_refresh_completed == 1
-    assert host._status_refresh_buffer == [("server", info)]
-    assert host._status_refresh_inflight == 0
+    assert host.c.completed == 1
+    assert host.c.buffer == [("server", info)]
+    assert host.c.inflight == 0
 
 
 @pytest.mark.parametrize("terminal_path", ["missing", "invalid", "submit-failure"])
 def test_synchronous_terminal_paths_increment_exactly_once(terminal_path):
     host = completion_host()
-    host._status_refresh_queue = deque(["server"])
-    host._status_refresh_inflight = 0
-    host._maybe_finish_status_refresh = lambda _generation: False
-    host._query_status_refresh_one = lambda *_args: None
+    host.c.queue = deque(["server"])
+    host.c.inflight = 0
+    host.c._maybe_finish = lambda _generation: False
+    host.c._query_one = lambda *_args: None
     if terminal_path == "missing":
-        host._obj_by_key = {}
-        host._startup_live_executor = None
+        host.servers = {}
+        host.executor = None
     elif terminal_path == "invalid":
-        host._obj_by_key = {"server": SimpleNamespace(ip="127.0.0.1", qport=object())}
-        host._startup_live_executor = None
+        host.servers = {"server": SimpleNamespace(ip="127.0.0.1", qport=object())}
+        host.executor = None
     else:
-        host._obj_by_key = {"server": SimpleNamespace(ip="127.0.0.1", qport=2302)}
-        host._startup_live_executor = SimpleNamespace(
+        host.servers = {"server": SimpleNamespace(ip="127.0.0.1", qport=2302)}
+        host.executor = SimpleNamespace(
             submit=lambda *_args: (_ for _ in ()).throw(RuntimeError("submit failed"))
         )
-    bind(host, "_pump_status_refresh")
 
-    host._pump_status_refresh(1)
+    host.c._pump(1)
 
-    assert host._status_refresh_completed == 1
-    assert not host._status_refresh_queue
+    assert host.c.completed == 1
+    assert not host.c.queue
+    assert host.c.inflight == 0
 
 
 def test_authoritative_helper_is_the_only_increment_owner_and_clamps():
-    source = WINDOW_SOURCE.read_text(encoding="utf-8")
-    increment = "self._status_refresh_completed = min(total, completed + 1)"
+    source = CONTROLLER_SOURCE.read_text(encoding="utf-8")
+    increment = "self.completed = min(total, completed + 1)"
     assert source.count(increment) == 1
-    assert "self._status_refresh_completed +=" not in source
+    assert "self.completed +=" not in source
+    assert re.findall(r"self\._status_refresh_\w+", WINDOW_SOURCE.read_text(encoding="utf-8")) == []
     host = completion_host(total=2)
 
-    assert host._status_refresh_attempt_finished(1) is True
-    assert host._status_refresh_attempt_finished(1) is True
-    assert host._status_refresh_attempt_finished(1) is True
-    assert host._status_refresh_completed == 2
+    assert host.c._attempt_finished(1) is True
+    assert host.c._attempt_finished(1) is True
+    assert host.c._attempt_finished(1) is True
+    assert host.c.completed == 2
 
 
 def test_render_is_monotonic_clamped_and_uses_completed_over_total():
     host = progress_host(total=8, completed=3)
-    host._render_status_refresh_progress(1)
+    host.c._render_progress(1)
     assert host.status_refresh_progress_count_label.text == "3 / 8"
     assert host.status_refresh_progress_bar.fraction == pytest.approx(3 / 8)
 
-    host._status_refresh_completed = 1
-    host._render_status_refresh_progress(1)
+    host.c.completed = 1
+    host.c._render_progress(1)
     assert host.status_refresh_progress_count_label.text == "3 / 8"
-    host._status_refresh_completed = 99
-    host._render_status_refresh_progress(1)
+    host.c.completed = 99
+    host.c._render_progress(1)
     assert host.status_refresh_progress_count_label.text == "8 / 8"
     assert host.status_refresh_progress_bar.fraction == 1.0
 
@@ -331,7 +326,7 @@ def test_render_is_monotonic_clamped_and_uses_completed_over_total():
 def test_full_progress_text_format_is_not_shortened_or_abbreviated():
     host = progress_host(total=8_484, completed=1_464)
 
-    host._render_status_refresh_progress(1)
+    host.c._render_progress(1)
 
     assert host.status_refresh_progress_prefix_label.text == "Refreshing:"
     assert host.status_refresh_progress_count_label.text == "1,464 / 8,484"
@@ -342,11 +337,11 @@ def test_full_progress_text_format_is_not_shortened_or_abbreviated():
 def test_initial_and_final_text_keep_exact_thousands_separated_values():
     host = progress_host(total=8_484, completed=0)
 
-    host._render_status_refresh_progress(1)
+    host.c._render_progress(1)
     assert host.status_refresh_progress_count_label.text == "0 / 8,484"
 
-    host._status_refresh_completed = 8_484
-    host._render_status_refresh_progress(1)
+    host.c.completed = 8_484
+    host.c._render_progress(1)
     assert host.status_refresh_progress_count_label.text == "8,484 / 8,484"
     assert host.status_refresh_progress_bar.fraction == 1.0
 
@@ -359,54 +354,44 @@ def test_many_completions_schedule_one_coalesced_render(monkeypatch):
         scheduled.append((interval, callback, generation))
         return 41
 
-    monkeypatch.setattr(window_module.GLib, "timeout_add", timeout_add)
+    monkeypatch.setattr(status_refresh_controller.GLib, "timeout_add", timeout_add)
     for _ in range(20):
-        host._status_refresh_attempt_finished(1)
+        host.c._attempt_finished(1)
 
-    assert host._status_refresh_completed == 20
+    assert host.c.completed == 20
     assert len(scheduled) == 1
-    assert scheduled[0][0] == window_module.STATUS_REFRESH_PROGRESS_UPDATE_MS == 125
+    assert scheduled[0][0] == status_refresh_controller.STATUS_REFRESH_PROGRESS_UPDATE_MS == 125
+    assert scheduled[0][1:] == (host.c._render_progress, 1)
 
 
 def test_stale_timer_and_stale_future_do_not_update_or_increment():
     host = completion_host(total=5)
-    host._status_refresh_inflight = 1
-    host._pump_status_refresh = lambda _generation: False
-    bind(host, "_on_status_refresh_future_done")
+    host.c.inflight = 1
+    host.c._pump = lambda _generation: False
 
-    host._render_status_refresh_progress(0)
-    host._on_status_refresh_future_done(0, FakeFuture((0, ("old", {"ok": True}))))
+    host.c._render_progress(0)
+    host.c._on_future_done(0, FakeFuture((0, ("old", {"ok": True}))))
 
-    assert host._status_refresh_completed == 0
+    assert host.c.completed == 0
     assert host.status_refresh_progress_count_label.history == []
-    assert host._status_refresh_inflight == 1
+    assert host.c.inflight == 1
 
 
 def test_final_completion_force_renders_total_then_hides_and_resets(monkeypatch):
     host = progress_host(total=2, completed=2)
-    host._status_refresh_queue = deque()
-    host._status_refresh_inflight = 0
-    host._status_refresh_buffer = []
-    host._status_refresh_flush_id = 0
-    host._status_refresh_progress_update_id = 91
-    host.combined_filter = None
-    host.sorter = None
-    host._status_refresh_scroll_value = None
-    host._snapshot_all_sort_keys = lambda: None
-    host._browser_reorder = SimpleNamespace(log=lambda *_args, **_kwargs: None)
-    host._rebuild_column_view_store = lambda **_kwargs: None
-    host._set_status_refresh_slot_running = lambda *_args, **_kwargs: False
+    host.c.progress_update_id = 91
+    host.c._set_slot_running = lambda *_args, **_kwargs: False
     removed = []
-    monkeypatch.setattr(window_module.GLib, "source_remove", removed.append)
-    bind(host, "_maybe_finish_status_refresh")
+    monkeypatch.setattr(status_refresh_controller.GLib, "source_remove", removed.append)
 
-    host._maybe_finish_status_refresh(1)
+    host.c._maybe_finish(1)
 
     assert 91 in removed
     assert "2 / 2" in host.status_refresh_progress_count_label.history
     assert host.status_refresh_progress_bar.history[-2:] == [1.0, 0.0]
     assert host.status_refresh_progress_box.visible is False
-    assert host._status_refresh_running is False
+    assert host.c.running is False
+    assert host.browser_refreshes == [True]
 
 
 def test_stale_cleanup_cannot_hide_newer_sweep():
@@ -414,7 +399,7 @@ def test_stale_cleanup_cannot_hide_newer_sweep():
     host.status_refresh_progress_box.visible = True
     host.status_refresh_progress_count_label.text = "1 / 2"
 
-    host._clear_status_refresh_progress(1)
+    host.c._clear_progress(1)
 
     assert host.status_refresh_progress_box.visible is True
     assert host.status_refresh_progress_count_label.text == "1 / 2"
@@ -422,44 +407,44 @@ def test_stale_cleanup_cannot_hide_newer_sweep():
 
 def test_shutdown_clears_timer_and_blocks_later_updates(monkeypatch):
     host = progress_host(total=4, completed=2)
-    host._status_refresh_progress_update_id = 52
+    host.c.progress_update_id = 52
     removed = []
-    monkeypatch.setattr(window_module.GLib, "source_remove", removed.append)
+    monkeypatch.setattr(status_refresh_controller.GLib, "source_remove", removed.append)
 
-    host._clear_status_refresh_progress(1)
-    host._shutdown_cleanup_done = True
-    host._status_refresh_completed = 3
-    host._render_status_refresh_progress(1)
+    host.c._clear_progress(1)
+    host.shutdown = True
+    host.c.completed = 3
+    host.c._render_progress(1)
 
     assert removed == [52]
-    assert host._status_refresh_progress_update_id == 0
+    assert host.c.progress_update_id == 0
     assert host.status_refresh_progress_box.visible is False
     assert host.status_refresh_progress_count_label.text == ""
 
 
 def test_repeated_click_while_running_is_ignored():
     host = progress_host(running=True)
-    host._obj_by_key = {"new": object()}
-    host._status_refresh_queue = deque(["existing"])
-    bind(host, "_on_refresh_status_clicked")
+    host.servers = {"new": object()}
+    host.c.queue = deque(["existing"])
 
-    host._on_refresh_status_clicked()
+    host.c.start()
 
-    assert list(host._status_refresh_queue) == ["existing"]
-    assert host._status_refresh_generation == 1
+    assert list(host.c.queue) == ["existing"]
+    assert host.c.generation == 1
 
 
 def test_progress_is_manual_sweep_only_and_no_manual_spinner_path_remains():
+    controller = CONTROLLER_SOURCE.read_text(encoding="utf-8")
     source = WINDOW_SOURCE.read_text(encoding="utf-8")
-    manual = source[source.index("def _on_refresh_status_clicked"):source.index("def _query_status_refresh_one")]
+    manual = controller[controller.index("    def start(self"):controller.index("    def _query_one")]
     row_start = source.index("def _refresh_server_for_obj")
     row = source[row_start:source.index("\n    def ", row_start + 1)]
-    startup = source[source.index("def _submit_startup_rest_batches"):source.index("def _apply_status_refresh_cursor_for_state")]
-    assert "_render_status_refresh_progress" in manual
-    assert "_render_status_refresh_progress" not in row
-    assert "_render_status_refresh_progress" not in startup
+    startup = source[source.index("def _submit_startup_rest_batches"):source.index("def _refresh_browser_after_status_refresh")]
+    assert "_render_progress" in manual
+    assert "_status_refresh" not in row
+    assert "_status_refresh" not in startup
 
-    slot_state = source[source.index("def _set_status_refresh_slot_running"):source.index("def _on_refresh_status_clicked")]
+    slot_state = controller[controller.index("def _set_slot_running"):controller.index("def _attempt_finished")]
     assert "Gtk.Spinner" not in slot_state
     assert "spinner" not in slot_state
 

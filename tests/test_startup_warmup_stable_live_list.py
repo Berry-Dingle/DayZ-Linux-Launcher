@@ -7,6 +7,8 @@ from types import MethodType, SimpleNamespace
 import pytest
 
 from dzll_launcher import config, window
+from dzll_launcher import status_refresh_controller
+from dzll_launcher.status_refresh_controller import StatusRefreshController, StatusRefreshWidgets
 from dzll_launcher.ui_row import ServerObject
 from dzll_launcher.settings_ui import SettingsUI
 from dzll_launcher.window import DZLLWindow, fav_key
@@ -332,25 +334,37 @@ def test_refresh_all_final_rebuild_and_scroll_restoration_remain_separate(monkey
     events = []
     adjustment = SimpleNamespace(set_value=lambda value: events.append(("scroll", value)))
     host = SimpleNamespace(
-        _status_refresh_generation=1, _status_refresh_running=True,
-        _status_refresh_inflight=0, _status_refresh_queue=[], _status_refresh_buffer=[],
-        _status_refresh_scroll_value=43.0, _status_refresh_total=2,
-        _status_refresh_completed=2, _shutdown_cleanup_done=False,
-        _cancel_status_refresh_progress_update=lambda *_: None,
-        _render_status_refresh_progress=lambda *_, **__: None,
         _snapshot_all_sort_keys=lambda: None,
         _browser_reorder=SimpleNamespace(log=lambda *_, **__: None),
         _sort_debug=SimpleNamespace(note_model_event=lambda *_: None),
         _rebuild_column_view_store=lambda **_: events.append("rebuild"),
-        _set_status_refresh_slot_running=lambda *_, **__: None,
-        _clear_status_refresh_progress=lambda *_: None,
         scroller=SimpleNamespace(get_vadjustment=lambda: adjustment), sorter=None,
         combined_filter=None,
     )
-    bind(host, "_maybe_finish_status_refresh")
-    monkeypatch.setattr(window.GLib, "idle_add", lambda callback: callback())
+    bind(host, "_refresh_browser_after_status_refresh")
+    controller = StatusRefreshController(
+        widgets=StatusRefreshWidgets,
+        server_keys=lambda: [],
+        lookup_server=lambda _key: None,
+        submit=lambda *_args: None,
+        apply_live_results=lambda *_args, **_kwargs: None,
+        refresh_browser=host._refresh_browser_after_status_refresh,
+        scroller=lambda: host.scroller,
+        model_id=lambda: 0,
+        is_shut_down=lambda: False,
+    )
+    controller.generation = 1
+    controller.running = True
+    controller.scroll_value = 43.0
+    controller.total = 2
+    controller.completed = 2
+    controller._cancel_progress_update = lambda *_: None
+    controller._render_progress = lambda *_, **__: None
+    controller._set_slot_running = lambda *_, **__: None
+    controller._clear_progress = lambda *_: None
+    monkeypatch.setattr(status_refresh_controller.GLib, "idle_add", lambda callback: callback())
 
-    host._maybe_finish_status_refresh(1)
+    controller._maybe_finish(1)
 
     assert events == ["rebuild", ("scroll", 43.0)]
-    assert host._status_refresh_running is False
+    assert controller.running is False
