@@ -36,6 +36,17 @@ H3_AUTHORITY_MINIMUM = 0.88
 H3_PHASE_AUTHORITY_MINIMUM = 0.85
 H4_AUTHORITY_MINIMUM = 0.94
 HIGH_AUTHORITY_CAP = 0.97
+# Stage 6 cycle-change recovery.  A credible challenger (H2, or a level-2
+# context that has suspended the countdown) is resolved in favour of the
+# incumbent only by this many independent, complete, high-eligible incumbent
+# intervals that start strictly after the challenger's latest high evidence.
+ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS = 2
+COUNTDOWN_SUSPENSION_LATCH_REASON = (
+    "credible_challenger_suspension_requires_original_cycle_confirmations"
+)
+HISTORICAL_CHALLENGER_EVIDENCE_REASON = (
+    "pre_establishment_high_evidence_excluded_from_challenger_authorization"
+)
 
 
 class AuthorityGate(str, Enum):
@@ -279,6 +290,8 @@ def evaluate_authority(
         windows=window_values,
         events=event_values,
         prior=prior_decision,
+        relationships=relationship_values,
+        streaks=streak_values,
     )
 
 
@@ -812,6 +825,8 @@ def _transition_decision(
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
     prior: AuthorityDecision | None,
+    relationships: tuple[IntervalRelationship, ...] = (),
+    streaks: tuple[CadenceStreak, ...] = (),
 ) -> AuthorityDecision:
     ranked = tuple(sorted(candidates, key=_candidate_rank, reverse=True))
     high_h3 = tuple(item for item in ranked if item.h3_gate)
@@ -972,10 +987,22 @@ def _transition_decision(
         )
         > incumbent.phase_tolerance
     )
+    event_map = {item.event_id: item for item in events}
+    relationship_map = {item.relationship_id: item for item in relationships}
     contexts = tuple(
         _challenger_context(
             incumbent=incumbent,
-            candidate=item,
+            candidate=_post_establishment_view(
+                item,
+                established_at=incumbent.established_at,
+                relationship_map=relationship_map,
+                streaks=streaks,
+                relationships=relationships,
+                normal_score=normal_score,
+                windows=windows,
+                events=events,
+                event_map=event_map,
+            ),
             normal=_normal_for_candidate(normal_ledger, item),
             active_miss_ids=active_misses,
             events=events,
@@ -983,16 +1010,44 @@ def _transition_decision(
         for item in ranked
         if _candidate_conflicts_regime(item, incumbent)
     )
-    active_contexts = tuple(
-        item
-        for item in contexts
-        if (
-            (
-                item.high_confirmation_present
-                and item.last_evidence_at > (incumbent.established_at or 0.0)
-            )
-            or item.last_evidence_at > last_aligned_at
+    recovery = {
+        item.context_id: _original_cycle_recovery_confirmations(
+            incumbent=incumbent,
+            context=item,
+            relationships=relationships,
+            event_map=event_map,
         )
+        for item in contexts
+    }
+    activity = {
+        item.context_id: _context_activity(
+            item,
+            incumbent=incumbent,
+            last_aligned_at=last_aligned_at,
+            confirmations=len(recovery[item.context_id]),
+            prior=prior,
+        )
+        for item in contexts
+    }
+    contexts = tuple(
+        _annotate_context_recovery(
+            item,
+            incumbent=incumbent,
+            active=activity[item.context_id],
+            confirmations=len(recovery[item.context_id]),
+        )
+        for item in contexts
+    )
+    active_contexts = tuple(
+        item for item in contexts if activity[item.context_id]
+    )
+    # Evidence-only, so repeated rebuilds keep the same decision identity.
+    original_cycle_reconfirmed = any(
+        not activity[item.context_id]
+        and item.authorization_state is ChallengerAuthorization.AUTHORIZED
+        and item.last_evidence_at > (incumbent.established_at or 0.0)
+        and len(recovery[item.context_id]) >= ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS
+        for item in contexts
     )
     strongest = max(active_contexts or contexts, key=_context_rank, default=None)
     authorized_h3 = max(
@@ -1021,6 +1076,13 @@ def _transition_decision(
         new_regime = _regime_from_candidate(
             challenger_candidate, status=RegimeRecordStatus.ESTABLISHED
         )
+        if new_regime.established_at is None:
+            # The challenger passed H3 on its post-establishment evidence; the
+            # establishment boundary must exist so the superseded regime is an
+            # ordinary challenger afterwards.
+            new_regime = replace(
+                new_regime, established_at=authorized_h3.last_evidence_at
+            )
         old_regime = replace(
             incumbent,
             status=RegimeRecordStatus.SUPERSEDED,
@@ -1071,12 +1133,7 @@ def _transition_decision(
         provisional = _regime_from_candidate(
             challenger_candidate, status=RegimeRecordStatus.PROVISIONAL
         )
-        previous_state = prior.state if prior is not None else None
-        state = (
-            RegimeState.NEW_REGIME_PROVISIONAL
-            if previous_state is RegimeState.TRANSITION_CONFIRMED
-            else RegimeState.TRANSITION_CONFIRMED
-        )
+        state = _stable_transition_state(prior, incumbent, authorized_h2)
         context_status = (
             ChallengerStatus.PROVISIONAL
             if state is RegimeState.NEW_REGIME_PROVISIONAL
@@ -1122,6 +1179,9 @@ def _transition_decision(
                 "h2_challenger_authorizes_provisional_transition",
                 "old_incumbent_retained_for_rollback",
                 "shadow_countdown_unsafe_during_transition",
+                _recovery_progress_reason(
+                    len(recovery.get(authorized_h2.context_id, ()))
+                ),
             ),
         )
 
@@ -1146,7 +1206,7 @@ def _transition_decision(
                 *(
                     strongest.high_relationship_ids
                     if strongest is not None
-                    and strongest.last_evidence_at > last_aligned_at
+                    and activity.get(strongest.context_id, False)
                     else ()
                 ),
             }
@@ -1161,6 +1221,16 @@ def _transition_decision(
             "two_coherent_strong_contradictions_without_h2",
             "incumbent_retained",
             "shadow_countdown_unsafe",
+            _recovery_progress_reason(
+                min(
+                    (
+                        len(recovery[item.context_id])
+                        for item in active_contexts
+                        if len(item.high_relationship_ids) >= 2
+                    ),
+                    default=0,
+                )
+            ),
         )
     elif has_normal_context:
         state = RegimeState.CHALLENGER_ACCUMULATING
@@ -1199,6 +1269,11 @@ def _transition_decision(
         reasons = (
             "established_incumbent_stable",
             "aligned_evidence_clears_active_level_one_suspicion",
+        )
+    if original_cycle_reconfirmed:
+        reasons = (
+            *reasons,
+            "provisional_challenger_resolved_by_original_cycle_confirmations",
         )
     return _decision(
         server_key=server_key,
@@ -1368,6 +1443,8 @@ def _challenger_context(
         reasons.add("h3_high_confirmation_present")
     if candidate.candidate_period_seconds == incumbent.candidate_period_seconds:
         reasons.add("same_period_distinct_phase_regime")
+    if HISTORICAL_CHALLENGER_EVIDENCE_REASON in candidate.reason_codes:
+        reasons.add(HISTORICAL_CHALLENGER_EVIDENCE_REASON)
     return ChallengerContext(
         schema_version=AUTHORITY_SCHEMA_VERSION,
         semantic_version=AUTHORITY_SEMANTIC_VERSION,
@@ -1392,6 +1469,289 @@ def _challenger_context(
         last_evidence_at=candidate.last_evidence_at,
         reason_codes=tuple(sorted(reasons)),
     )
+
+
+def _post_establishment_view(
+    candidate: AuthorityCandidate,
+    *,
+    established_at: float | None,
+    relationship_map: dict[str, IntervalRelationship],
+    streaks: tuple[CadenceStreak, ...],
+    relationships: tuple[IntervalRelationship, ...],
+    normal_score: ScheduleScore,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    event_map: dict[str, PhysicalRestartEvent],
+) -> AuthorityCandidate:
+    """Return the challenger as seen against an established incumbent.
+
+    High evidence that starts before the incumbent's establishment is
+    historical: it is retained (and still contributes to the regime's own
+    confidence if it is ever re-established), but it cannot authorize a
+    transition away from a newer established regime.  The unchanged H1-H4
+    gates are recomputed on the post-establishment subset only.  Identity
+    (regime, period, phase) stays that of the full candidate.
+    """
+
+    if established_at is None or not candidate.high_relationship_ids:
+        return candidate
+    retained = tuple(
+        relationship_map[identity]
+        for identity in candidate.high_relationship_ids
+        if identity in relationship_map
+        and relationship_map[identity].left_at >= established_at
+    )
+    if len(retained) == len(candidate.high_relationship_ids):
+        return candidate
+    reasons = tuple(
+        sorted({*candidate.reason_codes, HISTORICAL_CHALLENGER_EVIDENCE_REASON})
+    )
+    if not retained:
+        return replace(
+            candidate,
+            high_relationship_ids=(),
+            maximal_streak_ids=(),
+            high_authority=0.0,
+            high_phase_authority=0.0,
+            h1_gate=False,
+            h2_gate=False,
+            h3_gate=False,
+            h4_gate=False,
+            reason_codes=reasons,
+        )
+    retained_ids = {item.relationship_id for item in retained}
+    period = candidate.candidate_period_seconds
+    view, _normal = _authority_candidate(
+        server_key=candidate.server_key,
+        period=period,
+        component=tuple(
+            sorted(
+                retained,
+                key=lambda item: (item.left_at, item.right_at, item.relationship_id),
+            )
+        ),
+        streaks=tuple(
+            item
+            for item in streaks
+            if item.candidate_period_seconds == period
+            and set(item.relationship_ids).issubset(retained_ids)
+        ),
+        all_relationships=relationships,
+        normal_candidate=normal_score.candidate(period),
+        windows=windows,
+        events=events,
+        event_map=event_map,
+    )
+    return replace(
+        candidate,
+        high_relationship_ids=view.high_relationship_ids,
+        maximal_streak_ids=view.maximal_streak_ids,
+        high_authority=view.high_authority,
+        high_phase_authority=view.high_phase_authority,
+        h1_gate=view.h1_gate,
+        h2_gate=view.h2_gate,
+        h3_gate=view.h3_gate,
+        h4_gate=view.h4_gate,
+        first_evidence_at=view.first_evidence_at,
+        last_evidence_at=view.last_evidence_at,
+        reason_codes=reasons,
+    )
+
+
+def _original_cycle_recovery_confirmations(
+    *,
+    incumbent: RegimeRecord,
+    context: ChallengerContext,
+    relationships: tuple[IntervalRelationship, ...],
+    event_map: dict[str, PhysicalRestartEvent],
+) -> tuple[str, ...]:
+    """Independent incumbent intervals observed after the challenger evidence.
+
+    Each confirmation is an existing high-eligible DIRECT relationship
+    (complete same-chain continuity, authentic endpoints, no intervening
+    restart) at the incumbent's period whose phase and both endpoints lie
+    within the incumbent's tolerance, and which starts strictly after the
+    challenger's latest high evidence (a restart shared with the challenger
+    cannot open a confirmation).  Overlapping or duplicated intervals
+    count once; adjacent intervals sharing one restart are independent.
+    """
+
+    if context.authorization_state is ChallengerAuthorization.ESTABLISHED:
+        return ()
+    period = incumbent.candidate_period_seconds
+    tolerance = incumbent.phase_tolerance
+    eligible = []
+    for item in relationships:
+        if (
+            not item.high_authority_eligible
+            or item.relationship_kind is not RelationshipKind.DIRECT
+            or item.intervening_event_ids
+            or item.candidate_period_seconds != period
+            or item.left_at <= context.last_evidence_at
+            or _circular_distance(
+                _relationship_phase_value(item, period),
+                incumbent.phase_offset,
+                period,
+            )
+            > tolerance
+        ):
+            continue
+        left = event_map.get(item.left_event_id)
+        right = event_map.get(item.right_event_id)
+        if left is None or right is None:
+            continue
+        if not all(
+            _authentic_event(value)
+            and _event_at(value) is not None
+            and _circular_distance(_event_at(value), incumbent.phase_offset, period)
+            <= tolerance
+            for value in (left, right)
+        ):
+            continue
+        if relationship_authority_quality(item, (left, right)) <= 0.0:
+            continue
+        eligible.append(item)
+    selected: list[str] = []
+    pairs: set[tuple[str, str]] = set()
+    latest_end = -math.inf
+    for item in sorted(
+        eligible, key=lambda value: (value.right_at, value.left_at, value.relationship_id)
+    ):
+        pair = (item.left_event_id, item.right_event_id)
+        if pair in pairs or item.left_at < latest_end:
+            continue
+        selected.append(item.relationship_id)
+        pairs.add(pair)
+        latest_end = item.right_at
+    return tuple(selected)
+
+
+def _credible_suspension_context(context: ChallengerContext) -> bool:
+    return bool(
+        context.authorization_state is not ChallengerAuthorization.ESTABLISHED
+        and (
+            context.high_confirmation_present
+            or len(context.high_relationship_ids) >= 2
+        )
+    )
+
+
+def _context_activity(
+    context: ChallengerContext,
+    *,
+    incumbent: RegimeRecord,
+    last_aligned_at: float,
+    confirmations: int,
+    prior: AuthorityDecision | None,
+) -> bool:
+    recent = context.last_evidence_at > last_aligned_at
+    post_establishment = context.last_evidence_at > (incumbent.established_at or 0.0)
+    recovered = confirmations >= ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS
+    if context.authorization_state is ChallengerAuthorization.ESTABLISHED:
+        # An H3 challenger is promoted immediately; there is no rollback
+        # privilege to apply.
+        return bool(post_establishment or recent)
+    if context.high_confirmation_present:
+        return bool((post_establishment or recent) and not recovered)
+    if len(context.high_relationship_ids) >= 2:
+        # A level-2 context that has actually suspended the countdown stays
+        # credible until the original cycle is reconfirmed twice; a single
+        # aligned restart no longer clears it.  Contexts that never suspended
+        # the countdown keep the original latest-aligned rule.
+        return bool(
+            recent
+            or (
+                _prior_suspension_latched(prior, incumbent, context)
+                and not recovered
+            )
+        )
+    return recent
+
+
+def _prior_suspension_latched(
+    prior: AuthorityDecision | None,
+    incumbent: RegimeRecord,
+    context: ChallengerContext,
+) -> bool:
+    if (
+        prior is None
+        or prior.incumbent_shadow_regime is None
+        or prior.incumbent_shadow_regime.regime_id != incumbent.regime_id
+    ):
+        return False
+    period = context.candidate_period_seconds
+    return any(
+        COUNTDOWN_SUSPENSION_LATCH_REASON in item.reason_codes
+        and item.incumbent_regime_id == incumbent.regime_id
+        and item.candidate_period_seconds == period
+        and _circular_distance(item.phase_offset, context.phase_offset, period)
+        <= context.phase_tolerance
+        for item in prior.challenger_contexts
+    )
+
+
+def _annotate_context_recovery(
+    context: ChallengerContext,
+    *,
+    incumbent: RegimeRecord,
+    active: bool,
+    confirmations: int,
+) -> ChallengerContext:
+    if not _credible_suspension_context(context):
+        return context
+    reasons = set(context.reason_codes)
+    if context.high_confirmation_present:
+        if context.last_evidence_at <= (incumbent.established_at or 0.0):
+            return context
+        reasons.add(_recovery_progress_reason(confirmations))
+    elif active:
+        reasons.add(COUNTDOWN_SUSPENSION_LATCH_REASON)
+        reasons.add(_recovery_progress_reason(confirmations))
+    else:
+        return context
+    return replace(context, reason_codes=tuple(sorted(reasons)))
+
+
+def _recovery_progress_reason(confirmations: int) -> str:
+    count = min(int(confirmations), ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS)
+    return (
+        f"original_cycle_recovery_confirmations_{count}_of_"
+        f"{ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS}"
+    )
+
+
+def _stable_transition_state(
+    prior: AuthorityDecision | None,
+    incumbent: RegimeRecord,
+    challenger: ChallengerContext,
+) -> RegimeState:
+    """Deterministic H2 transition state.
+
+    Entry is TRANSITION_CONFIRMED.  The same challenger moves to
+    NEW_REGIME_PROVISIONAL only when it gains newer high evidence; with
+    identical evidence the prior transition state is kept, so rebuilds no
+    longer alternate (and no longer mint a new decision identity).
+    """
+
+    previous = prior.strongest_challenger if prior is not None else None
+    period = challenger.candidate_period_seconds
+    same_transition = bool(
+        prior is not None
+        and prior.state
+        in {RegimeState.TRANSITION_CONFIRMED, RegimeState.NEW_REGIME_PROVISIONAL}
+        and prior.incumbent_shadow_regime is not None
+        and prior.incumbent_shadow_regime.regime_id == incumbent.regime_id
+        and previous is not None
+        and previous.candidate_period_seconds == period
+        and _circular_distance(previous.phase_offset, challenger.phase_offset, period)
+        <= challenger.phase_tolerance
+    )
+    if not same_transition:
+        return RegimeState.TRANSITION_CONFIRMED
+    assert prior is not None and previous is not None
+    if challenger.last_evidence_at > previous.last_evidence_at:
+        return RegimeState.NEW_REGIME_PROVISIONAL
+    return prior.state
 
 
 def _regime_from_candidate(

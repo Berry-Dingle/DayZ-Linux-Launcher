@@ -602,7 +602,7 @@ def test_h2_four_hour_challenger_authorizes_provisional_transition():
     assert not value.prediction_usable and not value.countdown_safe
 
 
-def test_repeated_h2_evaluation_enters_new_regime_provisional():
+def test_repeated_h2_evaluation_is_stable_and_new_evidence_enters_provisional():
     (events3, relationships3, streaks3), incumbent = established_three_hour()
     start = events3[-1].canonical_phase_at + HOUR
     events4, relationships4, streaks4 = cadence(4 * HOUR, 3, start=start, sequence=200)
@@ -612,14 +612,37 @@ def test_repeated_h2_evaluation_enters_new_regime_provisional():
         combine(streaks3, streaks4),
         prior=incumbent,
     )
-    provisional = evaluate(
+    repeated = evaluate(
         combine(events3, events4),
         combine(relationships3, relationships4),
         combine(streaks3, streaks4),
         prior=transition,
     )
+    # Stage 6: identical evidence no longer alternates the transition state.
+    assert transition.state is authority.RegimeState.TRANSITION_CONFIRMED
+    assert repeated == transition
+    assert repeated.decision_id == transition.decision_id
+
+    # Newer challenger support that stays below H3 moves it to provisional.
+    later_left = event(300, start + 16 * HOUR, authenticity=0.6)
+    later_right = event(301, start + 20 * HOUR, authenticity=0.6)
+    later = relationship(later_left, later_right, 4 * HOUR, chain="challenger-later")
+    provisional = evaluate(
+        combine(events3, events4, (later_left, later_right)),
+        combine(relationships3, relationships4, (later,)),
+        combine(streaks3, streaks4),
+        prior=repeated,
+    )
+    assert not candidate(provisional, 4 * HOUR).h3_gate
     assert provisional.state is authority.RegimeState.NEW_REGIME_PROVISIONAL
     assert provisional.incumbent_shadow_regime.candidate_period_seconds == 3 * HOUR
+    settled = evaluate(
+        combine(events3, events4, (later_left, later_right)),
+        combine(relationships3, relationships4, (later,)),
+        combine(streaks3, streaks4),
+        prior=provisional,
+    )
+    assert settled == provisional
 
 
 def test_disconfirmed_provisional_challenger_rolls_back_to_old_incumbent():
