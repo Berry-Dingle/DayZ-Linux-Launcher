@@ -20,10 +20,17 @@ from .companion_restart_phase2_expected_windows import (
 )
 from .companion_restart_phase2_scoring import (
     CANDIDATE_PERIODS,
+    PHASE_UNCERTAINTY_CAP,
     CandidateScore,
     ScheduleScore,
+    _event_count_cap,
+    _event_tolerance,
+    _event_weight,
+    _phase_cluster,
+    _signed_phase_residual,
     candidate_phase_tolerance,
     event_learning_eligible,
+    phase_quality_band,
 )
 
 
@@ -66,6 +73,9 @@ TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM = 0.909
 TWO_INTERVAL_ESTABLISHMENT_REASON = "unknown_server_established_by_two_interval_streak"
 # Persistent marker on a regime whose origin was upgraded NORMAL -> CONTINUITY.
 ORIGIN_UPGRADE_REASON = "normal_origin_upgraded_to_continuity"
+# Stage 8.3 long-horizon sparse evidence (the ``aligned_normal`` input of the
+# unchanged combined formula; its 0.10 ceiling is unchanged).
+LONG_HORIZON_SPARSE_REASON = "long_horizon_per_event_sparse_statistic_v1"
 
 
 class AuthorityGate(str, Enum):
@@ -292,6 +302,7 @@ def evaluate_authority(
     streak_values = _unique_streaks(streaks, server_key)
     event_values = _unique_events(events, server_key)
     window_values = _latest_window_records(expected_window_ledger, server_key)
+    sparse = _sparse_evidence(event_values, prior_decision)
     candidates, normal_ledger, high_ledger = _build_ledgers(
         server_key=server_key,
         normal_score=normal_score,
@@ -299,6 +310,7 @@ def evaluate_authority(
         streaks=streak_values,
         windows=window_values,
         events=event_values,
+        sparse=sparse,
     )
     return _transition_decision(
         server_key=server_key,
@@ -311,6 +323,126 @@ def evaluate_authority(
         prior=prior_decision,
         relationships=relationship_values,
         streaks=streak_values,
+        sparse=sparse,
+    )
+
+
+@dataclass(frozen=True)
+class _SparseEvidence:
+    """Persisted physical restarts usable as independent sparse evidence.
+
+    ``events`` are the authentic, learning-eligible restarts with a positive
+    schedule weight, each physical restart once (``_unique_events``), over the
+    whole persisted horizon.  ``historical`` maps each superseded regime to
+    the restarts it explained up to its supersession: they may not strengthen
+    a conflicting regime.
+    """
+
+    events: tuple[PhysicalRestartEvent, ...]
+    historical: tuple[tuple[RegimeRecord, frozenset[str]], ...]
+
+
+def _sparse_evidence(
+    events: tuple[PhysicalRestartEvent, ...], prior: AuthorityDecision | None
+) -> _SparseEvidence:
+    usable = tuple(
+        item
+        for item in events
+        if _authentic_event(item)
+        and _event_weight(item) > 0
+        and _event_at(item) is not None
+    )
+    historical = []
+    for regime in prior.regimes if prior is not None else ():
+        if (
+            regime.status is not RegimeRecordStatus.SUPERSEDED
+            or regime.superseded_at is None
+        ):
+            continue
+        explained = frozenset(
+            item.event_id
+            for item in usable
+            if _event_at(item) <= regime.superseded_at
+            and _circular_distance(
+                _event_at(item),
+                regime.phase_offset,
+                regime.candidate_period_seconds,
+            )
+            <= regime.phase_tolerance
+        )
+        historical.append((regime, explained))
+    return _SparseEvidence(
+        events=usable,
+        historical=tuple(sorted(historical, key=lambda item: item[0].regime_id)),
+    )
+
+
+def _long_horizon_sparse_confidence(
+    *,
+    period: int,
+    phase_offset: float,
+    sparse: _SparseEvidence,
+    excluded_event_ids: frozenset[str],
+) -> float:
+    """Per-event sparse support for one candidate (period, phase).
+
+    Reuses the schema-3 per-event phase statistic: event-count cap x MAD
+    quality band x consistency, with effective counts weighted by the
+    existing schedule weights.  Every physical restart counts at most once;
+    the candidate's own high-relationship endpoints are excluded so no
+    restart is counted in both the continuous and the sparse slot.  Gaps
+    are never interpreted (no relationships, no inferred restarts), so
+    observations days apart remain independent evidence.  Consistency is
+    measured over the restarts from the first aligned one onwards.
+    """
+
+    historical: set[str] = set()
+    for regime, explained in sparse.historical:
+        if (
+            period != regime.candidate_period_seconds
+            or _circular_distance(phase_offset, regime.phase_offset, period)
+            > regime.phase_tolerance
+        ):
+            historical.update(explained)
+    pool = tuple(
+        item for item in sparse.events if item.event_id not in excluded_event_ids
+    )
+    aligned = tuple(
+        item
+        for item in pool
+        if item.event_id not in historical
+        and abs(_signed_phase_residual(_event_at(item), phase_offset, period))
+        <= _event_tolerance(period, item)
+    )
+    if not aligned:
+        return 0.0
+    first = min(_event_at(item) for item in aligned)
+    effective = sum(_event_weight(item) for item in aligned)
+    total = sum(
+        _event_weight(item) for item in pool if _event_at(item) >= first
+    )
+    mad = statistics.median(
+        max(
+            abs(_signed_phase_residual(_event_at(item), phase_offset, period)),
+            min(PHASE_UNCERTAINTY_CAP, max(0.0, item.phase_uncertainty)),
+        )
+        for item in aligned
+    )
+    value = (
+        _event_count_cap(effective)
+        * phase_quality_band(mad)
+        * (effective / total if total > 0 else 0.0)
+    )
+    return round(min(1.0, max(0.0, value)), 6)
+
+
+def _relationship_endpoint_ids(
+    relationships: Iterable[IntervalRelationship],
+) -> frozenset[str]:
+    return frozenset(
+        value
+        for item in relationships
+        for value in (item.left_event_id, item.right_event_id)
     )
 
 
@@ -350,6 +482,7 @@ def _build_ledgers(
     streaks: tuple[CadenceStreak, ...],
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
+    sparse: _SparseEvidence,
 ) -> tuple[
     tuple[AuthorityCandidate, ...], NormalEvidenceLedger, HighEvidenceLedger
 ]:
@@ -387,38 +520,46 @@ def _build_ledgers(
                 windows=windows,
                 events=events,
                 event_map=event_map,
+                sparse=sparse,
             )
             candidate_values.append(candidate)
             normal_values.append(normal)
 
+        # Normal-only candidates: the schema-3 recent phase (unchanged
+        # identity) and the long-horizon phase of the persisted sparse
+        # restarts, each only where no candidate of this period already sits.
         normal_candidate = normal_score.candidate(period)
-        if normal_candidate.phase_offset is None:
-            continue
-        has_normal_evidence = bool(
+        phases = []
+        if normal_candidate.phase_offset is not None and bool(
             normal_candidate.fundamental_period_confidence > 0
             or normal_candidate.phase_confidence > 0
             or any(item.candidate_period_seconds == period for item in relationships)
-        )
-        if not has_normal_evidence:
-            continue
-        if any(
-            _circular_distance(
-                item.phase_offset, normal_candidate.phase_offset, period
-            )
-            <= item.phase_tolerance
-            for item in candidate_values
-            if item.candidate_period_seconds == period
         ):
-            continue
-        candidate, normal = _normal_only_candidate(
-            server_key=server_key,
-            normal_candidate=normal_candidate,
-            relationships=relationships,
-            windows=windows,
-            events=events,
+            phases.append(float(normal_candidate.phase_offset) % period)
+        long_horizon_phase, _mad, aligned_count, _recent = _phase_cluster(
+            sparse.events, period
         )
-        candidate_values.append(candidate)
-        normal_values.append(normal)
+        if long_horizon_phase is not None and aligned_count > 0:
+            phases.append(float(long_horizon_phase) % period)
+        for phase in phases:
+            if any(
+                _circular_distance(item.phase_offset, phase, period)
+                <= item.phase_tolerance
+                for item in candidate_values
+                if item.candidate_period_seconds == period
+            ):
+                continue
+            candidate, normal = _normal_only_candidate(
+                server_key=server_key,
+                normal_candidate=normal_candidate,
+                phase=phase,
+                relationships=relationships,
+                windows=windows,
+                events=events,
+                sparse=sparse,
+            )
+            candidate_values.append(candidate)
+            normal_values.append(normal)
 
     candidates = tuple(sorted(candidate_values, key=_candidate_sort_key))
     normal_candidates = tuple(
@@ -489,6 +630,7 @@ def _authority_candidate(
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
     event_map: dict[str, PhysicalRestartEvent],
+    sparse: _SparseEvidence,
 ) -> tuple[AuthorityCandidate, NormalCandidateEvidence]:
     tolerance = candidate_phase_tolerance(period)
     quality_values = tuple(
@@ -533,6 +675,8 @@ def _authority_candidate(
         relationships=all_relationships,
         windows=windows,
         events=events,
+        sparse=sparse,
+        excluded_event_ids=_relationship_endpoint_ids(component),
     )
     aligned_normal = normal.aligned_normal_confidence
     combined = high_authority + (1.0 - high_authority) * min(
@@ -653,12 +797,14 @@ def _normal_only_candidate(
     *,
     server_key: str,
     normal_candidate: CandidateScore,
+    phase: float,
     relationships: tuple[IntervalRelationship, ...],
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
+    sparse: _SparseEvidence,
 ) -> tuple[AuthorityCandidate, NormalCandidateEvidence]:
     period = normal_candidate.period_seconds
-    phase = float(normal_candidate.phase_offset or 0.0) % period
+    phase = float(phase) % period
     tolerance = candidate_phase_tolerance(period)
     normal = _normal_candidate_evidence(
         period=period,
@@ -668,6 +814,8 @@ def _normal_only_candidate(
         relationships=relationships,
         windows=windows,
         events=events,
+        sparse=sparse,
+        excluded_event_ids=frozenset(),
     )
     defining = normal.aligned_relationship_ids or (
         f"normal-candidate-{period}-{round(phase, 6)}",
@@ -743,6 +891,8 @@ def _normal_candidate_evidence(
     relationships: tuple[IntervalRelationship, ...],
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
+    sparse: _SparseEvidence,
+    excluded_event_ids: frozenset[str],
 ) -> NormalCandidateEvidence:
     aligned_relationships = tuple(
         item
@@ -753,20 +903,14 @@ def _normal_candidate_evidence(
         )
         <= tolerance
     )
-    normal_phase_compatible = bool(
-        normal_candidate.phase_offset is not None
-        and _circular_distance(
-            normal_candidate.phase_offset, phase_offset, period
-        )
-        <= tolerance
-    )
-    aligned_confidence = (
-        min(
-            normal_candidate.fundamental_period_confidence,
-            normal_candidate.phase_confidence,
-        )
-        if normal_phase_compatible
-        else 0.0
+    # Stage 8.3: the sparse input is the long-horizon per-event statistic over
+    # persisted restarts, not schema-3's recent-window (7 day / 16 event)
+    # pair-derived confidence, which also re-counted continuous intervals.
+    aligned_confidence = _long_horizon_sparse_confidence(
+        period=period,
+        phase_offset=phase_offset,
+        sparse=sparse,
+        excluded_event_ids=excluded_event_ids,
     )
     misses = tuple(
         item.result_id
@@ -832,6 +976,7 @@ def _normal_candidate_evidence(
             "normal_phase_and_period_compatibility_required",
             "normal_reinforcement_bounded",
             "off_phase_spacing_not_incumbent_reinforcement",
+            LONG_HORIZON_SPARSE_REASON,
         ),
     )
 
@@ -848,7 +993,10 @@ def _transition_decision(
     prior: AuthorityDecision | None,
     relationships: tuple[IntervalRelationship, ...] = (),
     streaks: tuple[CadenceStreak, ...] = (),
+    sparse: _SparseEvidence | None = None,
 ) -> AuthorityDecision:
+    if sparse is None:
+        sparse = _sparse_evidence(events, prior)
     ranked = tuple(sorted(candidates, key=_candidate_rank, reverse=True))
     previous_incumbent = prior.incumbent_shadow_regime if prior is not None else None
     event_map = {item.event_id: item for item in events}
@@ -917,6 +1065,7 @@ def _transition_decision(
         incumbent=incumbent,
         incumbent_candidate=incumbent_candidate,
         upgrade_reasons=upgrade_reasons,
+        sparse=sparse,
     )
 
 
@@ -1246,6 +1395,7 @@ def _incumbent_decision(
     incumbent: RegimeRecord,
     incumbent_candidate: AuthorityCandidate | None,
     upgrade_reasons: tuple[str, ...],
+    sparse: _SparseEvidence,
 ) -> AuthorityDecision:
     """The established-incumbent path: suspicion, challengers and transitions."""
 
@@ -1290,8 +1440,10 @@ def _incumbent_decision(
                 windows=windows,
                 events=events,
                 event_map=event_map,
+                sparse=sparse,
             ),
             normal=_normal_for_candidate(normal_ledger, item),
+            normal_context_strength=_schema3_context_strength(normal_score, item),
             active_miss_ids=active_misses,
             events=events,
         )
@@ -1679,6 +1831,7 @@ def _challenger_context(
     incumbent: RegimeRecord,
     candidate: AuthorityCandidate,
     normal: NormalCandidateEvidence,
+    normal_context_strength: float,
     active_miss_ids: tuple[str, ...],
     events: tuple[PhysicalRestartEvent, ...],
 ) -> ChallengerContext:
@@ -1750,7 +1903,7 @@ def _challenger_context(
         active_genuine_miss_ids=tuple(sorted(active_miss_ids)),
         high_relationship_ids=candidate.high_relationship_ids,
         streak_ids=candidate.maximal_streak_ids,
-        normal_context_strength=normal.aligned_normal_confidence,
+        normal_context_strength=normal_context_strength,
         high_authority=candidate.high_authority,
         high_confirmation_present=candidate.h2_gate or candidate.h3_gate,
         authorization_state=authorization,
@@ -1758,6 +1911,29 @@ def _challenger_context(
         first_evidence_at=candidate.first_evidence_at,
         last_evidence_at=candidate.last_evidence_at,
         reason_codes=tuple(sorted(reasons)),
+    )
+
+
+def _schema3_context_strength(
+    normal_score: ScheduleScore, candidate: AuthorityCandidate
+) -> float:
+    """Pattern-level normal context of a challenger (unchanged by Stage 8.3).
+
+    Challenger classification keeps its schema-3 basis (recent fundamental
+    and phase confidence at a compatible phase), so long-horizon sparse
+    evidence never escalates or relabels challenger contexts (D8-14).
+    """
+
+    period = candidate.candidate_period_seconds
+    normal = normal_score.candidate(period)
+    if (
+        normal.phase_offset is None
+        or _circular_distance(normal.phase_offset, candidate.phase_offset, period)
+        > candidate.phase_tolerance
+    ):
+        return 0.0
+    return round(
+        min(normal.fundamental_period_confidence, normal.phase_confidence), 6
     )
 
 
@@ -1772,6 +1948,7 @@ def _post_establishment_view(
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
     event_map: dict[str, PhysicalRestartEvent],
+    sparse: _SparseEvidence,
 ) -> AuthorityCandidate:
     """Return the challenger as seen against an established incumbent.
 
@@ -1831,6 +2008,7 @@ def _post_establishment_view(
         windows=windows,
         events=events,
         event_map=event_map,
+        sparse=sparse,
     )
     return replace(
         candidate,

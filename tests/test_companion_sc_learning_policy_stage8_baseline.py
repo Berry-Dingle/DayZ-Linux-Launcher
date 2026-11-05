@@ -33,6 +33,8 @@ both S09 cases into ordinary tests and added the ``test_s81_*`` section.
 Stage 8.2 (continuous confidence milestones: streak-bonus magnitude 0.10,
 H1-H4 gates kept on their 0.08 calibration) converted the S01 warning and S02
 95 % tests and added the ``test_s82_*`` section.
+Stage 8.3 (long-horizon per-event sparse input, ceiling unchanged) added the
+``test_s83_*`` section.
 """
 
 from __future__ import annotations
@@ -77,7 +79,12 @@ Presentation = consumers4.AuthorityPresentationKey
 # Planned implementation stages (design audit section 13).
 STAGE_8_5 = (
     "Stage 8.5 (sparse ceiling S and SE1-SE7 sparse establishment; "
-    "needs the Stage 8.3 long-horizon per-event sparse input)"
+    "builds on the Stage 8.3 long-horizon per-event sparse input)"
+)
+OPERATOR_DECISION_8_3 = (
+    "operator decision after Stage 8.3: removing the duplicated schema-3 term "
+    "leaves two-interval magnitude below 0.80 for any timing jitter "
+    "(warning threshold vs magnitude)"
 )
 STAGE_8_6 = "Stage 8.6 (QV refinements: queue return, ambiguous-drain learning)"
 
@@ -901,7 +908,7 @@ def test_s12_unconfirmed_drains_are_not_interval_relationship_endpoints():
     assert step.relationships == (), len(step.relationships)
 
 
-@expected_failure(STAGE_8_6, "AMBIGUOUS_DRAIN keeps an eligible hint weight; aligned drains raise the 3 h fundamental 0.45 -> 0.48 and combined 0.809 -> 0.8096")
+@expected_failure(STAGE_8_6, "AMBIGUOUS_DRAIN keeps an eligible hint weight; aligned drains raise the schema-3 3 h fundamental 0.45 -> 0.48 (schema-4 combined is no longer affected since Stage 8.3)")
 def test_s12_unconfirmed_drains_contribute_no_learning():
     plain = three_hour_chain(3)
     with_drains = plain.copy()
@@ -1511,3 +1518,254 @@ def test_s82_two_interval_warning_is_at_most_once_across_settle_and_reopen():
         value = later.consumer(now=due, fired_keys=fired)
         assert value.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
         assert not value.scheduled_pre_restart_alert_eligible
+
+
+# --------------------------------------------------------------------------
+# Stage 8.3 focused tests: long-horizon sparse evidence
+# --------------------------------------------------------------------------
+
+
+def sparse_support(step, period, phase=None):
+    candidate = step.candidate(period, phase)
+    return candidate.aligned_normal_confidence
+
+
+def test_s83_sparse_observations_accumulate_across_days_and_sessions():
+    supports = []
+    for count in (3, 5, 8):
+        step = sparse_pipeline(SPARSE_DISCRIMINATING[:count]).evaluate()
+        supports.append(sparse_support(step, P3))
+    final = sparse_pipeline().evaluate()
+    candidate = final.candidate(P3)
+
+    assert supports == [
+        round(scoring._event_count_cap(3), 6),
+        round(scoring._event_count_cap(5), 6),
+        round(scoring._event_count_cap(8), 6),
+    ]
+    assert candidate.high_authority == 0
+    assert candidate.combined_confidence == round(0.10 * supports[-1], 6)
+    assert len({item.monitoring_session_id for item in final.events}) == 8
+
+
+def test_s83_long_horizon_evidence_survives_the_schema3_recent_window():
+    """Eight observations spread over 14 days: schema-3 sees only its recent
+    7-day window, schema-4 sparse support counts every one."""
+
+    times = [at(day * 2, hour) for day, hour in enumerate((6, 9, 12, 15, 18, 21, 3, 15))]
+    step = sparse_pipeline(times).evaluate()
+
+    assert times[-1] - times[0] > 7 * DAY
+    assert step.score.candidate(P3).aligned_event_count < 8
+    assert sparse_support(step, P3) == round(scoring._event_count_cap(8), 6)
+
+
+def test_s83_repeated_clock_slots_on_different_days_count_separately():
+    first_days = [at(0, 21), at(2, 0), at(3, 21), at(5, 0)]
+    repeats = [at(1, 21), at(3, 0), at(4, 21), at(6, 0)]
+    before = sparse_pipeline(first_days).evaluate()
+    pipeline = sparse_pipeline(first_days)
+    pipeline.sparse("repeat", repeats)
+    after = pipeline.evaluate()
+
+    assert sparse_support(before, P3) == round(scoring._event_count_cap(4), 6)
+    assert sparse_support(after, P3) == round(scoring._event_count_cap(8), 6)
+
+
+def test_s83_one_physical_restart_delivered_twice_counts_once():
+    once = sparse_pipeline(SPARSE_DISCRIMINATING[:4])
+    twice = once.copy()
+    twice.events.extend(once.events)
+
+    assert twice.evaluate().decision == once.evaluate().decision
+    assert sparse_support(twice.evaluate(), P3) == round(scoring._event_count_cap(4), 6)
+
+
+def test_s83_no_relationships_are_fabricated_across_unmonitored_gaps():
+    step = sparse_pipeline().evaluate()
+    three = [item for item in step.relationships if item.candidate_period_seconds == P3]
+    candidate = step.candidate(P3)
+
+    # Consecutive observations are more than 8 periods apart (or separated
+    # by unmonitored time): no 3 h interval is inferred, high or otherwise.
+    assert all(not item.high_authority_eligible for item in step.relationships)
+    assert all(item.relationship_kind is not continuity.RelationshipKind.DIRECT for item in three)
+    assert not candidate.high_relationship_ids and not candidate.h1_gate
+    assert candidate.aligned_normal_confidence > 0
+
+
+def test_s83_normal_only_phase_comes_from_long_horizon_evidence():
+    """Ten restarts at one 3 h phase over 10 days, then two restarts an hour
+    off that phase 10 days later: schema-3's recent window only sees the two;
+    the long-horizon phase candidate is still derived and supported."""
+
+    old = [at(day, 9) for day in range(10)]
+    recent = [at(20, 10), at(21, 13)]
+    pipeline = sparse_pipeline(old)
+    pipeline.sparse("recent", recent)
+    step = pipeline.evaluate()
+    schema3_phase = step.score.candidate(P3).phase_offset
+    long_horizon = step.candidate(P3, at(0, 9) % P3)
+    recent_candidate = step.candidate(P3, at(20, 10) % P3)
+
+    assert abs(((schema3_phase - at(20, 10)) + P3 / 2) % P3 - P3 / 2) < 60
+    assert abs(((long_horizon.phase_offset - at(0, 9)) + P3 / 2) % P3 - P3 / 2) < 1
+    assert long_horizon.aligned_normal_confidence == round(
+        scoring._event_count_cap(10) * (10 / 12), 6
+    )
+    assert recent_candidate.regime_id != long_horizon.regime_id
+
+
+def test_s83_sparse_and_continuous_evidence_reinforce_one_candidate():
+    pipeline = three_hour_chain(3, day=7)
+    continuous = pipeline.evaluate()
+    pipeline.sparse("sparse", SPARSE_DISCRIMINATING[:5])
+    mixed = pipeline.evaluate()
+    before = continuous.candidate(P3)
+    after = mixed.candidate(P3)
+
+    assert after.regime_id == before.regime_id
+    assert after.high_authority == before.high_authority == 0.80
+    assert before.aligned_normal_confidence == 0
+    assert after.aligned_normal_confidence == round(scoring._event_count_cap(5), 6)
+    assert after.combined_confidence == round(
+        0.80 + 0.20 * 0.10 * after.aligned_normal_confidence, 6
+    )
+    assert mixed.decision.state is State.ESTABLISHED
+
+
+def test_s83_own_high_endpoints_are_excluded_from_sparse_support():
+    pipeline = three_hour_chain(4)
+    only_continuous = pipeline.evaluate()
+    pipeline.sparse("extra", [at(2, 9)])
+    with_one_sparse = pipeline.evaluate()
+
+    assert sparse_support(only_continuous, P3) == 0
+    assert only_continuous.candidate(P3).combined_confidence == 0.95
+    assert sparse_support(with_one_sparse, P3) == round(scoring._event_count_cap(1), 6)
+
+
+def test_s83_alternative_periods_evaluate_the_same_restarts_independently():
+    step = three_hour_chain(4).evaluate()
+    six = step.candidate(P3 * 2, at(0, 12) % (P3 * 2))
+
+    # The 3 h candidate's own endpoints give it no sparse support, but the
+    # same four restarts are evaluated independently for 6 h: the long-horizon
+    # 6 h phase is 12:00/18:00 (2 aligned of the 3 restarts from 12:00 on).
+    assert sparse_support(step, P3) == 0
+    assert abs(((six.phase_offset - at(0, 12)) + P3) % (2 * P3) - P3) < 1
+    assert six.aligned_normal_confidence == round(scoring._event_count_cap(2) * 2 / 3, 6)
+    assert not six.h1_gate and not six.h2_gate
+    assert step.decision.selected_shadow_regime.candidate_period_seconds == P3
+
+
+def _superseded_three_hour():
+    pipeline = Pipeline()
+    pipeline.observe("three", [at(0, 0) + index * P3 for index in range(7)])
+    original = settled(pipeline)
+    pipeline.observe("four", [at(1, 0) + index * 4 * HOUR for index in range(4)])
+    replaced = pipeline.evaluate(persisted(original.decision))
+    return pipeline, replaced
+
+
+def test_s83_superseded_regime_evidence_does_not_strengthen_a_conflicting_regime():
+    pipeline, replaced = _superseded_three_hour()
+    assert replaced.decision.state is State.NEW_REGIME_ESTABLISHED
+    old = next(
+        item for item in replaced.decision.regimes if item.candidate_period_seconds == P3
+    )
+    assert old.status is authority.RegimeRecordStatus.SUPERSEDED
+    without_history = pipeline.copy().evaluate()
+    with_history = pipeline.evaluate(persisted(replaced.decision))
+
+    # Day-0 00:00 and 12:00 lie on the 4 h grid, but they were explained by
+    # the superseded 3 h regime: they count only without that history.
+    assert sparse_support(without_history, 4 * HOUR) > 0
+    assert sparse_support(with_history, 4 * HOUR) == 0
+    assert (
+        with_history.decision.incumbent_shadow_regime.regime_id
+        == replaced.decision.incumbent_shadow_regime.regime_id
+    )
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(lambda: sparse_pipeline(), id="sparse"),
+        pytest.param(
+            lambda: (lambda p: (p.sparse("sparse", SPARSE_DISCRIMINATING[:5]), p)[1])(
+                three_hour_chain(3, day=7)
+            ),
+            id="mixed",
+        ),
+    ],
+)
+def test_s83_rebuild_and_reload_are_stable(build):
+    pipeline = build()
+    first = pipeline.evaluate()
+    values = rebuilds(pipeline, first)
+
+    assert len({item.decision.state for item in values}) == 1
+    assert values[1].decision == values[2].decision == values[3].decision
+    assert len({sparse_support(item, P3) for item in values}) == 1
+
+
+def test_s83_superseded_history_rebuild_is_stable():
+    pipeline, replaced = _superseded_three_hour()
+    values = rebuilds(pipeline, replaced)
+
+    assert values[1].decision == values[2].decision == values[3].decision
+
+
+def test_s83_sparse_only_evidence_cannot_establish_before_stage_8_5():
+    step = settled(sparse_pipeline(SPARSE_DISCRIMINATING + tuple(at(day, 0) for day in (7, 8, 9))))
+    value = step.consumer()
+
+    assert step.decision.state is State.NORMAL_LEARNING
+    assert all(item.combined_confidence <= 0.10 for item in step.decision.candidates)
+    assert not value.countdown_visible and not value.scheduled_warning_eligible
+
+
+@expected_failure(OPERATOR_DECISION_8_3, "a two-interval streak with 5 s timing jitter has combined 0.798986 < 0.80, so no scheduled warning")
+def test_s83_two_interval_establishment_with_realistic_jitter_enables_warning():
+    pipeline = Pipeline()
+    pipeline.observe("jitter", [at(0, 9), at(0, 12) + 5, at(0, 15)])
+    step = pipeline.evaluate()
+    occurrence = step.consumer().next_expected_restart_at
+    due = step.consumer(now=occurrence - 300)
+
+    assert step.decision.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert due.scheduled_warning_eligible, step.decision.combined_confidence
+
+
+@pytest.mark.parametrize(
+    "contaminate",
+    [
+        pytest.param(lambda item: replace(item, coverage_complete=False), id="coverage_incomplete"),
+        pytest.param(
+            lambda item: replace(
+                item,
+                coverage_complete=False,
+                lifecycle_interruption=detection.LifecycleMarker.SLEEP_GAP,
+            ),
+            id="sleep_gap_or_local_outage",
+        ),
+        pytest.param(
+            lambda item: replace(item, outcome=Outcome.AMBIGUOUS_DRAIN, authenticity=0.25),
+            id="unconfirmed_drain",
+        ),
+        pytest.param(
+            lambda item: replace(item, outcome=Outcome.INCOMPLETE, authenticity=0.10),
+            id="incomplete_episode",
+        ),
+    ],
+)
+def test_s83_ineligible_or_unconfirmed_restarts_add_no_sparse_support(contaminate):
+    clean = sparse_pipeline(SPARSE_DISCRIMINATING[:4])
+    contaminated = clean.copy()
+    contaminated.sparse("extra", SPARSE_DISCRIMINATING[4:])
+    contaminated.events[4:] = [contaminate(item) for item in contaminated.events[4:]]
+
+    assert sparse_support(contaminated.evaluate(), P3, at(0, 6) % P3) == sparse_support(
+        clean.evaluate(), P3, at(0, 6) % P3
+    )

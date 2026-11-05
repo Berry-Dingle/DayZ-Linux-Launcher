@@ -1661,16 +1661,7 @@ def _phase_confidence(
 ) -> float:
     if mad is None or aligned_count == 0:
         return 0.0
-    if mad <= 3 * 60:
-        quality = 1.0
-    elif mad <= 7 * 60:
-        quality = 0.9
-    elif mad <= 12 * 60:
-        quality = 0.75
-    elif mad <= 20 * 60:
-        quality = 0.5
-    else:
-        quality = 0.0
+    quality = phase_quality_band(mad)
     cap = _event_count_cap(aligned_count)
     consistency = aligned_count / max(1, total_count)
     confidence = cap * quality * consistency
@@ -1680,6 +1671,20 @@ def _phase_confidence(
     ):
         confidence = min(confidence, 0.60)
     return min(1.0, confidence)
+
+
+def phase_quality_band(mad: float) -> float:
+    """Phase-precision quality for a median absolute phase residual."""
+
+    if mad <= 3 * 60:
+        return 1.0
+    if mad <= 7 * 60:
+        return 0.9
+    if mad <= 12 * 60:
+        return 0.75
+    if mad <= 20 * 60:
+        return 0.5
+    return 0.0
 
 
 def _hint_diagnostics(work: _CandidateWork, period: int) -> HintDiagnostics:

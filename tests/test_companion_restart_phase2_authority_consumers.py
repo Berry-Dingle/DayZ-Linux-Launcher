@@ -1073,7 +1073,12 @@ def test_same_period_phase_transition_mapping(new_state, key):
 
 def test_unresolved_harmonic_blocks_prediction():
     base = _authority(4)
-    candidate = replace(base.candidates[0], harmonic_blockers=("unresolved_divisor",))
+    incumbent_candidate = next(
+        item
+        for item in base.candidates
+        if item.regime_id == base.selected_shadow_regime.regime_id
+    )
+    candidate = replace(incumbent_candidate, harmonic_blockers=("unresolved_divisor",))
     value = consumers4.evaluate_authority_consumers(
         _policy(
             replace(base, candidates=(candidate,)),

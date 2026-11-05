@@ -497,19 +497,40 @@ def test_one_month_unmonitored_is_exactly_neutral():
 
 
 def test_spotty_aligned_normal_evidence_only_refines_remaining_uncertainty():
+    # Stage 8.3: the sparse input is per-event over persisted restarts that
+    # are not the candidate's own high endpoints (here eight aligned
+    # confirmed restarts on earlier days, effective count 8 x 0.8 = 6.4).
+    events, relationships, streaks = cadence(3 * HOUR, 4)
+    base = evaluate(events, relationships, streaks)
+    original = candidate(base, 3 * HOUR)
+    assert original.aligned_normal_confidence == 0
+    assert original.combined_confidence == original.high_authority
+    spotty = tuple(
+        event(100 + index, BASE - (index + 1) * scoring.DAY) for index in range(8)
+    )
+    reinforced = evaluate(events + spotty, relationships, streaks, prior=base)
+    updated = candidate(reinforced, 3 * HOUR)
+    expected = round(scoring._event_count_cap(6.4), 6)
+    assert updated.high_authority == original.high_authority
+    assert updated.aligned_normal_confidence == expected
+    assert updated.combined_confidence == pytest.approx(
+        original.high_authority + (1 - original.high_authority) * 0.10 * expected,
+        abs=1e-6,
+    )
+    assert updated.combined_confidence - updated.high_authority <= 0.10
+
+
+def test_schema3_recent_window_scores_no_longer_feed_sparse_magnitude():
+    # Stage 8.3 removes the schema-3 pair-derived input (which re-counted the
+    # continuous intervals); schema-3 values alone no longer move combined.
     events, relationships, streaks = cadence(3 * HOUR, 4)
     base = evaluate(events, relationships, streaks)
     phase = candidate(base, 3 * HOUR).phase_offset
     score = score_for(3 * HOUR, phase, 0.9, 0.9)
     reinforced = evaluate(events, relationships, streaks, score=score, prior=base)
-    original = candidate(base, 3 * HOUR)
-    updated = candidate(reinforced, 3 * HOUR)
-    assert updated.high_authority == original.high_authority
-    assert updated.combined_confidence == pytest.approx(
-        original.high_authority + (1 - original.high_authority) * 0.09,
-        abs=1e-6,
-    )
-    assert updated.combined_confidence - updated.high_authority <= 0.10
+    assert candidate(reinforced, 3 * HOUR).combined_confidence == candidate(
+        base, 3 * HOUR
+    ).combined_confidence
 
 
 def test_normal_correct_spacing_at_shifted_phase_does_not_reinforce_incumbent():

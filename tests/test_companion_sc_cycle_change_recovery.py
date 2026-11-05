@@ -600,8 +600,11 @@ def test_14_former_regime_can_return_through_normal_rules():
     )
     four = next(item for item in value.regimes if item.candidate_period_seconds == P4)
     assert four.status is authority.RegimeRecordStatus.SUPERSEDED
-    # Historical learning is preserved in the re-established regime.
-    assert value.combined_confidence == authority.HIGH_AUTHORITY_CAP
+    # Historical learning is preserved in the re-established regime (since
+    # Stage 8.3 aligned restarts outside its streaks add bounded sparse
+    # support on top of the capped continuous authority).
+    assert value.selected_shadow_regime.high_authority == authority.HIGH_AUTHORITY_CAP
+    assert value.combined_confidence >= authority.HIGH_AUTHORITY_CAP
 
 
 # --------------------------------------------------------------------------
@@ -623,8 +626,11 @@ def test_15_and_16_restoration_preserves_confidence_and_challenger_evidence():
     assert after.candidate_period_seconds == before.candidate_period_seconds
     assert after.phase_offset == before.phase_offset
     assert after.established_at == before.established_at
-    assert after.combined_confidence == before.combined_confidence
-    assert value.combined_confidence == original.combined_confidence
+    # Continuous authority is preserved exactly; since Stage 8.3 the 4 h
+    # challenger restart on the 3 h grid adds bounded sparse support.
+    assert after.high_authority == before.high_authority
+    assert after.combined_confidence >= before.combined_confidence
+    assert value.combined_confidence >= original.combined_confidence
     # Challenger evidence is retained, not deleted, after restoration.
     context = next(
         item for item in value.challenger_contexts if item.candidate_period_seconds == P4
