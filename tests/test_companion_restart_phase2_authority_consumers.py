@@ -113,6 +113,29 @@ def _authority(event_count, period=3 * HOUR, *, server=SERVER, start=BASE):
     )
 
 
+def _likely_h2(period=3 * HOUR):
+    """H2 that misses the Stage 8.1 two-interval phase precision: LIKELY."""
+
+    events = (
+        _event(1, BASE),
+        _event(2, BASE + period + 50),
+        _event(3, BASE + 2 * period),
+    )
+    relationships = (
+        _relationship(events[0], events[1], period),
+        _relationship(events[1], events[2], period),
+    )
+    decision = authority.evaluate_authority(
+        server_key=SERVER,
+        normal_score=_empty_score(),
+        relationships=relationships,
+        streaks=continuity.build_cadence_streaks(relationships),
+        events=events,
+    )
+    assert decision.state is authority.RegimeState.LIKELY
+    return decision
+
+
 def _established_continuity_h2():
     source = _authority(4)
     regime = source.selected_shadow_regime
@@ -678,13 +701,37 @@ def test_h1_does_not_show_likely_even_at_fifty_percent():
     assert value.presentation_state is consumers4.AuthorityPresentationKey.NONE
 
 
-def test_h2_is_likely_at_seventy_nine_percent_without_countdown():
-    value = consumers4.evaluate_authority_consumers(_policy(_authority(3)))
+def test_h2_likely_shows_cycle_without_countdown():
+    decision = _likely_h2()
+    value = consumers4.evaluate_authority_consumers(_policy(decision))
     assert value.presentation_state is consumers4.AuthorityPresentationKey.LIKELY_CYCLE
-    assert value.confidence_display_value == 0.79
+    assert value.confidence_display_value == decision.combined_confidence
+    assert 0.77 < value.confidence_display_value < 0.79
     assert value.visible_cycle and not value.countdown_visible
     assert not value.scheduled_warning_eligible
     assert "h2_countdown_withheld" in value.reason_codes
+
+
+def test_two_interval_establishment_is_confirmed_with_countdown_but_no_warning():
+    # Stage 8.1 establishes at the unchanged ~79 % magnitude; the 0.80
+    # continuity-H2 warning threshold is untouched (magnitude is Stage 8.2).
+    decision = _authority(3)
+    regime = decision.selected_shadow_regime
+    occurrence = consumers4.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE + 100,
+    )
+    value = consumers4.evaluate_authority_consumers(
+        _policy(decision, now=occurrence - 300, restart_alert_enabled=True)
+    )
+    assert decision.state is authority.RegimeState.ESTABLISHED
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert value.confidence_display_value == 0.79
+    assert value.countdown_visible and value.countdown_safe
+    assert value.next_expected_restart_at == occurrence
+    assert "safe_established_continuity_h2_prediction_available" in value.reason_codes
+    assert not value.scheduled_warning_eligible
 
 
 def test_established_continuity_h2_retains_confirmed_cycle_eta_and_warning():
@@ -881,7 +928,7 @@ def test_offline_h3_retains_prediction_metadata_but_disables_warning():
 @pytest.mark.parametrize(
     "decision,expected_presentation",
     [
-        (_authority(3), consumers4.AuthorityPresentationKey.LIKELY_CYCLE),
+        (_likely_h2(), consumers4.AuthorityPresentationKey.LIKELY_CYCLE),
         (
             _transition(
                 _authority(4),

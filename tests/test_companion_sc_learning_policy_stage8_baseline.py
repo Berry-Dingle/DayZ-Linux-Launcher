@@ -18,7 +18,7 @@ Status of every test is explicit:
   holding through every Stage 8 sub-stage.
 * ``pytest.mark.xfail(strict=True, raises=AssertionError)`` tests describe
   approved Stage 8 policy that does not hold yet.  Each names the planned
-  implementation stage (``STAGE_8_1`` and so on).  ``strict=True`` makes an
+  implementation stage (``STAGE_8_2`` and so on).  ``strict=True`` makes an
   unexpected pass fail, so the marker must be removed in the stage that
   implements the behaviour.  ``raises=AssertionError`` keeps harness errors
   visible as real failures.
@@ -26,13 +26,17 @@ Status of every test is explicit:
 Scenario numbers (S01 to S19) follow the Stage 8.0 task brief.  Cases that
 are already covered by existing suites are not duplicated here; the Stage
 8.0 report maps them to those tests.
+
+Stage 8.1 (deterministic two-interval establishment, LIKELY guard and
+NORMAL -> CONTINUITY origin upgrade) converted S01 (establishment), S08 and
+both S09 cases into ordinary tests and added the ``test_s81_*`` section.
 """
 
 from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import pytest
 
@@ -68,10 +72,6 @@ Outcome = detection.EventOutcome
 Presentation = consumers4.AuthorityPresentationKey
 
 # Planned implementation stages (design audit section 13).
-STAGE_8_1 = (
-    "Stage 8.1 (origin upgrade, deterministic two-interval establishment, "
-    "LIKELY guard, established_at)"
-)
 STAGE_8_2 = "Stage 8.2 (two-interval and continuous magnitude, D8-3)"
 STAGE_8_5 = (
     "Stage 8.5 (sparse ceiling S and SE1-SE7 sparse establishment; "
@@ -563,7 +563,6 @@ def test_s01_precondition_two_consecutive_intervals_are_one_high_eligible_streak
     assert not candidate.harmonic_blockers
 
 
-@expected_failure(STAGE_8_1, "two consecutive complete intervals stay LIKELY with no countdown until an evidence-free rebuild")
 def test_s01_two_consecutive_intervals_establish_immediately_at_about_80_percent():
     step = three_hour_chain(3).evaluate()
     value = step.consumer()
@@ -576,7 +575,7 @@ def test_s01_two_consecutive_intervals_establish_immediately_at_about_80_percent
     assert shown is not None and 80 <= shown <= 85, shown
 
 
-@expected_failure(STAGE_8_2, "after establishment the two-interval magnitude 0.79945 is below the 0.80 warning threshold (also needs Stage 8.1)")
+@expected_failure(STAGE_8_2, "after establishment the two-interval magnitude 0.79945 is below the 0.80 warning threshold")
 def test_s01_establishment_immediately_enables_scheduled_warning():
     step = three_hour_chain(3).evaluate()
     occurrence = step.consumer().next_expected_restart_at
@@ -776,7 +775,6 @@ def test_s08_precondition_normal_origin_incumbent_and_h3_continuous_candidate():
     assert step.decision.incumbent_shadow_regime.regime_id == incumbent.regime_id
 
 
-@expected_failure(STAGE_8_1, "origin lock: the NORMAL-origin regime keeps gate NORMAL, so H3 continuous evidence gives no continuity countdown")
 def test_s08_continuous_evidence_upgrades_sparse_first_normal_regime():
     _normal_step, step = _sparse_first_then_continuous()
     regime = step.decision.selected_shadow_regime
@@ -798,7 +796,6 @@ def test_s08_continuous_evidence_upgrades_sparse_first_normal_regime():
         ),
     ],
 )
-@expected_failure(STAGE_8_1, "a LIKELY incumbent is rebuilt as ESTABLISHED by the incumbent path with no new evidence")
 def test_s09_likely_state_does_not_become_established_on_evidence_free_rebuild(build):
     pipeline = build()
     first = pipeline.evaluate()
@@ -1090,3 +1087,296 @@ def test_s19_generic_online_alert_is_independent_of_schedule_confidence(name):
     assert first.generic_recovery_alert_eligible
     assert first.generic_recovery_suppression_key.regime_id is None
     assert not again.generic_recovery_alert_eligible
+
+
+# --------------------------------------------------------------------------
+# Stage 8.1 focused tests: deterministic establishment and origin upgrade
+# --------------------------------------------------------------------------
+
+
+def genuine_miss(period, expected, *, key):
+    tolerance = scoring.candidate_phase_tolerance(period)
+    return windows.import_legacy_expected_miss(
+        server_key=SERVER,
+        candidate_period_seconds=period,
+        expected_phase_offset=expected % period,
+        window_start_at=expected - tolerance,
+        expected_at=expected,
+        window_end_at=expected + tolerance,
+        model_revision_id="stage8-model",
+        legacy_key=key,
+    )
+
+
+def imprecise_h2():
+    """H2 (existing gates pass) with a 50 s phase deviation: pq < 0.909."""
+
+    pipeline = Pipeline()
+    pipeline.observe("imprecise", [at(0, 9), at(0, 12) + 50, at(0, 15)])
+    return pipeline
+
+
+def rebuilds(pipeline, first, count=3, **kwargs):
+    values = [first]
+    for _ in range(count):
+        values.append(pipeline.evaluate(persisted(values[-1].decision), **kwargs))
+    return values
+
+
+def test_s81_two_interval_establishment_sets_established_at_to_streak_end():
+    step = three_hour_chain(3).evaluate()
+    regime = step.decision.incumbent_shadow_regime
+    (streak,) = step.streaks
+
+    assert step.decision.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert regime.status is authority.RegimeRecordStatus.ESTABLISHED
+    assert regime.origin is Origin.CONTINUITY
+    assert regime.authority_gate is Gate.H2
+    assert regime.established_at == streak.end_at == at(0, 15)
+    assert step.decision.combined_confidence == step.candidate(P3).combined_confidence
+
+
+def test_s81_two_interval_regime_identity_is_stable_across_rebuilds():
+    pipeline = three_hour_chain(3)
+    values = rebuilds(pipeline, pipeline.evaluate())
+
+    assert len({item.decision.incumbent_shadow_regime.regime_id for item in values}) == 1
+    assert len({item.decision.incumbent_shadow_regime.established_at for item in values}) == 1
+    assert all(item.decision.state is State.ESTABLISHED for item in values)
+    # One settle into the incumbent path (pre-existing), then a fixed point.
+    assert values[1].decision == values[2].decision == values[3].decision
+    assert all(established(item) for item in values)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(imprecise_h2, id="imprecise_phase"),
+        pytest.param(
+            lambda: three_hour_chain(5, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART),
+            id="normal_origin",
+        ),
+    ],
+)
+def test_s81_likely_is_a_fixed_point_of_identical_rebuilds(build):
+    pipeline = build()
+    first = pipeline.evaluate()
+    values = rebuilds(pipeline, first)
+
+    assert first.decision.state is State.LIKELY
+    assert all(item.decision == first.decision for item in values)
+    assert all(not item.consumer().countdown_visible for item in values)
+
+
+def test_s81_imprecise_h2_stays_likely_without_countdown():
+    step = imprecise_h2().evaluate()
+    candidate = step.candidate(P3)
+    value = step.consumer()
+
+    assert candidate.h2_gate and not candidate.h3_gate
+    assert candidate.phase_quality < authority.TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM
+    assert step.decision.state is State.LIKELY
+    assert value.presentation_state is Presentation.LIKELY_CYCLE
+    assert not value.countdown_visible
+
+
+def test_s81_harmonic_blocked_h2_stays_likely():
+    """6 h H2 with its divisors H2-resolved (one healthy miss each) but not
+    H3-resolved: the H3 harmonic blocker withholds two-interval establishment."""
+
+    pipeline = Pipeline()
+    pipeline.observe("six-hour", [at(0, 0), at(0, 6), at(0, 12)])
+    ledger = (
+        genuine_miss(3 * HOUR, at(1, 3), key="divisor-3h"),
+        genuine_miss(2 * HOUR, at(1, 2), key="divisor-2h"),
+    )
+    step = pipeline.evaluate(ledger=ledger)
+    candidate = step.candidate(6 * HOUR)
+
+    assert candidate.h2_gate
+    assert any(item.startswith("high_harmonic_divisor_unresolved_") for item in candidate.harmonic_blockers)
+    assert step.decision.state is State.LIKELY
+    again = pipeline.evaluate(persisted(step.decision), ledger=ledger)
+    assert again.decision == step.decision
+
+
+def test_s81_competing_h2_candidate_withholds_two_interval_establishment():
+    pipeline = Pipeline()
+    pipeline.observe("three-hour", [at(0, 9), at(0, 12), at(0, 15)])
+    pipeline.observe("four-hour", [at(1, 1), at(1, 5), at(1, 9)])
+    step = pipeline.evaluate()
+
+    assert step.candidate(P3).h2_gate and step.candidate(4 * HOUR).h2_gate
+    assert step.decision.state is State.LIKELY
+
+
+def test_s81_active_genuine_miss_in_phase_withholds_two_interval_establishment():
+    pipeline = three_hour_chain(3)
+    ledger = (genuine_miss(P3, at(0, 21), key="in-phase-miss"),)
+    step = pipeline.evaluate(ledger=ledger)
+
+    assert step.candidate(P3).h2_gate
+    assert step.decision.state is State.LIKELY
+
+
+def test_s81_off_phase_restart_after_streak_withholds_two_interval_establishment():
+    pipeline = three_hour_chain(3)
+    pipeline.sparse("off-phase", [at(0, 19, 30)])
+    step = pipeline.evaluate()
+
+    assert step.candidate(P3).h2_gate
+    assert step.decision.state is State.LIKELY
+
+
+def test_s81_likely_established_by_later_evidence_keeps_identity_and_sets_established_at():
+    pipeline = imprecise_h2()
+    likely = pipeline.evaluate()
+    pipeline.observe("later", [at(1, 9) + index * P3 for index in range(4)])
+    step = pipeline.evaluate(persisted(likely.decision))
+    regime = step.decision.incumbent_shadow_regime
+
+    assert step.decision.state is State.ESTABLISHED
+    assert regime.regime_id == likely.decision.incumbent_shadow_regime.regime_id
+    assert regime.established_at == step.candidate(P3, regime.phase_offset).last_evidence_at
+    assert established(step)
+
+
+def test_s81_legacy_established_h2_incumbent_is_preserved():
+    """A pre-8.1 rebuild-promoted H2 incumbent (ESTABLISHED, no
+    ``established_at``) is not revoked by the LIKELY guard."""
+
+    pipeline = imprecise_h2()
+    likely = pipeline.evaluate()
+    regime = replace(
+        likely.decision.incumbent_shadow_regime,
+        status=authority.RegimeRecordStatus.ESTABLISHED,
+    )
+    legacy = replace(
+        likely.decision,
+        state=State.ESTABLISHED,
+        selected_shadow_regime=regime,
+        incumbent_shadow_regime=regime,
+        regimes=(regime,),
+        prediction_usable=True,
+        countdown_safe=True,
+    )
+    step = pipeline.evaluate(persisted(legacy))
+
+    assert step.decision.state is State.ESTABLISHED
+    assert step.decision.incumbent_shadow_regime.regime_id == regime.regime_id
+    assert step.decision.incumbent_shadow_regime.established_at is None
+    assert established(step)
+
+
+def _normal_established_then_continuous():
+    pipeline = three_hour_chain(9, name="qv", outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)
+    normal = settled(pipeline)
+    assert normal.decision.state is State.ESTABLISHED
+    assert normal.decision.incumbent_shadow_regime.origin is Origin.NORMAL
+    pipeline.observe("continuous", [at(2, 0) + index * P3 for index in range(4)])
+    return pipeline, normal, pipeline.evaluate(persisted(normal.decision))
+
+
+def test_s81_established_normal_regime_upgrades_with_identity_and_alert_key():
+    pipeline, normal, upgraded = _normal_established_then_continuous()
+    before = normal.decision.incumbent_shadow_regime
+    after = upgraded.decision.incumbent_shadow_regime
+    occurrence = upgraded.consumer().next_expected_restart_at
+    due = occurrence - 300
+    first = normal.consumer(now=due)
+    fired = frozenset({first.scheduled_warning_suppression_key})
+    value = upgraded.consumer(now=due, fired_keys=fired)
+
+    assert after.regime_id == before.regime_id
+    assert after.origin is Origin.CONTINUITY
+    assert after.authority_gate in {Gate.H3, Gate.H4}
+    assert after.established_at == before.established_at
+    assert authority.ORIGIN_UPGRADE_REASON in upgraded.decision.reason_codes
+    assert value.presentation_state is Presentation.CONFIRMED_CYCLE
+    assert "safe_h3_prediction_available" in value.reason_codes
+    assert first.scheduled_pre_restart_alert_eligible
+    assert value.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
+    assert not value.scheduled_pre_restart_alert_eligible
+    # The upgrade is persistent and a fixed point of identical rebuilds.
+    again = pipeline.evaluate(persisted(upgraded.decision))
+    assert again.decision == upgraded.decision
+
+
+def test_s81_established_normal_regime_does_not_upgrade_on_weak_h2():
+    pipeline = three_hour_chain(9, name="qv", outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)
+    normal = settled(pipeline)
+    pipeline.observe("weak", [at(2, 0), at(2, 3) + 50, at(2, 6)])
+    step = pipeline.evaluate(persisted(normal.decision))
+    regime = step.decision.incumbent_shadow_regime
+
+    assert step.candidate(P3, regime.phase_offset).h2_gate
+    assert regime.origin is Origin.NORMAL
+    assert regime.regime_id == normal.decision.incumbent_shadow_regime.regime_id
+    assert authority.ORIGIN_UPGRADE_REASON not in step.decision.reason_codes
+
+
+def test_s81_harmonically_blocked_candidate_never_upgrades_origin():
+    step = three_hour_chain(4).evaluate()
+    candidate = step.candidate(P3)
+    kwargs = {
+        "streaks": step.streaks,
+        "relationship_map": {item.relationship_id: item for item in step.relationships},
+        "event_map": {item.event_id: item for item in step.events},
+    }
+
+    assert authority._continuity_upgrade_qualifies(candidate, **kwargs)
+    blocked = replace(candidate, harmonic_blockers=("high_harmonic_divisor_unresolved_3",))
+    assert not authority._continuity_upgrade_qualifies(blocked, **kwargs)
+
+
+def _boundary_pipeline():
+    pipeline = Pipeline()
+    # A 4 h interval the day before the 3 h cycle is acquired.
+    pipeline.observe("old-four-hour", [at(-1, 10), at(-1, 14)])
+    pipeline.observe("acquire", [at(0, 9), at(0, 12), at(0, 15)])
+    return pipeline
+
+
+def test_s81_pre_establishment_challenger_evidence_is_historical():
+    pipeline = _boundary_pipeline()
+    acquired = pipeline.evaluate()
+    assert acquired.decision.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert acquired.decision.incumbent_shadow_regime.established_at == at(0, 15)
+    pipeline.observe("new-four-hour", [at(1, 10), at(1, 14)])
+    step = pipeline.evaluate(persisted(acquired.decision))
+
+    # Only the post-establishment interval counts: level 1, prediction kept
+    # by authority.  (The consumer's continuity-H2 countdown path requires
+    # suspicion 0, a pre-existing presentation rule outside Stage 8.1.)
+    assert step.decision.suspicion_level == 1
+    assert step.decision.prediction_usable and step.decision.countdown_safe
+    # The same evidence against an incumbent without an establishment
+    # boundary (the legacy shape) counts both intervals: level 2.
+    legacy_regime = replace(acquired.decision.incumbent_shadow_regime, established_at=None)
+    legacy = replace(
+        acquired.decision,
+        selected_shadow_regime=legacy_regime,
+        incumbent_shadow_regime=legacy_regime,
+        regimes=(legacy_regime,),
+    )
+    unbounded = pipeline.evaluate(persisted(legacy))
+    assert unbounded.decision.suspicion_level == 2
+    assert not unbounded.decision.countdown_safe
+    assert not unbounded.consumer().countdown_visible
+
+
+def test_s81_two_interval_rule_does_not_promote_challengers():
+    """Initial acquisition only: a clean two-interval challenger against an
+    established cycle stays a provisional transition (Stage 6 unchanged)."""
+
+    pipeline = three_hour_chain(7)
+    original = settled(pipeline)
+    pipeline.observe("challenger", [at(2, 1), at(2, 5), at(2, 9)])
+    step = pipeline.evaluate(persisted(original.decision))
+
+    assert step.candidate(4 * HOUR).h2_gate and not step.candidate(4 * HOUR).h3_gate
+    assert step.decision.state is State.TRANSITION_CONFIRMED
+    assert (
+        step.decision.incumbent_shadow_regime.regime_id
+        == original.decision.incumbent_shadow_regime.regime_id
+    )

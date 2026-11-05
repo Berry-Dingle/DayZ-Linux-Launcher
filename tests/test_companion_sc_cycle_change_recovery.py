@@ -380,14 +380,27 @@ def test_07_h2_two_independent_intervals_restore_original():
 
 
 def test_07b_h2_recovery_also_applies_to_incumbent_without_establishment_time():
-    """A LIKELY-then-established incumbent has established_at None."""
+    """A legacy LIKELY-then-established incumbent has established_at None.
+
+    Since Stage 8.1 a clean two-interval streak establishes at once with
+    ``established_at`` set, so the pre-8.1 persisted shape (an ESTABLISHED
+    regime promoted from LIKELY by a rebuild, ``established_at=None``) is
+    reproduced explicitly.  Such incumbents remain valid and recoverable.
+    """
 
     evidence = Evidence()
     values, _ = evidence.chain(
         P3, [BASE + index * P3 for index in range(3)], chain="incumbent"
     )
-    likely = evidence.evaluate()
-    assert likely.state is State.LIKELY
+    current = evidence.evaluate()
+    assert current.state is State.ESTABLISHED
+    legacy_regime = replace(current.incumbent_shadow_regime, established_at=None)
+    likely = replace(
+        current,
+        selected_shadow_regime=legacy_regime,
+        incumbent_shadow_regime=legacy_regime,
+        regimes=(legacy_regime,),
+    )
     more = [evidence.restart(BASE + index * P3) for index in range(3, 7)]
     previous = values[-1]
     for value in more:

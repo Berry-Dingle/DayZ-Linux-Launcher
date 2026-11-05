@@ -47,6 +47,14 @@ COUNTDOWN_SUSPENSION_LATCH_REASON = (
 HISTORICAL_CHALLENGER_EVIDENCE_REASON = (
     "pre_establishment_high_evidence_excluded_from_challenger_authorization"
 )
+# Stage 8.1 two-interval establishment (initial acquisition only).  The phase
+# precision is the H3-equivalent one: H3 phase authority 0.85 divided by the
+# authority of a clean three-interval streak (0.935), so a two-interval
+# establishment is never looser on phase than today's three-interval H3.
+TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM = 0.909
+TWO_INTERVAL_ESTABLISHMENT_REASON = "unknown_server_established_by_two_interval_streak"
+# Persistent marker on a regime whose origin was upgraded NORMAL -> CONTINUITY.
+ORIGIN_UPGRADE_REASON = "normal_origin_upgraded_to_continuity"
 
 
 class AuthorityGate(str, Enum):
@@ -829,54 +837,140 @@ def _transition_decision(
     streaks: tuple[CadenceStreak, ...] = (),
 ) -> AuthorityDecision:
     ranked = tuple(sorted(candidates, key=_candidate_rank, reverse=True))
-    high_h3 = tuple(item for item in ranked if item.h3_gate)
-    high_h2 = tuple(item for item in ranked if item.h2_gate)
     previous_incumbent = prior.incumbent_shadow_regime if prior is not None else None
+    event_map = {item.event_id: item for item in events}
+    relationship_map = {item.relationship_id: item for item in relationships}
 
-    incumbent_candidate = None
-    incumbent = previous_incumbent
-    if previous_incumbent is not None:
-        incumbent_candidate = _matching_candidate(previous_incumbent, candidates)
-        if incumbent_candidate is not None:
-            incumbent = _regime_from_candidate(
-                incumbent_candidate,
-                status=RegimeRecordStatus.ESTABLISHED,
-                existing=previous_incumbent,
-            )
-
-    if incumbent is None and high_h3:
-        selected_candidate = high_h3[0]
-        incumbent = _regime_from_candidate(
-            selected_candidate, status=RegimeRecordStatus.ESTABLISHED
-        )
-        return _decision(
+    if (
+        previous_incumbent is None
+        or previous_incumbent.status is RegimeRecordStatus.LIKELY
+    ):
+        # A LIKELY regime was never established: it is re-acquired from the
+        # evidence on every rebuild (keeping its identity when the same
+        # period and phase is selected) and never promoted by a rebuild alone.
+        return _acquisition_decision(
             server_key=server_key,
-            state=RegimeState.ESTABLISHED,
-            selected=incumbent,
-            incumbent=incumbent,
-            regimes=(incumbent,),
+            normal_score=normal_score,
             candidates=candidates,
-            contexts=(),
-            strongest=None,
+            ranked=ranked,
             normal_ledger=normal_ledger,
             high_ledger=high_ledger,
-            cycle_visible=True,
-            prediction_usable=True,
-            countdown_safe=True,
-            suspicion_level=0,
-            suspicion_ids=(),
-            selected_candidate=selected_candidate,
-            reasons=("unknown_server_established_by_h3",),
+            windows=windows,
+            events=events,
+            event_map=event_map,
+            relationship_map=relationship_map,
+            streaks=streaks,
+            previous=previous_incumbent,
         )
 
-    if incumbent is None and high_h2:
-        selected_candidate = high_h2[0]
-        selected = _regime_from_candidate(
-            selected_candidate, status=RegimeRecordStatus.LIKELY
+    incumbent_candidate = _matching_candidate(previous_incumbent, candidates)
+    incumbent = previous_incumbent
+    if incumbent_candidate is not None:
+        upgrade = bool(
+            previous_incumbent.origin is AuthorityOrigin.NORMAL
+            and _continuity_upgrade_qualifies(
+                incumbent_candidate,
+                streaks=streaks,
+                relationship_map=relationship_map,
+                event_map=event_map,
+            )
         )
+        incumbent = _regime_from_candidate(
+            incumbent_candidate,
+            status=RegimeRecordStatus.ESTABLISHED,
+            existing=previous_incumbent,
+            upgrade_origin=upgrade,
+        )
+    upgrade_reasons = (
+        (ORIGIN_UPGRADE_REASON,)
+        if ORIGIN_UPGRADE_REASON in incumbent.reason_codes
+        else ()
+    )
+
+    return _incumbent_decision(
+        server_key=server_key,
+        normal_score=normal_score,
+        candidates=candidates,
+        ranked=ranked,
+        normal_ledger=normal_ledger,
+        high_ledger=high_ledger,
+        windows=windows,
+        events=events,
+        event_map=event_map,
+        relationship_map=relationship_map,
+        prior=prior,
+        relationships=relationships,
+        streaks=streaks,
+        incumbent=incumbent,
+        incumbent_candidate=incumbent_candidate,
+        upgrade_reasons=upgrade_reasons,
+    )
+
+
+def _acquisition_decision(
+    *,
+    server_key: str,
+    normal_score: ScheduleScore,
+    candidates: tuple[AuthorityCandidate, ...],
+    ranked: tuple[AuthorityCandidate, ...],
+    normal_ledger: NormalEvidenceLedger,
+    high_ledger: HighEvidenceLedger,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    event_map: dict[str, PhysicalRestartEvent],
+    relationship_map: dict[str, IntervalRelationship],
+    streaks: tuple[CadenceStreak, ...],
+    previous: RegimeRecord | None,
+) -> AuthorityDecision:
+    """Initial acquisition for an unknown server or a never-established LIKELY one.
+
+    The result depends on the evidence only, so an evidence-identical
+    rebuild reproduces it.  A prior LIKELY regime keeps its regime ID (and
+    defining evidence) when the same period and phase is selected again.
+    """
+
+    high_h3 = tuple(item for item in ranked if item.h3_gate)
+    high_h2 = tuple(item for item in ranked if item.h2_gate)
+
+    def regime_for(
+        candidate: AuthorityCandidate,
+        *,
+        status: RegimeRecordStatus,
+        origin: AuthorityOrigin = AuthorityOrigin.CONTINUITY,
+        established_at: float | None = None,
+    ) -> RegimeRecord:
+        regime = _regime_from_candidate(candidate, status=status, origin=origin)
+        if established_at is not None and regime.established_at is None:
+            regime = replace(regime, established_at=established_at)
+        if previous is not None and not _candidate_conflicts_regime(candidate, previous):
+            reasons = list(regime.reason_codes)
+            if (
+                (
+                    previous.origin is AuthorityOrigin.NORMAL
+                    and origin is AuthorityOrigin.CONTINUITY
+                )
+                or ORIGIN_UPGRADE_REASON in previous.reason_codes
+            ) and ORIGIN_UPGRADE_REASON not in reasons:
+                reasons.append(ORIGIN_UPGRADE_REASON)
+            regime = replace(
+                regime,
+                regime_id=previous.regime_id,
+                defining_evidence_ids=previous.defining_evidence_ids,
+                reason_codes=tuple(reasons),
+            )
+        return regime
+
+    def selected_decision(
+        *,
+        state: RegimeState,
+        selected: RegimeRecord,
+        selected_candidate: AuthorityCandidate,
+        usable: bool,
+        reasons: tuple[str, ...],
+    ) -> AuthorityDecision:
         return _decision(
             server_key=server_key,
-            state=RegimeState.LIKELY,
+            state=state,
             selected=selected,
             incumbent=selected,
             regimes=(selected,),
@@ -886,15 +980,56 @@ def _transition_decision(
             normal_ledger=normal_ledger,
             high_ledger=high_ledger,
             cycle_visible=True,
-            prediction_usable=False,
-            countdown_safe=False,
+            prediction_usable=usable,
+            countdown_safe=usable,
             suspicion_level=0,
             suspicion_ids=(),
             selected_candidate=selected_candidate,
+            reasons=reasons,
+        )
+
+    if high_h3:
+        selected_candidate = high_h3[0]
+        return selected_decision(
+            state=RegimeState.ESTABLISHED,
+            selected=regime_for(selected_candidate, status=RegimeRecordStatus.ESTABLISHED),
+            selected_candidate=selected_candidate,
+            usable=True,
+            reasons=("unknown_server_established_by_h3",),
+        )
+
+    if high_h2:
+        selected_candidate = high_h2[0]
+        streak = _two_interval_establishing_streak(
+            selected_candidate,
+            streaks=streaks,
+            relationship_map=relationship_map,
+            event_map=event_map,
+            contradictions=_AcquisitionContradictions(
+                candidates=candidates, windows=windows, events=events
+            ),
+        )
+        if streak is not None:
+            return selected_decision(
+                state=RegimeState.ESTABLISHED,
+                selected=regime_for(
+                    selected_candidate,
+                    status=RegimeRecordStatus.ESTABLISHED,
+                    established_at=streak.end_at,
+                ),
+                selected_candidate=selected_candidate,
+                usable=True,
+                reasons=(TWO_INTERVAL_ESTABLISHMENT_REASON,),
+            )
+        return selected_decision(
+            state=RegimeState.LIKELY,
+            selected=regime_for(selected_candidate, status=RegimeRecordStatus.LIKELY),
+            selected_candidate=selected_candidate,
+            usable=False,
             reasons=("unknown_server_likely_by_h2",),
         )
 
-    if incumbent is None and normal_score.selected_period_seconds is not None:
+    if normal_score.selected_period_seconds is not None:
         selected_candidate = _normal_selected_candidate(normal_score, ranked)
         if selected_candidate is not None:
             status = (
@@ -902,62 +1037,204 @@ def _transition_decision(
                 if normal_score.prediction_usable
                 else RegimeRecordStatus.LIKELY
             )
-            selected = _regime_from_candidate(
-                selected_candidate,
-                status=status,
-                origin=AuthorityOrigin.NORMAL,
-            )
-            state = (
-                RegimeState.ESTABLISHED
-                if status is RegimeRecordStatus.ESTABLISHED
-                else RegimeState.LIKELY
-            )
-            return _decision(
-                server_key=server_key,
-                state=state,
-                selected=selected,
-                incumbent=selected,
-                regimes=(selected,),
-                candidates=candidates,
-                contexts=(),
-                strongest=None,
-                normal_ledger=normal_ledger,
-                high_ledger=high_ledger,
-                cycle_visible=True,
-                prediction_usable=normal_score.prediction_usable,
-                countdown_safe=normal_score.prediction_usable,
-                suspicion_level=0,
-                suspicion_ids=(),
+            return selected_decision(
+                state=(
+                    RegimeState.ESTABLISHED
+                    if status is RegimeRecordStatus.ESTABLISHED
+                    else RegimeState.LIKELY
+                ),
+                selected=regime_for(
+                    selected_candidate, status=status, origin=AuthorityOrigin.NORMAL
+                ),
                 selected_candidate=selected_candidate,
+                usable=normal_score.prediction_usable,
                 reasons=("normal_scorer_remains_available_for_unknown_server",),
             )
 
-    if incumbent is None:
-        state = RegimeState.NORMAL_LEARNING if candidates else RegimeState.UNKNOWN
-        reasons = (
-            "evidence_retained_without_structural_selection"
-            if candidates
-            else "no_candidate_evidence"
+    state = RegimeState.NORMAL_LEARNING if candidates else RegimeState.UNKNOWN
+    reasons = (
+        "evidence_retained_without_structural_selection"
+        if candidates
+        else "no_candidate_evidence"
+    )
+    return _decision(
+        server_key=server_key,
+        state=state,
+        selected=None,
+        incumbent=None,
+        regimes=(),
+        candidates=candidates,
+        contexts=(),
+        strongest=None,
+        normal_ledger=normal_ledger,
+        high_ledger=high_ledger,
+        cycle_visible=False,
+        prediction_usable=False,
+        countdown_safe=False,
+        suspicion_level=0,
+        suspicion_ids=(),
+        selected_candidate=ranked[0] if ranked else None,
+        reasons=(reasons,),
+    )
+
+
+@dataclass(frozen=True)
+class _AcquisitionContradictions:
+    candidates: tuple[AuthorityCandidate, ...]
+    windows: tuple[ExpectedWindowLedgerRecord, ...]
+    events: tuple[PhysicalRestartEvent, ...]
+
+
+def _two_interval_establishing_streak(
+    candidate: AuthorityCandidate,
+    *,
+    streaks: tuple[CadenceStreak, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    event_map: dict[str, PhysicalRestartEvent],
+    contradictions: _AcquisitionContradictions | None,
+) -> CadenceStreak | None:
+    """The streak that establishes ``candidate`` on two intervals, if any.
+
+    Requires the existing H2 gate (quality, streak, phase authority, no H2
+    harmonic blocker), no harmonic blocker at all (so 6/8/12 h still need
+    their divisors resolved for H3), H3-equivalent phase precision, and a
+    maximal streak of at least two consecutive high-eligible DIRECT intervals
+    in one continuity chain whose (at least three) endpoints are all
+    authentic.  With ``contradictions`` it also requires no competing H2
+    candidate, no active genuine miss in phase from the streak onwards and no
+    authentic off-phase restart after the streak.
+    """
+
+    if (
+        not candidate.h2_gate
+        or candidate.harmonic_blockers
+        or candidate.phase_quality < TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM
+    ):
+        return None
+    streak_map = {item.streak_id: item for item in streaks}
+    qualifying = []
+    for identity in candidate.maximal_streak_ids:
+        streak = streak_map.get(identity)
+        if streak is None or streak.interval_count < 2 or streak.event_count < 3:
+            continue
+        relationships = tuple(
+            relationship_map.get(item) for item in streak.relationship_ids
         )
-        return _decision(
-            server_key=server_key,
-            state=state,
-            selected=None,
-            incumbent=None,
-            regimes=(),
-            candidates=candidates,
-            contexts=(),
-            strongest=None,
-            normal_ledger=normal_ledger,
-            high_ledger=high_ledger,
-            cycle_visible=False,
-            prediction_usable=False,
-            countdown_safe=False,
-            suspicion_level=0,
-            suspicion_ids=(),
-            selected_candidate=ranked[0] if ranked else None,
-            reasons=(reasons,),
+        if any(item is None for item in relationships):
+            continue
+        if not all(
+            item.high_authority_eligible
+            and item.relationship_kind is RelationshipKind.DIRECT
+            and not item.intervening_event_ids
+            and item.continuity_qualified
+            and item.continuity_chain_id == streak.continuity_chain_id
+            for item in relationships
+        ):
+            continue
+        endpoint_ids = {
+            value
+            for item in relationships
+            for value in (item.left_event_id, item.right_event_id)
+        }
+        endpoints = tuple(event_map.get(item) for item in sorted(endpoint_ids))
+        if len(endpoints) < 3 or any(
+            item is None or not _authentic_event(item) for item in endpoints
+        ):
+            continue
+        if any(
+            relationship_authority_quality(item, endpoints) <= 0.0
+            for item in relationships
+        ):
+            continue
+        qualifying.append(streak)
+    streak = max(qualifying, key=lambda item: (item.end_at, item.streak_id), default=None)
+    if streak is None or contradictions is None:
+        return streak
+    period = candidate.candidate_period_seconds
+    tolerance = candidate.phase_tolerance
+    if any(
+        item.h2_gate
+        and item.candidate_id != candidate.candidate_id
+        and (
+            item.candidate_period_seconds != period
+            or _circular_distance(item.phase_offset, candidate.phase_offset, period)
+            > tolerance
         )
+        for item in contradictions.candidates
+    ):
+        return None
+    if any(
+        item.outcome is ExpectedWindowOutcome.GENUINE_MISS
+        and item.negative_penalty_active
+        and item.candidate_period_seconds == period
+        and _circular_distance(item.expected_phase_offset, candidate.phase_offset, period)
+        <= tolerance
+        and item.expected_at >= streak.start_at
+        for item in contradictions.windows
+    ):
+        return None
+    if any(
+        _authentic_event(item)
+        and _event_at(item) is not None
+        and _event_at(item) > streak.end_at
+        and _circular_distance(_event_at(item), candidate.phase_offset, period)
+        > tolerance
+        for item in contradictions.events
+    ):
+        return None
+    return streak
+
+
+def _continuity_upgrade_qualifies(
+    candidate: AuthorityCandidate,
+    *,
+    streaks: tuple[CadenceStreak, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    event_map: dict[str, PhysicalRestartEvent],
+) -> bool:
+    """A NORMAL-origin incumbent's matching candidate earns continuity authority.
+
+    H3, or H2 meeting the two-interval establishment evidence contract; never
+    a candidate with any harmonic blocker.  Contradictions are handled by the
+    ordinary incumbent suspicion and challenger logic.
+    """
+
+    if candidate.harmonic_blockers:
+        return False
+    if candidate.h3_gate:
+        return True
+    return (
+        _two_interval_establishing_streak(
+            candidate,
+            streaks=streaks,
+            relationship_map=relationship_map,
+            event_map=event_map,
+            contradictions=None,
+        )
+        is not None
+    )
+
+
+def _incumbent_decision(
+    *,
+    server_key: str,
+    normal_score: ScheduleScore,
+    candidates: tuple[AuthorityCandidate, ...],
+    ranked: tuple[AuthorityCandidate, ...],
+    normal_ledger: NormalEvidenceLedger,
+    high_ledger: HighEvidenceLedger,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    event_map: dict[str, PhysicalRestartEvent],
+    relationship_map: dict[str, IntervalRelationship],
+    prior: AuthorityDecision | None,
+    relationships: tuple[IntervalRelationship, ...],
+    streaks: tuple[CadenceStreak, ...],
+    incumbent: RegimeRecord,
+    incumbent_candidate: AuthorityCandidate | None,
+    upgrade_reasons: tuple[str, ...],
+) -> AuthorityDecision:
+    """The established-incumbent path: suspicion, challengers and transitions."""
 
     last_aligned_at = _last_aligned_evidence_at(incumbent, events, windows)
     active_misses = tuple(
@@ -987,8 +1264,6 @@ def _transition_decision(
         )
         > incumbent.phase_tolerance
     )
-    event_map = {item.event_id: item for item in events}
-    relationship_map = {item.relationship_id: item for item in relationships}
     contexts = tuple(
         _challenger_context(
             incumbent=incumbent,
@@ -1182,6 +1457,7 @@ def _transition_decision(
                 _recovery_progress_reason(
                     len(recovery.get(authorized_h2.context_id, ()))
                 ),
+                *upgrade_reasons,
             ),
         )
 
@@ -1275,6 +1551,7 @@ def _transition_decision(
             *reasons,
             "provisional_challenger_resolved_by_original_cycle_confirmations",
         )
+    reasons = (*reasons, *upgrade_reasons)
     return _decision(
         server_key=server_key,
         state=state,
@@ -1760,15 +2037,30 @@ def _regime_from_candidate(
     status: RegimeRecordStatus,
     origin: AuthorityOrigin = AuthorityOrigin.CONTINUITY,
     existing: RegimeRecord | None = None,
+    upgrade_origin: bool = False,
 ) -> RegimeRecord:
     established = candidate.last_evidence_at if candidate.h3_gate else None
     regime_id = candidate.regime_id
     defining = candidate.defining_evidence_ids
+    reasons = [
+        "period_and_phase_regime_identity",
+        "high_authority_does_not_decay_with_inactivity",
+        "regime_remains_reversible",
+    ]
     if existing is not None:
         regime_id = existing.regime_id
         established = existing.established_at
         defining = existing.defining_evidence_ids
         origin = existing.origin
+        if upgrade_origin and origin is AuthorityOrigin.NORMAL:
+            # Same regime identity (and so the same alert keys); the matching
+            # candidate's high gates now govern it.  ``established_at`` is
+            # kept: the regime was already established, so evidence between
+            # its normal establishment and this upgrade is not historical.
+            origin = AuthorityOrigin.CONTINUITY
+            reasons.append(ORIGIN_UPGRADE_REASON)
+        elif ORIGIN_UPGRADE_REASON in existing.reason_codes:
+            reasons.append(ORIGIN_UPGRADE_REASON)
     gate = candidate.highest_gate if origin is AuthorityOrigin.CONTINUITY else AuthorityGate.NORMAL
     return RegimeRecord(
         schema_version=AUTHORITY_SCHEMA_VERSION,
@@ -1788,11 +2080,7 @@ def _regime_from_candidate(
         established_at=established,
         superseded_at=None,
         superseded_by_id=None,
-        reason_codes=(
-            "period_and_phase_regime_identity",
-            "high_authority_does_not_decay_with_inactivity",
-            "regime_remains_reversible",
-        ),
+        reason_codes=tuple(reasons),
     )
 
 

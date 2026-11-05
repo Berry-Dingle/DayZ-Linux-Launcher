@@ -238,7 +238,9 @@ def test_one_clean_interval_is_h1_only_and_not_usable():
     assert not value.cycle_visible and not value.prediction_usable
 
 
-def test_two_matching_intervals_are_h2_likely():
+def test_two_matching_intervals_are_h2_and_establish_on_two_interval_streak():
+    # Stage 8.1: the H2 magnitude is unchanged; a clean two-interval streak on
+    # an unknown server now establishes at once (no rebuild needed).
     events, relationships, streaks = cadence(3 * HOUR, 3)
     value = evaluate(events, relationships, streaks)
     result = candidate(value, 3 * HOUR)
@@ -246,6 +248,29 @@ def test_two_matching_intervals_are_h2_likely():
     assert result.streak_bonus == 0.04
     assert result.high_authority == 0.79
     assert result.h1_gate and result.h2_gate and not result.h3_gate
+    assert value.state is authority.RegimeState.ESTABLISHED
+    assert value.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert value.cycle_visible and value.prediction_usable and value.countdown_safe
+    assert value.incumbent_shadow_regime.established_at == events[-1].canonical_phase_at
+
+
+def test_imprecise_two_interval_h2_stays_likely():
+    # A 50 s phase deviation keeps H2 but misses the H3-equivalent precision.
+    period = 3 * HOUR
+    events = (
+        event(1, BASE),
+        event(2, BASE + period + 50),
+        event(3, BASE + 2 * period),
+    )
+    relationships = (
+        relationship(events[0], events[1], period),
+        relationship(events[1], events[2], period),
+    )
+    streaks = continuity.build_cadence_streaks(relationships)
+    value = evaluate(events, relationships, streaks)
+    result = candidate(value, period)
+    assert result.h2_gate and not result.h3_gate
+    assert result.phase_quality < authority.TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM
     assert value.state is authority.RegimeState.LIKELY
     assert value.cycle_visible and not value.prediction_usable
 
