@@ -397,6 +397,10 @@ class PhysicalEpisodeEngine:
         self._pending_failure: ObservationSample | None = None
         self._provisional_drain: _ProvisionalDrain | None = None
         self._visible_history_interruption_mono: float | None = None
+        # Most recent healthy NORMAL observation in the current continuity.
+        # An outage onset is observed only when the first failure follows it
+        # within the online continuity-gap limit.
+        self._last_healthy_sample: ObservationSample | None = None
 
     @property
     def active_episode(self) -> _Episode | None:
@@ -434,6 +438,26 @@ class PhysicalEpisodeEngine:
             )
             self._reset_normal_history()
 
+        if self._outage_episode_continuity_broken(sample):
+            # Observing the server offline before an unobserved polling gap
+            # (including system suspend) and in any state afterwards does not
+            # prove what happened during the gap.  Finalize through the
+            # lifecycle-interruption mechanism so the episode stays diagnostic
+            # only, and require a fresh observation sequence afterwards.
+            episode = self._episode
+            assert episode is not None
+            completed.append(
+                self._finalize(
+                    EventOutcome.AMBIGUOUS_DRAIN
+                    if episode.drain_mono is not None
+                    else EventOutcome.INCOMPLETE,
+                    sample.wall_at,
+                    "outage_polling_continuity_broken",
+                    lifecycle=LifecycleMarker.SLEEP_GAP,
+                )
+            )
+            self._reset_normal_history()
+
         if self._last_sample is not None and not self._same_continuity(sample, self._last_sample):
             if self._episode is not None:
                 completed.append(
@@ -454,6 +478,8 @@ class PhysicalEpisodeEngine:
         else:
             completed.extend(self._consume_idle(sample))
 
+        if _is_healthy_normal(sample):
+            self._last_healthy_sample = sample
         self._last_sample = sample
         return tuple(event for event in completed if event is not None)
 
@@ -515,6 +541,12 @@ class PhysicalEpisodeEngine:
                     sample.monotonic_at,
                     self.config.online_poll_interval,
                 )
+                # The monotonic clock does not advance during system suspend.
+                # Apply the same pending-strike lifetime to wall time so two
+                # strikes separated by an unobserved interval never confirm
+                # an outage across it.
+                or sample.wall_at - pending.wall_at
+                > self.config.pending_strike_lifetime
             ):
                 self._pending_failure = sample
                 return completed
@@ -610,6 +642,7 @@ class PhysicalEpisodeEngine:
             episode.failure_count = 1
             _append_bounded(episode.failure_statuses, sample.info_status, 16)
             episode.sources.add(SignalSource.INFO_OUTAGE)
+            self._mark_unobserved_outage_onset(sample)
             self.state = EpisodeState.OBSERVING
             return
 
@@ -631,6 +664,7 @@ class PhysicalEpisodeEngine:
             episode.failure_count = 1
             episode.failure_statuses[:] = [sample.info_status]
             episode.reason_codes.add("pending_offline_strike_expired")
+            self._mark_unobserved_outage_onset(sample)
             self.state = EpisodeState.OBSERVING
             return
 
@@ -1020,6 +1054,59 @@ class PhysicalEpisodeEngine:
             or sample.monotonic_at - previous.monotonic_at
             > max(30.0, 3.0 * self.config.online_poll_interval)
         )
+
+    def _outage_episode_continuity_broken(
+        self, sample: ObservationSample
+    ) -> bool:
+        """Whether an open outage episode spans an unobserved polling gap.
+
+        Applies from the first observed failure until the return is
+        observed.  The limits are the established continuity-gap thresholds
+        (``span_from_observations`` / runtime coverage): the offline limit
+        once offline is confirmed, otherwise the online limit.  Wall time is
+        considered as well as monotonic time because the monotonic clock does
+        not advance during system suspend.
+        """
+
+        episode = self._episode
+        previous = self._last_sample
+        if (
+            episode is None
+            or previous is None
+            or episode.first_failure_mono is None
+            or episode.info_return_mono is not None
+            or not self._same_continuity(sample, previous)
+        ):
+            return False
+        limit = (
+            max(12.0, 4.0 * self.config.offline_poll_interval)
+            if episode.confirmed_offline_mono is not None
+            else max(30.0, 3.0 * self.config.online_poll_interval)
+        )
+        return _observation_gap(previous, sample) > limit
+
+    def _mark_unobserved_outage_onset(self, first_failure: ObservationSample) -> None:
+        """Keep the classification but withhold learning without an observed onset.
+
+        The onset is observed only when a healthy NORMAL sample in the same
+        continuity precedes the first failure within the online
+        continuity-gap limit.  Otherwise monitoring began during the outage,
+        or the healthy reference is stale, and the first observed failure is
+        not a restart start.
+        """
+
+        episode = self._episode
+        assert episode is not None
+        healthy = self._last_healthy_sample
+        observed = bool(
+            healthy is not None
+            and self._same_continuity(first_failure, healthy)
+            and _observation_gap(healthy, first_failure)
+            <= max(30.0, 3.0 * self.config.online_poll_interval)
+        )
+        if not observed:
+            episode.coverage_complete = False
+            episode.reason_codes.add("outage_onset_unobserved")
 
     def _visible_episode_continuity_broken(
         self, sample: ObservationSample
@@ -1455,6 +1542,7 @@ class PhysicalEpisodeEngine:
         self._pending_failure = None
         self._provisional_drain = None
         self._visible_history_interruption_mono = None
+        self._last_healthy_sample = None
 
 
 def _authenticity(outcome: EventOutcome, episode: _Episode) -> float:
@@ -1654,6 +1742,13 @@ def _has_confirmed_visible_low(episode: _Episode, config: DetectionConfig) -> bo
 
 def _is_healthy_normal(sample: ObservationSample) -> bool:
     return sample.info_status is InfoStatus.HEALTHY and sample.lifecycle is LifecycleMarker.NORMAL
+
+
+def _observation_gap(previous: ObservationSample, current: ObservationSample) -> float:
+    return max(
+        current.wall_at - previous.wall_at,
+        current.monotonic_at - previous.monotonic_at,
+    )
 
 
 def _is_qualifying_failure(sample: ObservationSample) -> bool:

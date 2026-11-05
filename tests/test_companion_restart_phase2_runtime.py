@@ -125,6 +125,9 @@ def conventional(value):
         poll(value, at, players=players)
     poll(value, 90, ok=False)
     poll(value, 96, ok=False)
+    # Continuous offline polling: no unobserved gap inside the outage.
+    for at in (102, 108, 114):
+        poll(value, at, ok=False)
     poll(value, 120, players=3, queue_marker=2)
     return value.tick(SERVER, wall_at=BASE + 150, monotonic_at=150)
 
@@ -430,6 +433,8 @@ def test_confirmed_outage_without_player_drain_has_positive_schedule_weight(tmp_
         poll(value, at, players=12)
     poll(value, 30, ok=False)
     poll(value, 40, ok=False)
+    for at in range(46, 100, 6):
+        poll(value, at, ok=False)
     poll(value, 100, players=None)
     event = value.tick(SERVER, wall_at=BASE + 130, monotonic_at=130).finalized_events[0]
     assert event.outcome is detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
@@ -450,6 +455,8 @@ def test_bobs_three_restart_shape_produces_three_distinct_weighted_events(tmp_pa
             poll(value, restart_at + offset, players=players)
         poll(value, restart_at, ok=False)
         poll(value, restart_at + 10, ok=False)
+        for offset in range(16, 70, 6):
+            poll(value, restart_at + offset, ok=False)
         poll(value, restart_at + 70, players=0)
         finalized.extend(poll(value, restart_at + 100, players=0).finalized_events)
 

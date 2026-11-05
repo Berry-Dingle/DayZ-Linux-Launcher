@@ -60,6 +60,14 @@ def feed(engine, observations):
     return events
 
 
+def outage_polls(start, stop, step=6, players=MISSING):
+    """Continuous offline polls so a synthetic outage has no unobserved gap."""
+    return [
+        sample(at, players, info=detection.InfoStatus.TIMEOUT)
+        for at in range(start, stop, step)
+    ]
+
+
 def populated(engine, counts=(12, 12, 12), start=0):
     feed(engine, [sample(start + index * 10, value) for index, value in enumerate(counts)])
 
@@ -82,10 +90,14 @@ def offline_sequence(engine, *, drain=True, queue=MISSING, recovery_players=3):
     observations = []
     if drain:
         observations.extend([sample(30, 0), sample(60, 0)])
+    else:
+        # Keep the healthy-to-failure onset observed within the online limit.
+        observations.extend([sample(30, 12), sample(60, 12)])
     observations.extend(
         [
             sample(90, 0 if drain else MISSING, info=detection.InfoStatus.TIMEOUT),
             sample(96, 0 if drain else MISSING, info=detection.InfoStatus.TIMEOUT),
+            *outage_polls(102, 120, players=0 if drain else MISSING),
             sample(120, recovery_players if drain else MISSING, queue=queue),
         ]
     )
@@ -303,7 +315,11 @@ def test_offline_return_enters_recovering():
     populated(offline)
     feed(
         offline,
-        [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(36, MISSING, info=detection.InfoStatus.TIMEOUT)],
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+            *outage_polls(42, 60),
+        ],
     )
     offline.ingest(sample(60, MISSING))
     assert offline.state is detection.EpisodeState.RECOVERING
@@ -339,6 +355,7 @@ def test_variable_outage_recovery_duration_does_not_move_restart_start_phase():
             [
                 sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
                 sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+                *outage_polls(42, recovery_at),
                 sample(recovery_at, MISSING),
             ],
         )
@@ -370,6 +387,7 @@ def test_changed_player_repopulation_corroborates_offline_restart():
         [
             sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
             sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+            *outage_polls(42, 60),
             sample(60, 3),
         ],
     )
@@ -436,7 +454,12 @@ def test_outage_then_zero_return_is_clustered_as_one_reverse_order_episode():
     populated(engine)
     feed(
         engine,
-        [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(36, MISSING, info=detection.InfoStatus.TIMEOUT), sample(60, 0)],
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+            *outage_polls(42, 60),
+            sample(60, 0),
+        ],
     )
     event = engine.tick(90, BASE_WALL + 90)[0]
     assert event.outcome is detection.EventOutcome.CONFIRMED_OFFLINE_RESTART
@@ -535,6 +558,7 @@ def test_repeated_outage_segment_before_finalization_stays_one_episode():
         [
             sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
             sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+            *outage_polls(42, 60),
             sample(60, MISSING),
             sample(70, MISSING, info=detection.InfoStatus.TIMEOUT),
             sample(76, MISSING, info=detection.InfoStatus.TIMEOUT),
@@ -708,7 +732,12 @@ def test_unchanged_snapshot_makes_confirmed_signal_non_restart_like():
     populated(unchanged, (12, 12, 12))
     feed(
         unchanged,
-        [sample(30, MISSING, info=detection.InfoStatus.TIMEOUT), sample(36, MISSING, info=detection.InfoStatus.TIMEOUT), sample(60, 12)],
+        [
+            sample(30, MISSING, info=detection.InfoStatus.TIMEOUT),
+            sample(36, MISSING, info=detection.InfoStatus.TIMEOUT),
+            *outage_polls(42, 60),
+            sample(60, 12),
+        ],
     )
     event = unchanged.tick(90, BASE_WALL + 90)[0]
     assert event.outcome is detection.EventOutcome.SERVICE_INTERRUPTION

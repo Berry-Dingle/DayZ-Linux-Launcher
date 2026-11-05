@@ -507,6 +507,9 @@ def test_abrupt_crash_without_drain_is_only_strong_outage_evidence():
     feed(engine, [sample(0, 12), sample(10, 12), sample(20, 12)])
     assert engine.ingest(sample(30, None, info=detection.InfoStatus.TIMEOUT)) == ()
     assert engine.ingest(sample(40, None, info=detection.InfoStatus.NETWORK_ERROR)) == ()
+    # Continuous offline polling: no unobserved gap inside the outage.
+    for at in (46, 52, 58):
+        engine.ingest(sample(at, None, info=detection.InfoStatus.TIMEOUT))
     engine.ingest(sample(60, 4))
     event = engine.tick(90, BASE + 90)[0]
 
@@ -551,6 +554,9 @@ def test_drain_followed_by_outage_stays_one_corroborated_outage_event():
     feed(engine, values)
     engine.ingest(sample(210, None, info=detection.InfoStatus.TIMEOUT))
     engine.ingest(sample(220, None, info=detection.InfoStatus.NETWORK_ERROR))
+    # Continuous offline polling: no unobserved gap inside the outage.
+    for at in (226, 232, 238):
+        engine.ingest(sample(at, None, info=detection.InfoStatus.TIMEOUT))
     engine.ingest(sample(240, 6))
     event = engine.tick(270, BASE + 270)[0]
 

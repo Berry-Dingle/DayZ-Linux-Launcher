@@ -1171,6 +1171,9 @@ def _persist_resumable_episode(
         OLD_BOOT_MONOTONIC + 20, {"ok": False, "err": "timeout"}
     ).persisted
     if recovering:
+        # Continuous offline polling: no unobserved gap inside the outage.
+        for offset in range(26, 100, 6):
+            ingest(OLD_BOOT_MONOTONIC + offset, {"ok": False, "err": "timeout"})
         assert ingest(RECOVERY_MONOTONIC, {"ok": True}).persisted
     server = value._servers[SERVER]
     episode = server.engine.active_episode
@@ -1686,6 +1689,9 @@ def test_confirmed_offline_boundary_reloads_without_counter_write_churn(tmp_path
     assert settled.write_count == boundary.write_count
     assert active.read_bytes() == raw
 
+    # Continuous offline polling up to the observed return.
+    for at in (189, 195):
+        ingest(again, 9, at)
     assert ingest(again, 9, 200, healthy=True, players=None).persisted
     completed = again.tick(
         SERVER, wall_at=start + 231, monotonic_at=231
@@ -1732,6 +1738,9 @@ def test_phase2_finalized_event_rebuilds_and_persists_schema4(tmp_path):
         poll(at, players=players)
     poll(90, ok=False)
     poll(100, ok=False)
+    # Continuous offline polling: no unobserved gap inside the outage.
+    for at in range(106, 130, 6):
+        poll(at, ok=False)
     poll(130, players=3)
     completed = value.tick(SERVER, wall_at=start + 170, monotonic_at=170)
     assert completed.finalized_events
