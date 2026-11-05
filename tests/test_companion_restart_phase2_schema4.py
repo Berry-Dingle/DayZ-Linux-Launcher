@@ -10,6 +10,7 @@ import pytest
 
 from dzll_launcher import companion_restart_phase2_authority as authority
 from dzll_launcher import companion_restart_phase2_authority_consumers as consumers4
+from dzll_launcher import companion_restart_phase2_consumer_state as state4
 from dzll_launcher import companion_restart_phase2_continuity as continuity
 from dzll_launcher import companion_restart_phase2_detection as detection
 from dzll_launcher import companion_restart_phase2_expected_windows as windows
@@ -1299,3 +1300,251 @@ def test_historical_and_current_bob_sources_have_identical_corrected_semantics()
     assert consumer.confidence_display_value == 0.97
     assert consumer.countdown_visible and consumer.countdown_safe
     assert summary["cycle_text"] == "Confirmed: Every 3 hours"
+
+
+# --- Authority-history retention must preserve consumer references -----------
+
+_RETENTION_LIMIT = 64
+
+
+def _retention_consumer_decision(decision_id: str, authority_decision_id: str):
+    return state4.ConsumerDecisionRecord(
+        schema_version=state4.CONSUMER_STATE_SCHEMA_VERSION,
+        semantic_version=state4.CONSUMER_STATE_SEMANTIC_VERSION,
+        decision_id=decision_id,
+        authority_decision_id=authority_decision_id,
+        server_key=SERVER,
+        selected_regime_id=None,
+        presentation_state=consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE.value,
+        cycle_period_seconds=3 * 3600,
+        confidence_display_value=0.9,
+        next_expected_restart_at=None,
+        countdown_safe=False,
+        prediction_suspended=False,
+        reason_codes=("retention_fixture",),
+    )
+
+
+def _record_at_authority_history_limit(references: dict[str, str]):
+    """Return (existing record, schema-3 record) with exactly 64 history entries.
+
+    ``references`` maps consumer decision IDs to the authority decision they
+    reference.  Every referencing consumer decision is protected by an emitted
+    generic-recovery alert record, matching the production failure where the
+    consumer ledger can never drop those decisions.
+    """
+
+    existing = copy.deepcopy(_record(_migrated()))
+    real = existing["authority_decision"]
+    padding = []
+    for index in range(_RETENTION_LIMIT - 1):
+        item = copy.deepcopy(real)
+        item["decision_id"] = f"retention-pad-{index:03d}"
+        item["state"] = authority.RegimeState.ESTABLISHED.value
+        padding.append(item)
+    current = copy.deepcopy(real)
+    current["decision_id"] = "retention-current"
+    existing["authority_decisions"] = padding + [current]
+    existing["authority_decision"] = copy.deepcopy(current)
+    existing["prior_authority_decision_id"] = padding[-1]["decision_id"]
+
+    event_ids = [item["event_id"] for item in existing["physical_events"]]
+    assert len(event_ids) >= len(references)
+    decisions = [
+        _retention_consumer_decision("retention-consumer-current", "retention-current")
+    ]
+    alerts = []
+    for index, (consumer_id, authority_id) in enumerate(sorted(references.items())):
+        decisions.append(_retention_consumer_decision(consumer_id, authority_id))
+        alerts.append(
+            state4.alert_record(
+                key=consumers4.AuthoritySuppressionKey(
+                    kind=consumers4.AuthoritySuppressionKind.GENERIC_RECOVERY,
+                    server_key=SERVER,
+                    event_id=event_ids[index],
+                ),
+                authority_consumer_decision_id=consumer_id,
+                created_at=BASE + index,
+                lifecycle=state4.AlertLifecycle.EMITTED,
+                action_outcome=state4.AlertActionOutcome.EMITTED,
+            )
+        )
+    ledger = replace(
+        state4.ledger_from_mapping(state4.empty_consumer_state(SERVER), server_key=SERVER),
+        current_authority_consumer_decision_id="retention-consumer-current",
+        decisions=tuple(decisions),
+        alert_records=tuple(alerts),
+    )
+    existing["consumer_state"] = state4.ledger_to_mapping(ledger)
+    assert schema4._validate_server_record(SERVER, existing) == []
+    return existing, _schema3_state()["servers"][SERVER]
+
+
+def _rebuild(existing: dict, schema3_record: dict, *, offset: float = 10 * 3600) -> dict:
+    return schema4.rebuild_schema4_server_record(
+        copy.deepcopy(existing),
+        copy.deepcopy(schema3_record),
+        server_key=SERVER,
+        updated_at=BASE + offset,
+    )
+
+
+def _history_ids(record: dict) -> list[str]:
+    return [item["decision_id"] for item in record["authority_decisions"]]
+
+
+def test_unprotected_retention_reproduces_consumer_authority_decision_missing():
+    """The pre-fix policy evicts a referenced decision at the 64-entry limit."""
+
+    existing, schema3_record = _record_at_authority_history_limit(
+        {"retention-consumer-a": "retention-pad-000", "retention-consumer-b": "retention-pad-000"}
+    )
+    rebuilt = _rebuild(existing, schema3_record)
+    new_id = rebuilt["authority_decision"]["decision_id"]
+    assert new_id not in _history_ids(existing)
+    history = list(existing["authority_decisions"]) + [rebuilt["authority_decision"]]
+    legacy = schema4._retain_authority_decisions(
+        history, current_id=new_id, prior_id="retention-current"
+    )
+    legacy_ids = {item["decision_id"] for item in legacy}
+    assert len(legacy) == _RETENTION_LIMIT
+    assert "retention-pad-000" not in legacy_ids
+    errors = state4.validate_consumer_state(
+        existing["consumer_state"],
+        server_key=SERVER,
+        regime_ids={item["regime_id"] for item in existing["regimes"]},
+        physical_event_ids={item["event_id"] for item in existing["physical_events"]},
+        authority_decision_ids=legacy_ids,
+    )
+    assert errors == (
+        "consumer_authority_decision_missing:retention-consumer-a",
+        "consumer_authority_decision_missing:retention-consumer-b",
+    )
+
+
+def test_rebuild_at_history_limit_retains_shared_consumer_referenced_decision():
+    existing, schema3_record = _record_at_authority_history_limit(
+        {"retention-consumer-a": "retention-pad-000", "retention-consumer-b": "retention-pad-000"}
+    )
+    assert len(existing["authority_decisions"]) == _RETENTION_LIMIT
+
+    rebuilt = _rebuild(existing, schema3_record)
+
+    ids = _history_ids(rebuilt)
+    assert rebuilt["authority_decision"]["decision_id"] not in _history_ids(existing)
+    assert "retention-pad-000" in ids
+    assert "retention-current" in ids
+    assert rebuilt["authority_decision"]["decision_id"] in ids
+    # The oldest unreferenced decision remains eligible for pruning.
+    assert "retention-pad-001" not in ids
+    assert len(ids) == _RETENTION_LIMIT
+    assert rebuilt["consumer_state"] == existing["consumer_state"]
+    assert schema4._validate_server_record(SERVER, rebuilt) == []
+
+
+def test_rebuild_retains_every_distinct_consumer_referenced_decision():
+    references = {
+        "retention-consumer-a": "retention-pad-000",
+        "retention-consumer-b": "retention-pad-001",
+        "retention-consumer-c": "retention-pad-002",
+        "retention-consumer-d": "retention-pad-002",
+    }
+    existing, schema3_record = _record_at_authority_history_limit(references)
+
+    rebuilt = _rebuild(existing, schema3_record)
+
+    ids = _history_ids(rebuilt)
+    for authority_id in set(references.values()):
+        assert authority_id in ids
+    assert "retention-pad-003" not in ids
+    assert len(ids) == _RETENTION_LIMIT
+    assert schema4._validate_server_record(SERVER, rebuilt) == []
+
+
+def test_repeated_rebuilds_stay_valid_without_history_growth():
+    existing, schema3_record = _record_at_authority_history_limit(
+        {"retention-consumer-a": "retention-pad-000", "retention-consumer-b": "retention-pad-000"}
+    )
+    record = existing
+    sizes = []
+    for round_index in range(5):
+        record = _rebuild(record, schema3_record, offset=(10 + round_index) * 3600)
+        assert schema4._validate_server_record(SERVER, record) == []
+        assert "retention-pad-000" in _history_ids(record)
+        sizes.append(len(record["authority_decisions"]))
+    assert sizes == [_RETENTION_LIMIT] * 5
+
+
+def _synthetic_history(count: int, *, significant: set[int] = frozenset()) -> list[dict]:
+    return [
+        {
+            "decision_id": f"d{index:03d}",
+            "state": (
+                authority.RegimeState.CHANGE_SUSPECTED.value
+                if index in significant
+                else authority.RegimeState.ESTABLISHED.value
+            ),
+        }
+        for index in range(count)
+    ]
+
+
+def test_retention_without_references_is_unchanged():
+    history = _synthetic_history(80, significant={1, 2})
+    kept = schema4._retain_authority_decisions(
+        history, current_id="d079", prior_id="d078"
+    )
+    explicit = schema4._retain_authority_decisions(
+        history, current_id="d079", prior_id="d078", referenced_ids=()
+    )
+    ids = [item["decision_id"] for item in kept]
+    assert kept == explicit
+    assert len(ids) == _RETENTION_LIMIT
+    assert {"d001", "d002", "d078", "d079"} <= set(ids)
+    assert ids[2:] == [f"d{index:03d}" for index in range(18, 80)]
+
+
+def test_retention_protects_references_and_prunes_unreferenced():
+    history = _synthetic_history(80, significant={1})
+    kept = schema4._retain_authority_decisions(
+        history,
+        current_id="d079",
+        prior_id="d078",
+        referenced_ids=("d000", "d005", "d005", "missing-authority-id"),
+    )
+    ids = [item["decision_id"] for item in kept]
+    assert len(ids) == _RETENTION_LIMIT
+    assert {"d000", "d001", "d005", "d078", "d079"} <= set(ids)
+    assert "missing-authority-id" not in ids
+    # Unreferenced, non-significant entries are still pruned oldest first.
+    assert "d002" not in ids and "d004" not in ids and "d006" not in ids
+    assert ids == sorted(ids)
+
+
+def test_retention_exceeds_limit_only_for_referential_integrity():
+    history = _synthetic_history(120, significant={110, 111})
+    referenced = [f"d{index:03d}" for index in range(70)]
+    kept = schema4._retain_authority_decisions(
+        history, current_id="d119", prior_id="d118", referenced_ids=referenced
+    )
+    ids = {item["decision_id"] for item in kept}
+    assert ids == set(referenced) | {"d118", "d119"}
+    assert len(ids) == 72
+
+
+def test_repeated_retention_with_stable_references_is_bounded():
+    history = _synthetic_history(_RETENTION_LIMIT)
+    referenced = ("d000", "d001", "d002")
+    prior = "d063"
+    for step in range(200):
+        current = f"n{step:03d}"
+        history = schema4._retain_authority_decisions(
+            [*history, {"decision_id": current, "state": "established"}],
+            current_id=current,
+            prior_id=prior,
+            referenced_ids=referenced,
+        )
+        prior = current
+        ids = {item["decision_id"] for item in history}
+        assert set(referenced) <= ids
+        assert len(history) == _RETENTION_LIMIT

@@ -1378,18 +1378,20 @@ def rebuild_schema4_server_record(
         if isinstance(item, Mapping) and isinstance(item.get("decision_id"), str)
     }
     history[decision.decision_id] = _decision_payload(decision)
+    consumer_state = copy.deepcopy(
+        existing_record.get("consumer_state", empty_consumer_state(server_key))
+    )
     fresh["authority_decisions"] = _retain_authority_decisions(
         history.values(),
         current_id=decision.decision_id,
         prior_id=None if prior is None else prior.decision_id,
+        referenced_ids=_consumer_referenced_authority_decision_ids(consumer_state),
     )
     fresh["prior_authority_decision_id"] = (
         None if prior is None else prior.decision_id
     )
     fresh["authority_decision"] = _decision_payload(decision)
-    fresh["consumer_state"] = copy.deepcopy(
-        existing_record.get("consumer_state", empty_consumer_state(server_key))
-    )
+    fresh["consumer_state"] = consumer_state
     fresh["authority_status"] = "valid_authoritative_runtime"
     fresh["legacy_schema3_record"] = copy.deepcopy(dict(schema3_record))
     fresh["reason_codes"] = sorted(
@@ -1415,14 +1417,35 @@ def rebuild_schema4_server_record(
     return fresh
 
 
+def _consumer_referenced_authority_decision_ids(
+    consumer_state: object,
+) -> frozenset[str]:
+    """Return authority decision IDs referenced by persisted consumer decisions."""
+
+    if not isinstance(consumer_state, Mapping):
+        return frozenset()
+    return frozenset(
+        str(item["authority_decision_id"])
+        for item in consumer_state.get("decisions", ()) or ()
+        if isinstance(item, Mapping)
+        and isinstance(item.get("authority_decision_id"), str)
+    )
+
+
 def _retain_authority_decisions(
     decisions: Iterable[Mapping[str, object]],
     *,
     current_id: str,
     prior_id: str | None = None,
+    referenced_ids: Iterable[str] = (),
     limit: int = 64,
 ) -> list[dict]:
-    """Deterministically retain current/prior and transition-significant history."""
+    """Deterministically retain current/prior and transition-significant history.
+
+    Decisions referenced by the retained consumer ledger are never pruned, so
+    history may exceed ``limit`` when that is required for referential
+    integrity.  Unreferenced decisions remain subject to the bounded policy.
+    """
 
     by_id: dict[str, dict] = {}
     for item in decisions:
@@ -1448,10 +1471,12 @@ def _retain_authority_decisions(
     if prior_id is not None:
         mandatory_ids.add(prior_id)
     # Retain the newest transition-significant decisions when even transition
-    # history exceeds the bounded policy, while never dropping current/prior.
+    # history exceeds the bounded policy, while never dropping current/prior
+    # or any decision still referenced by consumer state.
     protected = {current_id}
     if prior_id is not None:
         protected.add(prior_id)
+    protected.update(str(item) for item in referenced_ids if str(item) in by_id)
     significant_order = [
         str(item["decision_id"])
         for item in ordered
@@ -1459,7 +1484,7 @@ def _retain_authority_decisions(
         and str(item["decision_id"]) not in protected
     ]
     room = max(0, int(limit) - len(protected))
-    keep_ids = protected | set(significant_order[-room:])
+    keep_ids = protected | set(significant_order[-room:] if room else ())
     for item in reversed(ordered):
         if len(keep_ids) >= int(limit):
             break
