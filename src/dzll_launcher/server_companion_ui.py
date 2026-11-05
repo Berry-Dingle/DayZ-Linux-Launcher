@@ -35,7 +35,11 @@ RESTART_PRESENTATION_TOOLTIPS = {
     "pattern_only": "Recurring timing is visible, but its duration is not established yet.",
     "likely_cycle": "A repeated cycle is likely; exact restart prediction remains withheld.",
     "confirmed_cycle": "Repeated restart timing established this cycle and phase.",
-    "schedule_change_suspected": "DZLL is checking contradictory timing before changing the learned cycle.",
+    "schedule_change_suspected": (
+        "Recent restarts fit a different schedule, so the learned countdown is paused. "
+        "Cycle Confidence shows support for the possible new schedule. The learned "
+        "cycle returns after it is confirmed twice more."
+    ),
     "likely_new_cycle": "A possible replacement cycle is being verified; prediction is paused.",
     "confirmed_new_cycle": "A newer repeated cadence has replaced the previous cycle.",
     "prediction_temporarily_suspended": "The learned schedule is temporarily unsafe to predict.",

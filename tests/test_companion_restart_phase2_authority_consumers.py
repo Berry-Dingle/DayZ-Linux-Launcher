@@ -126,12 +126,30 @@ def _established_continuity_h2():
         status=authority.RegimeRecordStatus.ESTABLISHED,
         origin=authority.AuthorityOrigin.CONTINUITY,
     )
+    # The durable regime keeps its own ID, so the consumer finds its candidate
+    # by period and phase (as authority does).  That candidate must carry the
+    # same structural H2 gate as the regime.
+    candidates = tuple(
+        replace(
+            item,
+            h2_gate=True,
+            h3_gate=False,
+            h4_gate=False,
+            high_phase_authority=0.767018,
+            combined_confidence=0.972369,
+        )
+        if item.regime_id == regime.regime_id
+        else item
+        for item in source.candidates
+    )
     return replace(
         source,
         decision_id="established-continuity-h2",
         selected_shadow_regime=durable,
         incumbent_shadow_regime=durable,
         regimes=(durable,),
+        candidates=candidates,
+        high_ledger=replace(source.high_ledger, candidates=candidates),
         state=authority.RegimeState.ESTABLISHED,
         cycle_visible=True,
         prediction_usable=True,

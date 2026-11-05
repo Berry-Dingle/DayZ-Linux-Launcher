@@ -7,18 +7,31 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .companion_restart_phase2_authority import (
+    COUNTDOWN_SUSPENSION_LATCH_REASON,
     AuthorityCandidate,
     AuthorityDecision,
     AuthorityGate,
     AuthorityOrigin,
+    ChallengerAuthorization,
+    ChallengerContext,
     RegimeRecord,
     RegimeRecordStatus,
     RegimeState,
+    # Shared with authority so the consumer selects exactly what authority
+    # selected: incumbent candidate by period and phase, challenger by rank.
+    _context_rank,
+    _matching_candidate,
 )
 from .companion_restart_phase2_consumers import ConsumerDecision
 
 
 AUTHORITY_CONSUMER_SEMANTIC_VERSION = 1
+SUSPECTED_CHANGE_CHALLENGER_CONFIDENCE_REASON = (
+    "suspected_change_challenger_confidence_display"
+)
+SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON = (
+    "suspected_change_challenger_confidence_unavailable"
+)
 SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED_DEFAULT = False
 SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED_DEFAULT = False
 
@@ -431,9 +444,16 @@ def evaluate_authority_consumers(
             AuthorityPresentationKey.CONFIRMED_CYCLE,
         }
     )
+    challenger_confidence = (
+        _suspected_change_challenger_confidence(decision)
+        if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
+        else None
+    )
     confidence = (
         policy.normal_pattern_confidence
         if normal_schedule_confidence_display
+        else (challenger_confidence or 0.0)
+        if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
         else candidate.combined_confidence
         if candidate is not None and regime is not None
         else (
@@ -450,6 +470,12 @@ def evaluate_authority_consumers(
     }
     if normal_schedule_confidence_display:
         reasons.add("normal_schedule_confidence_display")
+    if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED:
+        reasons.add(
+            SUSPECTED_CHANGE_CHALLENGER_CONFIDENCE_REASON
+            if challenger_confidence is not None
+            else SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON
+        )
     if safe_h3 and countdown_visible:
         reasons.add("safe_h3_prediction_available")
     if safe_established_normal_schedule and countdown_visible:
@@ -642,6 +668,10 @@ def authority_consumer_summary(
     normal_schedule_confidence = (
         "normal_schedule_confidence_display" in decision.reason_codes
     )
+    suspected_change = (
+        decision.presentation_state
+        is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
+    )
     return {
         "confidence_percent": int(round(decision.confidence_display_value * 100)),
         "confidence_kind": (
@@ -650,11 +680,17 @@ def authority_consumer_summary(
             else ("period" if decision.visible_cycle else "pattern")
         ),
         "confidence_label": (
-            "Confidence:"
+            "Cycle Confidence:"
+            if suspected_change
+            else "Confidence:"
             if normal_schedule_confidence or decision.visible_cycle
             else "Pattern Confidence:"
         ),
-        "confidence_visible": decision.presentation_state is not AuthorityPresentationKey.NONE,
+        "confidence_visible": (
+            decision.presentation_state is not AuthorityPresentationKey.NONE
+            and SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON
+            not in decision.reason_codes
+        ),
         "cycle_text": _presentation_text(decision),
         "next_text": "Prediction suspended" if decision.prediction_suspended else (
             str(int(prediction)) if prediction is not None else "--"
@@ -762,7 +798,63 @@ def _candidate_for_regime(
     if regime is None:
         return None
     matches = [item for item in decision.candidates if item.regime_id == regime.regime_id]
-    return max(matches, key=lambda item: item.high_authority, default=None)
+    if matches:
+        return max(matches, key=lambda item: item.high_authority)
+    # A durable incumbent keeps its original regime ID while candidate IDs
+    # follow their defining evidence.  Authority matches the incumbent's
+    # candidate by exact period and phase tolerance; use the same rule so the
+    # harmonic blockers of the real candidate are never skipped.
+    return _matching_candidate(regime, decision.candidates)
+
+
+def _suspected_change_challenger_confidence(
+    decision: AuthorityDecision,
+) -> float | None:
+    """Display-only confidence in the alternative behind a level-2 suspicion.
+
+    The relevant challenger is the active, credible level-2 context: the one
+    authority latched as suspending the countdown.  Ties resolve with
+    authority's own challenger rank.  The value is that challenger's
+    phase-qualified high authority (authority's ``high_authority *
+    phase_quality``), using the post-establishment evidence that authority
+    itself uses for the challenger.  Nothing here feeds back into authority.
+    """
+
+    incumbent = decision.incumbent_shadow_regime
+    if incumbent is None:
+        return None
+    relevant = [
+        item
+        for item in decision.challenger_contexts
+        if COUNTDOWN_SUSPENSION_LATCH_REASON in item.reason_codes
+        and item.incumbent_regime_id == incumbent.regime_id
+        and item.authorization_state is not ChallengerAuthorization.ESTABLISHED
+        and len(item.high_relationship_ids) >= 2
+    ]
+    context = max(relevant, key=_context_rank, default=None)
+    if context is None:
+        return None
+    candidate = _challenger_candidate(decision, context)
+    if candidate is None:
+        return None
+    value = context.high_authority * candidate.phase_quality
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return round(min(1.0, value), 6)
+
+
+def _challenger_candidate(
+    decision: AuthorityDecision, context: ChallengerContext
+) -> AuthorityCandidate | None:
+    return next(
+        (
+            item
+            for item in decision.candidates
+            if item.regime_id == context.proposed_regime_id
+            and item.candidate_period_seconds == context.candidate_period_seconds
+        ),
+        None,
+    )
 
 
 def _cycle_label(period: int | None) -> str | None:
@@ -780,7 +872,7 @@ def _presentation_text(decision: AuthorityConsumerDecision) -> str:
         AuthorityPresentationKey.PATTERN_ONLY: "Learning Restart Pattern",
         AuthorityPresentationKey.LIKELY_CYCLE: f"Likely: {label}",
         AuthorityPresentationKey.CONFIRMED_CYCLE: f"Confirmed: {label}",
-        AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED: "Schedule change suspected",
+        AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED: "Suspected Cycle Change",
         AuthorityPresentationKey.LIKELY_NEW_CYCLE: f"Likely new: {label}",
         AuthorityPresentationKey.CONFIRMED_NEW_CYCLE: f"Confirmed new: {label}",
         AuthorityPresentationKey.PREDICTION_TEMPORARILY_SUSPENDED: "Prediction temporarily suspended",
