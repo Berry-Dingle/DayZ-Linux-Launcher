@@ -825,7 +825,8 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._join_preparation_overlay_ui = JoinPreparationOverlayUI(
             self,
             pulse_active=lambda: (
-                getattr(self, "_mod_download_backend_active", "") == "steam_client"
+                not bool(getattr(self, "_shutdown_cleanup_done", False))
+                and getattr(self, "_mod_download_backend_active", "") == "steam_client"
                 and bool(getattr(self, "_steam_ugc_worker_in_progress", False))
             ),
             active_download=lambda: getattr(self, "_steam_ugc_active_event", None),
@@ -2413,6 +2414,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
         mod_suggestions = getattr(self, "_mod_suggestions", None)
         if mod_suggestions is not None:  # absent if construction failed before it was built
             mod_suggestions.invalidate()
+        mod_suggestion_popover = getattr(self, "_mod_suggestion_popover", None)
+        if mod_suggestion_popover is not None:  # absent if construction failed before it was built
+            try:
+                mod_suggestion_popover.cancel_refresh()
+            except Exception:
+                pass
+        DZLLWindow._cancel_search_filter_debounce(self)
         self._server_mod_cache_generation = int(getattr(self, "_server_mod_cache_generation", 0) or 0) + 1
         try:
             self._dayz_watch_shutdown_event.set()
@@ -2476,6 +2484,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._clear_join_pending_state(active.attempt_id)
         except Exception:
             pass
+        join_overlay_ui = getattr(self, "_join_preparation_overlay_ui", None)
+        if join_overlay_ui is not None:  # absent if construction failed before it was built
+            try:
+                join_overlay_ui.stop_progress_timer()
+            except Exception:
+                pass
 
         try:
             self._startup_presentation.begin_shutdown()

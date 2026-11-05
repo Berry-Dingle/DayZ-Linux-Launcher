@@ -267,6 +267,50 @@ def test_real_window_wires_preparation_overlay_renderer_to_its_widgets_and_downl
         _close_window(app, window)
 
 
+def test_real_window_shutdown_cancels_search_suggestion_and_pulse_timers(
+    isolated_window_state,
+):
+    from gi.repository import GLib
+
+    app = _new_app()
+    window = window_module.DZLLWindow(app)
+    removed = []
+    try:
+        ui = window._join_preparation_overlay_ui
+        popover = window._mod_suggestion_popover
+        window._mod_download_backend_active = "steam_client"
+        window._steam_ugc_worker_in_progress = True
+        ui.start_progress_timer()
+        popover.queue_refresh()
+        window._on_search_changed_debounced()
+        armed = (ui.progress_timer_id, popover.refresh_source_id, window._search_filter_debounce_id)
+        assert all(armed)
+        assert ui._pulse_active() is True
+
+        real_remove = GLib.source_remove
+
+        def recording_remove(source_id):
+            removed.append(int(source_id))
+            return real_remove(source_id)
+
+        GLib.source_remove = recording_remove
+        try:
+            window._shutdown_cleanup()
+        finally:
+            GLib.source_remove = real_remove
+
+        assert set(armed) <= set(removed)
+        assert (ui.progress_timer_id, popover.refresh_source_id, window._search_filter_debounce_id) == (0, 0, 0)
+        # The Join flags are untouched, but the pulse may no longer stay active.
+        assert window._steam_ugc_worker_in_progress is True
+        assert ui._pulse_active() is False
+        assert ui._progress_pulse() is False
+    finally:
+        window._mod_download_backend_active = ""
+        window._steam_ugc_worker_in_progress = False
+        _close_window(app, window)
+
+
 def test_a2s_warmup_opt_in_perf_activation_constructs_and_presents_real_window(
     isolated_window_state, monkeypatch,
 ):
