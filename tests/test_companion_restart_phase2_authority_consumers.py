@@ -712,9 +712,10 @@ def test_h2_likely_shows_cycle_without_countdown():
     assert "h2_countdown_withheld" in value.reason_codes
 
 
-def test_two_interval_establishment_is_confirmed_with_countdown_but_no_warning():
-    # Stage 8.1 establishes at the unchanged ~79 % magnitude; the 0.80
-    # continuity-H2 warning threshold is untouched (magnitude is Stage 8.2).
+def test_two_interval_establishment_is_confirmed_with_countdown_and_warning():
+    # Stage 8.1 establishes on two clean intervals; Stage 8.2 sets that
+    # magnitude to 0.80, which meets the unchanged 0.80 continuity-H2
+    # warning threshold.
     decision = _authority(3)
     regime = decision.selected_shadow_regime
     occurrence = consumers4.next_phase_occurrence(
@@ -727,11 +728,12 @@ def test_two_interval_establishment_is_confirmed_with_countdown_but_no_warning()
     )
     assert decision.state is authority.RegimeState.ESTABLISHED
     assert value.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
-    assert value.confidence_display_value == 0.79
+    assert value.confidence_display_value == 0.80
     assert value.countdown_visible and value.countdown_safe
     assert value.next_expected_restart_at == occurrence
     assert "safe_established_continuity_h2_prediction_available" in value.reason_codes
-    assert not value.scheduled_warning_eligible
+    assert value.scheduled_warning_eligible
+    assert value.scheduled_pre_restart_alert_eligible
 
 
 def test_established_continuity_h2_retains_confirmed_cycle_eta_and_warning():

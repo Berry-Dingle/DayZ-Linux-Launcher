@@ -36,6 +36,17 @@ H3_AUTHORITY_MINIMUM = 0.88
 H3_PHASE_AUTHORITY_MINIMUM = 0.85
 H4_AUTHORITY_MINIMUM = 0.94
 HIGH_AUTHORITY_CAP = 0.97
+# Stage 8.2 continuous confidence milestones.  The maximal-streak bonus is
+# ``coefficient * (1 - 2^-(intervals - 1)) * minimum quality``.  At 0.10 a
+# clean two-interval streak has authority 0.80 and a clean three-interval
+# streak 0.95 (the user-facing milestones).
+STREAK_BONUS_COEFFICIENT = 0.10
+# The H1-H4 gates keep the calibration they were defined with (the v1 bonus
+# coefficient 0.08).  Gates are products of authority and phase quality, so
+# evaluating them on the raised magnitude would silently loosen their phase
+# precision (an imprecise three-interval challenger would supersede an
+# established incumbent instead of becoming provisional).
+GATE_STREAK_BONUS_COEFFICIENT = 0.08
 # Stage 6 cycle-change recovery.  A credible challenger (H2, or a level-2
 # context that has suspended the countdown) is resolved in favour of the
 # incumbent only by this many independent, complete, high-eligible incumbent
@@ -491,18 +502,19 @@ def _authority_candidate(
     base = 1.0 - base
     chosen_streaks = _non_overlapping_streaks(streaks)
     streak_bonus_values = []
+    gate_bonus = 0.0
     for streak in chosen_streaks:
         minimum_quality = min(
             quality_map[item] for item in streak.relationship_ids
         )
-        bonus = (
-            0.08
-            * (1.0 - 2.0 ** -(streak.interval_count - 1))
-            * minimum_quality
+        shape = (1.0 - 2.0 ** -(streak.interval_count - 1)) * minimum_quality
+        streak_bonus_values.append(
+            (streak.streak_id, round(STREAK_BONUS_COEFFICIENT * shape, 6))
         )
-        streak_bonus_values.append((streak.streak_id, round(bonus, 6)))
+        gate_bonus += round(GATE_STREAK_BONUS_COEFFICIENT * shape, 6)
     streak_bonus = sum(value for _identity, value in streak_bonus_values)
     high_authority = min(HIGH_AUTHORITY_CAP, base + streak_bonus)
+    gate_authority = min(HIGH_AUTHORITY_CAP, base + gate_bonus)
 
     phase_streak = _phase_defining_streak(chosen_streaks)
     if phase_streak is not None:
@@ -512,6 +524,7 @@ def _authority_candidate(
         phase_offset, phase_spread = _relationship_phase(component, period)
     phase_quality = max(0.0, 1.0 - phase_spread / tolerance)
     phase_authority = high_authority * phase_quality
+    gate_phase_authority = gate_authority * phase_quality
     normal = _normal_candidate_evidence(
         period=period,
         phase_offset=phase_offset,
@@ -529,15 +542,15 @@ def _authority_candidate(
     h2_harmonic, h3_harmonic = _harmonic_blockers(
         period, normal_candidate, windows
     )
-    h1 = len(component) >= 1 and high_authority >= H1_AUTHORITY_MINIMUM
+    h1 = len(component) >= 1 and gate_authority >= H1_AUTHORITY_MINIMUM
     has_h2_streak = any(
         item.interval_count >= 2 and item.event_count >= 3
         for item in chosen_streaks
     )
     h2 = bool(
         has_h2_streak
-        and high_authority >= H2_AUTHORITY_MINIMUM
-        and phase_authority >= H2_PHASE_AUTHORITY_MINIMUM
+        and gate_authority >= H2_AUTHORITY_MINIMUM
+        and gate_phase_authority >= H2_PHASE_AUTHORITY_MINIMUM
         and not h2_harmonic
     )
     h3_structure = bool(
@@ -546,12 +559,12 @@ def _authority_candidate(
     )
     h3 = bool(
         h3_structure
-        and high_authority >= H3_AUTHORITY_MINIMUM
-        and phase_authority >= H3_PHASE_AUTHORITY_MINIMUM
+        and gate_authority >= H3_AUTHORITY_MINIMUM
+        and gate_phase_authority >= H3_PHASE_AUTHORITY_MINIMUM
         and not h3_harmonic
     )
     h4 = bool(
-        h3 and len(component) >= 4 and high_authority >= H4_AUTHORITY_MINIMUM
+        h3 and len(component) >= 4 and gate_authority >= H4_AUTHORITY_MINIMUM
     )
     defining = _defining_evidence(component, chosen_streaks, h2=h2, h3=h3)
     normalized_phase = _normalized_phase_cluster(phase_offset, tolerance, period)

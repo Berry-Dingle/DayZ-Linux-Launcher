@@ -245,8 +245,9 @@ def test_two_matching_intervals_are_h2_and_establish_on_two_interval_streak():
     value = evaluate(events, relationships, streaks)
     result = candidate(value, 3 * HOUR)
     assert result.base_authority == 0.75
-    assert result.streak_bonus == 0.04
-    assert result.high_authority == 0.79
+    # Stage 8.2 milestone magnitude: 0.10 x 0.5 bonus -> 0.80.
+    assert result.streak_bonus == 0.05
+    assert result.high_authority == 0.80
     assert result.h1_gate and result.h2_gate and not result.h3_gate
     assert value.state is authority.RegimeState.ESTABLISHED
     assert value.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
@@ -280,9 +281,10 @@ def test_three_matching_intervals_are_h3_established_and_usable():
     value = evaluate(events, relationships, streaks)
     result = candidate(value, 3 * HOUR)
     assert result.base_authority == 0.875
-    assert result.streak_bonus == 0.06
-    assert result.high_authority == 0.935
-    assert result.high_phase_authority == 0.935
+    # Stage 8.2 milestone magnitude: 0.10 x 0.75 bonus -> 0.95.
+    assert result.streak_bonus == 0.075
+    assert result.high_authority == 0.95
+    assert result.high_phase_authority == 0.95
     assert result.h3_gate and not result.h4_gate
     assert value.state is authority.RegimeState.ESTABLISHED
     assert value.cycle_visible and value.prediction_usable and value.countdown_safe
@@ -319,7 +321,7 @@ def test_h2_streak_plus_four_high_relationships_is_h3_and_h4():
     result = candidate(value, 3 * HOUR)
     assert len(result.high_relationship_ids) == 4
     assert result.base_authority == 0.9375
-    assert result.streak_bonus == 0.04
+    assert result.streak_bonus == 0.05
     assert result.high_authority == 0.97
     assert result.h2_gate and result.h3_gate and result.h4_gate
     assert value.state is authority.RegimeState.ESTABLISHED
@@ -362,7 +364,7 @@ def test_sanitized_bob_projection_matches_exact_quality_and_authority_values():
         0.999633,
     )
     assert result.base_authority == 0.937291
-    assert result.streak_bonus == 0.039985
+    assert result.streak_bonus == 0.049982
     assert result.high_authority == 0.97
     assert result.phase_spread == 0.99599
     assert result.high_phase_authority == 0.968211
@@ -533,7 +535,7 @@ def test_one_genuine_miss_sets_level_one_suspicion_but_keeps_prediction():
     assert value.suspicion_level == 1
     assert value.incumbent_shadow_regime.regime_id == initial.incumbent_shadow_regime.regime_id
     assert value.prediction_usable and value.countdown_safe
-    assert candidate(value, 3 * HOUR).high_authority == 0.935
+    assert candidate(value, 3 * HOUR).high_authority == 0.95
 
 
 def test_later_aligned_hit_clears_level_one_suspicion():
@@ -876,7 +878,7 @@ def test_long_harmonic_h3_is_blocked_without_divisor_resolution():
     events, relationships, streaks = cadence(period, 4)
     value = evaluate(events, relationships, streaks, score=score_for(period, events[0].canonical_phase_at))
     result = candidate(value, period)
-    assert result.high_authority == 0.935
+    assert result.high_authority == 0.95
     assert not result.h2_gate and not result.h3_gate
     assert "unresolved_harmonic_divisor_7200" in result.harmonic_blockers
     assert "unresolved_harmonic_divisor_10800" in result.harmonic_blockers

@@ -18,7 +18,7 @@ Status of every test is explicit:
   holding through every Stage 8 sub-stage.
 * ``pytest.mark.xfail(strict=True, raises=AssertionError)`` tests describe
   approved Stage 8 policy that does not hold yet.  Each names the planned
-  implementation stage (``STAGE_8_2`` and so on).  ``strict=True`` makes an
+  implementation stage (``STAGE_8_5`` and so on).  ``strict=True`` makes an
   unexpected pass fail, so the marker must be removed in the stage that
   implements the behaviour.  ``raises=AssertionError`` keeps harness errors
   visible as real failures.
@@ -30,6 +30,9 @@ are already covered by existing suites are not duplicated here; the Stage
 Stage 8.1 (deterministic two-interval establishment, LIKELY guard and
 NORMAL -> CONTINUITY origin upgrade) converted S01 (establishment), S08 and
 both S09 cases into ordinary tests and added the ``test_s81_*`` section.
+Stage 8.2 (continuous confidence milestones: streak-bonus magnitude 0.10,
+H1-H4 gates kept on their 0.08 calibration) converted the S01 warning and S02
+95 % tests and added the ``test_s82_*`` section.
 """
 
 from __future__ import annotations
@@ -72,7 +75,6 @@ Outcome = detection.EventOutcome
 Presentation = consumers4.AuthorityPresentationKey
 
 # Planned implementation stages (design audit section 13).
-STAGE_8_2 = "Stage 8.2 (two-interval and continuous magnitude, D8-3)"
 STAGE_8_5 = (
     "Stage 8.5 (sparse ceiling S and SE1-SE7 sparse establishment; "
     "needs the Stage 8.3 long-horizon per-event sparse input)"
@@ -558,7 +560,7 @@ def test_s01_precondition_two_consecutive_intervals_are_one_high_eligible_streak
     assert len({item.continuity_chain_id for item in direct}) == 1
     assert [(item.candidate_period_seconds, item.interval_count) for item in step.streaks] == [(P3, 2)]
     assert candidate.h2_gate and not candidate.h3_gate
-    assert candidate.high_authority == 0.79
+    assert candidate.high_authority == 0.80
     assert candidate.phase_quality == 1.0
     assert not candidate.harmonic_blockers
 
@@ -575,7 +577,6 @@ def test_s01_two_consecutive_intervals_establish_immediately_at_about_80_percent
     assert shown is not None and 80 <= shown <= 85, shown
 
 
-@expected_failure(STAGE_8_2, "after establishment the two-interval magnitude 0.79945 is below the 0.80 warning threshold")
 def test_s01_establishment_immediately_enables_scheduled_warning():
     step = three_hour_chain(3).evaluate()
     occurrence = step.consumer().next_expected_restart_at
@@ -602,7 +603,6 @@ def test_s02_three_consecutive_intervals_establish_with_countdown_and_warning():
     assert percent(step) >= 90
 
 
-@expected_failure(STAGE_8_2, "three consecutive intervals give combined 0.939225, displayed 94 %, not the 95 % ceiling")
 def test_s02_three_consecutive_intervals_reach_95_percent_ceiling():
     step = three_hour_chain(4).evaluate()
 
@@ -901,7 +901,7 @@ def test_s12_unconfirmed_drains_are_not_interval_relationship_endpoints():
     assert step.relationships == (), len(step.relationships)
 
 
-@expected_failure(STAGE_8_6, "AMBIGUOUS_DRAIN keeps an eligible hint weight; aligned drains raise the 3 h fundamental 0.45 -> 0.48 and combined 0.79945 -> 0.80008")
+@expected_failure(STAGE_8_6, "AMBIGUOUS_DRAIN keeps an eligible hint weight; aligned drains raise the 3 h fundamental 0.45 -> 0.48 and combined 0.809 -> 0.8096")
 def test_s12_unconfirmed_drains_contribute_no_learning():
     plain = three_hour_chain(3)
     with_drains = plain.copy()
@@ -1380,3 +1380,134 @@ def test_s81_two_interval_rule_does_not_promote_challengers():
         step.decision.incumbent_shadow_regime.regime_id
         == original.decision.incumbent_shadow_regime.regime_id
     )
+
+
+# --------------------------------------------------------------------------
+# Stage 8.2 focused tests: continuous confidence milestones
+# --------------------------------------------------------------------------
+
+
+def test_s82_clean_streak_milestone_magnitudes():
+    two = three_hour_chain(3).evaluate()
+    three = three_hour_chain(4).evaluate()
+
+    assert two.candidate(P3).streak_bonus == 0.05
+    assert two.candidate(P3).high_authority == 0.80
+    assert two.decision.combined_confidence >= 0.80
+    assert 80 <= percent(two) <= 85
+    assert three.candidate(P3).streak_bonus == 0.075
+    assert three.candidate(P3).high_authority == 0.95
+    assert percent(three) == DISPLAY_CEILING_PERCENT
+
+
+def test_s82_imperfect_establishing_streak_stays_below_warning_threshold():
+    """A 48 s phase deviation still establishes (phase quality >= 0.909), but
+    relationship quality below 1 keeps the genuine magnitude under the 0.80
+    milestone: countdown yes, scheduled warning no (unchanged warning rule)."""
+
+    pipeline = Pipeline()
+    pipeline.observe("imperfect", [at(0, 9), at(0, 12) + 48, at(0, 15)])
+    step = pipeline.evaluate()
+    value = step.consumer()
+    due = step.consumer(now=value.next_expected_restart_at - 300)
+
+    assert step.decision.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert step.candidate(P3).high_authority < 0.80
+    assert step.decision.combined_confidence < 0.80
+    assert value.countdown_visible
+    assert not due.scheduled_warning_eligible
+
+
+def _gate_scenarios():
+    def chain(name, times):
+        pipeline = Pipeline()
+        pipeline.observe(name, times)
+        return pipeline.evaluate()
+
+    def challenger(times):
+        pipeline = three_hour_chain(7)
+        original = settled(pipeline)
+        pipeline.observe("challenger", times)
+        return pipeline.evaluate(persisted(original.decision))
+
+    return {
+        "clean_two": chain("a", [at(0, 9), at(0, 12), at(0, 15)]),
+        "imprecise_two_50s": chain("a", [at(0, 9), at(0, 12) + 50, at(0, 15)]),
+        "imprecise_two_60s": chain("a", [at(0, 9), at(0, 12) + 60, at(0, 15)]),
+        "clean_three": chain("a", [at(0, 9) + index * P3 for index in range(4)]),
+        "challenger_three_50s": challenger([at(2, 1), at(2, 5) + 50, at(2, 9), at(2, 13)]),
+        "challenger_three_66s": challenger([at(2, 1), at(2, 5) + 66, at(2, 9), at(2, 13)]),
+        "challenger_two": challenger([at(2, 1), at(2, 5), at(2, 9)]),
+    }
+
+
+def _gate_signature(step):
+    regime = step.decision.incumbent_shadow_regime
+    selected = step.decision.selected_shadow_regime
+    return (
+        step.decision.state,
+        step.decision.suspicion_level,
+        None if regime is None else regime.regime_id,
+        None if selected is None else selected.regime_id,
+        tuple(
+            (item.candidate_period_seconds, item.phase_offset, item.h1_gate, item.h2_gate, item.h3_gate, item.h4_gate)
+            for item in step.decision.candidates
+        ),
+    )
+
+
+def test_s82_gates_states_and_regime_ids_are_independent_of_magnitude_coefficient(monkeypatch):
+    """The raised milestone magnitude never moves an H1-H4 gate: every gate,
+    state, suspicion level and regime ID equals the v1 (0.08) calibration."""
+
+    current = {name: _gate_signature(step) for name, step in _gate_scenarios().items()}
+    monkeypatch.setattr(
+        authority, "STREAK_BONUS_COEFFICIENT", authority.GATE_STREAK_BONUS_COEFFICIENT
+    )
+    calibrated = {name: _gate_signature(step) for name, step in _gate_scenarios().items()}
+
+    assert current == calibrated
+
+
+def test_s82_imprecise_challenger_stays_provisional():
+    """A three-interval challenger 66 s off phase stays provisional; with the
+    raised magnitude used for gates it would have superseded the incumbent."""
+
+    scenarios = _gate_scenarios()
+
+    assert scenarios["challenger_three_66s"].decision.state is State.TRANSITION_CONFIRMED
+    assert scenarios["challenger_three_50s"].decision.state is State.NEW_REGIME_ESTABLISHED
+    assert scenarios["challenger_two"].decision.state is State.TRANSITION_CONFIRMED
+    assert scenarios["imprecise_two_60s"].decision.state is State.NORMAL_LEARNING
+
+
+def test_s82_level_two_disconnected_challenger_confidence_unchanged():
+    """Stage 7: disconnected (streak-free) challenger intervals keep 75 %."""
+
+    pipeline = three_hour_chain(7)
+    original = settled(pipeline)
+    pipeline.observe("challenger-a", [at(2, 1), at(2, 5)])
+    pipeline.observe("challenger-b", [at(2, 13), at(2, 17)])
+    step = pipeline.evaluate(persisted(original.decision))
+    value = step.consumer()
+
+    assert step.decision.state is State.CHALLENGER_ACCUMULATING
+    assert value.presentation_state is Presentation.SCHEDULE_CHANGE_SUSPECTED
+    assert value.confidence_display_value == 0.75
+
+
+def test_s82_two_interval_warning_is_at_most_once_across_settle_and_reopen():
+    pipeline = three_hour_chain(3)
+    first_step = pipeline.evaluate()
+    occurrence = first_step.consumer().next_expected_restart_at
+    due = occurrence - 300
+    first = first_step.consumer(now=due)
+    fired = frozenset({first.scheduled_warning_suppression_key})
+    settled_step = pipeline.evaluate(persisted(first_step.decision))
+    reopened = pipeline.evaluate(persisted(settled_step.decision))
+
+    assert first.scheduled_warning_eligible and first.scheduled_pre_restart_alert_eligible
+    for later in (first_step, settled_step, reopened):
+        value = later.consumer(now=due, fired_keys=fired)
+        assert value.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
+        assert not value.scheduled_pre_restart_alert_eligible
