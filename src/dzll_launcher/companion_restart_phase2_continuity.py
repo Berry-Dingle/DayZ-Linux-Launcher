@@ -26,6 +26,7 @@ from .companion_restart_phase2_scoring import (
     PHASE_UNCERTAINTY_CAP,
     SKIP_OVER_WEIGHT_FACTOR,
     candidate_phase_tolerance,
+    event_interrupts_interval_observation,
     event_learning_eligible,
 )
 
@@ -600,6 +601,21 @@ def extract_interval_relationships(
             authentic_intervening = tuple(
                 item for item in intervening if _authentic_physical_event(item)
             )
+            unobservable_intervening = tuple(
+                item
+                for item in intervening
+                if not _authentic_physical_event(item)
+                and not _schedule_neutral_attribution_anomaly(item)
+                and (
+                    event_interrupts_interval_observation(item)
+                    or item.outcome
+                    in {
+                        EventOutcome.AMBIGUOUS_DRAIN,
+                        EventOutcome.INCOMPLETE,
+                        EventOutcome.EXPIRED,
+                    }
+                )
+            )
             gap = right_at - left_at
             same_identity = _same_event_continuity(left, right)
             assessment = assess_interval_continuity(
@@ -647,6 +663,7 @@ def extract_interval_relationships(
                     tolerance,
                     authentic_intervening,
                     assessment,
+                    unobservable_intervening=unobservable_intervening,
                 )
                 eligible = not high_reasons
                 reasons = {
@@ -1142,6 +1159,8 @@ def _high_eligibility_reasons(
     tolerance: float,
     intervening: tuple[PhysicalRestartEvent, ...],
     assessment: ContinuityAssessment,
+    *,
+    unobservable_intervening: tuple[PhysicalRestartEvent, ...] = (),
 ) -> tuple[str, ...]:
     reasons = []
     if kind is not RelationshipKind.DIRECT:
@@ -1162,6 +1181,11 @@ def _high_eligibility_reasons(
         reasons.append("high_ineligible_continuity_identity")
     if intervening:
         reasons.append("high_ineligible_intervening_authentic_restart")
+    if unobservable_intervening:
+        # A service interruption, uncertain/incomplete episode or other
+        # non-restart outage between the endpoints: the interval was not
+        # fully observed, so it cannot be direct high-authority evidence.
+        reasons.append("high_ineligible_intervening_unobservable_episode")
     if abs(residual) > tolerance:
         reasons.append("high_ineligible_residual")
     if not assessment.continuity_qualified:

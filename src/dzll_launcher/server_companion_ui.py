@@ -877,7 +877,18 @@ class ServerCompanionPanel(Gtk.Box):
 
         self.name_label.set_text(name)
         self.name_label.set_tooltip_text(name)
-        self.status_value_label.set_text("ONLINE" if online else "OFFLINE")
+        local_failure = (
+            not online and self._snapshot.get("connectivity") == "local_failure"
+        )
+        # A confirmed local connectivity loss is not a server outage.
+        self.status_value_label.set_text(
+            "ONLINE" if online else ("NO INTERNET" if local_failure else "OFFLINE")
+        )
+        self.status_value_label.set_tooltip_text(
+            "Your internet connection appears to be down; the server's state is unknown."
+            if local_failure
+            else None
+        )
         for c in PING_CLASSES:
             self.status_value_label.remove_css_class(c)
         self.status_value_label.add_css_class("ping-good" if online else "ping-offline")

@@ -191,6 +191,10 @@ from .desktop_integration import ensure_user_desktop_integration
 from .steam_global_players import SteamGlobalPlayersPoller
 from .update_check import manual_update_check, startup_update_info
 from . import server_companion_audio, server_companion_state
+from .local_connectivity import (
+    IncidentVerdict,
+    ServerCompanionConnectivityGuard,
+)
 from .launch_utils import launch_direct_steam_url
 from .join_attempt import JoinAttemptTracker
 from .join_popup_presentation import (
@@ -1149,6 +1153,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._server_companion_observation_samples = deque(maxlen=5000)
         self._server_companion_phase2_first_accept_session_id = ""
         self._server_companion_phase2_logged_rejections = set()
+        self._server_companion_connectivity = (
+            DZLLWindow._create_server_companion_connectivity_guard(self)
+        )
         self._pending_server_companion_obj = None
         self._server_companion_dock = ServerCompanionDockController(
             panel=lambda: getattr(self, "server_companion_panel", None),
@@ -2497,6 +2504,13 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
+            guard = getattr(self, "_server_companion_connectivity", None)
+            if guard is not None:
+                guard.shutdown()
+        except Exception:
+            pass
+
+        try:
             self._record_server_companion_monitor_ended(
                 "shutdown", source="application_shutdown"
             )
@@ -2780,6 +2794,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
             "server_switch": LifecycleMarker.SERVER_SWITCH,
             "clear": LifecycleMarker.CLEAR,
             "shutdown": LifecycleMarker.SHUTDOWN,
+            # Observations contaminated by local connectivity loss, or
+            # separated by an unobserved interval: an existing persisted
+            # marker meaning "observation continuity was not maintained".
+            "connectivity": LifecycleMarker.SLEEP_GAP,
         }.get(str(reason), LifecycleMarker.PAUSE)
         try:
             polling_active = bool(
@@ -2963,6 +2981,94 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return max(0, int(value))
         except Exception:
             return 0
+
+    def _create_server_companion_connectivity_guard(self):
+        def submit(fn):
+            executor = getattr(self, "_hi_executor", None)
+            if executor is None:
+                raise RuntimeError("Server Companion executor unavailable")
+            return executor.submit(fn)
+
+        def log(message: str) -> None:
+            logger.info("Server Companion %s", message)
+
+        return ServerCompanionConnectivityGuard(
+            submit=submit,
+            post=GLib.idle_add,
+            on_local_failure=lambda incident: (
+                DZLLWindow._on_server_companion_local_connectivity_failure(
+                    self, incident
+                )
+            ),
+            on_connectivity_restored=lambda incident: (
+                DZLLWindow._on_server_companion_connectivity_restored(
+                    self, incident
+                )
+            ),
+            log=log,
+        )
+
+    def _server_companion_connectivity_scope(self):
+        key = self._server_companion_restart_learning_key()
+        if not key:
+            return None
+        return (str(key), int(getattr(self, "_server_companion_poll_token", 0) or 0))
+
+    def _close_server_companion_connectivity_incident(self, reason: str) -> None:
+        guard = getattr(self, "_server_companion_connectivity", None)
+        if guard is not None:
+            try:
+                guard.close_incident(reason)
+            except Exception:
+                pass
+
+    def _neutralise_server_companion_incident(
+        self, reason: str, *, resume: bool
+    ) -> None:
+        """Exclude an incident from learning and alerts.
+
+        Cancels the recovery confirmation and any held alert, ends the
+        learner's monitoring session through the existing lifecycle
+        mechanism (any open episode is finalized interrupted and
+        learning-ineligible, outside live alert dispatch), and optionally
+        begins a fresh session with a new pre-roll and continuity chain.
+        """
+
+        self._cancel_server_companion_recovery_confirmation()
+        self._cancel_server_companion_pending_recovery_alert()
+        key = self._server_companion_restart_learning_key()
+        if key:
+            self._record_server_companion_monitor_ended(
+                "connectivity", key, source=f"connectivity:{reason}"
+            )
+            if resume:
+                self._record_server_companion_monitor_started(key)
+        logger.info(
+            "Server Companion incident excluded from restart learning and "
+            "alerts: reason=%s resumed=%s",
+            reason,
+            bool(resume),
+        )
+
+    def _on_server_companion_local_connectivity_failure(self, incident) -> None:
+        if getattr(incident, "scope", None) != (
+            DZLLWindow._server_companion_connectivity_scope(self)
+        ):
+            return
+        DZLLWindow._neutralise_server_companion_incident(
+            self, "local_connectivity_failure", resume=False
+        )
+
+    def _on_server_companion_connectivity_restored(self, incident) -> None:
+        if getattr(incident, "scope", None) != (
+            DZLLWindow._server_companion_connectivity_scope(self)
+        ):
+            return
+        key = self._server_companion_restart_learning_key()
+        if key and self._server_companion_should_poll():
+            # Fresh session, pre-roll and chain.  The incident itself stays
+            # contaminated: no restart or alert can come from it.
+            self._record_server_companion_monitor_started(key)
 
     def _cancel_server_companion_recovery_confirmation(self) -> None:
         source_id = int(
@@ -3380,6 +3486,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _release_server_companion_pending_recovery_alert(
         self, pending: dict
     ) -> bool:
+        guard = getattr(self, "_server_companion_connectivity", None)
+        if guard is not None and guard.incident_open():
+            # A new, unverified failure sequence is in progress: never let a
+            # deferred alert escape while local connectivity is in question.
+            self._debug_server_companion_alert(
+                "held confirmed recovery alert cancelled: failure sequence open"
+            )
+            self._cancel_server_companion_pending_recovery_alert()
+            return False
         if not self._server_companion_pending_recovery_alert_is_current(pending):
             if pending is getattr(
                 self, "_server_companion_pending_recovery_alert", None
@@ -3411,6 +3526,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pending.get("event_id") or ""
         ) != str(getattr(event, "event_id", "") or ""):
             return False
+        guard = getattr(self, "_server_companion_connectivity", None)
         if (
             str(pending.get("monitoring_session_id") or "")
             != str(getattr(event, "monitoring_session_id", "") or "")
@@ -3419,6 +3535,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             or not self._server_companion_pending_recovery_alert_is_current(
                 pending
             )
+            or (guard is not None and guard.incident_open())
         ):
             self._cancel_server_companion_pending_recovery_alert()
             return True
@@ -3537,6 +3654,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         new_key = f"{ip}:{gport}" if ip and gport > 0 else None
         self._cancel_server_companion_recovery_confirmation()
         self._cancel_server_companion_pending_recovery_alert()
+        DZLLWindow._close_server_companion_connectivity_incident(
+            self, "server_selected"
+        )
         if old_key and old_key != new_key:
             self._record_server_companion_monitor_ended(
                 "server_switch", old_key, source="server_selection_changed"
@@ -3574,6 +3694,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def clear_server_companion(self):
         self._cancel_server_companion_recovery_confirmation()
         self._cancel_server_companion_pending_recovery_alert()
+        DZLLWindow._close_server_companion_connectivity_incident(
+            self, "server_cleared"
+        )
         self._record_server_companion_monitor_ended(
             "clear", source="companion_server_cleared"
         )
@@ -3675,6 +3798,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _stop_server_companion_polling(self):
         self._cancel_server_companion_recovery_confirmation()
         self._cancel_server_companion_pending_recovery_alert()
+        DZLLWindow._close_server_companion_connectivity_incident(
+            self, "polling_stopped"
+        )
         self._server_companion_poll_token = int(
             getattr(self, "_server_companion_poll_token", 0) or 0
         ) + 1
@@ -3763,15 +3889,58 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
             >= 2
         )
+        connectivity_excluded = False
+        learning_suspended = False
+        guard = getattr(self, "_server_companion_connectivity", None)
+        scope = (str(key), int(token)) if guard is not None and key else None
+        if scope is not None:
+            try:
+                if disposition is LiveResultDisposition.HEALTHY:
+                    connectivity_excluded = (
+                        DZLLWindow._gate_server_companion_recovery_connectivity(
+                            self,
+                            guard,
+                            scope,
+                            confirmed_offline=confirmed_offline,
+                            confirmation_pending=(
+                                confirmed_offline and confirmed_recovery is None
+                            ),
+                        )
+                    )
+                    if connectivity_excluded:
+                        confirmed_recovery = None
+                elif disposition in {
+                    LiveResultDisposition.NEUTRAL,
+                    LiveResultDisposition.PROTOCOL_FAILURE,
+                }:
+                    guard.note_observation(
+                        scope, confirmed_offline=confirmed_offline
+                    )
+                else:
+                    guard.note_failure(scope, confirmed_offline=confirmed_offline)
+                learning_suspended = guard.learning_suspended(scope)
+            except Exception as exc:
+                self._debug_server_companion_alert(
+                    f"connectivity guard failed safely: {exc!r}"
+                )
+                # Fail closed for this observation only.
+                learning_suspended = disposition is not LiveResultDisposition.HEALTHY
+                if disposition is LiveResultDisposition.HEALTHY and confirmed_offline:
+                    DZLLWindow._neutralise_server_companion_incident(
+                        self, "connectivity_guard_error", resume=True
+                    )
+                    connectivity_excluded = True
+                    confirmed_recovery = None
         if (
             disposition is LiveResultDisposition.HEALTHY
             and confirmed_offline
             and confirmed_recovery is None
+            and not connectivity_excluded
         ):
             self._schedule_server_companion_recovery_confirmation()
             return False
         phase2_update = None
-        if key:
+        if key and not learning_suspended:
             try:
                 phase2_update = self._companion_restart_phase2.ingest_live_result(
                     key,
@@ -3821,6 +3990,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if live_time:
                 snapshot["time"] = live_time
             snapshot["online"] = True
+            snapshot.pop("connectivity", None)
             self._server_companion_offline_since = None
             self._server_companion_consecutive_offline_polls = 0
             self._server_companion_first_offline_strike_mono = None
@@ -3858,6 +4028,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._server_companion_consecutive_offline_polls = 1
                 self._server_companion_first_offline_strike_mono = now
             failure_count = int(self._server_companion_consecutive_offline_polls)
+            if guard is not None and guard.local_failure_active():
+                # Both independent providers failed: present a local
+                # connectivity problem, not a confirmed server outage.
+                snapshot["connectivity"] = "local_failure"
+            else:
+                snapshot.pop("connectivity", None)
             if failure_count < 2:
                 self._set_server_companion_poll_interval(COMPANION_POLL_ONLINE_SECONDS)
                 self._debug_server_companion_alert(
@@ -3948,6 +4124,53 @@ class DZLLWindow(Gtk.ApplicationWindow):
             self._refresh_server_companion_restart_learning_summary()
             panel.set_polling_paused(False)
         return False
+
+    def _gate_server_companion_recovery_connectivity(
+        self,
+        guard,
+        scope,
+        *,
+        confirmed_offline: bool,
+        confirmation_pending: bool,
+    ) -> bool:
+        """Decide a healthy observation after a failure sequence.
+
+        Returns True when the failure sequence is excluded from learning and
+        alerts (it was neutralised).  A verified sequence keeps its incident
+        open while the recovery confirmation query is pending, and closes it
+        once the confirmed recovery is applied.
+        """
+
+        if not guard.incident_open(scope):
+            if confirmed_offline:
+                # Visible offline with no connectivity record: unverifiable.
+                DZLLWindow._neutralise_server_companion_incident(
+                    self, "connectivity_unrecorded", resume=True
+                )
+                return True
+            return False
+        incident = guard.incident
+        verdict = guard.evaluate_recovery(scope, confirmed_offline=confirmed_offline)
+        if verdict is IncidentVerdict.VERIFIED_HEALTHY:
+            if not confirmation_pending:
+                guard.close_incident("verified_recovery")
+            return False
+        multi_failure = bool(
+            confirmed_offline or int(getattr(incident, "failure_count", 0) or 0) >= 2
+        )
+        excluded = verdict is IncidentVerdict.CONTAMINATED or multi_failure
+        if excluded:
+            DZLLWindow._neutralise_server_companion_incident(
+                self, f"recovery_{verdict.value}", resume=True
+            )
+        guard.resume_learning()
+        guard.close_incident(f"recovery_{verdict.value}")
+        self._debug_server_companion_alert(
+            "failure sequence ended without verified local connectivity: "
+            f"verdict={verdict.value} excluded={excluded} "
+            f"reasons={sorted(getattr(incident, 'reasons', ()) or ())!r}"
+        )
+        return excluded
 
     def _handle_phase2_query_visible_repopulation_alert(
         self,

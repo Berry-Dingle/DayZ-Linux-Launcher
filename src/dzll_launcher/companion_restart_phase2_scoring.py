@@ -680,6 +680,14 @@ class RestartScheduleScorer:
                     _blocks_interval(event)
                     and left_at < (_event_at(event) or left_at) < right_at
                     for event in events
+                ) or any(
+                    # A service interruption or learning-ineligible outage
+                    # starting inside the interval means it was not fully
+                    # observed.  Single-poll uncertain blips stay neutral.
+                    event.event_id not in {left.event_id, right.event_id}
+                    and event_interrupts_interval_observation(event)
+                    and left_at < event_activity_start(event) < right_at
+                    for event in events
                 )
                 fully_covered = (
                     assessment.fully_covered
@@ -1401,6 +1409,35 @@ def event_learning_eligible(event: PhysicalRestartEvent) -> bool:
     """Whether an event may contribute positive or negative schedule learning."""
 
     return event.coverage_complete and event.lifecycle_interruption is None
+
+
+def event_interrupts_interval_observation(event: PhysicalRestartEvent) -> bool:
+    """Whether an episode leaves an interval around it not fully observed.
+
+    A service interruption (an observed outage classified as non-restart) or
+    any learning-ineligible episode (incomplete onset, polling gap, local
+    connectivity contamination, lifecycle interruption) means a restart
+    inside it could not have been observed.
+    """
+
+    return bool(
+        event.outcome is EventOutcome.SERVICE_INTERRUPTION
+        or not event_learning_eligible(event)
+    )
+
+
+def event_activity_start(event: PhysicalRestartEvent) -> float:
+    values = [
+        value
+        for value in (
+            event.episode_started_at,
+            event.outage.first_failure_at,
+            event.outage.confirmed_offline_at,
+            event.canonical_phase_at,
+        )
+        if value is not None
+    ]
+    return min(values, default=event.episode_started_at)
 
 
 def event_overlaps_window(

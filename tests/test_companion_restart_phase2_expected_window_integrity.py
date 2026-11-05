@@ -374,8 +374,10 @@ def test_overlapping_outage_blocks_divisor_resolution_miss_only_in_its_window():
         6,
     )
     assert interrupted.candidate(PERIOD3).covered_miss_count == 0
-    six = interrupted.candidate(6 * HOUR)
-    assert six.strict_direct_interval_count == plain.candidate(6 * HOUR).strict_direct_interval_count
+    # Stages 3+4: an interval crossing a service interruption is not a fully
+    # observed direct interval either (it remains available as a hint).
+    assert plain.candidate(6 * HOUR).strict_direct_interval_count == 1
+    assert interrupted.candidate(6 * HOUR).strict_direct_interval_count == 0
 
 
 def test_ineligible_outage_in_intermediate_window_is_not_a_covered_miss():
