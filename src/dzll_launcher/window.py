@@ -4245,8 +4245,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             getattr(self, "settings_revealer", None),
             getattr(self, "start_steam_join_scrim", None),
             getattr(self, "start_steam_join_box", None),
-            getattr(getattr(self, "_join_preparation_overlay_ui", None), "scrim", None),
-            getattr(getattr(self, "_join_preparation_overlay_ui", None), "revealer", None),
+            getattr(
+                getattr(self, "_join_preparation_overlay_ui", None),
+                "join_preparation_scrim",
+                None,
+            ),
+            getattr(
+                getattr(self, "_join_preparation_overlay_ui", None),
+                "join_preparation_card",
+                None,
+            ),
         )
         for widget in widgets:
             if widget is None:
@@ -4272,8 +4280,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             getattr(self, "settings_revealer", None),
             getattr(self, "start_steam_join_scrim", None),
             getattr(self, "start_steam_join_box", None),
-            getattr(getattr(self, "_join_preparation_overlay_ui", None), "scrim", None),
-            getattr(getattr(self, "_join_preparation_overlay_ui", None), "revealer", None),
+            getattr(
+                getattr(self, "_join_preparation_overlay_ui", None),
+                "join_preparation_scrim",
+                None,
+            ),
+            getattr(
+                getattr(self, "_join_preparation_overlay_ui", None),
+                "join_preparation_card",
+                None,
+            ),
         )
         for widget in widgets:
             if widget is None:
