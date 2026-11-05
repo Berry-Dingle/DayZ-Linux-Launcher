@@ -738,16 +738,22 @@ class RestartScheduleScorer:
                             if expected >= right_at - tolerance:
                                 continue
                             window_tolerance = candidate_phase_tolerance(divisor)
-                            window = coverage.assess(
-                                max(left_at, expected - window_tolerance),
-                                min(right_at, expected + window_tolerance),
-                            )
+                            window_start = max(left_at, expected - window_tolerance)
+                            window_end = min(right_at, expected + window_tolerance)
+                            window = coverage.assess(window_start, window_end)
                             if (
                                 window.fully_covered
                                 and window.query_health_adequate
                                 and not window.unresolved_episode
                                 and not _query_visible_only_evidence(
                                     (left, *skipped, right)
+                                )
+                                and not expected_window_unobservable(
+                                    events,
+                                    coverage.segments,
+                                    window_start,
+                                    window_end,
+                                    exclude_event_ids=(left.event_id, right.event_id),
                                 )
                             ):
                                 work[divisor].misses.append((expected, 1.0, f"{left.event_id}:{right.event_id}"))
@@ -789,6 +795,7 @@ class RestartScheduleScorer:
                 population_transition_required=_query_visible_only_evidence(
                     (left, *skipped, right)
                 ),
+                exclude_event_ids=(left.event_id, right.event_id),
             )
             for index in range(1, multiplier)
         )
@@ -896,6 +903,7 @@ class RestartScheduleScorer:
         coverage: CoverageTimeline,
         *,
         population_transition_required: bool = False,
+        exclude_event_ids: tuple[str, ...] = (),
     ) -> IntermediateWindowDiagnostic:
         tolerance = candidate_phase_tolerance(period)
         start = max(left_at, expected_at - tolerance)
@@ -909,7 +917,15 @@ class RestartScheduleScorer:
             status = IntermediateWindowStatus.OBSERVED_COMPATIBLE
             return IntermediateWindowDiagnostic(expected_at, status)
         assessment = coverage.assess(start, end)
-        unresolved = any(_blocks_interval(event) for event in events_inside)
+        unresolved = any(
+            _blocks_interval(event) for event in events_inside
+        ) or expected_window_unobservable(
+            events,
+            coverage.segments,
+            start,
+            end,
+            exclude_event_ids=exclude_event_ids,
+        )
         if (
             assessment.fully_covered
             and assessment.query_health_adequate
@@ -1385,6 +1401,75 @@ def event_learning_eligible(event: PhysicalRestartEvent) -> bool:
     """Whether an event may contribute positive or negative schedule learning."""
 
     return event.coverage_complete and event.lifecycle_interruption is None
+
+
+def event_overlaps_window(
+    event: PhysicalRestartEvent, start_at: float, end_at: float
+) -> bool:
+    """Whether a finalized episode's observed activity interval meets a window.
+
+    The interval runs from the earliest episode, failure, confirmation or
+    phase timestamp to the latest recovery, return, phase or finalization
+    timestamp.  Boundaries are inclusive.  These are the same semantics as
+    the schema-4 expected-window classifier, so both learning systems treat
+    the same episodes as overlapping.
+    """
+
+    starts = [
+        value
+        for value in (
+            event.episode_started_at,
+            event.outage.first_failure_at,
+            event.outage.confirmed_offline_at,
+            event.canonical_phase_at,
+        )
+        if value is not None
+    ]
+    ends = [
+        value
+        for value in (
+            event.recovery.stable_recovery_at,
+            event.outage.info_return_at,
+            event.canonical_phase_at,
+            event.finalized_at,
+        )
+        if value is not None
+    ]
+    event_start = min(starts, default=event.episode_started_at)
+    event_end = max(ends, default=event.finalized_at)
+    return event_end >= start_at and event_start <= end_at
+
+
+def expected_window_unobservable(
+    events: Iterable[PhysicalRestartEvent],
+    coverage_segments: Iterable[CoverageSegment],
+    start_at: float,
+    end_at: float,
+    *,
+    exclude_event_ids: Iterable[str] = (),
+) -> bool:
+    """Whether physical activity made a restart in the window unobservable.
+
+    An unobservable window is not evidence that a restart was missed.  Any
+    finalized episode overlapping the window (of any outcome or learning
+    eligibility), or observed offline coverage inside it, blocks miss
+    evidence.  This only withholds negative evidence; it never creates a
+    positive observation.
+    """
+
+    excluded = set(exclude_event_ids)
+    if any(
+        event.event_id not in excluded
+        and event_overlaps_window(event, start_at, end_at)
+        for event in events
+    ):
+        return True
+    return any(
+        segment.kind is CoverageKind.OFFLINE_OBSERVED
+        and segment.end_at > start_at
+        and segment.start_at < end_at
+        for segment in coverage_segments
+    )
 
 
 def _event_weight(event: PhysicalRestartEvent) -> float:

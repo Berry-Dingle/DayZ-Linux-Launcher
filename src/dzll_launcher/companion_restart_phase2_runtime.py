@@ -68,6 +68,7 @@ from .companion_restart_phase2_scoring import (
     ScheduleScore,
     candidate_phase_tolerance,
     event_learning_eligible,
+    expected_window_unobservable,
 )
 from .companion_restart_phase2_storage import (
     PHASE2_SCHEMA_VERSION,
@@ -1822,8 +1823,23 @@ class Phase2RestartRuntime:
                     active_episode = server.engine.active_episode
                     if (
                         active_episode is not None
-                        and window_start <= active_episode.started_wall <= window_end
+                        and _active_episode_earliest_wall(active_episode)
+                        <= window_end
                     ):
+                        # The episode is still open, so it extends to now and
+                        # overlaps every closed window it started before or
+                        # inside.  A restart there could not be observed.
+                        blocked = True
+                    if expected_window_unobservable(
+                        server.events,
+                        server.coverage,
+                        window_start,
+                        window_end,
+                    ):
+                        # Any finalized episode overlapping the window (any
+                        # outcome or eligibility), or offline observation
+                        # inside it, leaves the window neutral: no miss and
+                        # no positive observation.
                         blocked = True
                     observed = any(
                         item.outcome not in {
@@ -3229,6 +3245,22 @@ def _field_from_payload(payload: dict, name: str, *, healthy: bool) -> tuple[Fie
 
 def _event_at(event: PhysicalRestartEvent) -> float | None:
     return event.canonical_phase_at
+
+
+def _active_episode_earliest_wall(episode: object) -> float:
+    """Earliest observed wall time of an open episode, including inherited drain."""
+
+    values = [
+        value
+        for value in (
+            getattr(episode, "started_wall", None),
+            getattr(episode, "drain_wall", None),
+            getattr(episode, "low_start_wall", None),
+            getattr(episode, "first_failure_wall", None),
+        )
+        if isinstance(value, (int, float)) and math.isfinite(value)
+    ]
+    return min(values)
 
 
 def _query_visible_population_transition_observable(
