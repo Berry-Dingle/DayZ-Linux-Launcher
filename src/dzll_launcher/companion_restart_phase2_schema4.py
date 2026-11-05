@@ -118,6 +118,9 @@ SCHEMA4_SUPPORTED_MIGRATION_TOOL_VERSIONS = frozenset({1, 2})
 SCHEMA4_SUPPORTED_SCORING_ALGORITHM_VERSIONS = frozenset({2, 3})
 SCHEMA4_RECONCILIATION_EVIDENCE_ID_VERSION = 1
 SCHEMA4_APPLY_APPROVAL_TOKEN = "APPLY-SCHEMA4-PREPARED-STATE"
+# Persisted raw samples are retained only for the schema-3 runtime's own sample
+# horizon (`_serialize_server` keeps samples on its latest 12 events).
+SCHEMA4_EVIDENCE_SAMPLE_EVENT_LIMIT = 12
 
 
 class Schema4Error(ValueError):
@@ -1235,6 +1238,11 @@ def rebuild_schema4_server_record(
         state=synthetic,
         source_bytes=source_bytes,
     )
+    fresh_span_ids = _collection_ids(fresh.get("continuity_spans"), "reference_id")
+    fresh_chain_ids = _collection_ids(fresh.get("continuity_chains"), "chain_id")
+    fresh_episode_ids = _collection_ids(
+        fresh.get("expected_window_episode_evidence"), "evidence_id"
+    )
 
     def union(
         name: str,
@@ -1318,6 +1326,17 @@ def rebuild_schema4_server_record(
             lineage_children[parent] = value["result_id"]
     fresh["expected_window_results"] = sorted(
         windows.values(), key=lambda item: (item.get("expected_at", 0), item["result_id"])
+    )
+    # Phase-1 evidence retention: bound non-learning evidence before the
+    # authority evaluates, so persisted evidence equals evaluated evidence.
+    fresh.update(
+        retain_schema4_evidence(
+            fresh,
+            fresh_span_ids=fresh_span_ids,
+            fresh_chain_ids=fresh_chain_ids,
+            fresh_episode_ids=fresh_episode_ids,
+            sample_event_ids=schema3_sample_horizon_event_ids(schema3_record),
+        )
     )
 
     from .companion_restart_phase2_runtime import _deserialize_server
@@ -1415,6 +1434,146 @@ def rebuild_schema4_server_record(
             "; ".join(f"{item.code}: {item.detail}" for item in issues)
         )
     return fresh
+
+
+def schema3_sample_horizon_event_ids(
+    schema3_record: Mapping[str, object],
+    *,
+    limit: int = SCHEMA4_EVIDENCE_SAMPLE_EVENT_LIMIT,
+) -> frozenset[str]:
+    """Return IDs of the schema-3 record's latest sample-bearing events.
+
+    The schema-3 event list is in runtime order, which is also the order
+    `_serialize_server` uses to decide which events keep their samples.
+    """
+
+    events = schema3_record.get("events") if isinstance(schema3_record, Mapping) else None
+    if not isinstance(events, list):
+        return frozenset()
+    bearing = [
+        str(item["event_id"])
+        for item in events
+        if isinstance(item, Mapping)
+        and isinstance(item.get("event_id"), str)
+        and isinstance(item.get("samples"), list)
+        and item["samples"]
+    ]
+    count = max(0, int(limit))
+    return frozenset(bearing[-count:] if count else ())
+
+
+def retain_schema4_evidence(
+    record: Mapping[str, object],
+    *,
+    fresh_span_ids: Iterable[str] = (),
+    fresh_chain_ids: Iterable[str] = (),
+    fresh_episode_ids: Iterable[str] = (),
+    sample_event_ids: Iterable[str] = (),
+) -> dict[str, list]:
+    """Bound evidence that no learning algorithm reads after persistence.
+
+    Phase-1 retention only touches continuity spans, continuity chains,
+    expected-window episode evidence and raw physical-event samples.  Learning
+    inputs (event metadata, relationships, streaks, window lineages, regimes,
+    decisions and consumer state) are never removed or modified.  Retained
+    objects are exactly the current rebuild's fresh projection plus the
+    reference closure that schema-4 validation requires from retained learning
+    inputs.  Malformed entries are left untouched so validation still sees
+    them.  The result is deterministic and idempotent: it depends only on its
+    inputs and preserves the existing collection order.
+
+    Returns replacement lists only for collections present as lists.
+    """
+
+    def items(name: str) -> list:
+        value = record.get(name)
+        return list(value) if isinstance(value, list) else []
+
+    def referenced(values: Iterable[object], field: str) -> set[str]:
+        return {
+            str(item[field])
+            for item in values
+            if isinstance(item, Mapping) and isinstance(item.get(field), str)
+        }
+
+    relationships = items("interval_relationships")
+    streaks = items("cadence_streaks")
+    windows = items("expected_window_results")
+    window_refs: set[str] = set()
+    for window in windows:
+        if not isinstance(window, Mapping):
+            continue
+        refs = window.get("overlapping_outage_episode_ids")
+        if isinstance(refs, (list, tuple)):
+            window_refs.update(str(ref) for ref in refs if isinstance(ref, str))
+
+    chain_keep = set(str(value) for value in fresh_chain_ids)
+    chain_keep |= referenced(relationships, "continuity_chain_id")
+    chain_keep |= referenced(streaks, "continuity_chain_id")
+    chain_keep |= referenced(windows, "continuity_chain_id")
+
+    def keep(item: object, field: str, wanted: set[str]) -> bool:
+        if not isinstance(item, Mapping) or not isinstance(item.get(field), str):
+            return True
+        return str(item[field]) in wanted
+
+    result: dict[str, list] = {}
+    retained_chains = [
+        item for item in items("continuity_chains") if keep(item, "chain_id", chain_keep)
+    ]
+    if isinstance(record.get("continuity_chains"), list):
+        result["continuity_chains"] = retained_chains
+
+    span_keep = set(str(value) for value in fresh_span_ids) | window_refs
+    for chain in retained_chains:
+        if not isinstance(chain, Mapping):
+            continue
+        refs = chain.get("reference_ids")
+        if isinstance(refs, (list, tuple)):
+            span_keep.update(str(ref) for ref in refs if isinstance(ref, str))
+    if isinstance(record.get("continuity_spans"), list):
+        result["continuity_spans"] = [
+            item
+            for item in items("continuity_spans")
+            if keep(item, "reference_id", span_keep)
+        ]
+
+    episode_keep = set(str(value) for value in fresh_episode_ids) | window_refs
+    if isinstance(record.get("expected_window_episode_evidence"), list):
+        result["expected_window_episode_evidence"] = [
+            item
+            for item in items("expected_window_episode_evidence")
+            if keep(item, "evidence_id", episode_keep)
+        ]
+
+    sampled = set(str(value) for value in sample_event_ids)
+    if isinstance(record.get("physical_events"), list):
+        events: list = []
+        for item in items("physical_events"):
+            if (
+                isinstance(item, Mapping)
+                and isinstance(item.get("event_id"), str)
+                and str(item["event_id"]) not in sampled
+                and isinstance(item.get("samples"), list)
+                and item["samples"]
+            ):
+                trimmed = dict(item)
+                trimmed["samples"] = []
+                events.append(trimmed)
+            else:
+                events.append(item)
+        result["physical_events"] = events
+    return result
+
+
+def _collection_ids(values: object, field: str) -> frozenset[str]:
+    if not isinstance(values, (list, tuple)):
+        return frozenset()
+    return frozenset(
+        str(item[field])
+        for item in values
+        if isinstance(item, Mapping) and isinstance(item.get(field), str)
+    )
 
 
 def _consumer_referenced_authority_decision_ids(
