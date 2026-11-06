@@ -121,6 +121,12 @@ SCHEMA4_APPLY_APPROVAL_TOKEN = "APPLY-SCHEMA4-PREPARED-STATE"
 # Persisted raw samples are retained only for the schema-3 runtime's own sample
 # horizon (`_serialize_server` keeps samples on its latest 12 events).
 SCHEMA4_EVIDENCE_SAMPLE_EVENT_LIMIT = 12
+# Retention R2: every authoritative rebuild maintains the compact per-server
+# learned state (folded knowledge plus the bounded ring definition).  The
+# authority still evaluates the persisted raw collections; the compact state
+# is maintained alongside them so it is complete before raw history is pruned.
+LEARNED_STATE_PERSISTENCE_ENABLED = True
+LEARNED_STATE_REBUILT_REASON = "learned_state_rebuilt_from_persisted_history"
 
 
 class Schema4Error(ValueError):
@@ -1370,6 +1376,25 @@ def rebuild_schema4_server_record(
         prior_decision=prior,
     )
 
+    if LEARNED_STATE_PERSISTENCE_ENABLED:
+        learned_state, learned_rebuilt = maintain_learned_state(
+            existing_record,
+            server_key=server_key,
+            prior=prior,
+            decision=decision,
+            score=score,
+            relationships=relationships,
+            events=events,
+            windows=windows_ledger,
+        )
+        from .companion_restart_phase2_learned_state import learned_state_to_mapping
+
+        fresh["learned_state"] = learned_state_to_mapping(learned_state)
+        if learned_rebuilt:
+            fresh["reason_codes"] = sorted(
+                set(fresh.get("reason_codes", ())) | {LEARNED_STATE_REBUILT_REASON}
+            )
+
     fresh["normal_evidence_ledger"] = _ledger_wrapper(
         "normal", decision.normal_ledger, decision.decision_id
     )
@@ -1434,6 +1459,82 @@ def rebuild_schema4_server_record(
             "; ".join(f"{item.code}: {item.detail}" for item in issues)
         )
     return fresh
+
+
+def maintain_learned_state(
+    existing_record: Mapping[str, object],
+    *,
+    server_key: str,
+    prior: AuthorityDecision | None,
+    decision: AuthorityDecision,
+    score,
+    relationships,
+    events,
+    windows,
+):
+    """Advance the compact learned state by one authoritative rebuild.
+
+    Order (the R1a contract): observe the previous decision so epoch-scoped
+    evidence is attributed to the incumbent in force when it was observed;
+    fold every unit that leaves the strict ring (watermark-protected, so each
+    physical restart and relationship is credited once); fold the best
+    schema-3 divisor resolution; observe the new decision (regime boundaries,
+    epoch reset, which also resets divisor resolution on supersession); fold
+    expected windows that end at or before the event
+    watermark (their lineages can no longer gain restart evidence).
+
+    A missing state is built from the persisted history, which is still
+    retained at this stage; an unreadable one is rebuilt the same way.
+    Returns ``(state, rebuilt_from_invalid)``.
+    """
+
+    from . import companion_restart_phase2_learned_state as learned
+
+    raw = existing_record.get("learned_state")
+    state = None
+    rebuilt = False
+    if raw is not None:
+        try:
+            state = learned.learned_state_from_mapping(raw)
+        except (learned.LearnedStateError, TypeError, ValueError, KeyError):
+            state = None
+        if state is not None and state.server_key != server_key:
+            state = None
+        rebuilt = state is None
+    if state is None:
+        state = learned.empty_learned_state(server_key)
+    if prior is not None:
+        state = learned.observe_decision(state, prior)
+    plan = learned.plan_ring_folding(state, events)
+    state = learned.apply_fold_plan(state, plan, relationships)
+    # Divisor resolution is folded before the new decision is observed, so a
+    # supersession in this rebuild resets it (it is epoch-scoped knowledge).
+    state = learned.fold_divisor_resolution(state, score)
+    state = learned.observe_decision(state, decision)
+    if state.watermark.at is not None:
+        state = learned.fold_windows(
+            state, [item for item in windows if item.window_end_at <= state.watermark.at]
+        )
+    return state, rebuilt
+
+
+def persisted_learned_state(record: Mapping[str, object]):
+    """The validated compact learned state of a record, or ``None``."""
+
+    from .companion_restart_phase2_learned_state import learned_state_from_mapping
+
+    raw = record.get("learned_state")
+    return None if raw is None else learned_state_from_mapping(raw)
+
+
+def learned_state_ring_events(
+    record: Mapping[str, object], state
+) -> tuple[PhysicalRestartEvent, ...]:
+    """Persisted events not yet folded, plus the open chain's anchor."""
+
+    from .companion_restart_phase2_learned_state import plan_ring_folding
+
+    return plan_ring_folding(state, persisted_physical_events(record)).ring
 
 
 def schema3_sample_horizon_event_ids(
@@ -2304,6 +2405,20 @@ def _validate_server_record(server_key: str, record: object) -> list[Schema4Vali
         persisted_authority_decision(record)
     except Exception as exc:
         add("authority_deserialization_failed", str(exc))
+    if record.get("learned_state") is not None:
+        from .companion_restart_phase2_learned_state import (
+            LearnedStateError,
+            learned_state_from_mapping,
+            learned_state_json_bytes,
+        )
+
+        try:
+            learned_state = learned_state_from_mapping(record["learned_state"])
+            learned_state_json_bytes(learned_state)
+            if learned_state.server_key != server_key:
+                add("learned_state_server_mismatch", "learned state belongs to another server")
+        except LearnedStateError as exc:
+            add("invalid_learned_state", str(exc))
     consumer_errors = validate_consumer_state(
         record.get("consumer_state"),
         server_key=server_key,
