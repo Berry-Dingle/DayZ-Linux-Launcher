@@ -24,6 +24,7 @@ from .companion_restart_phase2_schema4 import (
     Schema4ValidationError,
     Schema4VersionError,
     deserialize_schema4_bytes,
+    deserialize_schema4_state,
     schema_version_from_bytes,
     serialize_schema4_state,
 )
@@ -31,7 +32,9 @@ from .companion_restart_phase2_schema4_runtime import Schema4WriterLock
 from .companion_restart_phase2_storage import normalize_phase2_state
 
 
-MAX_IMPORT_BYTES = 8 * 1024 * 1024
+# Retention R5: there is no fixed transfer size limit.  Every import is fully
+# validated whatever its size, and a genuine resource or I/O failure while
+# reading or validating it is reported as a rejected import.
 PENDING_FORMAT_VERSION = 1
 PENDING_PAYLOAD_NAME = "companion_restart_learning_phase2.pending-import.json"
 PENDING_METADATA_NAME = PENDING_PAYLOAD_NAME + ".meta"
@@ -148,8 +151,17 @@ def validate_external_learning_bytes(
         raise TypeError("external learning input must be bytes")
     if not raw:
         raise ExternalLearningValidationError("The selected file is empty.")
-    if len(raw) > MAX_IMPORT_BYTES:
-        raise ExternalLearningValidationError("The selected file exceeds the 8 MiB limit.")
+    try:
+        return _validate_external_learning_bytes(raw, source_filename=source_filename)
+    except MemoryError as exc:
+        raise ExternalLearningValidationError(
+            "There is not enough memory to validate the selected file."
+        ) from exc
+
+
+def _validate_external_learning_bytes(
+    raw: bytes, *, source_filename: str
+) -> ValidatedLearningImport:
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
@@ -162,6 +174,7 @@ def validate_external_learning_bytes(
         )
     except (json.JSONDecodeError, ValueError) as exc:
         raise ExternalLearningValidationError(f"Invalid JSON: {exc}") from exc
+    del text
     if not isinstance(state, dict):
         raise ExternalLearningValidationError("The JSON top level must be an object.")
     version = state.get("schema_version")
@@ -183,9 +196,12 @@ def validate_external_learning_bytes(
     _reject_boolean_numeric_fields(state)
     _reject_nonfinite_tree(state)
     try:
-        loaded = deserialize_schema4_bytes(raw, quarantine_invalid_servers=False)
+        # The strictly parsed document is validated directly rather than
+        # parsing the same bytes a second time.
+        loaded = deserialize_schema4_state(state, quarantine_invalid_servers=False)
     except (Schema4ValidationError, Schema4VersionError, TypeError, ValueError) as exc:
         raise ExternalLearningValidationError(str(exc)) from exc
+    del state
     if not loaded.report.valid:
         detail = "; ".join(f"{item.code}: {item.detail}" for item in loaded.report.issues)
         raise ExternalLearningValidationError(detail or "Schema-4 validation failed.")
@@ -216,13 +232,7 @@ def validate_external_learning_bytes(
 def validate_external_learning_file(path: str | os.PathLike[str]) -> ValidatedLearningImport:
     source = Path(path)
     try:
-        size = source.stat().st_size
-    except OSError as exc:
-        raise ExternalLearningValidationError(f"Cannot read selected file: {exc}") from exc
-    if size > MAX_IMPORT_BYTES:
-        raise ExternalLearningValidationError("The selected file exceeds the 8 MiB limit.")
-    try:
-        raw = _read_capped(source)
+        raw = _read_whole(source)
     except OSError as exc:
         raise ExternalLearningValidationError(f"Cannot read selected file: {exc}") from exc
     return validate_external_learning_bytes(raw, source_filename=source.name)
@@ -336,8 +346,8 @@ def read_pending_import(
         except ValueError as exc:
             raise PendingImportError("Pending database replacement staged timestamp is invalid.") from exc
         try:
-            payload = _read_capped(payload_path)
-        except ExternalLearningValidationError as exc:
+            payload = _read_whole(payload_path)
+        except (OSError, ExternalLearningValidationError) as exc:
             raise PendingImportError(str(exc)) from exc
         digest = _sha256(payload)
         if digest != metadata.get("payload_sha256"):
@@ -714,9 +724,19 @@ def _unlink_quiet(path: Path) -> None:
         pass
 
 
-def _read_capped(path: Path) -> bytes:
+def _read_whole(path: Path) -> bytes:
+    """Read a whole learning file; a size change while reading is an error."""
+
     with path.open("rb") as handle:
-        payload = handle.read(MAX_IMPORT_BYTES + 1)
-    if len(payload) > MAX_IMPORT_BYTES:
-        raise ExternalLearningValidationError("The selected file exceeds the 8 MiB limit.")
+        expected = os.fstat(handle.fileno()).st_size
+        try:
+            payload = handle.read()
+        except MemoryError as exc:
+            raise ExternalLearningValidationError(
+                "There is not enough memory to read the selected file."
+            ) from exc
+    if len(payload) != expected:
+        raise ExternalLearningValidationError(
+            "The selected file changed while it was being read."
+        )
     return payload

@@ -1438,7 +1438,10 @@ def test_rebuild_at_history_limit_retains_shared_consumer_referenced_decision():
     # The oldest unreferenced decision remains eligible for pruning.
     assert "retention-pad-001" not in ids
     assert len(ids) == _RETENTION_LIMIT
-    assert rebuilt["consumer_state"] == existing["consumer_state"]
+    # Retention R5 only marks the (already bounded) ledger as bounded.
+    assert {k: v for k, v in rebuilt["consumer_state"].items() if k != "reason_codes"} == {
+        k: v for k, v in existing["consumer_state"].items() if k != "reason_codes"
+    }
     assert schema4._validate_server_record(SERVER, rebuilt) == []
 
 

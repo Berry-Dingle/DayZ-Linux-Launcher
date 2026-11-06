@@ -9,7 +9,6 @@ from dzll_launcher import companion_restart_phase2_storage as storage
 from dzll_launcher import companion_learning_transfer as transfer
 from dzll_launcher.companion_learning_transfer import (
     ExternalLearningValidationError,
-    MAX_IMPORT_BYTES,
     PendingImportError,
     apply_pending_import_at_startup,
     cancel_pending_import,
@@ -83,9 +82,11 @@ def test_rejects_invalid_json_envelopes(raw, message):
         validate_external_learning_bytes(raw)
 
 
-def test_rejects_oversized_input():
-    with pytest.raises(ExternalLearningValidationError, match="8 MiB"):
-        validate_external_learning_bytes(b" " * (MAX_IMPORT_BYTES + 1))
+def test_large_malformed_input_is_rejected_by_validation_not_by_size():
+    # Retention R5: no fixed size limit; content validation still rejects it.
+    with pytest.raises(ExternalLearningValidationError, match="Invalid JSON"):
+        validate_external_learning_bytes(b" " * (8 * 1024 * 1024 + 1))
+    assert not hasattr(transfer, "MAX_IMPORT_BYTES")
 
 
 @pytest.mark.parametrize("version", [3, 5])

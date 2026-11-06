@@ -20,6 +20,36 @@ CONSUMER_STATE_SEMANTIC_VERSION = 1
 CONSUMER_STATE_ADAPTER_VERSION = AUTHORITY_CONSUMER_SEMANTIC_VERSION
 AUTO_COMPACTION_ENABLED_DEFAULT = False
 
+# Retention R5: bounded alert and decision bookkeeping.
+#
+# Scheduled-warning keys are (regime, expected occurrence).  A warning can only
+# be due while its occurrence is still in the future (the consumer predicts the
+# first occurrence strictly after "now" and the warning window ends before it),
+# so a key whose occurrence is in the past can never become due again.  Such
+# keys are folded into one server-wide high-water mark: every scheduled key with
+# an occurrence at or before it is suppressed, for every regime.  Folding only
+# past occurrences (at least ``SCHEDULED_WARNING_FOLD_MARGIN_SECONDS`` old)
+# means the mark can never suppress a warning that has not been issued yet.
+#
+# Generic-recovery keys are per physical event and are offered only for the
+# event that has just finalized (its ``finalized_at`` is the wall time of
+# finalization).  Older keys are folded into a high-water mark over the
+# events' ``finalized_at``; every event finalized later lies above it.
+#
+# Folding never rewrites a retained record, so a pending reservation keeps its
+# record ID.  The folded keys stay suppressed through the marks, which are
+# saved in the same ledger as the records they replace.
+CONSUMER_RETAINED_SCHEDULED_WARNING_KEYS = 8
+CONSUMER_MAX_SCHEDULED_WARNING_KEYS = 12
+CONSUMER_RETAINED_GENERIC_RECOVERY_KEYS = 8
+CONSUMER_MAX_GENERIC_RECOVERY_KEYS = 12
+CONSUMER_MAX_RECORDS_PER_KEY = 3
+CONSUMER_DECISION_RETENTION_LIMIT = 64
+SCHEDULED_WARNING_FOLD_MARGIN_SECONDS = 3600
+CONSUMER_LEDGER_BOUNDED_REASON = "consumer_alert_ledger_bounded"
+SCHEDULED_SUPPRESSED_THROUGH_FIELD = "scheduled_warning_suppressed_through_occurrence_at"
+GENERIC_SUPPRESSED_THROUGH_FIELD = "generic_recovery_suppressed_through_finalized_at"
+
 
 class AlertLifecycle(str, Enum):
     ELIGIBLE = "eligible"
@@ -115,6 +145,45 @@ class ConsumerStateLedger:
     compaction_digest: str | None
     last_compacted_at: float | None
     reason_codes: tuple[str, ...]
+    scheduled_warning_suppressed_through: int | None = None
+    generic_recovery_suppressed_through: float | None = None
+
+
+class ConsumerFiredKeys(frozenset):
+    """Explicitly fired keys plus the folded scheduled-warning high-water mark.
+
+    Membership (``in``) also answers True for any scheduled-warning key of this
+    server whose occurrence is at or before the mark, so consumers that test
+    ``key not in fired_keys`` keep suppressing folded warnings.
+    """
+
+    scheduled_warning_suppressed_through: int | None
+    server_key: str | None
+
+    def __new__(
+        cls,
+        keys: Iterable[AuthoritySuppressionKey] = (),
+        *,
+        scheduled_warning_suppressed_through: int | None = None,
+        server_key: str | None = None,
+    ):
+        value = super().__new__(cls, keys)
+        value.scheduled_warning_suppressed_through = scheduled_warning_suppressed_through
+        value.server_key = server_key
+        return value
+
+    def __contains__(self, key: object) -> bool:
+        if frozenset.__contains__(self, key):
+            return True
+        through = self.scheduled_warning_suppressed_through
+        return bool(
+            through is not None
+            and isinstance(key, AuthoritySuppressionKey)
+            and key.kind is AuthoritySuppressionKind.SCHEDULED_WARNING
+            and (self.server_key is None or key.server_key == self.server_key)
+            and key.expected_occurrence_at is not None
+            and key.expected_occurrence_at <= through
+        )
 
 
 @dataclass(frozen=True)
@@ -247,12 +316,50 @@ def ledger_from_mapping(value: Mapping[str, object] | None, *, server_key: str) 
             else None
         ),
         reason_codes=tuple(str(item) for item in raw.get("reason_codes", ())),
+        scheduled_warning_suppressed_through=_optional_occurrence_mark(
+            meta.get(SCHEDULED_SUPPRESSED_THROUGH_FIELD)
+        ),
+        generic_recovery_suppressed_through=_optional_time_mark(
+            meta.get(GENERIC_SUPPRESSED_THROUGH_FIELD)
+        ),
     )
     _validate_ledger_shape(ledger, expected_server_key=server_key)
     return ledger
 
 
+def _optional_occurrence_mark(value: object) -> int | None:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError("scheduled-warning suppression mark must be a non-negative integer")
+    return value
+
+
+def _optional_time_mark(value: object) -> float | None:
+    if value is None:
+        return None
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+        or value < 0
+    ):
+        raise ValueError("generic-recovery suppression mark must be finite and non-negative")
+    return float(value)
+
+
 def ledger_to_mapping(ledger: ConsumerStateLedger) -> dict:
+    meta: dict[str, object] = {
+        "compacted_record_count": ledger.compacted_record_count,
+        "compaction_digest": ledger.compaction_digest,
+        "last_compacted_at": ledger.last_compacted_at,
+    }
+    # The marks are written only once set, so ledgers that never folded
+    # anything keep their earlier canonical form.
+    if ledger.scheduled_warning_suppressed_through is not None:
+        meta[SCHEDULED_SUPPRESSED_THROUGH_FIELD] = ledger.scheduled_warning_suppressed_through
+    if ledger.generic_recovery_suppressed_through is not None:
+        meta[GENERIC_SUPPRESSED_THROUGH_FIELD] = ledger.generic_recovery_suppressed_through
     return {
         "schema_version": ledger.schema_version,
         "semantic_version": ledger.semantic_version,
@@ -261,36 +368,70 @@ def ledger_to_mapping(ledger: ConsumerStateLedger) -> dict:
         "current_authority_consumer_decision_id": ledger.current_authority_consumer_decision_id,
         "decisions": [_primitive(item) for item in sorted(ledger.decisions, key=lambda item: item.decision_id)],
         "alert_records": [_primitive(item) for item in sorted(ledger.alert_records, key=lambda item: item.record_id)],
-        "compaction_metadata": {
-            "compacted_record_count": ledger.compacted_record_count,
-            "compaction_digest": ledger.compaction_digest,
-            "last_compacted_at": ledger.last_compacted_at,
-        },
+        "compaction_metadata": meta,
         "reason_codes": sorted(set(ledger.reason_codes)),
     }
 
 
 def with_decision(
-    ledger: ConsumerStateLedger, decision: AuthorityConsumerDecision, *, retain: int = 64
+    ledger: ConsumerStateLedger,
+    decision: AuthorityConsumerDecision,
+    *,
+    retain: int = CONSUMER_DECISION_RETENTION_LIMIT,
 ) -> ConsumerStateLedger:
     record = decision_record(decision)
     by_id = {item.decision_id: item for item in ledger.decisions}
     by_id[record.decision_id] = record
-    values = sorted(by_id.values(), key=lambda item: item.decision_id)
+    updated = replace(
+        ledger,
+        current_authority_consumer_decision_id=record.decision_id,
+        decisions=tuple(sorted(by_id.values(), key=lambda item: item.decision_id)),
+    )
+    # The decision being replaced (the immediately preceding one) is kept.
+    return trim_consumer_decisions(
+        updated,
+        retain=retain,
+        protect=(ledger.current_authority_consumer_decision_id,),
+    )
+
+
+def alert_referenced_decision_ids(ledger: ConsumerStateLedger) -> frozenset[str]:
+    return frozenset(item.authority_consumer_decision_id for item in ledger.alert_records)
+
+
+def trim_consumer_decisions(
+    ledger: ConsumerStateLedger,
+    *,
+    retain: int = CONSUMER_DECISION_RETENTION_LIMIT,
+    protect: Iterable[str | None] = (),
+    keep_only: Iterable[str] | None = None,
+) -> ConsumerStateLedger:
+    """Keep at most ``retain`` decisions without breaking a reference.
+
+    The current decision, ``protect`` and every decision referenced by a
+    retained alert record are never removed.  ``keep_only``, when given,
+    additionally removes every unprotected decision outside it.  Removal order
+    among the rest is the established deterministic decision-ID order.
+    """
+
+    protected = {
+        ledger.current_authority_consumer_decision_id,
+        *protect,
+        *alert_referenced_decision_ids(ledger),
+    }
+    allowed = None if keep_only is None else set(keep_only)
+    values = sorted(ledger.decisions, key=lambda item: item.decision_id)
+    if allowed is not None:
+        values = [
+            item for item in values if item.decision_id in protected or item.decision_id in allowed
+        ]
     if len(values) > retain:
-        protected = {
-            record.decision_id,
-            ledger.current_authority_consumer_decision_id,
-            *(item.authority_consumer_decision_id for item in ledger.alert_records),
-        }
         removable = [item for item in values if item.decision_id not in protected]
         remove = {item.decision_id for item in removable[: max(0, len(values) - retain)]}
         values = [item for item in values if item.decision_id not in remove]
-    return replace(
-        ledger,
-        current_authority_consumer_decision_id=record.decision_id,
-        decisions=tuple(values),
-    )
+    if len(values) == len(ledger.decisions):
+        return ledger
+    return replace(ledger, decisions=tuple(values))
 
 
 def append_alert(ledger: ConsumerStateLedger, record: ConsumerAlertRecord) -> ConsumerStateLedger:
@@ -365,51 +506,129 @@ def compact_consumer_ledger(
     ledger: ConsumerStateLedger,
     *,
     now: float,
-    superseded_regime_ids: Iterable[str] = (),
-    retained_scheduled_occurrences_per_regime: int = 8,
+    event_finalized_at: Mapping[str, float] | None = None,
+    protect_key_ids: Iterable[str] = (),
+    retained_scheduled_keys: int = CONSUMER_RETAINED_SCHEDULED_WARNING_KEYS,
+    max_scheduled_keys: int = CONSUMER_MAX_SCHEDULED_WARNING_KEYS,
+    retained_generic_keys: int = CONSUMER_RETAINED_GENERIC_RECOVERY_KEYS,
 ) -> ConsumerStateLedger:
+    """Fold old alert lineages into the suppression high-water marks.
+
+    Kept unchanged (no record is rewritten, so pending reservations keep their
+    record IDs): every record of the newest ``retained_scheduled_keys``
+    scheduled-warning keys by occurrence, of scheduled keys whose occurrence
+    is not yet ``SCHEDULED_WARNING_FOLD_MARGIN_SECONDS`` in the past (at most
+    ``max_scheduled_keys`` in all), of the newest ``retained_generic_keys``
+    generic-recovery keys by event ``finalized_at``, and of ``protect_key_ids``.
+
+    Every other key is folded: its records are removed and its occurrence (or
+    its event's ``finalized_at``) raises the matching mark, so it stays
+    suppressed.  A key with more than ``CONSUMER_MAX_RECORDS_PER_KEY`` records
+    is folded too.  A generic key whose event is unknown (no longer retained)
+    is removed without raising the mark; such an event can never be reserved
+    again (the runtime refuses events outside the retained ring).  The marks
+    never decrease.  Folding beyond ``max_scheduled_keys`` is the only case
+    that can fold a future occurrence; it requires the wall clock to have
+    moved backwards and errs towards suppression, never towards a repeat.
+    """
+
     _finite_nonnegative("now", now)
-    superseded = set(superseded_regime_ids)
-    latest = list(latest_alert_records(ledger))
-    scheduled: dict[str, list[ConsumerAlertRecord]] = {}
-    retained: list[ConsumerAlertRecord] = []
+    finalized = dict(event_finalized_at or {})
+    protected = set(protect_key_ids)
+    records_by_key: dict[str, list[ConsumerAlertRecord]] = {}
+    for item in ledger.alert_records:
+        records_by_key.setdefault(item.key_id, []).append(item)
+    latest = latest_alert_records(ledger)
+    scheduled = sorted(
+        (item for item in latest if item.namespace is AuthoritySuppressionKind.SCHEDULED_WARNING),
+        key=lambda item: (item.expected_occurrence_at or 0, item.key_id),
+    )
+    generic = sorted(
+        (item for item in latest if item.namespace is AuthoritySuppressionKind.GENERIC_RECOVERY),
+        key=lambda item: (finalized.get(item.physical_event_id or "", -1.0), item.key_id),
+    )
+    folded: set[str] = set()
     for item in latest:
+        if (
+            item.key_id not in protected
+            and len(records_by_key.get(item.key_id, ())) > CONSUMER_MAX_RECORDS_PER_KEY
+        ):
+            folded.add(item.key_id)
+    newest_scheduled = (
+        {item.key_id for item in scheduled[-retained_scheduled_keys:]}
+        if retained_scheduled_keys > 0
+        else set()
+    )
+    horizon = now - SCHEDULED_WARNING_FOLD_MARGIN_SECONDS
+    for item in scheduled:
+        if item.key_id in protected or item.key_id in newest_scheduled:
+            continue
+        if (item.expected_occurrence_at or 0) <= horizon:
+            folded.add(item.key_id)
+    remaining = [item for item in scheduled if item.key_id not in folded]
+    excess = len(remaining) - max_scheduled_keys
+    for item in remaining:
+        if excess <= 0:
+            break
+        if item.key_id in protected:
+            continue
+        folded.add(item.key_id)
+        excess -= 1
+    newest_generic = (
+        {item.key_id for item in generic[-retained_generic_keys:]}
+        if retained_generic_keys > 0
+        else set()
+    )
+    for item in generic:
+        if item.key_id in protected or item.key_id in newest_generic:
+            continue
+        folded.add(item.key_id)
+    for item in generic:
+        if item.physical_event_id not in finalized and item.key_id not in protected:
+            folded.add(item.key_id)
+    # A retained record must never supersede a removed one.
+    changed = True
+    while changed:
+        changed = False
+        removed_ids = {
+            record.record_id
+            for key_id in folded
+            for record in records_by_key.get(key_id, ())
+        }
+        for item in ledger.alert_records:
+            if (
+                item.key_id not in folded
+                and item.supersedes_record_id is not None
+                and item.supersedes_record_id in removed_ids
+            ):
+                folded.add(item.key_id)
+                changed = True
+    scheduled_mark = ledger.scheduled_warning_suppressed_through
+    generic_mark = ledger.generic_recovery_suppressed_through
+    for item in latest:
+        if item.key_id not in folded:
+            continue
         if item.namespace is AuthoritySuppressionKind.SCHEDULED_WARNING:
-            scheduled.setdefault(item.regime_id or "", []).append(item)
-        else:
-            retained.append(item)
-    for regime_id, values in scheduled.items():
-        values.sort(key=lambda item: (item.expected_occurrence_at or -1, item.record_id))
-        keep = retained_scheduled_occurrences_per_regime
-        if regime_id not in superseded:
-            keep = max(keep, 2)
-        retained.extend(values[-keep:])
-    retained_ids = {item.record_id for item in retained}
-    summarized = []
-    for item in retained:
-        if item.supersedes_record_id is not None and item.supersedes_record_id not in retained_ids:
-            summarized.append(
-                alert_record(
-                    key=item.suppression_key(),
-                    authority_consumer_decision_id=item.authority_consumer_decision_id,
-                    created_at=item.created_at,
-                    lifecycle=item.lifecycle,
-                    action_outcome=item.action_outcome,
-                    compacted=True,
-                    reason_codes=tuple(
-                        sorted(set(item.reason_codes) | {"prior_lineage_compacted"})
-                    ),
+            occurrence = item.expected_occurrence_at
+            if occurrence is not None:
+                scheduled_mark = (
+                    occurrence if scheduled_mark is None else max(scheduled_mark, occurrence)
                 )
-            )
         else:
-            summarized.append(item)
-    retained = summarized
+            at = finalized.get(item.physical_event_id or "")
+            if at is not None:
+                generic_mark = float(at) if generic_mark is None else max(generic_mark, float(at))
+    retained = tuple(
+        sorted(
+            (item for item in ledger.alert_records if item.key_id not in folded),
+            key=lambda item: item.record_id,
+        )
+    )
     removed = sorted(
-        set(item.record_id for item in ledger.alert_records)
-        - set(item.record_id for item in retained)
+        item.record_id for item in ledger.alert_records if item.key_id in folded
     )
     digest = (
-        _stable_id("schema4-consumer-compaction", removed)
+        _stable_id("schema4-consumer-compaction", [ledger.compaction_digest, removed])
         if removed
         else ledger.compaction_digest
     )
@@ -420,12 +639,92 @@ def compact_consumer_ledger(
         server_key=ledger.server_key,
         current_authority_consumer_decision_id=ledger.current_authority_consumer_decision_id,
         decisions=ledger.decisions,
-        alert_records=tuple(sorted(retained, key=lambda item: item.record_id)),
+        alert_records=retained,
         compacted_record_count=ledger.compacted_record_count + len(removed),
         compaction_digest=digest,
         last_compacted_at=now if removed else ledger.last_compacted_at,
-        reason_codes=tuple(sorted(set(ledger.reason_codes) | {"consumer_state_reference_safe_compaction"})),
+        reason_codes=tuple(
+            sorted(
+                set(ledger.reason_codes)
+                | {"consumer_state_reference_safe_compaction", CONSUMER_LEDGER_BOUNDED_REASON}
+            )
+        ),
+        scheduled_warning_suppressed_through=scheduled_mark,
+        generic_recovery_suppressed_through=generic_mark,
     )
+
+
+def bound_consumer_ledger(
+    ledger: ConsumerStateLedger,
+    *,
+    now: float,
+    event_finalized_at: Mapping[str, float] | None = None,
+    protect_key_ids: Iterable[str] = (),
+    protect_decision_ids: Iterable[str | None] = (),
+    retain_decisions: int = CONSUMER_DECISION_RETENTION_LIMIT,
+) -> ConsumerStateLedger:
+    """Fold old alert lineages, then trim the decision history to its bound."""
+
+    compacted = compact_consumer_ledger(
+        ledger,
+        now=now,
+        event_finalized_at=event_finalized_at,
+        protect_key_ids=protect_key_ids,
+    )
+    return trim_consumer_decisions(
+        compacted, retain=retain_decisions, protect=protect_decision_ids
+    )
+
+
+def consumer_suppression_set(
+    ledger: ConsumerStateLedger,
+    *,
+    event_finalized_at: Mapping[str, float] | None = None,
+) -> ConsumerFiredKeys:
+    """Every key the ledger suppresses, including folded ones.
+
+    Generic-recovery keys folded into the mark are listed explicitly for the
+    retained events at or before it; scheduled-warning keys at or before their
+    mark are answered by ``ConsumerFiredKeys`` membership.
+    """
+
+    keys = set(fired_suppression_keys(ledger))
+    mark = ledger.generic_recovery_suppressed_through
+    if mark is not None:
+        for event_id, at in (event_finalized_at or {}).items():
+            if at <= mark:
+                keys.add(
+                    AuthoritySuppressionKey(
+                        kind=AuthoritySuppressionKind.GENERIC_RECOVERY,
+                        server_key=ledger.server_key,
+                        event_id=event_id,
+                    )
+                )
+    return ConsumerFiredKeys(
+        keys,
+        scheduled_warning_suppressed_through=ledger.scheduled_warning_suppressed_through,
+        server_key=ledger.server_key,
+    )
+
+
+def key_suppressed(
+    ledger: ConsumerStateLedger,
+    key: AuthoritySuppressionKey,
+    *,
+    event_finalized_at: Mapping[str, float] | None = None,
+) -> bool:
+    if key in fired_suppression_keys(ledger):
+        return True
+    if key.kind is AuthoritySuppressionKind.SCHEDULED_WARNING:
+        mark = ledger.scheduled_warning_suppressed_through
+        return bool(
+            mark is not None
+            and key.expected_occurrence_at is not None
+            and key.expected_occurrence_at <= mark
+        )
+    mark = ledger.generic_recovery_suppressed_through
+    at = (event_finalized_at or {}).get(key.event_id or "")
+    return bool(mark is not None and at is not None and at <= mark)
 
 
 def auto_compaction_reasons(
@@ -514,7 +813,33 @@ def validate_consumer_state(
         errors.append("duplicate_consumer_key_lifecycle_record")
     if len(active_key_ids) != len(set(active_key_ids)):
         errors.append("duplicate_active_consumer_suppression_key")
+    if CONSUMER_LEDGER_BOUNDED_REASON in ledger.reason_codes:
+        errors.extend(_bounded_ledger_errors(ledger))
     return tuple(sorted(set(errors)))
+
+
+def _bounded_ledger_errors(ledger: ConsumerStateLedger) -> list[str]:
+    """Retention R5 bounds of a ledger that has been compacted at least once."""
+
+    errors = []
+    records_by_key: dict[str, int] = {}
+    kinds: dict[str, AuthoritySuppressionKind] = {}
+    for item in ledger.alert_records:
+        records_by_key[item.key_id] = records_by_key.get(item.key_id, 0) + 1
+        kinds[item.key_id] = item.namespace
+    scheduled = sum(
+        1 for kind in kinds.values() if kind is AuthoritySuppressionKind.SCHEDULED_WARNING
+    )
+    generic = len(kinds) - scheduled
+    if scheduled > CONSUMER_MAX_SCHEDULED_WARNING_KEYS:
+        errors.append(f"consumer_scheduled_warning_retention_exceeded:{scheduled}")
+    if generic > CONSUMER_MAX_GENERIC_RECOVERY_KEYS:
+        errors.append(f"consumer_generic_recovery_retention_exceeded:{generic}")
+    if any(count > CONSUMER_MAX_RECORDS_PER_KEY for count in records_by_key.values()):
+        errors.append("consumer_alert_lineage_retention_exceeded")
+    if len(ledger.decisions) > CONSUMER_DECISION_RETENTION_LIMIT:
+        errors.append(f"consumer_decision_retention_exceeded:{len(ledger.decisions)}")
+    return errors
 
 
 def _validate_ledger_shape(ledger: ConsumerStateLedger, *, expected_server_key: str) -> None:

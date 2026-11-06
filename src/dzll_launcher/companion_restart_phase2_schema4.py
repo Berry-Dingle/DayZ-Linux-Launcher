@@ -55,13 +55,18 @@ from .companion_restart_phase2_detection import (
     normalize_event_restart_start_phase,
 )
 from .companion_restart_phase2_consumer_state import (
+    CONSUMER_DECISION_RETENTION_LIMIT,
+    GENERIC_SUPPRESSED_THROUGH_FIELD,
     alert_record,
+    alert_referenced_decision_ids,
     append_alert,
+    bound_consumer_ledger,
     compact_consumer_ledger,
     empty_consumer_state,
     ledger_from_mapping as consumer_ledger_from_mapping,
     ledger_to_mapping as consumer_ledger_to_mapping,
     latest_alert_records,
+    trim_consumer_decisions,
     validate_consumer_state,
     with_decision,
 )
@@ -143,6 +148,11 @@ RAW_EVENT_RETENTION_LIMIT = 80
 # so beyond this many unfolded records the oldest settled ones are folded.
 EXPECTED_WINDOW_RETENTION_LIMIT = 240
 EXPECTED_WINDOW_FOLD_SETTLE_SECONDS = 24 * 3600
+# Retention R5: a record carrying this reason code keeps at most
+# ``AUTHORITY_DECISION_RETENTION_LIMIT`` authority decisions.  Consumer and
+# alert bookkeeping is bounded by the consumer ledger itself.
+DECISION_HISTORY_BOUNDED_REASON = "alert_and_decision_history_bounded"
+AUTHORITY_DECISION_RETENTION_LIMIT = 64
 
 
 class Schema4Error(ValueError):
@@ -1205,20 +1215,17 @@ def compact_schema4_state(state: object) -> dict:
         reasons.add("raw_samples_and_legacy_coverage_compacted")
         record["reason_codes"] = sorted(reasons)
         if isinstance(record.get("consumer_state"), Mapping):
-            regimes = {
-                str(item.get("regime_id"))
-                for item in record.get("regimes", ())
-                if isinstance(item, Mapping)
-                and item.get("status") == RegimeRecordStatus.SUPERSEDED.value
-            }
             consumer = consumer_ledger_from_mapping(
                 record["consumer_state"], server_key=str(record.get("server_key"))
             )
             record["consumer_state"] = consumer_ledger_to_mapping(
-                compact_consumer_ledger(
+                bound_consumer_ledger(
                     consumer,
                     now=float(compacted.get("updated_at", 0) or 0),
-                    superseded_regime_ids=regimes,
+                    event_finalized_at={
+                        item.event_id: item.finalized_at
+                        for item in persisted_physical_events(record)
+                    },
                 )
             )
     report = validate_schema4_state(compacted)
@@ -1460,14 +1467,14 @@ def rebuild_schema4_server_record(
         if isinstance(item, Mapping) and isinstance(item.get("decision_id"), str)
     }
     history[decision.decision_id] = _decision_payload(decision)
-    consumer_state = copy.deepcopy(
-        existing_record.get("consumer_state", empty_consumer_state(server_key))
-    )
-    fresh["authority_decisions"] = _retain_authority_decisions(
+    consumer_state, fresh["authority_decisions"] = bound_alert_and_decision_history(
+        existing_record.get("consumer_state", empty_consumer_state(server_key)),
         history.values(),
+        server_key=server_key,
         current_id=decision.decision_id,
         prior_id=None if prior is None else prior.decision_id,
-        referenced_ids=_consumer_referenced_authority_decision_ids(consumer_state),
+        now=updated_at,
+        event_finalized_at={item.event_id: item.finalized_at for item in events},
     )
     fresh["prior_authority_decision_id"] = (
         None if prior is None else prior.decision_id
@@ -1479,7 +1486,7 @@ def rebuild_schema4_server_record(
     fresh["reason_codes"] = sorted(
         set(existing_record.get("reason_codes", ()))
         | set(fresh.get("reason_codes", ()))
-        | {"authoritative_schema4_runtime_rebuilt"}
+        | {"authoritative_schema4_runtime_rebuilt", DECISION_HISTORY_BOUNDED_REASON}
     )
     audit = copy.deepcopy(fresh.get("migration_audit", {}))
     audit.update({
@@ -1870,6 +1877,22 @@ def prune_folded_raw_evidence(
             meta["compacted_record_count"] = int(meta.get("compacted_record_count", 0)) + len(
                 dropped
             )
+            # Retention R5: the dropped events stay suppressed through the
+            # generic-recovery high-water mark (in addition to the runtime
+            # refusing events outside the ring).
+            finalized = {item.event_id: item.finalized_at for item in events}
+            dropped_at = [
+                finalized[item["physical_event_id"]]
+                for item in alerts
+                if item.get("record_id") in dropped
+                and item.get("namespace") == AuthoritySuppressionKind.GENERIC_RECOVERY.value
+                and item.get("physical_event_id") in finalized
+            ]
+            if dropped_at:
+                prior_mark = meta.get(GENERIC_SUPPRESSED_THROUGH_FIELD)
+                meta[GENERIC_SUPPRESSED_THROUGH_FIELD] = float(
+                    max(dropped_at + ([prior_mark] if prior_mark is not None else []))
+                )
             consumer["compaction_metadata"] = meta
             consumer["reason_codes"] = sorted(
                 set(consumer.get("reason_codes", ()))
@@ -2023,19 +2046,66 @@ def _collection_ids(values: object, field: str) -> frozenset[str]:
     )
 
 
-def _consumer_referenced_authority_decision_ids(
+def bound_alert_and_decision_history(
     consumer_state: object,
-) -> frozenset[str]:
-    """Return authority decision IDs referenced by persisted consumer decisions."""
+    decisions: Iterable[Mapping[str, object]],
+    *,
+    server_key: str,
+    current_id: str,
+    prior_id: str | None,
+    now: float,
+    event_finalized_at: Mapping[str, float],
+) -> tuple[dict, list[dict]]:
+    """Retention R5: bound alert records, consumer and authority decisions.
 
-    if not isinstance(consumer_state, Mapping):
-        return frozenset()
-    return frozenset(
-        str(item["authority_decision_id"])
-        for item in consumer_state.get("decisions", ()) or ()
-        if isinstance(item, Mapping)
-        and isinstance(item.get("authority_decision_id"), str)
+    1. Old alert lineages are folded into the ledger's suppression marks
+       (``compact_consumer_ledger``), which bounds the retained alert records.
+    2. Protected consumer decisions are the current one and those referenced
+       by a retained alert record.  Only their authority decisions are
+       protected in the authority history, together with the current and
+       prior authority decision, so the history keeps at most
+       ``AUTHORITY_DECISION_RETENTION_LIMIT`` decisions.
+    3. Unprotected consumer decisions whose authority decision was not
+       retained are removed; the rest are trimmed to the consumer bound.
+
+    Nothing that a retained reference needs is removed, and the folded keys
+    stay suppressed in the same ledger.  Returns the consumer state mapping
+    and the retained authority decision payloads.
+    """
+
+    ledger = consumer_ledger_from_mapping(
+        copy.deepcopy(consumer_state), server_key=server_key
     )
+    ledger = compact_consumer_ledger(
+        ledger, now=float(now), event_finalized_at=event_finalized_at
+    )
+    protected_consumer = {
+        ledger.current_authority_consumer_decision_id,
+        *alert_referenced_decision_ids(ledger),
+    }
+    referenced = {
+        item.authority_decision_id
+        for item in ledger.decisions
+        if item.decision_id in protected_consumer
+    }
+    retained = _retain_authority_decisions(
+        decisions,
+        current_id=current_id,
+        prior_id=prior_id,
+        referenced_ids=referenced,
+        limit=AUTHORITY_DECISION_RETENTION_LIMIT,
+    )
+    retained_ids = {str(item["decision_id"]) for item in retained}
+    ledger = trim_consumer_decisions(
+        ledger,
+        retain=CONSUMER_DECISION_RETENTION_LIMIT,
+        keep_only=(
+            item.decision_id
+            for item in ledger.decisions
+            if item.authority_decision_id in retained_ids
+        ),
+    )
+    return consumer_ledger_to_mapping(ledger), retained
 
 
 def _retain_authority_decisions(
@@ -2048,9 +2118,11 @@ def _retain_authority_decisions(
 ) -> list[dict]:
     """Deterministically retain current/prior and transition-significant history.
 
-    Decisions referenced by the retained consumer ledger are never pruned, so
-    history may exceed ``limit`` when that is required for referential
-    integrity.  Unreferenced decisions remain subject to the bounded policy.
+    Decisions in ``referenced_ids`` are never pruned.  Since Retention R5 the
+    caller passes only the authority decisions of protected consumer decisions
+    (bounded by the consumer ledger), so the result stays within ``limit``;
+    strict validation enforces it for records marked
+    ``DECISION_HISTORY_BOUNDED_REASON``.
     """
 
     by_id: dict[str, dict] = {}
@@ -2331,6 +2403,17 @@ def normalize_restart_start_phases(
         if isinstance(existing_consumer, Mapping):
             old_consumer = consumer_ledger_from_mapping(
                 existing_consumer, server_key=server_key
+            )
+            # Retention R5: folded keys remain suppressed (both marks cover
+            # only past occurrences and earlier-finalized events).
+            rebuilt_consumer = dataclasses.replace(
+                rebuilt_consumer,
+                scheduled_warning_suppressed_through=(
+                    old_consumer.scheduled_warning_suppressed_through
+                ),
+                generic_recovery_suppressed_through=(
+                    old_consumer.generic_recovery_suppressed_through
+                ),
             )
             physical_ids = {item.event_id for item in migrated_events}
             for item in latest_alert_records(old_consumer):
@@ -2778,6 +2861,17 @@ def _validate_server_record(server_key: str, record: object) -> list[Schema4Vali
                 "raw_event_retention_exceeded",
                 f"pruned record retains {len(record['physical_events'])} physical events",
             )
+    reasons = record.get("reason_codes")
+    if (
+        isinstance(reasons, (list, tuple))
+        and DECISION_HISTORY_BOUNDED_REASON in reasons
+        and isinstance(record.get("authority_decisions"), list)
+        and len(record["authority_decisions"]) > AUTHORITY_DECISION_RETENTION_LIMIT
+    ):
+        add(
+            "authority_decision_retention_exceeded",
+            f"record retains {len(record['authority_decisions'])} authority decisions",
+        )
     consumer_errors = validate_consumer_state(
         record.get("consumer_state"),
         server_key=server_key,

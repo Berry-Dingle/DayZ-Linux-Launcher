@@ -24,8 +24,10 @@ from .companion_restart_phase2_consumer_state import (
     alert_record,
     auto_compaction_reasons,
     append_alert,
+    bound_consumer_ledger,
+    consumer_suppression_set,
     empty_consumer_state,
-    fired_suppression_keys,
+    key_suppressed,
     latest_alert_records,
     ledger_from_mapping as consumer_ledger_from_mapping,
     ledger_to_mapping as consumer_ledger_to_mapping,
@@ -350,7 +352,9 @@ class AuthoritativeSchema4Runtime:
         ledger = consumer_ledger_from_mapping(
             record.get("consumer_state"), server_key=str(server_key)
         )
-        return fired_suppression_keys(ledger)
+        return consumer_suppression_set(
+            ledger, event_finalized_at=_event_finalized_at(record)
+        )
 
     def record_consumer_decision(
         self, decision: AuthorityConsumerDecision, *, created_at: float
@@ -372,6 +376,12 @@ class AuthoritativeSchema4Runtime:
                 active_regime_id=decision.selected_regime_id,
                 authority_consumer_decision_id=decision.decision_id,
                 created_at=created_at,
+            )
+            updated = bound_consumer_ledger(
+                updated,
+                now=created_at,
+                event_finalized_at=_event_finalized_at(record),
+                protect_decision_ids=(ledger.current_authority_consumer_decision_id,),
             )
             if consumer_ledger_to_mapping(updated) == consumer_ledger_to_mapping(ledger):
                 return False
@@ -419,8 +429,10 @@ class AuthoritativeSchema4Runtime:
             ledger = consumer_ledger_from_mapping(
                 record.get("consumer_state"), server_key=decision.server_key
             )
+            preceding_decision_id = ledger.current_authority_consumer_decision_id
             ledger = with_decision(ledger, decision)
-            if key in fired_suppression_keys(ledger):
+            finalized = _event_finalized_at(record)
+            if key_suppressed(ledger, key, event_finalized_at=finalized):
                 return ConsumerAlertReservation(
                     False,
                     key,
@@ -449,6 +461,13 @@ class AuthoritativeSchema4Runtime:
                 ),
             )
             ledger = append_alert(ledger, reserved)
+            ledger = bound_consumer_ledger(
+                ledger,
+                now=created_at,
+                event_finalized_at=finalized,
+                protect_key_ids=(reserved.key_id,),
+                protect_decision_ids=(preceding_decision_id,),
+            )
             candidate = copy.deepcopy(self._state)
             candidate["servers"][decision.server_key]["consumer_state"] = (
                 consumer_ledger_to_mapping(ledger)
@@ -484,6 +503,19 @@ class AuthoritativeSchema4Runtime:
             ledger = consumer_ledger_from_mapping(
                 record.get("consumer_state"), server_key=decision.server_key
             )
+            if reservation.record.record_id not in {
+                item.record_id for item in ledger.alert_records
+            }:
+                # Retention R5: the reservation was folded into the suppression
+                # high-water mark, so the key stays suppressed without it and
+                # its outcome cannot change that.  Never re-append it.
+                if not key_suppressed(
+                    ledger, reservation.key, event_finalized_at=_event_finalized_at(record)
+                ):
+                    raise Schema4RuntimeError(
+                        "consumer alert reservation is missing and not suppressed"
+                    )
+                return self.flush()
             completed = alert_record(
                 key=reservation.key,
                 authority_consumer_decision_id=decision.decision_id,
@@ -507,6 +539,12 @@ class AuthoritativeSchema4Runtime:
                 ),
             )
             ledger = append_alert(ledger, completed)
+            ledger = bound_consumer_ledger(
+                ledger,
+                now=completed_at,
+                event_finalized_at=_event_finalized_at(record),
+                protect_key_ids=(completed.key_id,),
+            )
             candidate = copy.deepcopy(self._state)
             candidate["servers"][decision.server_key]["consumer_state"] = (
                 consumer_ledger_to_mapping(ledger)
@@ -1030,6 +1068,24 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def _event_finalized_at(record: Mapping[str, object]) -> dict[str, float]:
+    """Return ``finalized_at`` of every retained physical event of a record."""
+
+    result: dict[str, float] = {}
+    for item in record.get("physical_events", ()) or ():
+        if not isinstance(item, Mapping):
+            continue
+        event_id = item.get("event_id")
+        at = item.get("finalized_at")
+        if (
+            isinstance(event_id, str)
+            and not isinstance(at, bool)
+            and isinstance(at, (int, float))
+        ):
+            result[event_id] = float(at)
+    return result
 
 
 def _sha256(payload: bytes) -> str:

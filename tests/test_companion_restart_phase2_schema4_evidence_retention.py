@@ -649,7 +649,11 @@ def test_retention_preserves_alert_suppression_and_references(monkeypatch):
     for step in range(3, 9):
         record = _rebuild(record, _schema3_record(step), step=step)
         assert schema4._validate_server_record(SERVER, record) == []
-        assert record["consumer_state"] == payload
+        # Retention R5 only marks the (already bounded) ledger as bounded.
+        assert {k: v for k, v in record["consumer_state"].items() if k != "reason_codes"} == {
+            k: v for k, v in payload.items() if k != "reason_codes"
+        }
+        assert state4.CONSUMER_LEDGER_BOUNDED_REASON in record["consumer_state"]["reason_codes"]
     assert event_id in _ids(record, "physical_events", "event_id")
     assert state4.fired_suppression_keys(
         state4.ledger_from_mapping(record["consumer_state"], server_key=SERVER)
