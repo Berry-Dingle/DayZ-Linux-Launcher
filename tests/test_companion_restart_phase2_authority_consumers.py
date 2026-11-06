@@ -339,11 +339,17 @@ def test_unknown_has_no_schedule_consumers():
 
 
 def test_normal_learning_can_preserve_pattern_only_without_cycle():
+    decision = _authority(2)
     value = consumers4.evaluate_authority_consumers(
-        _policy(_authority(2), normal_pattern_supported=True, normal_pattern_confidence=0.78)
+        _policy(decision, normal_pattern_supported=True, normal_pattern_confidence=0.78)
     )
     assert value.presentation_state is consumers4.AuthorityPresentationKey.PATTERN_ONLY
-    assert value.confidence_display_value == 0.78
+    # Stage 8.4: learning confidence is the evaluated schema-4 candidate's
+    # combined confidence (H1, 0.50), not schema-3 schedule existence (0.78).
+    h1 = max(decision.candidates, key=lambda item: item.high_authority)
+    assert h1.h1_gate and not h1.h2_gate
+    assert value.confidence_display_value == h1.combined_confidence == 0.5
+    assert consumers4.LEARNING_CONFIDENCE_REASON in value.reason_codes
     assert value.cycle_period_seconds is None and not value.countdown_visible
 
 
@@ -701,15 +707,21 @@ def test_h1_does_not_show_likely_even_at_fifty_percent():
     assert value.presentation_state is consumers4.AuthorityPresentationKey.NONE
 
 
-def test_h2_likely_shows_cycle_without_countdown():
+def test_h2_likely_is_presented_as_learning_without_countdown():
+    # Stage 8.4: an acquisition LIKELY regime is not an established cycle.
     decision = _likely_h2()
     value = consumers4.evaluate_authority_consumers(_policy(decision))
-    assert value.presentation_state is consumers4.AuthorityPresentationKey.LIKELY_CYCLE
-    assert value.confidence_display_value == decision.combined_confidence
-    assert 0.77 < value.confidence_display_value < 0.79
-    assert value.visible_cycle and not value.countdown_visible
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.PATTERN_ONLY
+    assert value.confidence_display_value == min(0.79, decision.combined_confidence)
+    assert 0.77 < value.confidence_display_value <= 0.79
+    assert not value.visible_cycle and value.cycle_period_seconds is None
+    assert not value.countdown_visible
     assert not value.scheduled_warning_eligible
     assert "h2_countdown_withheld" in value.reason_codes
+    assert summary["cycle_text"] == "Learning Restart Pattern"
+    assert summary["confidence_label"] == "Learning Confidence:"
+    assert summary["confidence_visible"]
 
 
 def test_two_interval_establishment_is_confirmed_with_countdown_and_warning():
@@ -805,7 +817,9 @@ def test_likely_cycle_above_rounding_boundary_gets_no_warning():
     value = _warning_at_due_time(decision)
 
     assert decision.state is authority.RegimeState.LIKELY
-    assert value.presentation_state is consumers4.AuthorityPresentationKey.LIKELY_CYCLE
+    # Stage 8.4: LIKELY is presented as Learning, capped below establishment.
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.PATTERN_ONLY
+    assert value.confidence_display_value == 0.79
     assert not value.countdown_visible
     assert not value.scheduled_warning_eligible
 
@@ -1057,7 +1071,7 @@ def test_offline_h3_retains_prediction_metadata_but_disables_warning():
 @pytest.mark.parametrize(
     "decision,expected_presentation",
     [
-        (_likely_h2(), consumers4.AuthorityPresentationKey.LIKELY_CYCLE),
+        (_likely_h2(), consumers4.AuthorityPresentationKey.PATTERN_ONLY),
         (
             _transition(
                 _authority(4),

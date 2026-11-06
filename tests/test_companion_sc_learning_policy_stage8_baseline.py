@@ -36,6 +36,10 @@ H1-H4 gates kept on their 0.08 calibration) converted the S01 warning and S02
 Stage 8.3 (long-horizon per-event sparse input, ceiling unchanged) added the
 ``test_s83_*`` section.  Stage 8.3a (scheduled warning follows the displayed
 80 % milestone, internal >= 0.795) converted the realistic-jitter warning test.
+Stage 8.4 (unified confidence presentation: Learning shows the evaluated
+schema-4 candidate's capped ``combined_confidence``; acquisition LIKELY is
+presented as Learning) added the ``test_s84_*`` section and updated the one
+LIKELY presentation assertion that encoded the old named-cycle wording.
 """
 
 from __future__ import annotations
@@ -344,12 +348,8 @@ class Pipeline:
         return Step(now, score, relationships, streaks, decision, events)
 
 
-def consume(step, *, now, restart_alert_enabled=True, fired_keys=frozenset(), physical_recovery_event_id=None):
-    """The schema-4 consumer with runtime-equivalent normal-scorer inputs.
-
-    Mirrors ``Phase2RestartRuntime._evaluate_authority_consumer_shadow`` and
-    the schema-3 consumer input it is derived from.
-    """
+def schema3_consumer(step, *, now):
+    """The schema-3 consumer decision, its selected candidate and prediction."""
 
     score = step.score
     selected = (
@@ -387,6 +387,18 @@ def consume(step, *, now, restart_alert_enabled=True, fired_keys=frozenset(), ph
             ),
         )
     )
+    return schema3, selected, predicted
+
+
+def consume(step, *, now, restart_alert_enabled=True, fired_keys=frozenset(), physical_recovery_event_id=None):
+    """The schema-4 consumer with runtime-equivalent normal-scorer inputs.
+
+    Mirrors ``Phase2RestartRuntime._evaluate_authority_consumer_shadow`` and
+    the schema-3 consumer input it is derived from.
+    """
+
+    score = step.score
+    schema3, selected, predicted = schema3_consumer(step, now=now)
     normal = None
     if selected is not None:
         unresolved_divisor = bool(
@@ -1180,7 +1192,9 @@ def test_s81_imprecise_h2_stays_likely_without_countdown():
     assert candidate.h2_gate and not candidate.h3_gate
     assert candidate.phase_quality < authority.TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM
     assert step.decision.state is State.LIKELY
-    assert value.presentation_state is Presentation.LIKELY_CYCLE
+    # Stage 8.4: LIKELY is presented as Learning (no named period).
+    assert value.presentation_state is Presentation.PATTERN_ONLY
+    assert value.cycle_period_seconds is None
     assert not value.countdown_visible
 
 
@@ -1793,3 +1807,343 @@ def test_s83_ineligible_or_unconfirmed_restarts_add_no_sparse_support(contaminat
     assert sparse_support(contaminated.evaluate(), P3, at(0, 6) % P3) == sparse_support(
         clean.evaluate(), P3, at(0, 6) % P3
     )
+
+
+# --------------------------------------------------------------------------
+# Stage 8.4 focused tests: unified confidence presentation
+# --------------------------------------------------------------------------
+
+
+LEARNING_TEXT = "Learning Restart Pattern"
+
+
+def panel(step, *, now=None, **kwargs):
+    now = step.now if now is None else now
+    return ui(step, step.consumer(now=now, **kwargs), now)
+
+
+def assert_learning(shown):
+    assert shown["cycle_text"] == LEARNING_TEXT, shown["cycle_text"]
+    assert shown["confidence_label"] == "Learning Confidence:"
+    assert not shown["countdown_visible"] and not shown["next_visible"]
+    assert not shown["prediction_usable"]
+
+
+def test_s84_sparse_learning_shows_its_long_horizon_schema4_candidate():
+    step = settled(sparse_pipeline())
+    value = step.consumer()
+    shown = panel(step)
+    leading = max(step.decision.candidates, key=lambda item: item.combined_confidence)
+    schema3 = runtime.presentation_period_candidate(step.score, period_seconds=None)
+
+    assert step.decision.state is State.NORMAL_LEARNING
+    assert leading.candidate_period_seconds == P3
+    assert not leading.high_relationship_ids  # a sparse (normal-only) candidate
+    assert leading.aligned_normal_confidence == 0.95
+    assert_learning(shown)
+    assert shown["confidence_visible"]
+    assert value.confidence_display_value == leading.combined_confidence == 0.095
+    assert shown["confidence_percent"] == consumers4.confidence_display_percent(0.095) == 10
+    # Not the schema-3 recent-window fundamental (26 %), and never rescaled.
+    assert schema3 == (P3, 0.255056)
+    assert shown["confidence_percent"] != round(schema3[1] * 100)
+    assert consumers4.LEARNING_CONFIDENCE_REASON in value.reason_codes
+
+
+def test_s84_learning_confidence_never_comes_from_a_different_period():
+    step = settled(sparse_pipeline(SAME_CLOCK))
+    shown = panel(step)
+    schema3 = runtime.presentation_period_candidate(step.score, period_seconds=None)
+    best = max(item.combined_confidence for item in step.decision.candidates)
+    reordered = replace(step.decision, candidates=tuple(reversed(step.decision.candidates)))
+    again = consume(replace(step, decision=reordered), now=step.now)
+
+    # The schema-3 projection would name a 12 h period at 59 %.
+    assert schema3 == (12 * HOUR, 0.59)
+    assert_learning(shown)
+    assert shown["confidence_percent"] == consumers4.confidence_display_percent(best) == 10
+    assert again.confidence_display_value == step.consumer().confidence_display_value
+
+    # A LIKELY regime shows its own candidate, not the best other period.
+    likely = imprecise_h2().evaluate()
+    regime = likely.decision.selected_shadow_regime
+    own = consumers4._candidate_for_regime(likely.decision, regime)
+    assert own.candidate_period_seconds == regime.candidate_period_seconds == P3
+    assert likely.consumer().confidence_display_value == min(0.79, own.combined_confidence)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(imprecise_h2, id="h2_continuity_likely"),
+        pytest.param(
+            lambda: three_hour_chain(5, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART),
+            id="normal_origin_likely",
+        ),
+    ],
+)
+def test_s84_unknown_server_likely_consistently_shows_learning(build):
+    pipeline = build()
+    first = pipeline.evaluate()
+    values = rebuilds(pipeline, first)
+    values.append(pipeline.evaluate(values[-1].decision))  # in-memory reopen
+    occurrence = values[0].candidate(P3).phase_offset + 100 * P3
+
+    for step in values:
+        value = step.consumer()
+        shown = panel(step)
+        warning = step.consumer(now=occurrence - 300)
+        assert step.decision.state is State.LIKELY
+        assert value.presentation_state is Presentation.PATTERN_ONLY
+        assert not value.visible_cycle and value.cycle_period_seconds is None
+        assert_learning(shown)
+        assert shown["confidence_visible"]
+        assert shown["confidence_percent"] <= 79
+        assert not warning.scheduled_warning_eligible
+        assert not warning.countdown_visible
+    assert len({panel(step)["confidence_percent"] for step in values}) == 1
+    assert len({step.consumer().decision_id for step in values}) == 1
+
+
+def test_s84_two_interval_established_cycle_shows_80_percent_with_countdown_and_warning():
+    pipeline = three_hour_chain(3)
+    first = pipeline.evaluate()
+    for step in (first, pipeline.evaluate(persisted(first.decision))):
+        value = step.consumer()
+        shown = panel(step)
+        due = step.consumer(now=value.next_expected_restart_at - 300)
+
+        assert step.decision.state is State.ESTABLISHED
+        assert shown["cycle_text"] == "Every 3 Hours"
+        assert shown["confidence_label"] == "Cycle Confidence:"
+        assert shown["confidence_percent"] == 80
+        assert value.confidence_display_value == step.candidate(P3).combined_confidence
+        assert shown["countdown_visible"] and value.countdown_safe
+        assert due.scheduled_warning_eligible and due.scheduled_pre_restart_alert_eligible
+
+
+def test_s84_three_interval_established_cycle_shows_95_percent():
+    step = three_hour_chain(4).evaluate()
+    shown = panel(step)
+
+    assert shown["cycle_text"] == "Every 3 Hours"
+    assert shown["confidence_label"] == "Cycle Confidence:"
+    assert shown["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    assert shown["countdown_visible"]
+
+
+def _harmonic_likely():
+    pipeline = Pipeline()
+    pipeline.observe("six-hour", [at(0, 0), at(0, 6), at(0, 12)])
+    ledger = (
+        genuine_miss(3 * HOUR, at(1, 3), key="divisor-3h"),
+        genuine_miss(2 * HOUR, at(1, 2), key="divisor-2h"),
+    )
+    return pipeline, {"ledger": ledger}
+
+
+def _competing_likely():
+    pipeline = Pipeline()
+    pipeline.observe("three-hour", [at(0, 9), at(0, 12), at(0, 15)])
+    pipeline.observe("four-hour", [at(1, 1), at(1, 5), at(1, 9)])
+    return pipeline, {}
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        pytest.param(_harmonic_likely, id="harmonic_blocker"),
+        pytest.param(_competing_likely, id="period_ambiguity"),
+    ],
+)
+def test_s84_harmonic_blockers_and_period_ambiguity_cap_learning_at_59_percent(build):
+    pipeline, kwargs = build()
+    first = pipeline.evaluate(**kwargs)
+    again = pipeline.evaluate(persisted(first.decision), **kwargs)
+    candidate = consumers4._candidate_for_regime(
+        first.decision, first.decision.selected_shadow_regime
+    )
+
+    assert first.decision.state is State.LIKELY
+    assert candidate.combined_confidence > 0.59
+    for step in (first, again):
+        value = step.consumer()
+        shown = panel(step)
+        assert_learning(shown)
+        assert value.confidence_display_value == 0.59
+        assert shown["confidence_percent"] == 59
+        assert consumers4.LEARNING_CONFIDENCE_AMBIGUITY_CAP_REASON in value.reason_codes
+
+
+def test_s84_structurally_incomplete_learning_is_capped_at_79_percent():
+    # A clean two-interval streak (0.80) withheld from establishment by an
+    # in-phase genuine miss: LIKELY, no harmonic blocker, no competitor.
+    step = three_hour_chain(3).evaluate(ledger=(genuine_miss(P3, at(0, 21), key="in-phase-miss"),))
+    value = step.consumer()
+    imprecise = imprecise_h2().evaluate()
+
+    assert step.decision.state is State.LIKELY
+    assert step.candidate(P3).combined_confidence == 0.80
+    assert not step.candidate(P3).harmonic_blockers
+    assert value.confidence_display_value == 0.79
+    assert_learning(panel(step))
+    assert panel(step)["confidence_percent"] == 79
+    assert consumers4.LEARNING_CONFIDENCE_STRUCTURE_CAP_REASON in value.reason_codes
+    # Below the cap the actual value is shown unchanged (0.789786 -> 79 %).
+    assert imprecise.consumer().confidence_display_value == imprecise.candidate(P3).combined_confidence
+    assert panel(imprecise)["confidence_percent"] == 79
+
+
+def test_s84_stage7_suspected_change_presentation_unchanged():
+    pipeline = three_hour_chain(7)
+    original = settled(pipeline)
+    pipeline.observe("challenger-a", [at(2, 1), at(2, 5)])
+    pipeline.observe("challenger-b", [at(2, 13), at(2, 17)])
+    step = pipeline.evaluate(persisted(original.decision))
+    value = step.consumer()
+    shown = panel(step)
+
+    assert value.presentation_state is Presentation.SCHEDULE_CHANGE_SUSPECTED
+    assert value.confidence_display_value == 0.75
+    assert shown["cycle_text"] == "Suspected Cycle Change"
+    assert shown["confidence_label"] == "Cycle Confidence:"
+    assert shown["confidence_percent"] == 75
+    assert not shown["countdown_visible"]
+    assert consumers4.LEARNING_CONFIDENCE_REASON not in value.reason_codes
+
+
+def test_s84_provisional_new_cycle_keeps_likely_new_with_challenger_confidence():
+    step = _gate_scenarios()["challenger_two"]
+    value = step.consumer()
+    shown = panel(step)
+    selected = step.decision.selected_shadow_regime
+    challenger = next(
+        item for item in step.decision.candidates if item.regime_id == selected.regime_id
+    )
+
+    assert step.decision.state is State.TRANSITION_CONFIRMED
+    assert selected.candidate_period_seconds == 4 * HOUR
+    assert value.presentation_state is Presentation.LIKELY_NEW_CYCLE
+    assert value.confidence_display_value == challenger.combined_confidence
+    assert shown["cycle_text"] == "Likely new: Every 4 hours"
+    assert shown["confidence_label"] == "Cycle Confidence:"
+    assert shown["confidence_percent"] == consumers4.confidence_display_percent(
+        challenger.combined_confidence
+    )
+    assert not shown["countdown_visible"]
+
+
+def test_s84_legacy_schema3_fallback_when_schema4_is_invalid():
+    step = settled(sparse_pipeline())
+    schema3, _selected, _predicted = schema3_consumer(step, now=step.now)
+    resolution = consumers4.resolve_authority_consumer_cutover(
+        schema3_decision=schema3,
+        schema4_decision=step.consumer(),
+        production_cutover_enabled=True,
+        authoritative_schema4_runtime_enabled=True,
+        schema4_server_valid=False,
+    )
+    # The window path for a schema-3 source: schema-3 summary plus the
+    # schema-3 learning-candidate projection.
+    summary = runtime.phase2_learning_summary(schema3, now=step.now)
+    candidate = runtime.presentation_period_candidate(step.score, period_seconds=None)
+    shown = restart_learning_presentation(
+        companion_display_confidence_summary(
+            summary, candidate, period_seconds=schema3.selected_period_seconds
+        )
+    )
+
+    assert resolution.source is consumers4.CutoverSource.SCHEMA3_SAFE_FALLBACK
+    assert resolution.selected_output is schema3
+    assert "learning_confidence_source" not in (summary or {})
+    assert shown["cycle_text"] == LEARNING_TEXT
+    assert shown["confidence_label"] == "Learning Confidence:"
+    assert shown["confidence_percent"] == round(candidate[1] * 100) == 26
+
+
+PRESENTATION_BUILDERS = {
+    "sparse_learning": lambda: (sparse_pipeline(), {}),
+    "h2_likely": lambda: (imprecise_h2(), {}),
+    "harmonic_likely": _harmonic_likely,
+    "two_interval_established": lambda: (three_hour_chain(3), {}),
+    "three_interval_established": lambda: (three_hour_chain(4), {}),
+    "normal_origin_established": lambda: (
+        three_hour_chain(9, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART),
+        {},
+    ),
+}
+
+
+@pytest.mark.parametrize("name", sorted(PRESENTATION_BUILDERS))
+def test_s84_presentation_is_stable_across_rebuild_and_reopen(name):
+    pipeline, kwargs = PRESENTATION_BUILDERS[name]()
+    first = pipeline.evaluate(**kwargs)
+    second = pipeline.evaluate(persisted(first.decision), **kwargs)
+    third = pipeline.evaluate(persisted(second.decision), **kwargs)
+    fourth = pipeline.evaluate(third.decision, **kwargs)
+
+    shown = [panel(step) for step in (first, second, third, fourth)]
+    visible = [
+        (
+            item["cycle_text"],
+            item["confidence_label"],
+            item["confidence_visible"],
+            item["confidence_percent"],
+            item["presentation_key"],
+        )
+        for item in shown
+    ]
+    # The user-visible cycle and confidence never change with identical
+    # evidence.  First decisions settle once (pre-existing: diagnostic reason
+    # codes, and the schema-3 sticky incumbent period that a NORMAL-origin
+    # countdown needs); from the first rebuild on the panel is a fixed point.
+    assert all(item == visible[0] for item in visible), visible
+    assert shown[2] == shown[1] and shown[3] == shown[1]
+    assert third.consumer().decision_id == second.consumer().decision_id
+    assert fourth.consumer().decision_id == second.consumer().decision_id
+
+
+def test_s84_no_unapproved_sparse_only_establishment():
+    times = SPARSE_DISCRIMINATING + tuple(at(day, 0) for day in (7, 8, 9))
+    pipeline = sparse_pipeline(times)
+    values = rebuilds(pipeline, pipeline.evaluate())
+
+    for step in values:
+        value = step.consumer()
+        shown = panel(step)
+        assert step.decision.state is State.NORMAL_LEARNING
+        assert step.decision.selected_shadow_regime is None
+        assert not established(step)
+        assert value.cycle_period_seconds is None and not value.countdown_visible
+        assert_learning(shown)
+        # The 0.10 sparse ceiling is shown as it is, never scaled up.
+        assert all(item.combined_confidence <= 0.10 for item in step.decision.candidates)
+        assert shown["confidence_percent"] <= 10
+
+
+@pytest.mark.parametrize(
+    "jitter,displayed,eligible",
+    [
+        pytest.param(5, 80, True, id="5s"),
+        pytest.param(24, 80, True, id="24s"),
+        pytest.param(25, 79, False, id="25s"),
+    ],
+)
+def test_s84_stage8_3a_rounding_and_warning_deduplication_unchanged(jitter, displayed, eligible):
+    pipeline = Pipeline()
+    pipeline.observe("jitter", [at(0, 9), at(0, 12) + jitter, at(0, 15)])
+    step = pipeline.evaluate()
+    occurrence = step.consumer().next_expected_restart_at
+    due = step.consumer(now=occurrence - 300)
+    shown = panel(step)
+
+    assert step.decision.state is State.ESTABLISHED
+    assert shown["cycle_text"] == "Every 3 Hours"
+    assert shown["confidence_percent"] == displayed
+    assert due.scheduled_warning_eligible is eligible
+    if eligible:
+        fired = frozenset({due.scheduled_warning_suppression_key})
+        reopened = pipeline.evaluate(persisted(step.decision))
+        again = reopened.consumer(now=occurrence - 300, fired_keys=fired)
+        assert again.scheduled_warning_suppression_key == due.scheduled_warning_suppression_key
+        assert not again.scheduled_pre_restart_alert_eligible

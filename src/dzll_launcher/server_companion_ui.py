@@ -182,6 +182,11 @@ def companion_display_confidence_summary(
     result.setdefault("next_visible", False)
     result.setdefault("countdown_visible", False)
     result.setdefault("prediction_usable", False)
+    if result.get("learning_confidence_source") == "schema4_candidate":
+        # Stage 8.4: the schema-4 consumer already supplies the learning
+        # confidence of the candidate it evaluates; a schema-3 projection
+        # (possibly another period) never replaces it.
+        return result
     if candidate is None:
         result["confidence_visible"] = False
         return result

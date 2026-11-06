@@ -1036,6 +1036,44 @@ def test_low_and_capped_candidate_confidence_in_suppressed_learning_state(
     assert not presentation["countdown_visible"]
 
 
+@pytest.mark.parametrize(("visible", "percent"), ((True, 10), (False, 0)))
+def test_schema4_learning_confidence_is_never_replaced_by_schema3_projection(
+    monkeypatch, visible, percent
+):
+    """Stage 8.4: a schema-4 learning summary carries the confidence of the
+    candidate authority evaluates; the schema-3 projection (here another
+    period at 59 %) never substitutes, and a hidden value stays hidden."""
+
+    monkeypatch.setattr(window_module, "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED", True)
+    monkeypatch.setattr(window_module, "phase2_learning_summary", lambda *_args, **_kwargs: None)
+    original = {
+        **_authority_summary(
+            presentation="pattern_only", cycle_text="Learning Restart Pattern",
+            countdown_text="--", countdown_visible=False,
+            countdown_safe=False, prediction_usable=False,
+        ),
+        "confidence_percent": percent,
+        "confidence_label": "Learning Confidence:",
+        "confidence_visible": visible,
+        "learning_confidence_source": "schema4_candidate",
+        "cycle_period_seconds": None,
+        "next_visible": False,
+    }
+    host = _summary_host(original, online=True)
+    host._companion_restart_phase2.presentation_period_candidate = (
+        lambda _key, *, period_seconds: (12 * 3600, 0.59)
+    )
+    summary = DZLLWindow._server_companion_restart_learning_summary(host)
+    presentation = restart_learning_presentation(summary)
+
+    assert summary["cycle_text"] == "Learning Restart Pattern"
+    assert summary["confidence_percent"] == percent
+    assert summary["confidence_visible"] is visible
+    assert presentation["confidence_label"] == "Learning Confidence:"
+    assert presentation["confidence_percent"] == percent
+    assert not presentation["countdown_visible"]
+
+
 @pytest.mark.parametrize(("period_hours", "consumer_percent", "normal_confidence", "expected"), (
     (3, 97, 0.122839, 95),
     (4, 95, 0.797908, 95),

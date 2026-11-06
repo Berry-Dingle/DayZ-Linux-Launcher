@@ -19,6 +19,7 @@ from .companion_restart_phase2_authority import (
     RegimeState,
     # Shared with authority so the consumer selects exactly what authority
     # selected: incumbent candidate by period and phase, challenger by rank.
+    _candidate_rank,
     _context_rank,
     _matching_candidate,
 )
@@ -37,6 +38,22 @@ SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON = (
 # (``confidence_display_percent``), so internal confidence >= 0.795 (79.5 %,
 # which rounds to 80) qualifies.  Stored confidence is never rounded.
 SCHEDULED_WARNING_MINIMUM_CONFIDENCE_PERCENT = 80
+# Stage 8.4: learning presentation (NONE / PATTERN_ONLY, which includes an
+# acquisition LIKELY regime) shows the schema-4 ``combined_confidence`` of the
+# candidate authority is actually evaluating, never a schema-3 leading period.
+# Pre-establishment evidence is capped: 79 % while establishment structure is
+# unmet, 59 % while harmonic blockers or a competing schedule remain.
+LEARNING_CONFIDENCE_SOURCE = "schema4_candidate"
+LEARNING_CONFIDENCE_REASON = "learning_confidence_schema4_candidate"
+LEARNING_CONFIDENCE_UNAVAILABLE_REASON = "learning_confidence_unavailable"
+LEARNING_CONFIDENCE_STRUCTURE_CAP = 0.79
+LEARNING_CONFIDENCE_AMBIGUITY_CAP = 0.59
+LEARNING_CONFIDENCE_STRUCTURE_CAP_REASON = (
+    "learning_confidence_ceiling_structure_incomplete"
+)
+LEARNING_CONFIDENCE_AMBIGUITY_CAP_REASON = (
+    "learning_confidence_ceiling_period_ambiguity_or_harmonic"
+)
 SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED_DEFAULT = False
 SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED_DEFAULT = False
 
@@ -466,18 +483,25 @@ def evaluate_authority_consumers(
         if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
         else None
     )
+    learning_presentation = presentation in {
+        AuthorityPresentationKey.NONE,
+        AuthorityPresentationKey.PATTERN_ONLY,
+    }
+    learning_confidence, learning_reasons = (
+        _learning_confidence(decision, regime, candidate)
+        if learning_presentation
+        else (0.0, ())
+    )
     confidence = (
         policy.normal_pattern_confidence
         if normal_schedule_confidence_display
         else (challenger_confidence or 0.0)
         if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
+        else learning_confidence
+        if learning_presentation
         else candidate.combined_confidence
         if candidate is not None and regime is not None
-        else (
-            policy.normal_pattern_confidence
-            if presentation is AuthorityPresentationKey.PATTERN_ONLY
-            else decision.combined_confidence
-        )
+        else decision.combined_confidence
     )
     reasons = {
         *decision.reason_codes,
@@ -487,6 +511,7 @@ def evaluate_authority_consumers(
     }
     if normal_schedule_confidence_display:
         reasons.add("normal_schedule_confidence_display")
+    reasons.update(learning_reasons)
     if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED:
         reasons.add(
             SUSPECTED_CHANGE_CHALLENGER_CONFIDENCE_REASON
@@ -689,28 +714,46 @@ def authority_consumer_summary(
         decision.presentation_state
         is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
     )
+    learning = decision.presentation_state in {
+        AuthorityPresentationKey.NONE,
+        AuthorityPresentationKey.PATTERN_ONLY,
+    }
+    learning_visible = learning and LEARNING_CONFIDENCE_REASON in decision.reason_codes
+    learning_fields = (
+        {"learning_confidence_source": LEARNING_CONFIDENCE_SOURCE} if learning else {}
+    )
     return {
         "confidence_percent": confidence_display_percent(
             decision.confidence_display_value
         ),
         "confidence_kind": (
-            "schedule"
+            "period"
+            if learning
+            else "schedule"
             if normal_schedule_confidence
             else ("period" if decision.visible_cycle else "pattern")
         ),
         "confidence_label": (
-            "Cycle Confidence:"
+            "Learning Confidence:"
+            if learning
+            else "Cycle Confidence:"
             if suspected_change
             else "Confidence:"
             if normal_schedule_confidence or decision.visible_cycle
             else "Pattern Confidence:"
         ),
         "confidence_visible": (
-            decision.presentation_state is not AuthorityPresentationKey.NONE
-            and SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON
+            learning_visible
+            if learning
+            else SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON
             not in decision.reason_codes
         ),
-        "cycle_text": _presentation_text(decision),
+        **learning_fields,
+        "cycle_text": (
+            "Learning Restart Pattern"
+            if learning_visible
+            else _presentation_text(decision)
+        ),
         "next_text": "Prediction suspended" if decision.prediction_suspended else (
             str(int(prediction)) if prediction is not None else "--"
         ),
@@ -744,8 +787,13 @@ def _presentation(
         if policy.normal_pattern_supported:
             return AuthorityPresentationKey.PATTERN_ONLY, True, False, None
         return AuthorityPresentationKey.NONE, False, False, None
-    if state is RegimeState.LIKELY and gate is AuthorityGate.H2:
-        return AuthorityPresentationKey.LIKELY_CYCLE, True, False, None
+    if state is RegimeState.LIKELY:
+        # Stage 8.4: LIKELY exists only in acquisition (an unknown server or a
+        # never-established regime).  It is not an established cycle, so it
+        # is presented as Learning with no named period; its evaluated
+        # candidate supplies the (capped) learning confidence.  Provisional
+        # changes use TRANSITION_CONFIRMED / NEW_REGIME_PROVISIONAL, below.
+        return AuthorityPresentationKey.PATTERN_ONLY, False, False, None
     if safe_established_continuity_h2:
         return AuthorityPresentationKey.CONFIRMED_CYCLE, True, False, None
     if (
@@ -808,6 +856,77 @@ def _safe_established_continuity_h2(
         and regime.candidate_period_seconds > 0
         and math.isfinite(regime.phase_offset)
         and not (candidate and candidate.harmonic_blockers)
+    )
+
+
+def _learning_confidence(
+    decision: AuthorityDecision,
+    regime: RegimeRecord | None,
+    candidate: AuthorityCandidate | None,
+) -> tuple[float, tuple[str, ...]]:
+    """Display-only learning confidence from the evaluated schema-4 candidate.
+
+    With a selected regime (an acquisition LIKELY regime, or an incumbent
+    whose presentation fell back to Learning) the evaluated candidate is that
+    regime's candidate.  Without one (NORMAL_LEARNING) it is the leading
+    candidate: authority's structural rank (gate, then high authority), with
+    ``combined_confidence`` deciding among equally structured candidates, so
+    sparse-only candidates are compared by their actual support.  The value
+    is that candidate's existing ``combined_confidence``: nothing is rescaled
+    (the sparse ceiling stays 0.10).  Learning is pre-establishment, so it is
+    capped at 0.79, or 0.59 while harmonic blockers or a competing schedule at
+    an equal structural gate remain.  Nothing here feeds back into authority.
+    """
+
+    if regime is not None:
+        evaluated = candidate
+    else:
+        evaluated = max(decision.candidates, key=_learning_candidate_rank, default=None)
+    if evaluated is None and regime is None:
+        return 0.0, (LEARNING_CONFIDENCE_UNAVAILABLE_REASON,)
+    value = (
+        evaluated.combined_confidence
+        if evaluated is not None
+        else regime.combined_confidence
+    )
+    ambiguous = evaluated is not None and bool(
+        evaluated.harmonic_blockers or _competing_schedule(decision, evaluated)
+    )
+    cap, cap_reason = (
+        (LEARNING_CONFIDENCE_AMBIGUITY_CAP, LEARNING_CONFIDENCE_AMBIGUITY_CAP_REASON)
+        if ambiguous
+        else (LEARNING_CONFIDENCE_STRUCTURE_CAP, LEARNING_CONFIDENCE_STRUCTURE_CAP_REASON)
+    )
+    if not math.isfinite(value):
+        return 0.0, (LEARNING_CONFIDENCE_UNAVAILABLE_REASON,)
+    value = round(max(0.0, min(cap, value)), 6)
+    if confidence_display_percent(value) < 1:
+        return value, (LEARNING_CONFIDENCE_UNAVAILABLE_REASON, cap_reason)
+    return value, (LEARNING_CONFIDENCE_REASON, cap_reason)
+
+
+def _learning_candidate_rank(candidate: AuthorityCandidate) -> tuple[object, ...]:
+    gate_rank, high_authority, *rest = _candidate_rank(candidate)
+    return (gate_rank, high_authority, candidate.combined_confidence, *rest)
+
+
+def _competing_schedule(
+    decision: AuthorityDecision, evaluated: AuthorityCandidate
+) -> bool:
+    """Another schedule (period, or phase outside tolerance) is structurally
+    as well supported (same or higher H gate, at least H1)."""
+
+    threshold = max(1, _candidate_rank(evaluated)[0])
+    period = evaluated.candidate_period_seconds
+    return any(
+        _candidate_rank(item)[0] >= threshold
+        and (
+            item.candidate_period_seconds != period
+            or _phase_distance(item.phase_offset, evaluated.phase_offset, period)
+            > evaluated.phase_tolerance
+        )
+        for item in decision.candidates
+        if item.candidate_id != evaluated.candidate_id
     )
 
 
