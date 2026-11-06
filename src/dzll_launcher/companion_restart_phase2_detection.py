@@ -10,6 +10,16 @@ from enum import Enum
 PENDING_STRIKE_EXPIRY_POLL_MULTIPLIER = 2.5
 
 
+# Stage 8.6 query-visible restart confirmation.  After a qualifying sustained
+# exact-zero population (the existing standalone drain qualification, every
+# sample in the low run at zero), either a returning player or a queued player
+# is a valid recovery signal.  The recovery must follow the sustained zero; a
+# queue already observed during the low run never validates the candidate.
+SUSTAINED_ZERO_RECOVERY_REASON = "query_visible_sustained_zero_recovery_eligible"
+QUEUE_DURING_LOW_REASON = "query_visible_queue_observed_during_low_run"
+QUEUE_RECOVERY_REASON = "query_visible_queue_recovery_confirmed"
+
+
 def pending_strike_lifetime_seconds(online_poll_interval: float) -> float:
     """Return the shared cadence-aware lifetime for an unconfirmed first strike."""
     _require_finite_positive("online_poll_interval", online_poll_interval)
@@ -377,6 +387,8 @@ class _ProvisionalDrain:
     low_run_interrupted_by_recovery: bool = False
     recovery_peak_players: int = 0
     second_collapse_started: bool = False
+    contiguous_low_nonzero: bool = False
+    queue_during_low: bool = False
 
 
 class PhysicalEpisodeEngine:
@@ -697,6 +709,37 @@ class PhysicalEpisodeEngine:
         if sample.player_status is not FieldStatus.PRESENT:
             return
         assert sample.players is not None
+        sustained_zero = bool(
+            SUSTAINED_ZERO_RECOVERY_REASON in episode.reason_codes
+            and episode.first_failure_mono is None
+            and episode.confirmed_offline_mono is None
+        )
+        if (
+            sustained_zero
+            and sample.players == 0
+            and _queue_signal(sample)
+            and QUEUE_DURING_LOW_REASON not in episode.reason_codes
+        ):
+            # Queue-only recovery after the sustained zero.  Like player
+            # recovery it needs two consecutive healthy observations within
+            # the existing recovery spacing; a queued sample is never a low
+            # sample.
+            previous = self._last_sample
+            if (
+                episode.stable_recovery_mono is None
+                and previous is not None
+                and self._same_visible_identity(sample, previous)
+                and previous.player_status is FieldStatus.PRESENT
+                and previous.players == 0
+                and _queue_signal(previous)
+                and self.config.recovery_spacing_minimum
+                <= sample.monotonic_at - previous.monotonic_at
+                <= self.config.recovery_spacing_maximum
+            ):
+                episode.stable_recovery_mono = sample.monotonic_at
+                episode.stable_recovery_wall = sample.wall_at
+                episode.reason_codes.add(QUEUE_RECOVERY_REASON)
+            return
         low_limit = _low_limit(episode.baseline_players)
         positive_recovery = sample.players > 0 and (
             episode.first_queue_mono is not None
@@ -765,7 +808,11 @@ class PhysicalEpisodeEngine:
                 (episode.baseline_players or 0)
                 * self.config.visible_repopulation_fraction
             )
-            stable = stable and sample.players >= max(2, repopulation_level)
+            # Stage 8.6: after a sustained exact zero, at least one returning
+            # player (on the existing two spaced observations) is recovery.
+            stable = stable and (
+                sustained_zero or sample.players >= max(2, repopulation_level)
+            )
         if stable and episode.stable_recovery_mono is None:
             episode.stable_recovery_mono = sample.monotonic_at
             episode.stable_recovery_wall = sample.wall_at
@@ -805,6 +852,13 @@ class PhysicalEpisodeEngine:
             recovery_level = math.ceil(
                 provisional.baseline_players * self.config.drain_recovery_fraction
             )
+            if self._sustained_zero_qualified(provisional) and (
+                sample.players > 0
+                or (_queue_signal(sample) and not provisional.queue_during_low)
+            ):
+                self._promote_visible_episode(sample, provisional, sustained_zero=True)
+                self._record_low_or_recovery(sample)
+                return None
             if (
                 sample.players > _low_limit(provisional.baseline_players)
                 and self._standalone_visible_drain_qualified(provisional)
@@ -865,6 +919,8 @@ class PhysicalEpisodeEngine:
                     provisional.contiguous_low_sample_count = 0
                     provisional.contiguous_low_samples.clear()
                     provisional.second_collapse_started = False
+                    provisional.contiguous_low_nonzero = False
+                    provisional.queue_during_low = False
                 provisional.evidence_samples = _compact_observation_samples(
                     [*provisional.evidence_samples, sample],
                     self.config.event_pre_roll_sample_cap,
@@ -873,6 +929,15 @@ class PhysicalEpisodeEngine:
 
         self._provisional_drain = self._provisional_drain_from_history(sample)
         return None
+
+    def _sustained_zero_qualified(self, provisional: _ProvisionalDrain) -> bool:
+        """The existing standalone qualification with an exact-zero low run."""
+
+        return bool(
+            provisional.zero_reached
+            and not provisional.contiguous_low_nonzero
+            and self._standalone_visible_drain_qualified(provisional)
+        )
 
     def _standalone_visible_drain_qualified(
         self, provisional: _ProvisionalDrain
@@ -952,6 +1017,10 @@ class PhysicalEpisodeEngine:
         if provisional.contiguous_low_start_mono is None:
             provisional.contiguous_low_start_wall = sample.wall_at
             provisional.contiguous_low_start_mono = sample.monotonic_at
+        if sample.players is not None and sample.players > 0:
+            provisional.contiguous_low_nonzero = True
+        if _queue_signal(sample):
+            provisional.queue_during_low = True
         if (
             not provisional.contiguous_low_samples
             or sample.monotonic_at != provisional.contiguous_low_samples[-1]
@@ -981,6 +1050,8 @@ class PhysicalEpisodeEngine:
         self,
         sample: ObservationSample,
         provisional: _ProvisionalDrain,
+        *,
+        sustained_zero: bool = False,
     ) -> None:
         self._open_episode(sample, "query_visible_repopulation")
         episode = self._episode
@@ -1008,6 +1079,10 @@ class PhysicalEpisodeEngine:
         episode.low_samples[:] = provisional.contiguous_low_samples
         episode.sources.update((SignalSource.PLAYER_DRAIN, SignalSource.VISIBLE_LOW))
         episode.reason_codes.add("standalone_query_visible_drain_promoted")
+        if sustained_zero:
+            episode.reason_codes.add(SUSTAINED_ZERO_RECOVERY_REASON)
+        if provisional.queue_during_low:
+            episode.reason_codes.add(QUEUE_DURING_LOW_REASON)
         self._provisional_drain = None
 
     def _finalize_close_collapse_anomaly(
@@ -1266,6 +1341,10 @@ class PhysicalEpisodeEngine:
             contiguous_low_samples=[
                 item.monotonic_at for item in trailing_low[-32:]
             ],
+            contiguous_low_nonzero=any(
+                item.players is not None and item.players > 0 for item in trailing_low
+            ),
+            queue_during_low=any(_queue_signal(item) for item in trailing_low),
         )
 
     def _expire_provisional_drain(self, monotonic_at: float) -> None:
@@ -1709,6 +1788,15 @@ def _sample_signature(sample: ObservationSample) -> tuple[object, ...]:
         sample.queue_status,
         sample.queue,
         sample.lifecycle,
+    )
+
+
+def _queue_signal(sample: ObservationSample) -> bool:
+    return bool(
+        sample.info_status is InfoStatus.HEALTHY
+        and sample.queue_status is FieldStatus.PRESENT
+        and sample.queue is not None
+        and sample.queue > 0
     )
 
 

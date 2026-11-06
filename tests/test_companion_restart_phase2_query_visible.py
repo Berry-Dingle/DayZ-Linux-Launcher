@@ -416,7 +416,9 @@ def test_no_repopulation_by_grace_expiry_becomes_weak_drain_evidence_without_ale
     assert fired == set()
 
 
-def test_completed_repopulation_timeout_retains_intended_weak_hint_weight():
+def test_completed_repopulation_timeout_contributes_no_hint_weight():
+    # Stage 8.6: an unconfirmed drain stays diagnostic and learning-eligible
+    # for neutral blocking, but contributes no schema-3 hint.
     left = no_repopulation_event()
     right = no_repopulation_event(wall_shift=PERIOD)
     result = scoring.RestartScheduleScorer().score(
@@ -431,10 +433,10 @@ def test_completed_repopulation_timeout_retains_intended_weak_hint_weight():
     assert right.lifecycle_interruption is None
     assert scoring.event_learning_eligible(left)
     assert scoring.event_learning_eligible(right)
-    assert scoring._hint_event_weight(left) == 0.15
-    assert scoring._hint_event_weight(right) == 0.15
-    assert hint.event_count == 2
-    assert hint.weighted_alignment == pytest.approx(0.045)
+    assert scoring._hint_event_weight(left) == 0
+    assert scoring._hint_event_weight(right) == 0
+    assert hint.event_count == 0
+    assert hint.weighted_alignment == 0
 
 
 def test_no_repopulation_weak_evidence_anchors_to_drain_not_grace_expiry():
@@ -698,7 +700,8 @@ def test_no_repopulation_weak_case_blocks_miss_without_becoming_a_hit():
     assert result.qualifying_finalized_event_id is None
 
 
-def test_repeated_weak_drains_add_small_support_without_shifting_phase():
+def test_repeated_weak_drains_add_no_support_and_never_shift_phase():
+    # Stage 8.6: unconfirmed drains contribute nothing to schema-3 learning.
     strong = tuple(valid_visible_event(wall_shift=index * PERIOD) for index in range(4))
     weak = tuple(
         no_repopulation_event(wall_shift=index * PERIOD)
@@ -722,8 +725,8 @@ def test_repeated_weak_drains_add_small_support_without_shifting_phase():
         after_candidate.fundamental_period_confidence
         - before_candidate.fundamental_period_confidence
     )
-    assert 0 < round(contribution, 6) <= 0.03
-    assert after_candidate.hints.event_count == 3
+    assert round(contribution, 6) == 0
+    assert after_candidate.hints.event_count == 0
 
 
 def test_completed_visible_event_preserves_schema_compatible_round_trip():
@@ -987,3 +990,91 @@ def test_query_visible_alert_dispatch_works_for_normal_server_key():
 
     assert len(alerts) == 1
     assert fired == {("generic_recovery", "other-event")}
+
+
+# Stage 8.6: queue and one-player recovery after a sustained zero.
+
+
+def queued(at: float, players: int, queue: int):
+    return replace(
+        sample(at, players),
+        queue_status=detection.FieldStatus.PRESENT,
+        queue=queue,
+    )
+
+
+SUSTAINED_ZERO_DRAIN = (
+    sample(0, 12), sample(10, 12), sample(20, 12), sample(40, 11),
+    sample(60, 9), sample(80, 7), sample(100, 5), sample(120, 3),
+    *[sample(at, 0) for at in range(140, 201, 10)],
+)
+
+
+@pytest.mark.parametrize(
+    "recovery,snapshot_players",
+    [
+        pytest.param((queued(210, 0, 1), queued(220, 0, 1)), 0, id="queued_player"),
+        pytest.param((sample(210, 1), sample(220, 1)), 1, id="returning_player"),
+    ],
+)
+def test_sustained_zero_recovery_alerts_once_independent_of_schedule(recovery, snapshot_players):
+    engine = detection.PhysicalEpisodeEngine()
+    events = feed(engine, (*SUSTAINED_ZERO_DRAIN, *recovery))
+    host, alerts, fired = query_alert_host()
+    update = SimpleNamespace(finalized_events=tuple(events))
+
+    # No restart cycle is known to this host: the alert does not consult one.
+    DZLLWindow._handle_phase2_finalized_events(
+        host, update, {"name": "Crowbar", "online": True, "players": snapshot_players}
+    )
+    DZLLWindow._handle_phase2_finalized_events(
+        host, update, {"name": "Crowbar", "online": True, "players": snapshot_players}
+    )
+
+    assert len(events) == 1
+    assert events[0].outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
+    assert len(alerts) == 1
+    assert alerts[0][1] == "query-visible rejoin"
+    assert fired == {("generic_recovery", events[0].event_id)}
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        pytest.param(
+            (*SUSTAINED_ZERO_DRAIN, *[sample(at, 0) for at in range(210, 741, 10)]),
+            id="sustained_zero_without_recovery",
+        ),
+        pytest.param(
+            (
+                *[queued(at, players, 3) for at, players in ((0, 12), (10, 12), (20, 12), (40, 11), (60, 9), (80, 7), (100, 5), (120, 3))],
+                *[queued(at, 0, 3) for at in range(140, 741, 10)],
+            ),
+            id="queue_existed_before_candidate",
+        ),
+        pytest.param(
+            (*SUSTAINED_ZERO_DRAIN, queued(210, 0, 1), *[sample(at, 0) for at in range(220, 741, 10)]),
+            id="single_queue_sample_times_out",
+        ),
+        pytest.param(
+            (*SUSTAINED_ZERO_DRAIN[:-2], sample(260, 0), queued(270, 0, 1), queued(280, 0, 1)),
+            id="polling_gap",
+        ),
+    ],
+)
+def test_unconfirmed_queue_cases_never_alert(values):
+    engine = detection.PhysicalEpisodeEngine()
+    events = feed(engine, values)
+    host, alerts, fired = query_alert_host()
+
+    DZLLWindow._handle_phase2_finalized_events(
+        host,
+        SimpleNamespace(finalized_events=tuple(events)),
+        {"online": True, "players": 0},
+    )
+
+    assert not any(
+        item.outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART for item in events
+    )
+    assert alerts == []
+    assert fired == set()

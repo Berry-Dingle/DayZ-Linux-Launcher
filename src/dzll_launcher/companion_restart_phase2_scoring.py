@@ -1527,8 +1527,9 @@ def _hint_event_weight(event: PhysicalRestartEvent) -> float:
     direct = _event_weight(event)
     if direct > 0:
         return direct
-    if event.outcome is EventOutcome.AMBIGUOUS_DRAIN:
-        return min(0.15, event.authenticity * 0.5)
+    # Stage 8.6: an unconfirmed player drain (no qualifying recovery) is not
+    # restart evidence and contributes no hint.  It still blocks intervals
+    # neutrally (``_blocks_interval``) and stays diagnostic.
     if event.outcome is EventOutcome.UNCERTAIN_A2S_INTERRUPTION:
         return min(0.05, event.authenticity * 0.5)
     return 0.0

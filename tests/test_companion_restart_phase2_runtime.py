@@ -1337,3 +1337,45 @@ def test_phase2_integration_has_no_release_or_packaging_side_effects():
     assert "subprocess" not in runtime_source
     assert "import audio" not in runtime_source.lower()
     assert "_play_" not in runtime_source
+
+
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        pytest.param(({"players": 1}, {"players": 1}), id="one_returning_player"),
+        pytest.param(({"players": 0, "queue": 1}, {"players": 0, "queue": 1}), id="one_queued_player"),
+    ],
+)
+def test_sustained_zero_low_recovery_alerts_only_on_confirmation(tmp_path, recovery):
+    """Stage 8.6: a one-player or queue-only return confirms the restart on
+    finalization; the early first-repopulation alert keeps its scope."""
+
+    value, *_ = make_runtime(tmp_path)
+    begin(value)
+    observations = (
+        (0, 12), (10, 12), (20, 12), (40, 11), (60, 9),
+        (80, 7), (100, 5), (120, 3), (140, 0), (150, 0),
+        (160, 0), (170, 0), (180, 0), (190, 0), (200, 0),
+    )
+    for at, players in observations:
+        poll(value, at, players=players)
+
+    def recover(at, payload):
+        return value.ingest_live_result(
+            SERVER,
+            poll_generation=1,
+            info={"ok": True, "max_players": 60, "ping_ms": 42, **payload},
+            wall_at=BASE + at,
+            monotonic_at=at,
+        )
+
+    first = recover(210, recovery[0])
+    second = recover(220, recovery[1])
+
+    assert first.query_visible_repopulation_event_id is None
+    assert first.finalized_events == ()
+    assert second.query_visible_repopulation_event_id is None
+    assert len(second.finalized_events) == 1
+    event = second.finalized_events[0]
+    assert event.outcome is detection.EventOutcome.STRONG_QUERY_VISIBLE_RESTART
+    assert event.recovery.stable_recovery_at == BASE + 220

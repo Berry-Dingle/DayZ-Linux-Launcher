@@ -1250,6 +1250,12 @@ class Phase2RestartRuntime:
             and sample.player_status is FieldStatus.PRESENT
             and sample.players is not None
             and sample.players > 0
+            # Stage 8.6: a sustained-zero promotion on one returning player
+            # or a queued player alerts only once the restart is confirmed
+            # (finalized); the early first-repopulation alert keeps its
+            # existing above-low-population scope.
+            and sample.players
+            > detection_module._low_limit(active_episode.baseline_players)
             and "standalone_query_visible_drain_promoted"
             in active_episode.reason_codes
             and active_episode.first_failure_mono is None

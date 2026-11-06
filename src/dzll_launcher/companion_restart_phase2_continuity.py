@@ -581,6 +581,7 @@ def extract_interval_relationships(
         if (
             not event_learning_eligible(left)
             or _schedule_neutral_attribution_anomaly(left)
+            or _unconfirmed_drain(left)
         ):
             continue
         left_at = _event_at(left)
@@ -592,6 +593,7 @@ def extract_interval_relationships(
             if (
                 not event_learning_eligible(right)
                 or _schedule_neutral_attribution_anomaly(right)
+                or _unconfirmed_drain(right)
             ):
                 continue
             right_at = _event_at(right)
@@ -1248,6 +1250,16 @@ def _authentic_physical_event(event: PhysicalRestartEvent) -> bool:
         EventOutcome.EXPIRED,
         EventOutcome.SERVICE_INTERRUPTION,
     }
+
+
+def _unconfirmed_drain(event: PhysicalRestartEvent) -> bool:
+    """Stage 8.6: an unconfirmed player drain is never a relationship endpoint.
+
+    It remains in the event sequence, so it still blocks any interval that
+    spans it as an unobservable intervening episode (neutral blocking).
+    """
+
+    return event.outcome is EventOutcome.AMBIGUOUS_DRAIN
 
 
 def _schedule_neutral_attribution_anomaly(event: PhysicalRestartEvent) -> bool:

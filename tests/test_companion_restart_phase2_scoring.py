@@ -265,7 +265,9 @@ def test_weak_episodes_are_hint_only_across_unmonitored_time(outcome):
         physical, scoring.CoverageTimeline(), now=BASE + 3 * HOUR
     )
     candidate = result.candidate(3 * HOUR)
-    assert candidate.hints.event_count == 2
+    # Stage 8.6: unconfirmed drains are no longer hints at all.
+    expected_hints = 0 if outcome is detection.EventOutcome.AMBIGUOUS_DRAIN else 2
+    assert candidate.hints.event_count == expected_hints
     assert candidate.direct_support == 0
     assert candidate.covered_miss_count == 0
 

@@ -18,7 +18,7 @@ Status of every test is explicit:
   holding through every Stage 8 sub-stage.
 * ``pytest.mark.xfail(strict=True, raises=AssertionError)`` tests describe
   approved Stage 8 policy that does not hold yet.  Each names the planned
-  implementation stage (``STAGE_8_6`` and so on).  ``strict=True`` makes an
+  implementation stage (for example ``STAGE_8_7``).  ``strict=True`` makes an
   unexpected pass fail, so the marker must be removed in the stage that
   implements the behaviour.  ``raises=AssertionError`` keeps harness errors
   visible as real failures.
@@ -39,6 +39,10 @@ Stage 8.3 (long-horizon per-event sparse input, ceiling unchanged) added the
 Stage 8.5 (sparse establishment gate, sparse ceiling 0.84 and strong
 confirmation by a full interval) converted the four Stage 8.5 expected
 failures and added the ``test_s85_*`` section.
+Stage 8.6 (QV queue/one-player recovery after a sustained zero; unconfirmed
+drains neutral in schema-3 hints and schema-4 relationship endpoints)
+converted the last three expected failures and added the ``test_s86_*``
+section.  No expected failures remain.
 Stage 8.4 (unified confidence presentation: Learning shows the evaluated
 schema-4 candidate's capped ``combined_confidence``; acquisition LIKELY is
 presented as Learning) added the ``test_s84_*`` section and updated the one
@@ -83,9 +87,6 @@ Gate = authority.AuthorityGate
 Origin = authority.AuthorityOrigin
 Outcome = detection.EventOutcome
 Presentation = consumers4.AuthorityPresentationKey
-
-# Planned implementation stages (design audit section 13).
-STAGE_8_6 = "Stage 8.6 (QV refinements: queue return, ambiguous-drain learning)"
 
 # The user-facing ceiling (``server_companion_ui`` caps at 95 %).
 DISPLAY_CEILING_PERCENT = 95
@@ -868,7 +869,6 @@ def _qv_drain_to_sustained_zero():
     ]
 
 
-@expected_failure(STAGE_8_6, "a queue >= 1 return after a sustained zero is ignored; the episode times out as AMBIGUOUS_DRAIN")
 def test_s11_drain_zero_then_queue_return_is_confirmed_restart():
     engine = detection.PhysicalEpisodeEngine()
     events = []
@@ -904,7 +904,6 @@ def test_s12_unconfirmed_drains_alone_create_no_schedule_or_presentation():
     assert not value.countdown_visible
 
 
-@expected_failure(STAGE_8_6, "learning-eligible AMBIGUOUS_DRAIN events become schema-4 interval-relationship endpoints (normal-only, persisted)")
 def test_s12_unconfirmed_drains_are_not_interval_relationship_endpoints():
     pipeline = Pipeline()
     pipeline.sparse("drain", SPARSE_DISCRIMINATING, outcome=Outcome.AMBIGUOUS_DRAIN)
@@ -913,7 +912,6 @@ def test_s12_unconfirmed_drains_are_not_interval_relationship_endpoints():
     assert step.relationships == (), len(step.relationships)
 
 
-@expected_failure(STAGE_8_6, "AMBIGUOUS_DRAIN keeps an eligible hint weight; aligned drains raise the schema-3 3 h fundamental 0.45 -> 0.48 (schema-4 combined is no longer affected since Stage 8.3)")
 def test_s12_unconfirmed_drains_contribute_no_learning():
     plain = three_hour_chain(3)
     with_drains = plain.copy()
@@ -2617,3 +2615,250 @@ def test_s85_sparse_warning_is_at_most_once_across_settle_reopen_and_confirmatio
     following = confirmed.consumer(now=due + P3, fired_keys=fired)
     assert following.scheduled_warning_suppression_key != first.scheduled_warning_suppression_key
     assert following.scheduled_pre_restart_alert_eligible
+
+
+# --------------------------------------------------------------------------
+# Stage 8.6 focused tests: QV restart confirmation and drain neutrality
+# --------------------------------------------------------------------------
+
+
+def detect(values):
+    engine = detection.PhysicalEpisodeEngine()
+    events = []
+    for value in values:
+        events.extend(engine.ingest(value))
+    return engine, events
+
+
+def _zeros(start, stop, **kwargs):
+    return [_qv_sample(offset, 0, **kwargs) for offset in range(start, stop, 10)]
+
+
+def assert_confirmed_qv(event):
+    assert event.outcome is Outcome.STRONG_QUERY_VISIBLE_RESTART, event.outcome
+    assert event.recovery.stable_recovery_at is not None
+    assert event.drain.zero_reached and event.drain.low_duration >= 45
+    # The restart phase is the drain start, not the recovery.
+    assert event.canonical_phase_at == event.drain.low_started_at
+    assert event.coverage_complete and event.lifecycle_interruption is None
+    assert scoring.event_learning_eligible(event)
+    assert authority._authentic_event(event)
+    assert scoring._event_weight(event) == 0.8
+
+
+def test_s86_sustained_zero_then_one_queued_player_confirms_restart():
+    _engine, events = detect([
+        *_qv_drain_to_sustained_zero(),
+        _qv_sample(210, 0, queue=1),
+        _qv_sample(220, 0, queue=1),
+    ])
+
+    (event,) = events
+    assert_confirmed_qv(event)
+    assert event.recovery.first_queue_at == at(0, 9) + 210
+    assert event.recovery.first_player_at is None
+    assert event.recovery.stable_recovery_at == at(0, 9) + 220
+    assert detection.QUEUE_RECOVERY_REASON in event.reason_codes
+    assert detection.SUSTAINED_ZERO_RECOVERY_REASON in event.reason_codes
+
+
+def test_s86_sustained_zero_then_one_returning_player_confirms_restart():
+    _engine, events = detect([
+        *_qv_drain_to_sustained_zero(),
+        _qv_sample(210, 1),
+        _qv_sample(220, 1),
+    ])
+
+    (event,) = events
+    assert_confirmed_qv(event)
+    assert event.recovery.first_player_at == at(0, 9) + 210
+    assert event.recovery.first_queue_at is None
+    assert event.recovery.positive_sample_count == 2
+
+
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        pytest.param([_qv_sample(210, 0, queue=1)], id="single_queue_sample"),
+        pytest.param([_qv_sample(210, 1)], id="single_player_sample"),
+    ],
+)
+def test_s86_single_recovery_sample_does_not_confirm(recovery):
+    _engine, events = detect([*_qv_drain_to_sustained_zero(), *recovery, *_zeros(220, 760)])
+
+    assert len(events) == 1
+    assert events[0].outcome is not Outcome.STRONG_QUERY_VISIBLE_RESTART
+    assert not authority._authentic_event(events[0])
+    assert scoring._event_weight(events[0]) == 0
+
+
+def test_s86_queue_observed_before_sustained_zero_never_confirms():
+    # A queued player appears 10 s into the zero, before the 45 s sustained
+    # zero; later queue observations must not validate the candidate.
+    values = [
+        *_qv_drain_to_sustained_zero()[:9],
+        _qv_sample(150, 0, queue=1),
+        *_zeros(160, 210),
+        _qv_sample(210, 0, queue=1),
+        _qv_sample(220, 0, queue=1),
+        *_zeros(230, 760),
+    ]
+    _engine, events = detect(values)
+
+    (event,) = events
+    assert event.outcome is Outcome.AMBIGUOUS_DRAIN
+    assert event.recovery.stable_recovery_at is None
+
+
+def test_s86_queue_populated_throughout_never_confirms():
+    drain = [
+        _qv_sample(offset, players, queue=3)
+        for offset, players in zip((0, 10, 20, 40, 60, 80, 100, 120), (12, 12, 12, 11, 9, 7, 5, 3))
+    ]
+    _engine, events = detect([*drain, *_zeros(140, 760, queue=3)])
+
+    (event,) = events
+    assert event.outcome is Outcome.AMBIGUOUS_DRAIN
+    assert event.recovery.stable_recovery_at is None
+
+
+def test_s86_drain_without_queue_or_player_return_stays_unconfirmed():
+    _engine, events = detect([*_qv_drain_to_sustained_zero(), *_zeros(210, 760)])
+
+    (event,) = events
+    assert event.outcome is Outcome.AMBIGUOUS_DRAIN
+    assert "query_visible_repopulation_timeout" in event.reason_codes
+    assert not authority._authentic_event(event)
+    assert scoring._event_weight(event) == 0
+    assert scoring._hint_event_weight(event) == 0
+
+
+def test_s86_polling_gap_invalidates_the_candidate():
+    values = [
+        *_qv_drain_to_sustained_zero()[:-2],
+        _qv_sample(260, 0),  # 70 s unobserved gap inside the zero
+        _qv_sample(270, 0, queue=1),
+        _qv_sample(280, 0, queue=1),
+        *_zeros(290, 760),
+    ]
+    _engine, events = detect(values)
+
+    assert not any(item.outcome is Outcome.STRONG_QUERY_VISIBLE_RESTART for item in events)
+    assert not any(authority._authentic_event(item) for item in events)
+
+
+def test_s86_local_outage_lifecycle_boundary_invalidates_the_candidate():
+    # The window neutralises local connectivity loss with a SLEEP_GAP
+    # lifecycle boundary (Stages 3+4); recovery after it cannot confirm.
+    boundary = replace(
+        _qv_sample(205, 0), lifecycle=detection.LifecycleMarker.SLEEP_GAP
+    )
+    _engine, events = detect([
+        *_qv_drain_to_sustained_zero(),
+        boundary,
+        _qv_sample(210, 0, queue=1),
+        _qv_sample(220, 0, queue=1),
+        _qv_sample(230, 1),
+        _qv_sample(240, 1),
+    ])
+
+    assert not any(item.outcome is Outcome.STRONG_QUERY_VISIBLE_RESTART for item in events)
+    assert not any(
+        scoring.event_learning_eligible(item) and authority._authentic_event(item)
+        for item in events
+    )
+
+
+@pytest.mark.parametrize(
+    "late",
+    [
+        pytest.param([_qv_sample(900, 0, queue=2), _qv_sample(910, 0, queue=2)], id="queue"),
+        pytest.param([_qv_sample(900, 1), _qv_sample(910, 1)], id="player"),
+    ],
+)
+def test_s86_late_return_after_candidate_expiry_never_confirms(late):
+    _engine, events = detect([*_qv_drain_to_sustained_zero(), *_zeros(210, 760), *late])
+
+    (event,) = events
+    assert event.outcome is Outcome.AMBIGUOUS_DRAIN
+    assert event.recovery.stable_recovery_at is None
+
+
+def test_s86_ambiguous_drain_never_becomes_a_relationship_endpoint_but_still_blocks():
+    pipeline = Pipeline()
+    observe_mixed(
+        pipeline,
+        "mixed",
+        [
+            (at(0, 9), Outcome.CORROBORATED_OFFLINE_RESTART),
+            (at(0, 12), Outcome.AMBIGUOUS_DRAIN),
+            (at(0, 15), Outcome.CORROBORATED_OFFLINE_RESTART),
+        ],
+    )
+    step = pipeline.evaluate()
+    drain_id = next(item.event_id for item in step.events if item.outcome is Outcome.AMBIGUOUS_DRAIN)
+    spanning = [item for item in step.relationships if item.left_at < at(0, 12) < item.right_at]
+
+    assert all(drain_id not in (item.left_event_id, item.right_event_id) for item in step.relationships)
+    assert spanning
+    # Neutral blocking: an interval across the drain is never high evidence.
+    assert not any(item.high_authority_eligible for item in spanning)
+    assert all(
+        "high_ineligible_intervening_unobservable_episode" in item.reason_codes
+        or item.relationship_kind is not continuity.RelationshipKind.DIRECT
+        for item in spanning
+    )
+    assert not step.high_direct(P3)
+    assert step.decision.state is not State.ESTABLISHED
+
+
+def test_s86_ambiguous_drains_add_no_learning_and_keep_rebuilds_stable():
+    plain = sparse_pipeline()
+    with_drains = plain.copy()
+    with_drains.sparse("drain", [at(day, 3) for day in (7, 8, 9, 10, 11)], outcome=Outcome.AMBIGUOUS_DRAIN)
+    before = settled(plain)
+    after = settled(with_drains)
+    again = with_drains.evaluate(persisted(after.decision))
+
+    assert not any(
+        item.event_id in {value.left_event_id for value in after.relationships}
+        | {value.right_event_id for value in after.relationships}
+        for item in after.events
+        if item.outcome is Outcome.AMBIGUOUS_DRAIN
+    )
+    for period in scoring.CANDIDATE_PERIODS:
+        # Hints from the genuine sparse restarts only; drains add none.
+        assert after.score.candidate(period).hints == before.score.candidate(period).hints
+        assert (
+            after.score.candidate(period).fundamental_period_confidence
+            == before.score.candidate(period).fundamental_period_confidence
+        )
+    assert after.decision.state is before.decision.state is State.ESTABLISHED
+    assert after.decision.incumbent_shadow_regime.regime_id == before.decision.incumbent_shadow_regime.regime_id
+    assert after.decision.combined_confidence == before.decision.combined_confidence
+    assert panel(after)["confidence_percent"] == panel(before)["confidence_percent"] == 80
+    assert again.decision == after.decision
+
+
+def test_s86_queue_confirmed_restart_has_the_genuine_qv_learning_profile():
+    """A queue-confirmed restart is a genuine strong-QV restart: the same
+    outcome, weight and authenticity range the Stage 8.5 QV milestones use."""
+
+    _engine, events = detect([
+        *_qv_drain_to_sustained_zero(),
+        _qv_sample(210, 0, queue=1),
+        _qv_sample(220, 0, queue=1),
+    ])
+    (event,) = events
+
+    assert event.outcome is Outcome.STRONG_QUERY_VISIBLE_RESTART
+    assert 0.84 <= event.authenticity <= 0.95
+    assert scoring._event_weight(event) == scoring._event_weight(
+        physical_event(1, at(0, 9), Session("s", at(0, 8), at(0, 10)), outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)
+    )
+    # Stage 8.5 milestones for genuine QV restarts are unchanged.
+    sparse_step = settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    assert panel(sparse_step)["confidence_percent"] == 80
+    steps = _qv_trajectory()
+    assert panel(steps[8])["confidence_percent"] == 80
+    assert panel(steps[10])["confidence_percent"] == DISPLAY_CEILING_PERCENT
