@@ -1,34 +1,37 @@
-"""Compact persistent learned state for Server Companion (Retention Stage R1).
+"""Compact persistent learned state for Server Companion (Retention R1/R1a).
 
 Schema 4 currently re-derives every candidate, gate, phase and confidence on
 each rebuild from the full lifetime raw collections.  This module is the
 bounded replacement foundation: a fixed-size per-server summary into which
 genuine observations are *folded* once, plus pure evaluation functions that
-reproduce the existing Stage 8 statistics from that summary and a small set
-of not-yet-folded ("ring") raw items.
+reproduce the existing Stage 8 statistics from that summary and a strictly
+bounded ring of not-yet-folded raw items.
 
-Stage R1 scope: representation, folding and evaluation only.  Nothing here is
+Scope: representation, folding and evaluation only.  Nothing here is
 persisted by the production runtime and production authority does not read
-it yet.  It introduces no new confidence policy: every evaluation reuses the
-existing schema-3 / schema-4 formulas, thresholds and helpers.  Where the
-compact form cannot reproduce an existing calculation exactly, the docstring
-of the function says so.
+it yet.  No new confidence policy is introduced: every evaluation reuses the
+existing schema-3 / schema-4 formulas, thresholds and helpers.
 
-Storage bound.  Every collection is keyed by a bounded key space that does
-not depend on the number of observed restarts:
+Bounded folding.  ``plan_ring_folding`` keeps at most ``capacity`` raw events
+in the ring however long a continuity chain stays open.  An open chain is
+folded up to a boundary restart (the *anchor*); the anchor stays in the ring
+as already-credited context so the next genuine interval can still be
+extracted, and the streak running through it is carried as a bounded
+``OpenRun`` (counts, minimum quality, exact first phase and a quantised
+residual histogram bounded by the streak-coherence rule).  No restart is
+invented and no unmonitored interval becomes continuous: only relationships
+that continuity extraction produced are ever folded.
 
-* phase histograms: one bin per UTC minute of the day (1440).  All candidate
-  periods divide a day, so ``(t mod day) mod P == t mod P`` and one day
-  histogram yields the phase at every period;
-* interval, miss and superseded-regime summaries: one entry per
-  (candidate period, minute of that period): at most 2100 in total;
-* divisor evidence: one entry per (period, exact divisor);
-* recovery evidence: the two latest non-overlapping incumbent intervals;
-* scalars: watermark, counters, regime knowledge.
+Conservative representation.  Folded restarts sharing one UTC minute keep
+their exact offset range; a bin counts as phase-aligned only when its whole
+range is within tolerance, and an ambiguous bin is treated as off-phase.
+Folded relationship bins keep exact phase extremes, so single-linkage
+component formation is exact.  Every remaining approximation can only lower
+confidence or withhold a gate; none can promote.
 
-No event-ID or timestamp list grows with the number of observations.  The
-only ID tuple is the incumbent's ``defining_evidence_ids``, bounded by
-``RECENT_RING_CAPACITY``.
+Storage.  Every collection has a fixed key space that does not depend on the
+number of observed restarts (see ``LEARNED_STATE_MAX_ENTRIES`` and
+``LEARNED_STATE_MAX_JSON_BYTES``, both enforced on serialisation and load).
 """
 
 from __future__ import annotations
@@ -64,16 +67,11 @@ from .companion_restart_phase2_authority import (
     _authentic_event,
     _circular_distance,
     _full_interval_quality,
-    _non_overlapping_streaks,
     _relationship_phase,
     _relationship_phase_value,
     relationship_authority_quality,
 )
-from .companion_restart_phase2_continuity import (
-    CadenceStreak,
-    IntervalRelationship,
-    RelationshipKind,
-)
+from .companion_restart_phase2_continuity import IntervalRelationship, RelationshipKind
 from .companion_restart_phase2_detection import PhysicalRestartEvent
 from .companion_restart_phase2_expected_windows import (
     ExpectedWindowLedgerRecord,
@@ -94,37 +92,70 @@ from .companion_restart_phase2_scoring import (
 )
 
 
-LEARNED_STATE_SCHEMA_VERSION = 1
+LEARNED_STATE_SCHEMA_VERSION = 2
 PHASE_BIN_SECONDS = 60
 DAY_BINS = DAY // PHASE_BIN_SECONDS
+# Relationship, miss and superseded-regime bins.  Never wider than the
+# smallest candidate tolerance, so restarts sharing a bin are always linked.
+INTERVAL_BIN_SECONDS = 300
+MINIMUM_TOLERANCE = min(candidate_phase_tolerance(period) for period in CANDIDATE_PERIODS)
+MAXIMUM_TOLERANCE = max(candidate_phase_tolerance(period) for period in CANDIDATE_PERIODS)
+assert INTERVAL_BIN_SECONDS <= MINIMUM_TOLERANCE
+INTERVAL_BIN_TOTAL = sum(period // INTERVAL_BIN_SECONDS for period in CANDIDATE_PERIODS)
+# Open-streak residual histogram.  A coherent streak keeps every phase within
+# one tolerance of its estimate, so residuals from its first phase lie within
+# two tolerances: the key space is bounded by the coherence rule itself.
+RUN_RESIDUAL_QUANTUM_SECONDS = 5
+RUN_RESIDUAL_KEY_RADIUS = math.ceil(2 * MAXIMUM_TOLERANCE / RUN_RESIDUAL_QUANTUM_SECONDS)
+RUN_RESIDUAL_KEY_LIMIT = 2 * RUN_RESIDUAL_KEY_RADIUS + 1
 # The ring of not-yet-folded raw events reuses the existing schema-3 event
-# horizon; R1 introduces no new retention number.
+# horizon; no new retention number is introduced.
 RECENT_RING_CAPACITY = MAX_FINALIZED_EVENTS
+MINIMUM_RING_CAPACITY = 2
 HARMONIC_PERIODS = frozenset({6 * 3600, 8 * 3600, 12 * 3600})
+MAX_DEFINING_EVIDENCE_IDS = 3
 MAX_REASON_CODES = 64
+MAX_STRING_LENGTH = 256
 _EPSILON = 1e-9
 
-PERIOD_BIN_TOTAL = sum(period // PHASE_BIN_SECONDS for period in CANDIDATE_PERIODS)
 DIVISOR_KEYS = tuple(
     (period, divisor)
     for period in CANDIDATE_PERIODS
     for divisor in CANDIDATE_PERIODS
     if divisor < period and period % divisor == 0
 )
-# Worst-case number of stored entries, independent of observation count.
 LEARNED_STATE_MAX_ENTRIES = (
-    DAY_BINS  # pool
-    + len(CANDIDATE_PERIODS) * DAY_BINS  # high-interval endpoints
-    + PERIOD_BIN_TOTAL  # interval summaries
-    + PERIOD_BIN_TOTAL  # miss/hit summaries
+    DAY_BINS  # pool (endpoint and confirmation tags live inside pool bins)
+    + INTERVAL_BIN_TOTAL  # lifetime continuous evidence
+    + INTERVAL_BIN_TOTAL  # epoch challenger evidence
+    + INTERVAL_BIN_TOTAL  # expected-window outcomes
+    + INTERVAL_BIN_TOTAL  # superseded regimes
     + len(DIVISOR_KEYS)
-    + PERIOD_BIN_TOTAL  # superseded regimes
-    + PERIOD_BIN_TOTAL  # epoch challenger summaries
-    + PERIOD_BIN_TOTAL  # epoch confirmation summaries
-    + len(CANDIDATE_PERIODS) * DAY_BINS  # epoch confirmation endpoints
     + ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS
-    + 1  # incumbent
+    + RUN_RESIDUAL_KEY_LIMIT  # the single open streak
+    + 2  # incumbent, open chain
 )
+
+# Serialised-size bound, derived from the structural bounds.  Every number is
+# charged the longest JSON form a finite float can take (24 characters) plus
+# one separator, every string the maximum validated length plus quotes.
+_NUMBER = 25
+_STRING = MAX_STRING_LENGTH * 6 + 3  # worst-case JSON escaping of non-ASCII
+_POOL_BIN_NUMBERS = 10 + 3 * len(CANDIDATE_PERIODS) + 2
+_INTERVAL_BIN_NUMBERS = 17 + 7
+LEARNED_STATE_MAX_JSON_BYTES = (
+    4096  # keys, brackets and scalar fields
+    + DAY_BINS * (_POOL_BIN_NUMBERS * _NUMBER + 16 + 4 * len(CANDIDATE_PERIODS))
+    + 2 * INTERVAL_BIN_TOTAL * (_INTERVAL_BIN_NUMBERS * _NUMBER + 8)
+    + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)
+    + INTERVAL_BIN_TOTAL * (4 * _NUMBER + 4)
+    + len(DIVISOR_KEYS) * (4 * _NUMBER + 4)
+    + ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS * (2 * _NUMBER + 4)
+    + RUN_RESIDUAL_KEY_LIMIT * (4 * _NUMBER + 4)
+    + 40 * _NUMBER  # open chain and incumbent numbers
+    + (5 + MAX_DEFINING_EVIDENCE_IDS + MAX_REASON_CODES) * (_STRING + 1)
+)
+PERIOD_INDEX = {period: index for index, period in enumerate(CANDIDATE_PERIODS)}
 
 
 class LearnedStateError(ValueError):
@@ -137,27 +168,54 @@ class LearnedStateError(ValueError):
 
 
 @dataclass(frozen=True)
+class EndpointTag:
+    """Folded restarts in a bin that are endpoints at one period."""
+
+    period: int
+    weight: float
+    count: int
+
+
+@dataclass(frozen=True)
 class PhaseBin:
-    """Folded restarts sharing one UTC minute of the day."""
+    """Folded sparse-usable restarts sharing one UTC minute of the day.
+
+    ``offset_min``/``offset_max`` are the exact extreme seconds within the
+    minute; ``uncertainty_min``/``max`` the extreme capped uncertainties.
+    ``weight_before`` is the running pool weight total just before the bin's
+    first restart: folding is time-ordered, so the pool weight at or after
+    ``first_at`` is exactly ``pool_weight_total - weight_before``.
+    ``endpoints`` tag restarts that are high-relationship endpoints per
+    period; ``confirmation`` tags endpoints of epoch confirmation intervals.
+    """
 
     index: int
     weight: float
     count: int
-    offset_sum: float
+    offset_min: float
+    offset_max: float
     first_at: float
     last_at: float
-    uncertainty: float
-    # Pool histogram only: the running pool weight total just before this
-    # bin's first restart was folded.  Folding is time-ordered, so the pool
-    # weight at or after ``first_at`` is ``pool_weight_total - weight_before``
-    # (the exact consistency-domain total for a domain starting here).
-    weight_before: float = 0.0
+    uncertainty_min: float
+    uncertainty_max: float
+    weight_before: float
+    endpoints: tuple[EndpointTag, ...] = ()
+    confirmation: EndpointTag | None = None
 
     @property
-    def seconds(self) -> float:
-        """Mean time of day of the folded restarts (a phase source)."""
+    def seconds_min(self) -> float:
+        return self.index * PHASE_BIN_SECONDS + self.offset_min
 
-        return self.index * PHASE_BIN_SECONDS + self.offset_sum / self.count
+    @property
+    def seconds_max(self) -> float:
+        return self.index * PHASE_BIN_SECONDS + self.offset_max
+
+    @property
+    def seconds_mid(self) -> float:
+        return (self.seconds_min + self.seconds_max) / 2
+
+    def tag(self, period: int) -> EndpointTag | None:
+        return next((item for item in self.endpoints if item.period == period), None)
 
 
 @dataclass(frozen=True)
@@ -173,19 +231,23 @@ class StreakSummary:
 
 @dataclass(frozen=True)
 class IntervalBin:
-    """Folded continuous evidence at one (period, minute of period).
+    """Folded continuous evidence at one (period, 5-minute phase bin).
 
-    ``base_residual`` is the exact running product ``prod(1 - 0.5 q)`` of the
-    high-eligible DIRECT relationships (the schema-4 base-authority input);
-    ``full_interval_residual`` is ``prod(1 - 0.75 q)`` over the same
-    relationships that are full intervals (sparse confirmation input).  Folded
-    maximal streaks contribute their exact bonus terms.
+    ``base_residual`` is the exact running product ``prod(1 - 0.5 q)`` of
+    high-eligible DIRECT relationships whose phase falls in the bin, with the
+    exact phase extremes (``phase_min``/``phase_max``, offsets from the bin
+    start).  ``full_interval_residual`` is ``prod(1 - 0.75 q)`` over those
+    that are full intervals.  Closed maximal streaks whose phase estimate
+    falls in the bin contribute their exact bonus terms; ``streak_min`` /
+    ``streak_max`` bound the phases of their relationships (offsets from the
+    bin start), so a streak attaches only to a component containing them all.
     """
 
     period: int
     index: int
     relationship_count: int = 0
-    offset_sum: float = 0.0
+    phase_min: float | None = None
+    phase_max: float | None = None
     base_residual: float = 1.0
     full_interval_count: int = 0
     full_interval_residual: float = 1.0
@@ -194,25 +256,23 @@ class IntervalBin:
     streak_count: int = 0
     streak_bonus: float = 0.0
     gate_bonus: float = 0.0
+    streak_min: float | None = None
+    streak_max: float | None = None
     best_streak: StreakSummary | None = None
 
     @property
-    def phase(self) -> float:
-        count = self.relationship_count
-        if count <= 0 and self.best_streak is not None:
-            return self.best_streak.phase_estimate % self.period
-        return (
-            self.index * PHASE_BIN_SECONDS
-            + (self.offset_sum / count if count else PHASE_BIN_SECONDS / 2)
-        ) % self.period
+    def start(self) -> float:
+        return float(self.index * INTERVAL_BIN_SECONDS)
 
 
 @dataclass(frozen=True)
 class MissBin:
-    """Folded expected-window outcomes at one (period, minute of period)."""
+    """Folded expected-window outcomes at one (period, 5-minute phase bin)."""
 
     period: int
     index: int
+    phase_min: float
+    phase_max: float
     genuine_miss_count: int = 0
     last_genuine_miss_at: float | None = None
     last_hit_at: float | None = None
@@ -220,8 +280,6 @@ class MissBin:
 
 @dataclass(frozen=True)
 class DivisorEvidence:
-    """Best schema-3 divisor resolution observed for (period, divisor)."""
-
     period: int
     divisor: int
     covered_window_count: int
@@ -230,8 +288,6 @@ class DivisorEvidence:
 
 @dataclass(frozen=True)
 class SupersededRegime:
-    """A superseded regime boundary (evidence-separation key only)."""
-
     period: int
     phase_offset: float
     phase_tolerance: float
@@ -239,13 +295,11 @@ class SupersededRegime:
 
     @property
     def key(self) -> tuple[int, int]:
-        return (self.period, int((self.phase_offset % self.period) // PHASE_BIN_SECONDS))
+        return (self.period, int((self.phase_offset % self.period) // INTERVAL_BIN_SECONDS))
 
 
 @dataclass(frozen=True)
 class RegimeKnowledge:
-    """The incumbent regime as learned knowledge (survives evidence removal)."""
-
     regime_id: str
     period: int
     phase_offset: float
@@ -269,35 +323,58 @@ class RecoveryInterval:
 
 
 @dataclass(frozen=True)
-class EpochEvidence:
-    """Evidence scoped to the current incumbent establishment boundary.
+class RunResidual:
+    """Quantised residuals of an open streak: exact extremes per key."""
 
-    ``challenger`` holds high relationships starting at or after the
-    incumbent's ``established_at`` (the Stage 6 post-establishment view);
-    ``confirmation`` and ``confirmation_endpoints`` hold non-high full
-    intervals ending after it (Stage 8.5 sparse confirmation); ``recovery``
-    holds the two latest non-overlapping incumbent intervals (Stage 6
-    original-cycle recovery).  The epoch is reset when the incumbent identity
-    or its establishment boundary changes, so this window is bounded.
-    """
+    key: int
+    count: int
+    deviation_min: float
+    deviation_max: float
+
+
+@dataclass(frozen=True)
+class OpenRun:
+    """The streak running through the open chain's anchor (not yet closed)."""
+
+    period: int
+    interval_count: int
+    min_quality: float
+    start_at: float
+    end_at: float
+    first_phase: float
+    residuals: tuple[RunResidual, ...]
+    relationship_phase_min: float
+    relationship_phase_max: float
+
+
+@dataclass(frozen=True)
+class OpenChain:
+    """A continuity chain folded up to (and including) its anchor restart."""
+
+    chain_id: str
+    anchor_event_id: str
+    anchor_at: float
+    anchor_index: int | None
+    anchor_weight: float
+    anchor_high_periods: tuple[int, ...]
+    anchor_confirmation_tagged: bool
+    run: OpenRun | None
+
+
+@dataclass(frozen=True)
+class EpochEvidence:
+    """Evidence scoped to the current incumbent establishment boundary."""
 
     regime_id: str | None = None
     established_at: float | None = None
     challenger: tuple[IntervalBin, ...] = ()
-    confirmation: tuple[IntervalBin, ...] = ()
-    confirmation_endpoints: tuple[tuple[int, tuple[PhaseBin, ...]], ...] = ()
+    confirmation_count: int = 0
+    confirmation_residual: float = 1.0
     recovery: tuple[RecoveryInterval, ...] = ()
 
 
 @dataclass(frozen=True)
 class FoldWatermark:
-    """Protection against double credit.
-
-    Raw items at or before ``(at, event_id)`` have been folded; an event at or
-    before the watermark is never credited again (a replayed, re-imported or
-    late event is rejected for learning).
-    """
-
     at: float | None = None
     event_id: str | None = None
     folded_event_count: int = 0
@@ -312,37 +389,34 @@ class LearnedState:
     watermark: FoldWatermark = field(default_factory=FoldWatermark)
     pool_weight_total: float = 0.0
     pool: tuple[PhaseBin, ...] = ()
-    high_endpoints: tuple[tuple[int, tuple[PhaseBin, ...]], ...] = ()
     intervals: tuple[IntervalBin, ...] = ()
     misses: tuple[MissBin, ...] = ()
     divisors: tuple[DivisorEvidence, ...] = ()
     incumbent: RegimeKnowledge | None = None
     superseded: tuple[SupersededRegime, ...] = ()
     epoch: EpochEvidence = field(default_factory=EpochEvidence)
+    open_chain: OpenChain | None = None
 
 
 def empty_learned_state(server_key: str) -> LearnedState:
-    if not isinstance(server_key, str) or not server_key:
-        raise LearnedStateError("server_key must be a non-empty string")
+    if not isinstance(server_key, str) or not server_key or len(server_key) > MAX_STRING_LENGTH:
+        raise LearnedStateError("server_key must be a non-empty bounded string")
     return LearnedState(LEARNED_STATE_SCHEMA_VERSION, server_key)
 
 
 def learned_state_entry_count(state: LearnedState) -> int:
-    """Number of stored entries; never exceeds ``LEARNED_STATE_MAX_ENTRIES``."""
-
-    epoch = state.epoch
+    run = state.open_chain.run if state.open_chain is not None else None
     return (
         len(state.pool)
-        + sum(len(bins) for _period, bins in state.high_endpoints)
         + len(state.intervals)
+        + len(state.epoch.challenger)
         + len(state.misses)
-        + len(state.divisors)
         + len(state.superseded)
-        + len(epoch.challenger)
-        + len(epoch.confirmation)
-        + sum(len(bins) for _period, bins in epoch.confirmation_endpoints)
-        + len(epoch.recovery)
-        + (1 if state.incumbent is not None else 0)
+        + len(state.divisors)
+        + len(state.epoch.recovery)
+        + (len(run.residuals) if run is not None else 0)
+        + (state.incumbent is not None)
+        + (state.open_chain is not None)
     )
 
 
@@ -365,10 +439,21 @@ def _day_bin(at: float) -> tuple[int, float]:
     return index, seconds - index * PHASE_BIN_SECONDS
 
 
-def _period_bin(value: float, period: int) -> tuple[int, float]:
+def _interval_bin(value: float, period: int) -> tuple[int, float]:
     value = float(value) % period
-    index = min(period // PHASE_BIN_SECONDS - 1, int(value // PHASE_BIN_SECONDS))
-    return index, value - index * PHASE_BIN_SECONDS
+    index = min(period // INTERVAL_BIN_SECONDS - 1, int(value // INTERVAL_BIN_SECONDS))
+    return index, value - index * INTERVAL_BIN_SECONDS
+
+
+def _range_abs(low: float, high: float, reference: float, period: int) -> tuple[float, float]:
+    """Smallest and largest absolute phase residual over ``[low, high]``."""
+
+    first = _signed_phase_residual(low, reference, period)
+    last = first + (high - low)
+    if last > period / 2:
+        return min(abs(first), abs(last - period)), period / 2
+    smallest = 0.0 if first <= 0.0 <= last else min(abs(first), abs(last))
+    return smallest, max(abs(first), abs(last))
 
 
 def _watermark_key(state: LearnedState) -> tuple[float, str] | None:
@@ -389,51 +474,7 @@ def _sparse_usable(event: PhysicalRestartEvent) -> bool:
     """The schema-4 sparse pool predicate (``authority._sparse_evidence``)."""
 
     return bool(
-        _authentic_event(event) and _event_weight(event) > 0 and _event_at(event) is not None
-    )
-
-
-def _bin_add(
-    bins: dict[int, PhaseBin],
-    at: float,
-    weight: float,
-    uncertainty: float,
-    *,
-    weight_before: float = 0.0,
-) -> None:
-    index, offset = _day_bin(at)
-    existing = bins.get(index)
-    if existing is None:
-        bins[index] = PhaseBin(index, weight, 1, offset, at, at, uncertainty, weight_before)
-        return
-    bins[index] = PhaseBin(
-        index,
-        existing.weight + weight,
-        existing.count + 1,
-        existing.offset_sum + offset,
-        min(existing.first_at, at),
-        max(existing.last_at, at),
-        max(existing.uncertainty, uncertainty),
-        existing.weight_before,
-    )
-
-
-def _period_histograms(
-    values: tuple[tuple[int, tuple[PhaseBin, ...]], ...]
-) -> dict[int, dict[int, PhaseBin]]:
-    result = {period: {} for period in CANDIDATE_PERIODS}
-    for period, bins in values:
-        result[period] = {item.index: item for item in bins}
-    return result
-
-
-def _freeze_period_histograms(
-    values: Mapping[int, Mapping[int, PhaseBin]]
-) -> tuple[tuple[int, tuple[PhaseBin, ...]], ...]:
-    return tuple(
-        (period, tuple(values[period][key] for key in sorted(values[period])))
-        for period in CANDIDATE_PERIODS
-        if values.get(period)
+        _authentic_event(event) and _event_weight(event) > 0 and _event_at(event) is not None,
     )
 
 
@@ -458,86 +499,10 @@ def _median_of_counts(values: list[tuple[float, int]]) -> float:
     return (nth(total // 2 - 1) + nth(total // 2)) / 2
 
 
-def _interval_bin_add_relationship(
-    existing: IntervalBin | None,
-    relationship: IntervalRelationship,
-    quality: float,
-    full_quality: float,
-) -> IntervalBin:
-    period = relationship.candidate_period_seconds
-    index, offset = _period_bin(_relationship_phase_value(relationship, period), period)
-    value = existing or IntervalBin(period, index)
-    return replace(
-        value,
-        relationship_count=value.relationship_count + 1,
-        offset_sum=value.offset_sum + offset,
-        base_residual=value.base_residual * (1.0 - 0.50 * quality),
-        full_interval_count=value.full_interval_count + int(full_quality > 0),
-        full_interval_residual=(
-            value.full_interval_residual
-            * (1.0 - SPARSE_CONFIRMATION_INTERVAL_WEIGHT * full_quality)
-            if full_quality > 0
-            else value.full_interval_residual
-        ),
-        first_at=(
-            relationship.left_at
-            if value.first_at is None
-            else min(value.first_at, relationship.left_at)
-        ),
-        last_at=(
-            relationship.right_at
-            if value.last_at is None
-            else max(value.last_at, relationship.right_at)
-        ),
-    )
-
-
-def _streak_shape(interval_count: int, minimum_quality: float) -> float:
-    return (1.0 - 2.0 ** -(interval_count - 1)) * minimum_quality
-
-
-def _interval_bin_add_streak(
-    existing: IntervalBin | None, streak: CadenceStreak, minimum_quality: float
-) -> IntervalBin:
-    period = streak.candidate_period_seconds
-    index, _offset = _period_bin(streak.phase_estimate, period)
-    value = existing or IntervalBin(period, index)
-    shape = _streak_shape(streak.interval_count, minimum_quality)
-    summary = StreakSummary(
-        interval_count=streak.interval_count,
-        event_count=streak.event_count,
-        min_quality=round(minimum_quality, 6),
-        phase_estimate=streak.phase_estimate,
-        phase_spread=streak.phase_spread,
-        start_at=streak.start_at,
-        end_at=streak.end_at,
-    )
-    best = value.best_streak
-    if best is None or (summary.interval_count, summary.end_at) > (
-        best.interval_count,
-        best.end_at,
-    ):
-        best = summary
-    return replace(
-        value,
-        streak_count=value.streak_count + 1,
-        streak_bonus=value.streak_bonus + round(STREAK_BONUS_COEFFICIENT * shape, 6),
-        gate_bonus=value.gate_bonus + round(GATE_STREAK_BONUS_COEFFICIENT * shape, 6),
-        best_streak=best,
-    )
-
-
 def _greedy_recovery(intervals: Iterable[RecoveryInterval]) -> tuple[RecoveryInterval, ...]:
-    """The latest non-overlapping intervals, chosen backwards (at most two).
+    """The latest non-overlapping intervals, chosen backwards (at most two)."""
 
-    Two non-overlapping intervals starting after any time T exist exactly when
-    the backward-greedy pair (latest start, then the latest start ending at or
-    before it) both start after T.
-    """
-
-    ordered = sorted(
-        set(intervals), key=lambda item: (item.left_at, item.right_at), reverse=True
-    )
+    ordered = sorted(set(intervals), key=lambda item: (item.left_at, item.right_at), reverse=True)
     selected: list[RecoveryInterval] = []
     boundary = math.inf
     for item in ordered:
@@ -583,20 +548,242 @@ def _incumbent_recovery_interval(
     return relationship_authority_quality(relationship, (left, right)) > 0.0
 
 
+def _high_direct(relationship: IntervalRelationship) -> bool:
+    return bool(
+        relationship.high_authority_eligible
+        and relationship.relationship_kind is RelationshipKind.DIRECT
+    )
+
+
+# --------------------------------------------------------------------------
+# Streak runs (the build_cadence_streaks join rule, with a bounded seed)
+# --------------------------------------------------------------------------
+
+
+@dataclass
+class _Run:
+    period: int
+    chain_id: str
+    last_event_id: str
+    start_at: float
+    end_at: float
+    first_phase: float
+    interval_count: int
+    min_quality: float
+    folded: tuple[RunResidual, ...]
+    exact: list[float]
+    relationship_min: float
+    relationship_max: float
+
+    def residual(self, at: float) -> float:
+        return _signed_phase_residual(at, self.first_phase, self.period)
+
+    def phase(self, extra: Sequence[float] = ()) -> tuple[float, float]:
+        """(phase estimate, spread upper bound).
+
+        Exact residuals reproduce ``continuity._phase_estimate``; quantised
+        folded residuals contribute their exact per-key extremes, so the
+        returned spread is never smaller than the true spread.
+        """
+
+        quantum = RUN_RESIDUAL_QUANTUM_SECONDS
+        items = [
+            (
+                item.key * quantum + item.deviation_min,
+                item.key * quantum + item.deviation_max,
+                item.count,
+            )
+            for item in self.folded
+        ]
+        items.extend((value, value, 1) for value in (*self.exact, *extra))
+        low_median = _median_of_counts([(low, count) for low, _high, count in items])
+        high_median = _median_of_counts([(high, count) for _low, high, count in items])
+        center = _median_of_counts([((low + high) / 2, count) for low, high, count in items])
+        highest = max(high for _low, high, _count in items)
+        lowest = min(low for low, _high, _count in items)
+        spread = max(highest - low_median, high_median - lowest)
+        return (self.first_phase + center) % self.period, spread
+
+    def joins(self, relationship: IntervalRelationship) -> bool:
+        if (
+            relationship.candidate_period_seconds != self.period
+            or relationship.continuity_chain_id != self.chain_id
+            or relationship.left_event_id != self.last_event_id
+            or relationship.left_at != self.end_at
+            or relationship.intervening_event_ids
+        ):
+            return False
+        _phase, spread = self.phase((self.residual(relationship.right_at),))
+        return spread <= candidate_phase_tolerance(self.period)
+
+    def extend(self, relationship: IntervalRelationship, quality: float) -> None:
+        self.exact.append(self.residual(relationship.right_at))
+        self.last_event_id = relationship.right_event_id
+        self.end_at = relationship.right_at
+        self.interval_count += 1
+        self.min_quality = min(self.min_quality, quality)
+        value = self.residual(_relationship_phase_value(relationship, self.period))
+        self.relationship_min = min(self.relationship_min, value)
+        self.relationship_max = max(self.relationship_max, value)
+
+    def summary(self) -> StreakSummary:
+        estimate, spread = self.phase()
+        return StreakSummary(
+            self.interval_count,
+            self.interval_count + 1,
+            self.min_quality,
+            estimate,
+            spread,
+            self.start_at,
+            self.end_at,
+        )
+
+    def relationship_range(self) -> tuple[float, float]:
+        return (self.first_phase + self.relationship_min, self.first_phase + self.relationship_max)
+
+    def to_open(self) -> OpenRun:
+        quantum = RUN_RESIDUAL_QUANTUM_SECONDS
+        keys = {item.key: item for item in self.folded}
+        for value in self.exact:
+            key = int(round(value / quantum))
+            deviation = value - key * quantum
+            existing = keys.get(key)
+            keys[key] = (
+                RunResidual(key, 1, deviation, deviation)
+                if existing is None
+                else RunResidual(
+                    key,
+                    existing.count + 1,
+                    min(existing.deviation_min, deviation),
+                    max(existing.deviation_max, deviation),
+                )
+            )
+        return OpenRun(
+            period=self.period,
+            interval_count=self.interval_count,
+            min_quality=self.min_quality,
+            start_at=self.start_at,
+            end_at=self.end_at,
+            first_phase=self.first_phase,
+            residuals=tuple(keys[key] for key in sorted(keys)),
+            relationship_phase_min=self.relationship_min,
+            relationship_phase_max=self.relationship_max,
+        )
+
+
+def _run_from_relationship(relationship: IntervalRelationship, quality: float) -> _Run:
+    period = relationship.candidate_period_seconds
+    first_phase = relationship.left_at % period
+    run = _Run(
+        period=period,
+        chain_id=relationship.continuity_chain_id,
+        last_event_id=relationship.right_event_id,
+        start_at=relationship.left_at,
+        end_at=relationship.right_at,
+        first_phase=first_phase,
+        interval_count=1,
+        min_quality=quality,
+        folded=(),
+        exact=[0.0],
+        relationship_min=0.0,
+        relationship_max=0.0,
+    )
+    run.exact.append(run.residual(relationship.right_at))
+    value = run.residual(_relationship_phase_value(relationship, period))
+    run.relationship_min = run.relationship_max = value
+    return run
+
+
+def _run_from_open(open_chain: OpenChain) -> _Run | None:
+    value = open_chain.run
+    if value is None:
+        return None
+    return _Run(
+        period=value.period,
+        chain_id=open_chain.chain_id,
+        last_event_id=open_chain.anchor_event_id,
+        start_at=value.start_at,
+        end_at=value.end_at,
+        first_phase=value.first_phase,
+        interval_count=value.interval_count,
+        min_quality=value.min_quality,
+        folded=value.residuals,
+        exact=[],
+        relationship_min=value.relationship_phase_min,
+        relationship_max=value.relationship_phase_max,
+    )
+
+
+def _build_runs(
+    items: Iterable[tuple[IntervalRelationship, float]], seed: _Run | None
+) -> list[_Run]:
+    """``continuity.build_cadence_streaks`` runs, optionally seeded.
+
+    Same eligibility, ordering and join rule; single-interval runs are
+    returned too (the caller decides what is a streak or still open).
+    """
+
+    eligible = sorted(
+        (
+            (relationship, quality)
+            for relationship, quality in items
+            if _high_direct(relationship)
+            and relationship.continuity_chain_id
+            and not relationship.intervening_event_ids
+        ),
+        key=lambda item: (
+            item[0].candidate_period_seconds,
+            item[0].continuity_chain_id,
+            item[0].left_at,
+            item[0].right_at,
+            item[0].relationship_id,
+        ),
+    )
+    runs: list[_Run] = []
+    active: _Run | None = None
+    pending = seed
+    for relationship, quality in eligible:
+        group = (relationship.candidate_period_seconds, relationship.continuity_chain_id)
+        if pending is not None and group == (pending.period, pending.chain_id):
+            if active is not None:
+                runs.append(active)
+            active, pending = pending, None
+        if active is not None and active.joins(relationship):
+            active.extend(relationship, quality)
+            continue
+        if active is not None:
+            runs.append(active)
+        active = _run_from_relationship(relationship, quality)
+    if active is not None:
+        runs.append(active)
+    if pending is not None:
+        runs.append(pending)
+    return runs
+
+
 # --------------------------------------------------------------------------
 # Folding genuine observations
 # --------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class FoldUnit:
+    """Events to fold (may include already-folded context such as the anchor)."""
+
+    events: tuple[PhysicalRestartEvent, ...]
+    chain_open: bool
+
+
+@dataclass(frozen=True)
+class FoldPlan:
+    units: tuple[FoldUnit, ...]
+    ring: tuple[PhysicalRestartEvent, ...]
+
+
 def chain_fold_units(
     events: Iterable[PhysicalRestartEvent],
 ) -> tuple[tuple[PhysicalRestartEvent, ...], ...]:
-    """Group events into fold units: one continuity chain each, oldest first.
-
-    High-eligible relationships and streaks never cross a continuity chain,
-    so folding whole chains never splits a relationship or a streak.  Events
-    without a chain are their own unit.
-    """
+    """Group events by continuity chain, oldest chain first."""
 
     groups: dict[object, list[PhysicalRestartEvent]] = {}
     for event in events:
@@ -611,27 +798,161 @@ def chain_fold_units(
     return tuple(sorted(units, key=lambda unit: (_event_at(unit[0]), unit[0].event_id)))
 
 
-def ring_fold_units(
-    events: Iterable[PhysicalRestartEvent], *, capacity: int = RECENT_RING_CAPACITY
-) -> tuple[tuple[tuple[PhysicalRestartEvent, ...], ...], tuple[PhysicalRestartEvent, ...]]:
-    """Split raw events into (units to fold, events kept in the ring).
+def plan_ring_folding(
+    state: LearnedState,
+    events: Iterable[PhysicalRestartEvent],
+    *,
+    capacity: int = RECENT_RING_CAPACITY,
+) -> FoldPlan:
+    """Plan folds so that at most ``capacity`` raw events remain in the ring.
 
-    The oldest whole chains are folded until at most ``capacity`` events
-    remain; the newest chain is never folded (it may still be extended).  A
-    single chain longer than ``capacity`` stays whole in the ring: splitting
-    it would split a streak (documented R1 limitation, not exercised by
-    ordinary monitoring).
+    Whole older chains are folded first.  If the newest chain alone exceeds
+    the capacity it is folded up to a boundary restart that stays in the
+    ring as the already-credited anchor (``chain_open=True``); the anchor
+    counts against the capacity.  The ring never grows with chain length.
     """
 
-    units = list(chain_fold_units(events))
-    remaining = sum(len(unit) for unit in units)
-    folded = []
-    while len(units) > 1 and remaining > capacity:
-        unit = units.pop(0)
-        folded.append(unit)
-        remaining -= len(unit)
-    ring = tuple(event for unit in units for event in unit)
-    return tuple(folded), ring
+    if capacity < MINIMUM_RING_CAPACITY:
+        raise LearnedStateError("ring capacity must be at least 2")
+    mark = _watermark_key(state)
+    anchor_id = state.open_chain.anchor_event_id if state.open_chain is not None else None
+    anchor = None
+    unfolded: dict[str, PhysicalRestartEvent] = {}
+    for event in events:
+        if event.server_key != state.server_key:
+            continue
+        if event.event_id == anchor_id:
+            anchor = event
+        elif _newer(event, mark):
+            unfolded.setdefault(event.event_id, event)
+    chains = [list(unit) for unit in chain_fold_units(unfolded.values())]
+    open_id = state.open_chain.chain_id if state.open_chain is not None else None
+    units: list[FoldUnit] = []
+
+    def context(chain: list[PhysicalRestartEvent]) -> tuple[PhysicalRestartEvent, ...]:
+        if anchor is not None and chain and chain[0].continuity_chain_id == open_id:
+            return (anchor, *chain)
+        return tuple(chain)
+
+    def ring_size() -> int:
+        kept_anchor = anchor is not None and bool(
+            chains,
+        ) and chains[0][0].continuity_chain_id == open_id
+        return sum(len(chain) for chain in chains) + int(kept_anchor)
+
+    while chains and ring_size() > capacity:
+        if len(chains) > 1:
+            chain = chains.pop(0)
+            units.append(FoldUnit(context(chain), chain_open=False))
+            if chain[0].continuity_chain_id == open_id:
+                anchor, open_id = None, None
+            continue
+        chain = chains[0]
+        keep = capacity - 1
+        prefix, rest = chain[:-keep], chain[-keep:]
+        units.append(FoldUnit(context(prefix), chain_open=True))
+        anchor, open_id = prefix[-1], prefix[-1].continuity_chain_id
+        chains[0] = rest
+    ring: list[PhysicalRestartEvent] = []
+    if anchor is not None and chains and chains[0][0].continuity_chain_id == open_id:
+        ring.append(anchor)
+    ring.extend(event for chain in chains for event in chain)
+    return FoldPlan(tuple(units), tuple(ring))
+
+
+def _tag_bin(
+    pool: dict[int, PhaseBin],
+    index: int,
+    weight: float,
+    *,
+    period: int | None,
+    confirmation_period: int | None,
+) -> None:
+    value = pool[index]
+    if period is not None:
+        tags = {item.period: item for item in value.endpoints}
+        previous = tags.get(period)
+        tags[period] = EndpointTag(
+            period,
+            (previous.weight if previous else 0.0) + weight,
+            (previous.count if previous else 0) + 1,
+        )
+        value = replace(value, endpoints=tuple(tags[key] for key in sorted(tags)))
+    if confirmation_period is not None:
+        previous = value.confirmation
+        value = replace(
+            value,
+            confirmation=EndpointTag(
+                confirmation_period,
+                (previous.weight if previous else 0.0) + weight,
+                (previous.count if previous else 0) + 1,
+            ),
+        )
+    pool[index] = value
+
+
+def _interval_bin_add_relationship(
+    existing: IntervalBin | None,
+    relationship: IntervalRelationship,
+    quality: float,
+    full_quality: float,
+) -> IntervalBin:
+    period = relationship.candidate_period_seconds
+    index, offset = _interval_bin(_relationship_phase_value(relationship, period), period)
+    value = existing or IntervalBin(period, index)
+    return replace(
+        value,
+        relationship_count=value.relationship_count + 1,
+        phase_min=offset if value.phase_min is None else min(value.phase_min, offset),
+        phase_max=offset if value.phase_max is None else max(value.phase_max, offset),
+        base_residual=value.base_residual * (1.0 - 0.50 * quality),
+        full_interval_count=value.full_interval_count + int(full_quality > 0),
+        full_interval_residual=(
+            value.full_interval_residual * (
+                1.0 - SPARSE_CONFIRMATION_INTERVAL_WEIGHT * full_quality
+            )
+            if full_quality > 0
+            else value.full_interval_residual
+        ),
+        first_at=relationship.left_at if value.first_at is None else min(
+            value.first_at,
+            relationship.left_at,
+        ),
+        last_at=relationship.right_at if value.last_at is None else max(
+            value.last_at,
+            relationship.right_at,
+        ),
+    )
+
+
+def _interval_bin_add_streak(
+    existing: IntervalBin | None,
+    run: _Run,
+) -> tuple[tuple[int, int], IntervalBin]:
+    summary = run.summary()
+    period = run.period
+    index, _offset = _interval_bin(summary.phase_estimate, period)
+    value = existing if existing is not None and existing.index == index else None
+    value = value or IntervalBin(period, index)
+    low, _high = run.relationship_range()
+    low = _signed_phase_residual(low, value.start, period)
+    high = low + (run.relationship_max - run.relationship_min)
+    shape = (1.0 - 2.0 ** -(summary.interval_count - 1)) * summary.min_quality
+    best = value.best_streak
+    if best is None or (
+        summary.interval_count,
+        summary.end_at,
+    ) > (best.interval_count, best.end_at):
+        best = summary
+    return (period, index), replace(
+        value,
+        streak_count=value.streak_count + 1,
+        streak_bonus=value.streak_bonus + round(STREAK_BONUS_COEFFICIENT * shape, 6),
+        gate_bonus=value.gate_bonus + round(GATE_STREAK_BONUS_COEFFICIENT * shape, 6),
+        streak_min=low if value.streak_min is None else min(value.streak_min, low),
+        streak_max=high if value.streak_max is None else max(value.streak_max, high),
+        best_streak=best,
+    )
 
 
 def fold_unit(
@@ -639,52 +960,88 @@ def fold_unit(
     *,
     events: Sequence[PhysicalRestartEvent],
     relationships: Iterable[IntervalRelationship] = (),
-    streaks: Iterable[CadenceStreak] = (),
+    chain_open: bool = False,
 ) -> LearnedState:
-    """Fold one closed unit (normally one whole continuity chain).
+    """Fold one unit: a whole chain, or a chain prefix when ``chain_open``.
 
-    Events at or before the watermark are rejected; relationships and streaks
-    are folded only when every event they name is folded in this unit.
-    Ineligible or non-authentic events contribute no positive or negative
-    evidence (AGENTS learning invariant) but still advance the watermark.
-    Epoch-scoped evidence uses the incumbent recorded by ``observe_decision``.
+    Events at or before the watermark are rejected (they may be passed as
+    context, such as the open chain's anchor).  A relationship is folded
+    exactly once: when its right endpoint is folded, provided its left
+    endpoint is folded now or is the open chain's anchor.  Ineligible events
+    contribute no evidence but advance the watermark.  With ``chain_open``
+    the last folded restart becomes the anchor and the streak through it is
+    carried as an ``OpenRun``.
     """
 
     mark = _watermark_key(state)
+    context: dict[str, PhysicalRestartEvent] = {}
     accepted: dict[str, PhysicalRestartEvent] = {}
     for event in events:
-        if event.server_key != state.server_key or not _newer(event, mark):
+        if event.server_key != state.server_key or _event_at(event) is None:
             continue
-        accepted.setdefault(event.event_id, event)
+        context.setdefault(event.event_id, event)
+        if _newer(event, mark):
+            accepted.setdefault(event.event_id, event)
     if not accepted:
         return state
     ordered = sorted(accepted.values(), key=lambda item: (_event_at(item), item.event_id))
+    chain_id = ordered[-1].continuity_chain_id
+
+    open_chain = state.open_chain
+    seed = None
+    stale = None
+    anchor_id = None
+    anchor_high_periods: set[int] = set()
+    anchor_confirmation_tagged = False
+    if (
+        open_chain is not None
+        and open_chain.chain_id == chain_id
+        and open_chain.anchor_event_id in context
+    ):
+        seed = _run_from_open(open_chain)
+        anchor_id = open_chain.anchor_event_id
+        anchor_high_periods = set(open_chain.anchor_high_periods)
+        anchor_confirmation_tagged = open_chain.anchor_confirmation_tagged
+    elif open_chain is not None:
+        # The open chain did not continue into this unit: its streak closes.
+        stale = _run_from_open(open_chain)
 
     pool = {item.index: item for item in state.pool}
-    endpoints = _period_histograms(state.high_endpoints)
     intervals = {(item.period, item.index): item for item in state.intervals}
     epoch = state.epoch
     challenger = {(item.period, item.index): item for item in epoch.challenger}
-    confirmation = {(item.period, item.index): item for item in epoch.confirmation}
-    confirmation_endpoints = _period_histograms(epoch.confirmation_endpoints)
+    confirmation_count = epoch.confirmation_count
+    confirmation_residual = epoch.confirmation_residual
     recovery = list(epoch.recovery)
     incumbent = state.incumbent
     last_aligned = None if incumbent is None else incumbent.last_aligned_evidence_at
 
-    learning_count = 0
     pool_total = state.pool_weight_total
+    learning_count = 0
     for event in ordered:
         at = _event_at(event)
         if _sparse_usable(event):
             learning_count += 1
             weight = _event_weight(event)
-            _bin_add(
-                pool,
-                at,
-                weight,
-                _capped_uncertainty(event.phase_uncertainty),
-                weight_before=pool_total,
-            )
+            uncertainty = _capped_uncertainty(event.phase_uncertainty)
+            index, offset = _day_bin(at)
+            existing = pool.get(index)
+            if existing is None:
+                pool[index] = PhaseBin(
+                    index, weight, 1, offset, offset, at, at, uncertainty, uncertainty, pool_total
+                )
+            else:
+                pool[index] = replace(
+                    existing,
+                    weight=existing.weight + weight,
+                    count=existing.count + 1,
+                    offset_min=min(existing.offset_min, offset),
+                    offset_max=max(existing.offset_max, offset),
+                    first_at=min(existing.first_at, at),
+                    last_at=max(existing.last_at, at),
+                    uncertainty_min=min(existing.uncertainty_min, uncertainty),
+                    uncertainty_max=max(existing.uncertainty_max, uncertainty),
+                )
             pool_total += weight
         if (
             incumbent is not None
@@ -694,45 +1051,87 @@ def fold_unit(
         ):
             last_aligned = at if last_aligned is None else max(last_aligned, at)
 
-    quality: dict[str, float] = {}
-    endpoint_tags: set[tuple[int, str]] = set()
-    confirmation_tags: set[tuple[int, str]] = set()
-    unique_relationships = {
-        item.relationship_id: item
-        for item in relationships
-        if item.server_key == state.server_key
-        and item.left_event_id in accepted
-        and item.right_event_id in accepted
-    }
-    for relationship in sorted(
-        unique_relationships.values(),
+    def left_ok(relationship: IntervalRelationship) -> bool:
+        return relationship.left_event_id in accepted or relationship.left_event_id == anchor_id
+
+    folded = sorted(
+        {
+            item.relationship_id: item
+            for item in relationships
+            if item.server_key == state.server_key
+            and item.right_event_id in accepted
+            and left_ok(item)
+            and item.left_event_id in context
+        }.values(),
         key=lambda item: (item.left_at, item.right_at, item.relationship_id),
-    ):
+    )
+    tagged: set[tuple[int, str]] = set()
+    confirmation_tagged: set[str] = set()
+    high_items: list[tuple[IntervalRelationship, float]] = []
+
+    def tag(event_id: str, *, period: int | None = None, confirmation: int | None = None) -> None:
+        nonlocal anchor_confirmation_tagged
+        event = context[event_id]
+        if not _sparse_usable(event):
+            return
+        index = _day_bin(_event_at(event))[0]
+        if event_id == anchor_id:
+            if period is not None and period not in anchor_high_periods:
+                anchor_high_periods.add(period)
+                _tag_bin(pool, index, _event_weight(event), period=period, confirmation_period=None)
+            if confirmation is not None and not anchor_confirmation_tagged:
+                anchor_confirmation_tagged = True
+                _tag_bin(
+                    pool,
+                    index,
+                    _event_weight(event),
+                    period=None,
+                    confirmation_period=confirmation,
+                )
+            return
+        if period is not None and (period, event_id) not in tagged:
+            tagged.add((period, event_id))
+            _tag_bin(pool, index, _event_weight(event), period=period, confirmation_period=None)
+        if confirmation is not None and event_id not in confirmation_tagged:
+            confirmation_tagged.add(event_id)
+            _tag_bin(
+                pool,
+                index,
+                _event_weight(event),
+                period=None,
+                confirmation_period=confirmation,
+            )
+
+    for relationship in folded:
         period = relationship.candidate_period_seconds
         pair = {
-            relationship.left_event_id: accepted[relationship.left_event_id],
-            relationship.right_event_id: accepted[relationship.right_event_id],
+            relationship.left_event_id: context[relationship.left_event_id],
+            relationship.right_event_id: context[relationship.right_event_id],
         }
         full_quality = _full_interval_quality(relationship, pair)
-        if (
-            relationship.high_authority_eligible
-            and relationship.relationship_kind is RelationshipKind.DIRECT
-        ):
-            value = relationship_authority_quality(relationship, pair.values())
-            quality[relationship.relationship_id] = value
-            key = (period, _period_bin(_relationship_phase_value(relationship, period), period)[0])
+        if _high_direct(relationship):
+            quality = relationship_authority_quality(relationship, pair.values())
+            high_items.append((relationship, quality))
+            key = (
+                period,
+                _interval_bin(_relationship_phase_value(relationship, period), period)[0],
+            )
             intervals[key] = _interval_bin_add_relationship(
-                intervals.get(key), relationship, value, full_quality
+                intervals.get(key),
+                relationship,
+                quality,
+                full_quality,
             )
-            endpoint_tags.update(
-                (period, item) for item in (relationship.left_event_id, relationship.right_event_id)
-            )
+            tag(relationship.left_event_id, period=period)
+            tag(relationship.right_event_id, period=period)
             if epoch.established_at is not None and relationship.left_at >= epoch.established_at:
                 challenger[key] = _interval_bin_add_relationship(
-                    challenger.get(key), relationship, value, full_quality
+                    challenger.get(key), relationship, quality, full_quality
                 )
             if incumbent is not None and _incumbent_recovery_interval(
-                relationship, incumbent, pair
+                relationship,
+                incumbent,
+                pair,
             ):
                 recovery.append(RecoveryInterval(relationship.left_at, relationship.right_at))
         elif (
@@ -746,51 +1145,51 @@ def fold_unit(
             )
             <= incumbent.phase_tolerance
         ):
-            key = (period, _period_bin(_relationship_phase_value(relationship, period), period)[0])
-            confirmation[key] = _interval_bin_add_relationship(
-                confirmation.get(key), relationship, 0.0, full_quality
-            )
-            confirmation_tags.update(
-                (period, item) for item in (relationship.left_event_id, relationship.right_event_id)
-            )
+            confirmation_count += 1
+            confirmation_residual *= 1.0 - SPARSE_CONFIRMATION_INTERVAL_WEIGHT * full_quality
+            tag(relationship.left_event_id, confirmation=period)
+            tag(relationship.right_event_id, confirmation=period)
 
-    for tags, target in ((endpoint_tags, endpoints), (confirmation_tags, confirmation_endpoints)):
-        for period, event_id in sorted(tags):
-            event = accepted[event_id]
-            if _sparse_usable(event):
-                _bin_add(
-                    target[period],
-                    _event_at(event),
-                    _event_weight(event),
-                    _capped_uncertainty(event.phase_uncertainty),
-                )
+    def close(run: _Run) -> None:
+        if run.interval_count < 2:
+            return
+        key = (run.period, _interval_bin(run.summary().phase_estimate, run.period)[0])
+        key, intervals[key] = _interval_bin_add_streak(intervals.get(key), run)
+        if epoch.established_at is not None and run.start_at >= epoch.established_at:
+            key, challenger[key] = _interval_bin_add_streak(challenger.get(key), run)
 
-    for streak in sorted(
-        {
-            item.streak_id: item
-            for item in streaks
-            if item.server_key == state.server_key
-            and set(item.event_ids) <= set(accepted)
-            and all(value in quality for value in item.relationship_ids)
-        }.values(),
-        key=lambda item: (item.start_at, item.streak_id),
-    ):
-        minimum = min(quality[value] for value in streak.relationship_ids)
-        key = (
-            streak.candidate_period_seconds,
-            _period_bin(streak.phase_estimate, streak.candidate_period_seconds)[0],
+    if stale is not None:
+        close(stale)
+    new_anchor = ordered[-1] if chain_open and chain_id else None
+    open_run = None
+    for run in _build_runs(high_items, seed):
+        if new_anchor is not None and run.last_event_id == new_anchor.event_id:
+            open_run = run.to_open()
+            continue
+        close(run)
+
+    if new_anchor is not None:
+        high_periods = {period for period, event_id in tagged if event_id == new_anchor.event_id}
+        index = _day_bin(_event_at(new_anchor))[0] if _sparse_usable(new_anchor) else None
+        next_open = OpenChain(
+            chain_id=chain_id,
+            anchor_event_id=new_anchor.event_id,
+            anchor_at=_event_at(new_anchor),
+            anchor_index=index,
+            anchor_weight=_event_weight(new_anchor) if index is not None else 0.0,
+            anchor_high_periods=tuple(sorted(high_periods)),
+            anchor_confirmation_tagged=new_anchor.event_id in confirmation_tagged,
+            run=open_run,
         )
-        intervals[key] = _interval_bin_add_streak(intervals.get(key), streak, minimum)
-        if epoch.established_at is not None and streak.start_at >= epoch.established_at:
-            challenger[key] = _interval_bin_add_streak(challenger.get(key), streak, minimum)
+    else:
+        next_open = None
 
     last = ordered[-1]
     watermark = FoldWatermark(
         at=_event_at(last),
         event_id=last.event_id,
         folded_event_count=state.watermark.folded_event_count + len(ordered),
-        folded_learning_event_count=state.watermark.folded_learning_event_count
-        + learning_count,
+        folded_learning_event_count=state.watermark.folded_learning_event_count + learning_count,
         window_end_at=state.watermark.window_end_at,
     )
     if incumbent is not None and last_aligned != incumbent.last_aligned_evidence_at:
@@ -800,17 +1199,28 @@ def fold_unit(
         watermark=watermark,
         pool_weight_total=pool_total,
         pool=tuple(pool[key] for key in sorted(pool)),
-        high_endpoints=_freeze_period_histograms(endpoints),
         intervals=tuple(intervals[key] for key in sorted(intervals)),
         incumbent=incumbent,
         epoch=replace(
             epoch,
             challenger=tuple(challenger[key] for key in sorted(challenger)),
-            confirmation=tuple(confirmation[key] for key in sorted(confirmation)),
-            confirmation_endpoints=_freeze_period_histograms(confirmation_endpoints),
+            confirmation_count=confirmation_count,
+            confirmation_residual=confirmation_residual,
             recovery=_greedy_recovery(recovery),
         ),
+        open_chain=next_open,
     )
+
+
+def apply_fold_plan(
+    state: LearnedState, plan: FoldPlan, relationships: Iterable[IntervalRelationship]
+) -> LearnedState:
+    relationships = tuple(relationships)
+    for unit in plan.units:
+        state = fold_unit(
+            state, events=unit.events, relationships=relationships, chain_open=unit.chain_open
+        )
+    return state
 
 
 def latest_window_records(
@@ -818,9 +1228,8 @@ def latest_window_records(
 ) -> tuple[ExpectedWindowLedgerRecord, ...]:
     values = {item.result_id: item for item in records}
     superseded = {
-        item.supersedes_result_id
-        for item in values.values()
-        if item.supersedes_result_id is not None
+        item.supersedes_result_id for item in values.values(
+        ) if item.supersedes_result_id is not None
     }
     return tuple(
         sorted(
@@ -831,14 +1240,10 @@ def latest_window_records(
 
 
 def fold_windows(
-    state: LearnedState, records: Iterable[ExpectedWindowLedgerRecord]
+    state: LearnedState,
+    records: Iterable[ExpectedWindowLedgerRecord],
 ) -> LearnedState:
-    """Fold final expected-window outcomes (latest revision per lineage).
-
-    Only windows ending after the window watermark are folded, so a window is
-    credited once.  Callers must fold a window only after its lineage is
-    final: a revision arriving after its window was folded is ignored.
-    """
+    """Fold final expected-window outcomes (latest revision per lineage) once."""
 
     misses = {(item.period, item.index): item for item in state.misses}
     mark = state.watermark.window_end_at
@@ -849,22 +1254,32 @@ def fold_windows(
     ):
         if mark is not None and record.window_end_at <= mark:
             continue
-        latest_end = (
-            record.window_end_at if latest_end is None else max(latest_end, record.window_end_at)
+        latest_end = record.window_end_at if latest_end is None else max(
+            latest_end,
+            record.window_end_at,
         )
+        genuine = (
+            record.outcome is ExpectedWindowOutcome.GENUINE_MISS and record.negative_penalty_active
+        )
+        hit = record.outcome is ExpectedWindowOutcome.HIT
+        if not (genuine or hit):
+            continue
         period = record.candidate_period_seconds
-        index, _offset = _period_bin(record.expected_phase_offset, period)
-        value = misses.get((period, index)) or MissBin(period, index)
-        if record.outcome is ExpectedWindowOutcome.GENUINE_MISS and record.negative_penalty_active:
+        index, offset = _interval_bin(record.expected_phase_offset, period)
+        value = misses.get((period, index)) or MissBin(period, index, offset, offset)
+        value = replace(
+            value,
+            phase_min=min(value.phase_min, offset),
+            phase_max=max(value.phase_max, offset),
+        )
+        if genuine:
             value = replace(
                 value,
                 genuine_miss_count=value.genuine_miss_count + 1,
                 last_genuine_miss_at=max(value.last_genuine_miss_at or 0.0, record.expected_at),
             )
-        elif record.outcome is ExpectedWindowOutcome.HIT:
-            value = replace(value, last_hit_at=max(value.last_hit_at or 0.0, record.expected_at))
         else:
-            continue
+            value = replace(value, last_hit_at=max(value.last_hit_at or 0.0, record.expected_at))
         misses[(period, index)] = value
         changed = True
     if latest_end == mark and not changed:
@@ -879,13 +1294,10 @@ def fold_windows(
 def fold_divisor_resolution(state: LearnedState, score) -> LearnedState:
     """Retain the best divisor resolution the schema-3 scorer has observed.
 
-    Schema 3 recomputes divisor resolution from its 7-day / 16-event window
-    and 60-day coverage, so it disappears after inactivity.  Here the largest
-    covered-window and longer-interval counts per (period, divisor) persist
-    for the current regime epoch (they are reset when an incumbent is
-    superseded).  This is the intended persistent-knowledge semantics; it is
-    more durable than the current recomputation, never more permissive while
-    the live evidence is still present.
+    Per (period, divisor) the largest covered-window and longer-interval
+    counts persist for the current regime epoch (reset on supersession).
+    Equal to the live recomputation while live evidence exists; durable after
+    schema-3 coverage expires (the intended persistent-knowledge semantics).
     """
 
     stored = {(item.period, item.divisor): item for item in state.divisors}
@@ -909,9 +1321,7 @@ def fold_divisor_resolution(state: LearnedState, score) -> LearnedState:
     return state if values == state.divisors else replace(state, divisors=values)
 
 
-def _knowledge_from_regime(
-    regime: RegimeRecord, *, last_aligned: float | None
-) -> RegimeKnowledge:
+def _knowledge_from_regime(regime: RegimeRecord, *, last_aligned: float | None) -> RegimeKnowledge:
     return RegimeKnowledge(
         regime_id=regime.regime_id,
         period=regime.candidate_period_seconds,
@@ -925,7 +1335,8 @@ def _knowledge_from_regime(
         combined_confidence=regime.combined_confidence,
         established_at=regime.established_at,
         last_aligned_evidence_at=last_aligned,
-        defining_evidence_ids=tuple(regime.defining_evidence_ids[:RECENT_RING_CAPACITY]),
+        # References into raw evidence only; identity is ``regime_id``.
+        defining_evidence_ids=tuple(regime.defining_evidence_ids[:MAX_DEFINING_EVIDENCE_IDS]),
         reason_codes=tuple(sorted(set(regime.reason_codes)))[:MAX_REASON_CODES],
     )
 
@@ -933,11 +1344,10 @@ def _knowledge_from_regime(
 def observe_decision(state: LearnedState, decision: AuthorityDecision) -> LearnedState:
     """Record the authority's incumbent and regime boundaries as knowledge.
 
-    The incumbent's identity, period, phase, gate and magnitudes are kept
-    (learned knowledge that survives evidence removal).  Superseded regimes
-    are kept as separation keys, merged per (period, minute of period); the
-    union of their explained evidence is exactly the evidence up to the
-    latest ``superseded_at``.  A change of incumbent identity or
+    Superseded regimes are merged per (period, 5-minute phase bin) by
+    widening the tolerance to cover both and keeping the later boundary, so
+    the separated evidence is a superset of each regime's own (old evidence
+    never supports a conflicting regime).  A change of incumbent identity or
     establishment boundary starts a new epoch.
     """
 
@@ -946,28 +1356,32 @@ def observe_decision(state: LearnedState, decision: AuthorityDecision) -> Learne
     for regime in decision.regimes:
         if regime.status is not RegimeRecordStatus.SUPERSEDED or regime.superseded_at is None:
             continue
+        period = regime.candidate_period_seconds
         value = SupersededRegime(
-            regime.candidate_period_seconds,
-            regime.phase_offset % regime.candidate_period_seconds,
+            period,
+            regime.phase_offset % period,
             regime.phase_tolerance,
             regime.superseded_at,
         )
         previous = superseded.get(value.key)
-        if previous is not None:
-            if (
-                previous.superseded_at >= value.superseded_at
-                and previous.phase_tolerance >= value.phase_tolerance
-            ):
-                continue
-            value = replace(
-                value,
-                phase_offset=previous.phase_offset,
-                phase_tolerance=max(previous.phase_tolerance, value.phase_tolerance),
-                superseded_at=max(previous.superseded_at, value.superseded_at),
-            )
-        else:
+        if previous is None:
             supersession_seen = True
-        superseded[value.key] = value
+            superseded[value.key] = value
+            continue
+        widened = max(
+            previous.phase_tolerance,
+            value.phase_tolerance + _circular_distance(
+                previous.phase_offset,
+                value.phase_offset,
+                period,
+            ),
+        )
+        merged = replace(
+            previous,
+            phase_tolerance=widened,
+            superseded_at=max(previous.superseded_at, value.superseded_at),
+        )
+        superseded[value.key] = merged
 
     regime = decision.incumbent_shadow_regime
     previous = state.incumbent
@@ -975,38 +1389,48 @@ def observe_decision(state: LearnedState, decision: AuthorityDecision) -> Learne
         incumbent = None
     else:
         same = previous is not None and previous.regime_id == regime.regime_id
-        last_aligned = previous.last_aligned_evidence_at if same else None
-        if not same:
-            last_aligned = _folded_last_aligned(state, regime)
+        last_aligned = previous.last_aligned_evidence_at if same else _folded_last_aligned(
+            state,
+            regime,
+        )
         incumbent = _knowledge_from_regime(regime, last_aligned=last_aligned)
     epoch = state.epoch
+    pool = state.pool
+    open_chain = state.open_chain
     key = (
         None if incumbent is None else incumbent.regime_id,
         None if incumbent is None else incumbent.established_at,
     )
     if key != (epoch.regime_id, epoch.established_at):
         epoch = EpochEvidence(regime_id=key[0], established_at=key[1])
-    divisors = () if supersession_seen else state.divisors
+        pool = tuple(
+            replace(item, confirmation=None) if item.confirmation else item for item in pool
+        )
+        if open_chain is not None:
+            open_chain = replace(open_chain, anchor_confirmation_tagged=False)
     return replace(
         state,
+        pool=pool,
         incumbent=incumbent,
         superseded=tuple(superseded[item] for item in sorted(superseded)),
         epoch=epoch,
-        divisors=divisors,
+        open_chain=open_chain,
+        divisors=() if supersession_seen else state.divisors,
     )
 
 
 def _folded_last_aligned(state: LearnedState, regime: RegimeRecord) -> float | None:
-    """Latest folded aligned restart for a newly observed incumbent.
-
-    Bin-level (minute) phase resolution; the exact time of the bin's latest
-    restart is used.
-    """
+    """Latest folded restart wholly aligned with a newly observed incumbent."""
 
     values = [
         item.last_at
         for item in state.pool
-        if _circular_distance(item.seconds, regime.phase_offset, regime.candidate_period_seconds)
+        if _range_abs(
+            item.seconds_min,
+            item.seconds_max,
+            regime.phase_offset,
+            regime.candidate_period_seconds,
+        )[1]
         <= regime.phase_tolerance
     ]
     return max(values, default=None)
@@ -1017,46 +1441,63 @@ def _folded_last_aligned(state: LearnedState, regime: RegimeRecord) -> float | N
 # --------------------------------------------------------------------------
 
 
+_ALIGNED, _OFF, _AMBIGUOUS = "aligned", "off", "ambiguous"
+
+
 @dataclass(frozen=True)
-class _Point:
-    seconds: float
+class _Entry:
+    low: float
+    high: float
     weight: float
     count: int
     first_at: float
     last_at: float
-    uncertainty: float
-    event_id: str | None = None
+    uncertainty_min: float
+    uncertainty_max: float
+    source: PhaseBin | None = None
+
+    @property
+    def mid(self) -> float:
+        return (self.low + self.high) / 2
 
 
-def _bin_point(item: PhaseBin, *, weight: float | None = None, count: int | None = None) -> _Point:
-    return _Point(
-        item.seconds,
+def _bin_entry(item: PhaseBin, *, weight: float | None = None, count: int | None = None) -> _Entry:
+    return _Entry(
+        item.seconds_min,
+        item.seconds_max,
         item.weight if weight is None else weight,
         item.count if count is None else count,
         item.first_at,
         item.last_at,
-        item.uncertainty,
+        item.uncertainty_min,
+        item.uncertainty_max,
+        item,
     )
 
 
-def _ring_point(event: PhysicalRestartEvent) -> _Point:
+def _ring_entry(event: PhysicalRestartEvent) -> _Entry:
     at = _event_at(event)
-    return _Point(
-        at,
-        _event_weight(event),
-        1,
-        at,
-        at,
-        _capped_uncertainty(event.phase_uncertainty),
-        event.event_id,
-    )
+    uncertainty = _capped_uncertainty(event.phase_uncertainty)
+    return _Entry(at, at, _event_weight(event), 1, at, at, uncertainty, uncertainty, None)
+
+
+def _classify(entry: _Entry, phase: float, period: int) -> tuple[str, float]:
+    """Conservative alignment class and the largest possible MAD value."""
+
+    tolerance = candidate_phase_tolerance(period)
+    smallest, largest = _range_abs(entry.low, entry.high, phase, period)
+    if largest <= tolerance + entry.uncertainty_min:
+        state = _ALIGNED
+    elif smallest > tolerance + entry.uncertainty_max:
+        state = _OFF
+    else:
+        state = _AMBIGUOUS
+    return state, max(largest, entry.uncertainty_max)
 
 
 def ring_sparse_events(
     state: LearnedState, events: Iterable[PhysicalRestartEvent]
 ) -> tuple[PhysicalRestartEvent, ...]:
-    """Unfolded sparse-usable events, newer than the watermark, once each."""
-
     mark = _watermark_key(state)
     values = {
         item.event_id: item
@@ -1066,10 +1507,49 @@ def ring_sparse_events(
     return tuple(sorted(values.values(), key=lambda item: (_event_at(item), item.event_id)))
 
 
+def _ring_map(
+    state: LearnedState,
+    events: Iterable[PhysicalRestartEvent],
+) -> dict[str, PhysicalRestartEvent]:
+    """Unfolded ring events plus the open chain's anchor (context only)."""
+
+    mark = _watermark_key(state)
+    anchor_id = state.open_chain.anchor_event_id if state.open_chain is not None else None
+    return {
+        item.event_id: item
+        for item in events
+        if item.server_key == state.server_key and (
+            _newer(item, mark) or item.event_id == anchor_id
+        )
+    }
+
+
+def _ring_relationships(
+    state: LearnedState,
+    relationships: Iterable[IntervalRelationship],
+    ring_map: Mapping[str, PhysicalRestartEvent],
+) -> tuple[IntervalRelationship, ...]:
+    """Unfolded relationships: right endpoint unfolded, left unfolded or anchor."""
+
+    mark = _watermark_key(state)
+    values = {
+        item.relationship_id: item
+        for item in relationships
+        if item.server_key == state.server_key
+        and item.left_event_id in ring_map
+        and item.right_event_id in ring_map
+        and _newer(ring_map[item.right_event_id], mark)
+    }
+    return tuple(
+        sorted(
+            values.values(),
+            key=lambda item: (item.left_at, item.right_at, item.relationship_id),
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class CompactSparseSupport:
-    """Mirror of ``authority._SparseSupport`` computed from compact state."""
-
     value: float
     effective: float
     quality_band: float
@@ -1079,7 +1559,7 @@ class CompactSparseSupport:
     aligned_count: int
     first_aligned_at: float | None
     last_aligned_at: float | None
-    aligned_seconds: tuple[float, ...]
+    aligned_ranges: tuple[tuple[float, float], ...]
 
 
 _EMPTY_SUPPORT = CompactSparseSupport(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, None, None, ())
@@ -1094,30 +1574,20 @@ def compact_sparse_support(
     excluded_ring_event_ids: Iterable[str] = (),
     exclude_folded_high_endpoints: bool = False,
     exclude_folded_confirmation_endpoints: bool = False,
+    exclude_anchor: bool = False,
 ) -> CompactSparseSupport:
     """``authority._sparse_support`` over folded bins plus ring events.
 
-    Exact for ring events.  Folded restarts are represented per UTC minute:
-    phase residuals use the bin's mean time of day, the bin's largest capped
-    uncertainty widens its tolerance, and a bin belongs to the consistency
-    domain when its latest restart is at or after the first aligned restart
-    (a bin straddling that instant is counted whole).  The candidate's own
-    folded high endpoints are those folded at this period within tolerance of
-    its phase.  Folded restarts explained by a conflicting superseded regime
-    are excluded from the aligned set when the bin's first restart precedes
-    the supersession (a straddling bin is excluded whole: old evidence never
-    supports a conflicting regime).
-
-    The consistency-domain total is exact: the pool weight folded at or after
-    the first aligned restart is ``pool_weight_total - weight_before`` of the
-    bin holding it (folding is time-ordered).  Two splits of that total are
-    approximated when a single minute bin holds restarts on both sides of
-    the domain start: excluded endpoints and superseded-explained restarts in
-    such a bin are counted as off-phase.  Both approximations can only lower
-    the result, never raise it.
+    Exact for ring events.  A folded bin is aligned only when its whole
+    offset range is within tolerance; an ambiguous bin counts as off-phase.
+    Its MAD value is the largest residual in its range.  The domain total is
+    exact (``pool_weight_total - weight_before``); excluded endpoints are
+    removed from it only when the bin is wholly inside the domain, and
+    superseded-explained restarts count as historical only then (otherwise
+    off-phase).  Superseded explanation uses the bin's closest residual.
+    Every approximation lowers, never raises, the result.
     """
 
-    tolerance = candidate_phase_tolerance(period)
     excluded = set(excluded_ring_event_ids)
     historical = [
         regime
@@ -1125,100 +1595,84 @@ def compact_sparse_support(
         if period != regime.period
         or _circular_distance(phase_offset, regime.phase_offset, period) > regime.phase_tolerance
     ]
-    endpoint_bins = (
-        _period_histograms(state.high_endpoints)[period] if exclude_folded_high_endpoints else {}
-    )
-    confirmation_bins = (
-        _period_histograms(state.epoch.confirmation_endpoints)[period]
-        if exclude_folded_confirmation_endpoints
-        else {}
-    )
+    anchor = state.open_chain
+    anchor_index = None
+    if exclude_anchor and anchor is not None and anchor.anchor_index is not None:
+        covered = (exclude_folded_high_endpoints and period in anchor.anchor_high_periods) or (
+            exclude_folded_confirmation_endpoints and anchor.anchor_confirmation_tagged
+        )
+        if not covered:
+            anchor_index = anchor.anchor_index
 
-    def aligned_to_candidate(point: _Point) -> bool:
-        return abs(
-            _signed_phase_residual(point.seconds, phase_offset, period),
-        ) <= tolerance + point.uncertainty
-
-    def explained_by_history(point: _Point) -> bool:
+    def explained(entry: _Entry) -> bool:
         return any(
-            point.first_at <= regime.superseded_at
-            and _circular_distance(point.seconds, regime.phase_offset, regime.period)
+            entry.first_at <= regime.superseded_at
+            and _range_abs(entry.low, entry.high, regime.phase_offset, regime.period)[0]
             <= regime.phase_tolerance
             for regime in historical
         )
 
-    points: list[tuple[_Point, bool, PhaseBin | None]] = []
-    removed_bins: list[PhaseBin] = []
+    entries: list[tuple[_Entry, str, float, bool]] = []
+    removed: list[tuple[float, float]] = []
     for item in state.pool:
+        entry = _bin_entry(item)
+        state_class, mad_value = _classify(entry, phase_offset, period)
         weight, count = item.weight, item.count
-        if aligned_to_candidate(_bin_point(item)):
-            for removed in (endpoint_bins.get(item.index), confirmation_bins.get(item.index)):
-                if removed is not None:
-                    weight -= removed.weight
-                    count -= removed.count
-                    removed_bins.append(removed)
+        if state_class == _ALIGNED:
+            removals = []
+            tag = item.tag(period)
+            if exclude_folded_high_endpoints and tag is not None:
+                removals.append((tag.weight, tag.count, item.first_at))
+            if exclude_folded_confirmation_endpoints and item.confirmation is not None:
+                removals.append((item.confirmation.weight, item.confirmation.count, item.first_at))
+            if anchor_index == item.index:
+                removals.append((anchor.anchor_weight, 1, anchor.anchor_at))
+            for removed_weight, removed_count, removed_at in removals:
+                weight -= removed_weight
+                count -= removed_count
+                removed.append((removed_weight, removed_at))
         if count <= 0 or weight <= _EPSILON:
             continue
-        point = _bin_point(item, weight=weight, count=count)
-        points.append((point, explained_by_history(point), item))
+        entry = _bin_entry(item, weight=weight, count=count)
+        entries.append((entry, state_class, mad_value, explained(entry)))
     for event in ring_sparse_events(state, ring_events):
         if event.event_id in excluded:
             continue
-        point = _ring_point(event)
-        points.append((point, explained_by_history(point), None))
+        entry = _ring_entry(event)
+        state_class, mad_value = _classify(entry, phase_offset, period)
+        entries.append((entry, state_class, mad_value, explained(entry)))
 
     aligned = [
-        (point, source)
-        for point, explained, source in points
-        if not explained and aligned_to_candidate(point)
+        (entry, mad_value)
+        for entry, state_class, mad_value, hist in entries
+        if state_class == _ALIGNED and not hist
     ]
     if not aligned:
         return _EMPTY_SUPPORT
-    anchor_point, anchor_bin = min(
-        aligned, key=lambda item: (item[0].first_at, item[1] is None)
+    anchor_entry = min(
+        (entry for entry, _mad in aligned),
+        key=lambda item: (item.first_at, item.source is None),
     )
-    first = anchor_point.first_at
-    effective = sum(point.weight for point, _source in aligned)
+    first = anchor_entry.first_at
+    effective = sum(entry.weight for entry, _mad in aligned)
     ring_total = sum(
-        point.weight
-        for point, _explained, source in points
-        if source is None and point.first_at >= first
+        entry.weight
+        for entry, _class, _mad, _hist in entries
+        if entry.source is None and entry.first_at >= first
     )
-    if anchor_bin is not None:
-        # Exact: every restart folded at or after the first aligned one.
-        folded_total = state.pool_weight_total - anchor_bin.weight_before
-        for removed in removed_bins:
-            # Excluded endpoints are not in the pool.  A removed bin wholly
-            # before the domain start never counted; one straddling it is
-            # kept (conservative: a larger domain never raises confidence).
-            if removed.first_at >= first:
-                folded_total -= removed.weight
+    if anchor_entry.source is not None:
+        folded_total = state.pool_weight_total - anchor_entry.source.weight_before
+        folded_total -= sum(weight for weight, at in removed if at >= first)
     else:
         folded_total = 0.0
     total = folded_total + ring_total
-    # Historical (superseded-explained) restarts aligned with the candidate
-    # stay in the domain but are neither aligned evidence nor off-phase.  A
-    # folded bin is counted only when wholly inside the domain; a bin that
-    # straddles the domain start is treated as off-phase (conservative: it
-    # can only lower confidence).  Ring restarts are exact.
     historical_in_domain = sum(
-        point.weight
-        for point, explained, _source in points
-        if explained and aligned_to_candidate(point) and point.first_at >= first
+        entry.weight
+        for entry, state_class, _mad, hist in entries
+        if hist and state_class == _ALIGNED and entry.first_at >= first
     )
     off_phase_weight = max(0.0, total - effective - historical_in_domain)
-    mad = _median_of_counts(
-        [
-            (
-                max(
-                    abs(_signed_phase_residual(point.seconds, phase_offset, period)),
-                    point.uncertainty,
-                ),
-                point.count,
-            )
-            for point, _source in aligned
-        ]
-    )
+    mad = _median_of_counts([(mad_value, entry.count) for entry, mad_value in aligned])
     band = phase_quality_band(mad)
     consistency = effective / total if total > 0 else 0.0
     phase_confidence = _event_count_cap(effective) * band * consistency
@@ -1234,10 +1688,10 @@ def compact_sparse_support(
         round(min(1.0, max(0.0, phase_confidence)), 6),
         round(off_phase_weight, 6),
         round(consistency, 6),
-        sum(point.count for point, _source in aligned),
+        sum(entry.count for entry, _mad in aligned),
         first,
-        max(point.last_at for point, _source in aligned),
-        tuple(sorted(point.seconds for point, _source in aligned)),
+        max(entry.last_at for entry, _mad in aligned),
+        tuple(sorted((entry.low, entry.high) for entry, _mad in aligned)),
     )
 
 
@@ -1249,64 +1703,58 @@ def compact_phase_proposal(
 ) -> tuple[float | None, float | None, int, float | None]:
     """``scoring._phase_cluster`` over the sparse pool (folded plus ring).
 
-    The anchor of a folded bin is its mean time of day; anchors are visited
-    in order of first restart time, as the raw function visits events in
-    time order.  The scan is windowed by the largest possible tolerance, so
-    its cost is bounded by the (bounded) number of bins, not by restarts.
+    A folded bin's anchor is the middle of its offset range and it is counted
+    only when wholly aligned with the anchor.  Bounded cost: a windowed scan
+    over at most ``DAY_BINS`` bins plus the ring.
     """
 
-    points = [_bin_point(item) for item in state.pool]
-    points.extend(_ring_point(item) for item in ring_sparse_events(state, ring_events))
-    if not points:
+    entries = [_bin_entry(item) for item in state.pool]
+    entries.extend(_ring_entry(item) for item in ring_sparse_events(state, ring_events))
+    if not entries:
         return None, None, 0, None
     tolerance = candidate_phase_tolerance(period)
-    radius = tolerance + PHASE_UNCERTAINTY_CAP
-    phases = sorted(((point.seconds % period), index) for index, point in enumerate(points))
-    extended = [(value - period, index) for value, index in phases] + phases + [
-        (value + period, index) for value, index in phases
-    ]
-    extended_keys = [value for value, _index in extended]
+    radius = tolerance + PHASE_UNCERTAINTY_CAP + PHASE_BIN_SECONDS
+    phases = sorted((entry.mid % period, index) for index, entry in enumerate(entries))
+    extended = (
+        [(value - period, index) for value, index in phases]
+        + phases
+        + [(value + period, index) for value, index in phases]
+    )
+    keys = [value for value, _index in extended]
 
-    def aligned_with(anchor_phase: float) -> list[_Point]:
-        low = bisect.bisect_left(extended_keys, anchor_phase - radius)
-        high = bisect.bisect_right(extended_keys, anchor_phase + radius)
-        seen = set()
+    def aligned_with(anchor_phase: float) -> list[tuple[_Entry, float]]:
+        low = bisect.bisect_left(keys, anchor_phase - radius)
+        high = bisect.bisect_right(keys, anchor_phase + radius)
+        seen: set[int] = set()
         values = []
         for _value, index in extended[low:high]:
             if index in seen:
                 continue
             seen.add(index)
-            point = points[index]
-            if abs(
-                _signed_phase_residual(point.seconds, anchor_phase, period),
-            ) <= tolerance + point.uncertainty:
-                values.append(point)
+            state_class, mad_value = _classify(entries[index], anchor_phase, period)
+            if state_class == _ALIGNED:
+                values.append((entries[index], mad_value))
         return values
 
     best = None
-    for anchor in sorted(points, key=lambda item: (item.first_at, item.seconds)):
-        anchor_phase = anchor.seconds % period
+    for anchor in sorted(entries, key=lambda item: (item.first_at, item.mid)):
+        anchor_phase = anchor.mid % period
         aligned = aligned_with(anchor_phase)
+        if not aligned:
+            continue
         key = (
-            sum(point.weight for point in aligned),
-            sum(point.count for point in aligned),
-            max(point.last_at for point in aligned),
+            sum(entry.weight for entry, _mad in aligned),
+            sum(entry.count for entry, _mad in aligned),
+            max(entry.last_at for entry, _mad in aligned),
         )
         if best is None or key > best[0]:
             best = (key, anchor_phase, aligned)
+    if best is None:
+        return None, None, 0, None
     _key, offset, aligned = best
-    mad = _median_of_counts(
-        [
-            (
-                max(abs(_signed_phase_residual(point.seconds, offset, period)), point.uncertainty),
-                point.count,
-            )
-            for point in aligned
-        ]
-    )
-    return offset, mad, sum(point.count for point in aligned), max(
-        point.last_at for point in aligned
-    )
+    mad = _median_of_counts([(mad_value, entry.count) for entry, mad_value in aligned])
+    count = sum(entry.count for entry, _mad in aligned)
+    return offset, mad, count, max(entry.last_at for entry, _mad in aligned)
 
 
 def compact_harmonic_blockers(
@@ -1315,13 +1763,7 @@ def compact_harmonic_blockers(
     normal_candidate: CandidateScore | None = None,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """``authority._harmonic_blockers`` from persisted plus live evidence.
-
-    Divisor resolution is the larger of the persisted best counts and the
-    live schema-3 counts, with the scorer's unchanged thresholds (>= 2/2
-    established, >= 4/3 high).  Healthy midpoints count folded genuine
-    misses at the divisor period plus unfolded active ring misses.
-    """
+    """``authority._harmonic_blockers`` from persisted plus live evidence."""
 
     if period not in HARMONIC_PERIODS:
         return (), ()
@@ -1354,7 +1796,9 @@ def compact_harmonic_blockers(
         )
         midpoints = sum(
             item.genuine_miss_count for item in state.misses if item.period == divisor
-        ) + sum(item.candidate_period_seconds == divisor for item in ring_misses)
+        ) + sum(
+            item.candidate_period_seconds == divisor for item in ring_misses
+        )
         established = bool(
             (windows >= 2 and intervals >= 2)
             or (current is not None and current.established_resolved)
@@ -1380,15 +1824,20 @@ def compact_sparse_structure_reasons(
     normal_candidate: CandidateScore | None = None,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
 ) -> tuple[str, ...]:
-    """``authority._sparse_structure_reasons`` (SE1-SE5) from compact support."""
+    """``authority._sparse_structure_reasons`` (SE1-SE5).
+
+    SE4 period refutation requires certainty: an aligned folded bin refutes a
+    longer multiple only when every restart it can hold differs from the
+    first aligned restart by more than that multiple's tolerance.
+    """
 
     if not support.aligned_count or support.first_aligned_at is None:
         return ()
     first = support.first_aligned_at
     refuted = all(
         any(
-            _circular_distance(value, first, multiple) > candidate_phase_tolerance(multiple)
-            for value in support.aligned_seconds
+            _range_abs(low, high, first, multiple)[0] > candidate_phase_tolerance(multiple)
+            for low, high in support.aligned_ranges
         )
         for multiple in CANDIDATE_PERIODS
         if multiple > period and multiple % period == 0
@@ -1416,20 +1865,19 @@ def compact_genuine_miss_since(
     since: float,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
 ) -> bool:
-    """SE6: an active in-phase genuine miss at or after ``since``.
-
-    Folded misses keep their exact latest expected time per (period, minute
-    of period); the phase test uses the minute bin (widened by half a bin).
-    """
+    """SE6: an active, possibly in-phase genuine miss at or after ``since``."""
 
     if any(
         item.period == period
         and item.last_genuine_miss_at is not None
         and item.last_genuine_miss_at >= since
-        and _circular_distance(
-            item.index * PHASE_BIN_SECONDS + PHASE_BIN_SECONDS / 2, phase_offset, period
-        )
-        <= phase_tolerance + PHASE_BIN_SECONDS / 2
+        and _range_abs(
+            item.index * INTERVAL_BIN_SECONDS + item.phase_min,
+            item.index * INTERVAL_BIN_SECONDS + item.phase_max,
+            phase_offset,
+            period,
+        )[0]
+        <= phase_tolerance
         for item in state.misses
     ):
         return True
@@ -1455,8 +1903,6 @@ def sparse_milestone_reached(aligned_normal_confidence: float) -> bool:
 
 
 def compact_combined_confidence(high_authority: float, aligned_normal_confidence: float) -> float:
-    """The unchanged schema-4 combination of continuous and sparse slots."""
-
     return round(
         high_authority
         + (1.0 - high_authority)
@@ -1467,8 +1913,6 @@ def compact_combined_confidence(high_authority: float, aligned_normal_confidence
 
 @dataclass(frozen=True)
 class CompactCandidate:
-    """A continuous-evidence candidate synthesised from compact state."""
-
     period: int
     phase_offset: float
     phase_spread: float
@@ -1490,48 +1934,44 @@ class CompactCandidate:
     last_evidence_at: float | None
     ring_endpoint_ids: frozenset[str]
     has_folded_evidence: bool
+    excludes_anchor: bool
     sparse_reason_codes: tuple[str, ...]
+    longest_streak: int
 
 
-def _ring_high_relationships(
-    state: LearnedState,
-    relationships: Iterable[IntervalRelationship],
-    ring_ids: set[str],
-) -> tuple[IntervalRelationship, ...]:
-    values = {
-        item.relationship_id: item
-        for item in relationships
-        if item.server_key == state.server_key
-        and item.high_authority_eligible
-        and item.relationship_kind is RelationshipKind.DIRECT
-        and item.left_event_id in ring_ids
-        and item.right_event_id in ring_ids
-    }
-    return tuple(
-        sorted(
-            values.values(),
-            key=lambda item: (item.left_at, item.right_at, item.relationship_id),
-        )
-    )
+@dataclass
+class _Component:
+    low: float
+    high: float
+    members: list
 
 
-def _circular_components(
-    values: list[tuple[float, object]], period: int, tolerance: float
-) -> list[list[object]]:
-    """Single-linkage components on the circle (``authority._phase_components``)."""
+def _components(
+    members: list[tuple[float, float, object]],
+    period: int,
+    tolerance: float,
+) -> list[_Component]:
+    """Exact single-linkage components on the circle from member extremes."""
 
-    if not values:
+    if not members:
         return []
-    ordered = sorted(values, key=lambda item: item[0])
-    groups: list[list[tuple[float, object]]] = [[ordered[0]]]
-    for item in ordered[1:]:
-        if item[0] - groups[-1][-1][0] <= tolerance:
-            groups[-1].append(item)
+    ordered = sorted(members, key=lambda item: (item[0], item[1]))
+    groups = [_Component(ordered[0][0], ordered[0][1], [ordered[0][2]])]
+    for low, high, value in ordered[1:]:
+        if low - groups[-1].high <= tolerance:
+            groups[-1].high = max(groups[-1].high, high)
+            groups[-1].members.append(value)
         else:
-            groups.append([item])
-    if len(groups) > 1 and ordered[0][0] + period - ordered[-1][0] <= tolerance:
-        groups[0] = groups.pop() + groups[0]
-    return [[value for _phase, value in group] for group in groups]
+            groups.append(_Component(low, high, [value]))
+    if len(groups) > 1 and groups[0].low + period - groups[-1].high <= tolerance:
+        last = groups.pop()
+        groups[0] = _Component(last.low, groups[0].high + period, last.members + groups[0].members)
+    return groups
+
+
+def _within(component: _Component, low: float, high: float, period: int) -> bool:
+    start = component.low + ((low - component.low) % period)
+    return start + (high - low) <= component.high + 1e-6
 
 
 def compact_candidates(
@@ -1539,90 +1979,92 @@ def compact_candidates(
     *,
     ring_events: Iterable[PhysicalRestartEvent] = (),
     ring_relationships: Iterable[IntervalRelationship] = (),
-    ring_streaks: Iterable[CadenceStreak] = (),
     normal_score=None,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
     challenger: bool = False,
 ) -> tuple[CompactCandidate, ...]:
     """High (continuous) candidates from folded interval bins plus the ring.
 
-    Base authority and streak bonuses are exact (running products and sums).
-    Components are single-linkage clusters of relationship phases, where a
-    folded bin participates at its mean phase.  The phase comes from the
-    longest streak (ring or folded best streak) exactly as authority does;
-    for a component with folded evidence and no streak, the phase and spread
-    use folded bin mean phases (approximation, H1-only components).
-    ``challenger=True`` evaluates the epoch's post-establishment evidence
-    (the Stage 6 view) instead of the lifetime summary.
+    Base authority and streak bonuses are exact.  Streaks (ring runs, the
+    open run and folded closed streaks) attach to a component only when all
+    their relationship phases lie inside it (authority counts a streak only
+    when it is contained in the component).  The phase comes from the
+    longest streak; an open streak's spread is an upper bound.  A component
+    with folded bins and no streak uses bin extremes for its spread.
+    ``challenger=True`` evaluates the epoch's post-establishment evidence.
     """
 
     ring_events = tuple(ring_events)
-    mark = _watermark_key(state)
-    ring_map = {
-        item.event_id: item
-        for item in ring_events
-        if item.server_key == state.server_key and _newer(item, mark)
-    }
-    ring_ids = set(ring_map)
+    ring_map = _ring_map(state, ring_events)
     epoch_start = state.epoch.established_at
-    ring_rels = tuple(
+    anchor_id = state.open_chain.anchor_event_id if state.open_chain is not None else None
+    rels = tuple(
         item
-        for item in _ring_high_relationships(state, ring_relationships, ring_ids)
-        if not challenger or (epoch_start is not None and item.left_at >= epoch_start)
+        for item in _ring_relationships(state, ring_relationships, ring_map)
+        if _high_direct(item) and (
+            not challenger or (epoch_start is not None and item.left_at >= epoch_start)
+        )
     )
+    qualities = {
+        item.relationship_id: relationship_authority_quality(
+            item, (ring_map[item.left_event_id], ring_map[item.right_event_id])
+        )
+        for item in rels
+    }
+    seed = _run_from_open(state.open_chain) if state.open_chain is not None else None
+    runs = [
+        run
+        for run in _build_runs(((item, qualities[item.relationship_id]) for item in rels), seed)
+        if run.interval_count >= 2
+        and (not challenger or (epoch_start is not None and run.start_at >= epoch_start))
+    ]
     bins = state.epoch.challenger if challenger else state.intervals
     results = []
     for period in CANDIDATE_PERIODS:
         tolerance = candidate_phase_tolerance(period)
-        members: list[tuple[float, object]] = [
-            (_relationship_phase_value(item, period), item)
-            for item in ring_rels
-            if item.candidate_period_seconds == period
-        ]
-        members.extend((item.phase, item) for item in bins if item.period == period)
-        for component in _circular_components(members, period, tolerance):
-            rels = [item for item in component if isinstance(item, IntervalRelationship)]
-            folded = [item for item in component if isinstance(item, IntervalBin)]
-            quality_map = {
-                item.relationship_id: relationship_authority_quality(item, ring_events)
-                for item in rels
-            }
+        members: list[tuple[float, float, object]] = []
+        for item in rels:
+            if item.candidate_period_seconds == period:
+                value = _relationship_phase_value(item, period)
+                members.append((value, value, item))
+        for item in bins:
+            if item.period == period and item.relationship_count and item.phase_min is not None:
+                members.append((item.start + item.phase_min, item.start + item.phase_max, item))
+        for component in _components(members, period, tolerance):
+            ring_rels = [
+                item for item in component.members if isinstance(item, IntervalRelationship)
+            ]
+            folded = [item for item in component.members if isinstance(item, IntervalBin)]
             factor = 1.0
-            for value in quality_map.values():
-                factor *= 1.0 - 0.50 * value
+            for item in ring_rels:
+                factor *= 1.0 - 0.50 * qualities[item.relationship_id]
             for item in folded:
                 factor *= item.base_residual
             base = 1.0 - factor
-            rel_ids = set(quality_map)
-            component_streaks = [
-                item
-                for item in ring_streaks
-                if item.server_key == state.server_key
-                and item.candidate_period_seconds == period
-                and set(item.relationship_ids) <= rel_ids
-                and (not challenger or (epoch_start is not None and item.start_at >= epoch_start))
-            ]
-            chosen = _non_overlapping_streaks(component_streaks)
             streak_bonus = 0.0
             gate_bonus = 0.0
             summaries: list[StreakSummary] = []
-            for streak in chosen:
-                minimum = min(quality_map[value] for value in streak.relationship_ids)
-                shape = _streak_shape(streak.interval_count, minimum)
+            for run in runs:
+                if run.period != period:
+                    continue
+                low, high = run.relationship_range()
+                if not _within(component, low, high, period):
+                    continue
+                summary = run.summary()
+                shape = (1.0 - 2.0 ** -(summary.interval_count - 1)) * summary.min_quality
                 streak_bonus += round(STREAK_BONUS_COEFFICIENT * shape, 6)
                 gate_bonus += round(GATE_STREAK_BONUS_COEFFICIENT * shape, 6)
-                summaries.append(
-                    StreakSummary(
-                        streak.interval_count,
-                        streak.event_count,
-                        minimum,
-                        streak.phase_estimate,
-                        streak.phase_spread,
-                        streak.start_at,
-                        streak.end_at,
-                    )
-                )
-            for item in folded:
+                summaries.append(summary)
+            for item in bins:
+                if item.period != period or not item.streak_count or item.streak_min is None:
+                    continue
+                if not _within(
+                    component,
+                    item.start + item.streak_min,
+                    item.start + item.streak_max,
+                    period,
+                ):
+                    continue
                 streak_bonus += item.streak_bonus
                 gate_bonus += item.gate_bonus
                 if item.best_streak is not None:
@@ -1630,30 +2072,38 @@ def compact_candidates(
             high = min(HIGH_AUTHORITY_CAP, base + streak_bonus)
             gate = min(HIGH_AUTHORITY_CAP, base + gate_bonus)
             phase_streak = max(
-                summaries, key=lambda item: (item.interval_count, item.end_at), default=None
+                summaries,
+                key=lambda item: (item.interval_count, item.end_at),
+                default=None,
             )
             if phase_streak is not None:
                 phase_offset = phase_streak.phase_estimate % period
                 phase_spread = phase_streak.phase_spread
-            elif rels and not folded:
-                phase_offset, phase_spread = _relationship_phase(tuple(rels), period)
+            elif ring_rels and not folded:
+                phase_offset, phase_spread = _relationship_phase(tuple(ring_rels), period)
             else:
-                phases = [_relationship_phase_value(item, period) for item in rels]
-                phases.extend(item.phase for item in folded)
-                anchor = phases[0]
-                residuals = sorted(
-                    _signed_phase_residual(value, anchor, period) for value in phases
+                points = [(_relationship_phase_value(item, period),) * 2 for item in ring_rels] + [
+                    (item.start + item.phase_min, item.start + item.phase_max) for item in folded
+                ]
+                anchor_phase = (points[0][0] + points[0][1]) / 2
+                center = _median_of_counts(
+                    [
+                        (_signed_phase_residual((low + high) / 2, anchor_phase, period), 1)
+                        for low, high in points
+                    ]
                 )
-                center = _median_of_counts([(value, 1) for value in residuals])
-                phase_offset = (anchor + center) % period
+                phase_offset = (anchor_phase + center) % period
                 phase_spread = max(
-                    abs(_signed_phase_residual(value, phase_offset, period)) for value in phases
+                    _range_abs(low, high, phase_offset, period)[1] for low, high in points
                 )
             phase_quality = max(0.0, 1.0 - phase_spread / tolerance)
-            count = len(rels) + sum(item.relationship_count for item in folded)
+            count = len(ring_rels) + sum(item.relationship_count for item in folded)
             normal_candidate = normal_score.candidate(period) if normal_score is not None else None
             h2_harmonic, h3_harmonic = compact_harmonic_blockers(
-                state, period, normal_candidate, ring_windows
+                state,
+                period,
+                normal_candidate,
+                ring_windows,
             )
             has_h2_streak = any(
                 item.interval_count >= 2 and item.event_count >= 3 for item in summaries
@@ -1666,8 +2116,9 @@ def compact_candidates(
                 and not h2_harmonic
             )
             h3_structure = bool(
-                any(item.interval_count >= 3 for item in summaries)
-                or (has_h2_streak and count >= 3)
+                any(
+                    item.interval_count >= 3 for item in summaries
+                ) or (has_h2_streak and count >= 3)
             )
             h3 = bool(
                 h3_structure
@@ -1677,8 +2128,9 @@ def compact_candidates(
             )
             h4 = bool(h3 and count >= 4 and gate >= H4_AUTHORITY_MINIMUM)
             endpoints = frozenset(
-                value for item in rels for value in (item.left_event_id, item.right_event_id)
+                value for item in ring_rels for value in (item.left_event_id, item.right_event_id)
             )
+            excludes_anchor = anchor_id is not None and anchor_id in endpoints
             support = compact_sparse_support(
                 state,
                 period=period,
@@ -1686,6 +2138,7 @@ def compact_candidates(
                 ring_events=ring_events,
                 excluded_ring_event_ids=endpoints,
                 exclude_folded_high_endpoints=bool(folded),
+                exclude_anchor=excludes_anchor,
             )
             sparse_reasons = compact_sparse_structure_reasons(
                 state,
@@ -1694,10 +2147,10 @@ def compact_candidates(
                 normal_candidate=normal_candidate,
                 ring_windows=ring_windows,
             )
-            firsts = [item.left_at for item in rels] + [
+            firsts = [item.left_at for item in ring_rels] + [
                 item.first_at for item in folded if item.first_at is not None
             ]
-            lasts = [item.right_at for item in rels] + [
+            lasts = [item.right_at for item in ring_rels] + [
                 item.last_at for item in folded if item.last_at is not None
             ]
             results.append(
@@ -1723,7 +2176,9 @@ def compact_candidates(
                     last_evidence_at=max(lasts, default=None),
                     ring_endpoint_ids=endpoints,
                     has_folded_evidence=bool(folded),
+                    excludes_anchor=excludes_anchor,
                     sparse_reason_codes=sparse_reasons,
+                    longest_streak=max((item.interval_count for item in summaries), default=0),
                 )
             )
     return tuple(sorted(results, key=lambda item: (item.period, item.phase_offset)))
@@ -1738,11 +2193,9 @@ def compact_sparse_confirmation(
 ) -> float:
     """``authority._sparse_confirmed_candidate`` combined value (Stage 8.5).
 
-    Confirming intervals are full intervals at the incumbent's period and
-    phase: every high-eligible one (folded interval bins and ring) and the
-    non-high ones ending after establishment (the epoch confirmation bins
-    and ring).  Their endpoints leave the sparse slot.  Returns the
-    candidate's combined confidence when nothing confirms.
+    Folded high full intervals confirm only from bins wholly within the
+    incumbent's phase tolerance (conservative); epoch confirmation scalars
+    and ring intervals are exact.
     """
 
     incumbent = state.incumbent
@@ -1751,12 +2204,8 @@ def compact_sparse_confirmation(
     period = incumbent.period
     established_at = incumbent.established_at
     ring_events = tuple(ring_events)
-    mark = _watermark_key(state)
-    ring_map = {
-        item.event_id: item
-        for item in ring_events
-        if item.server_key == state.server_key and _newer(item, mark)
-    }
+    ring_map = _ring_map(state, ring_events)
+    anchor_id = state.open_chain.anchor_event_id if state.open_chain is not None else None
     residual = 1.0
     confirming = False
     excluded: set[str] = set(candidate.ring_endpoint_ids)
@@ -1765,24 +2214,24 @@ def compact_sparse_confirmation(
         if (
             item.period == period
             and item.full_interval_count
-            and _circular_distance(item.phase, incumbent.phase_offset, period)
+            and item.phase_min is not None
+            and _range_abs(
+                item.start + item.phase_min,
+                item.start + item.phase_max,
+                incumbent.phase_offset,
+                period,
+            )[1]
             <= incumbent.phase_tolerance
         ):
             residual *= item.full_interval_residual
-            confirming = True
-            folded_high = True
-    folded_confirmation = False
-    for item in state.epoch.confirmation:
-        if item.period == period and item.full_interval_count:
-            residual *= item.full_interval_residual
-            confirming = True
-            folded_confirmation = True
-    for relationship in ring_relationships:
+            confirming = folded_high = True
+    folded_confirmation = state.epoch.confirmation_count > 0
+    if folded_confirmation:
+        residual *= state.epoch.confirmation_residual
+        confirming = True
+    for relationship in _ring_relationships(state, ring_relationships, ring_map):
         if (
-            relationship.server_key != state.server_key
-            or relationship.left_event_id not in ring_map
-            or relationship.right_event_id not in ring_map
-            or relationship.candidate_period_seconds != period
+            relationship.candidate_period_seconds != period
             or (
                 not relationship.high_authority_eligible
                 and relationship.right_at <= established_at
@@ -1809,6 +2258,7 @@ def compact_sparse_confirmation(
         excluded_ring_event_ids=excluded,
         exclude_folded_high_endpoints=candidate.has_folded_evidence or folded_high,
         exclude_folded_confirmation_endpoints=folded_confirmation,
+        exclude_anchor=anchor_id is not None and anchor_id in excluded,
     )
     continuous = max(candidate.high_authority, confirmation)
     combined = continuous + (1.0 - continuous) * min(
@@ -1823,7 +2273,11 @@ def compact_last_aligned_evidence_at(
     ring_events: Iterable[PhysicalRestartEvent] = (),
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
 ) -> float | None:
-    """``authority._last_aligned_evidence_at`` for the recorded incumbent."""
+    """``authority._last_aligned_evidence_at`` for the recorded incumbent.
+
+    Folded hits count only from bins wholly within tolerance (a later last
+    aligned time could hide suspicion, so the folded side is conservative).
+    """
 
     incumbent = state.incumbent
     if incumbent is None:
@@ -1839,18 +2293,24 @@ def compact_last_aligned_evidence_at(
         if item.server_key == state.server_key
         and _newer(item, mark)
         and _authentic_event(item)
-        and _circular_distance(_event_at(item), incumbent.phase_offset, period)
-        <= incumbent.phase_tolerance
+        and _circular_distance(
+            _event_at(item),
+            incumbent.phase_offset,
+            period,
+        ) <= incumbent.phase_tolerance
     )
     values.extend(
         item.last_hit_at
         for item in state.misses
         if item.period == period
         and item.last_hit_at is not None
-        and _circular_distance(
-            item.index * PHASE_BIN_SECONDS + PHASE_BIN_SECONDS / 2, incumbent.phase_offset, period
-        )
-        <= incumbent.phase_tolerance + PHASE_BIN_SECONDS / 2
+        and _range_abs(
+            item.index * INTERVAL_BIN_SECONDS + item.phase_min,
+            item.index * INTERVAL_BIN_SECONDS + item.phase_max,
+            incumbent.phase_offset,
+            period,
+        )[1]
+        <= incumbent.phase_tolerance
     )
     window_mark = state.watermark.window_end_at
     values.extend(
@@ -1873,43 +2333,49 @@ def compact_isolated_off_phase_restart(
 ) -> bool:
     """``authority._isolated_off_phase_restart`` for one unfolded anomaly.
 
-    Phase coherence with folded off-phase restarts uses their bin mean time
-    of day and largest capped uncertainty.  The caller supplies the single
-    active off-phase restart, exactly as authority does.
+    Folded bins that may be off-phase are compared with the anomaly at their
+    closest possible phase: a bin that might be coherent counts as coherent
+    (conservative: the countdown is then withheld as authority would).
     """
 
     incumbent = state.incumbent
     if incumbent is None or not _authentic_event(anomaly) or _event_at(anomaly) is None:
         return False
-
-    def off_phase(seconds: float) -> bool:
-        return _circular_distance(
-            seconds,
+    if (
+        _circular_distance(_event_at(anomaly), incumbent.phase_offset, incumbent.period)
+        <= incumbent.phase_tolerance
+    ):
+        return False
+    anomaly_entry = _ring_entry(anomaly)
+    others = [
+        _bin_entry(item)
+        for item in state.pool
+        if _range_abs(
+            item.seconds_min,
+            item.seconds_max,
             incumbent.phase_offset,
             incumbent.period,
-        ) > incumbent.phase_tolerance
-
-    if not off_phase(_event_at(anomaly)):
-        return False
-    anomaly_point = _ring_point(anomaly)
-    others = [_bin_point(item) for item in state.pool if off_phase(item.seconds)]
+        )[1]
+        > incumbent.phase_tolerance
+    ]
     mark = _watermark_key(state)
     others.extend(
-        _ring_point(item)
+        _ring_entry(item)
         for item in ring_events
         if item.server_key == state.server_key
         and item.event_id != anomaly.event_id
         and _newer(item, mark)
         and _authentic_event(item)
-        and off_phase(_event_at(item))
+        and _circular_distance(_event_at(item), incumbent.phase_offset, incumbent.period)
+        > incumbent.phase_tolerance
     )
 
-    def coherent(other: _Point) -> bool:
+    def coherent(other: _Entry) -> bool:
         return any(
-            abs(_signed_phase_residual(anomaly_point.seconds, other.seconds, period))
+            _range_abs(other.low, other.high, anomaly_entry.low, period)[0]
             <= max(
-                candidate_phase_tolerance(period) + anomaly_point.uncertainty,
-                candidate_phase_tolerance(period) + other.uncertainty,
+                candidate_phase_tolerance(period) + anomaly_entry.uncertainty_max,
+                candidate_phase_tolerance(period) + other.uncertainty_max,
             )
             for period in CANDIDATE_PERIODS
         )
@@ -1929,19 +2395,10 @@ def compact_recovery_confirmations(
     incumbent = state.incumbent
     if incumbent is None:
         return 0
-    mark = _watermark_key(state)
-    ring_map = {
-        item.event_id: item
-        for item in ring_events
-        if item.server_key == state.server_key and _newer(item, mark)
-    }
+    ring_map = _ring_map(state, ring_events)
     intervals = list(state.epoch.recovery)
-    for relationship in ring_relationships:
-        if (
-            relationship.left_event_id in ring_map
-            and relationship.right_event_id in ring_map
-            and _incumbent_recovery_interval(relationship, incumbent, ring_map)
-        ):
+    for relationship in _ring_relationships(state, ring_relationships, ring_map):
+        if _incumbent_recovery_interval(relationship, incumbent, ring_map):
             intervals.append(RecoveryInterval(relationship.left_at, relationship.right_at))
     eligible = sorted(
         (item for item in set(intervals) if item.left_at > challenger_last_evidence_at),
@@ -1958,27 +2415,25 @@ def compact_recovery_confirmations(
 
 
 # --------------------------------------------------------------------------
-# Serialization with strict, bounded validation
+# Serialisation: positional arrays, strict structural and byte bounds
 # --------------------------------------------------------------------------
 
 
 def _finite(
-    value: object,
-    name: str,
-    *,
-    minimum: float = 0.0,
-    maximum: float | None = None,
+    value: object, name: str, *, minimum: float | None = 0.0, maximum: float | None = None
 ) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
         raise LearnedStateError(f"{name} must be a finite number")
     value = float(value)
-    if value < minimum - _EPSILON or (maximum is not None and value > maximum + _EPSILON):
+    if (minimum is not None and value < minimum - _EPSILON) or (
+        maximum is not None and value > maximum + _EPSILON
+    ):
         raise LearnedStateError(f"{name} out of range")
     return value
 
 
-def _optional_finite(value: object, name: str) -> float | None:
-    return None if value is None else _finite(value, name)
+def _optional_finite(value: object, name: str, **kwargs) -> float | None:
+    return None if value is None else _finite(value, name, **kwargs)
 
 
 def _integer(value: object, name: str, *, minimum: int = 0, maximum: int | None = None) -> int:
@@ -1992,15 +2447,19 @@ def _integer(value: object, name: str, *, minimum: int = 0, maximum: int | None 
 def _string(value: object, name: str, *, optional: bool = False) -> str | None:
     if value is None and optional:
         return None
-    if not isinstance(value, str) or not value:
-        raise LearnedStateError(f"{name} must be a non-empty string")
+    if not isinstance(value, str) or not value or len(value) > MAX_STRING_LENGTH:
+        raise LearnedStateError(f"{name} must be a non-empty bounded string")
     return value
 
 
-def _sequence(value: object, name: str, *, maximum: int) -> list:
+def _array(
+    value: object, name: str, *, length: int | None = None, maximum: int | None = None
+) -> list:
     if not isinstance(value, list):
         raise LearnedStateError(f"{name} must be a list")
-    if len(value) > maximum:
+    if length is not None and len(value) != length:
+        raise LearnedStateError(f"{name} must have {length} fields")
+    if maximum is not None and len(value) > maximum:
         raise LearnedStateError(f"{name} exceeds its storage bound")
     return value
 
@@ -2011,177 +2470,312 @@ def _mapping(value: object, name: str) -> Mapping:
     return value
 
 
-def _phase_bin_to(item: PhaseBin) -> dict:
-    return {
-        "index": item.index,
-        "weight": item.weight,
-        "count": item.count,
-        "offset_sum": item.offset_sum,
-        "first_at": item.first_at,
-        "last_at": item.last_at,
-        "uncertainty": item.uncertainty,
-        "weight_before": item.weight_before,
-    }
+def _period(value: object, name: str) -> int:
+    if isinstance(value, bool) or value not in CANDIDATE_PERIODS:
+        raise LearnedStateError(f"{name} is not a candidate period")
+    return value
 
 
-def _phase_bin_from(value: object, name: str) -> PhaseBin:
-    data = _mapping(value, name)
-    count = _integer(data.get("count"), f"{name}.count", minimum=1)
-    first_at = _finite(data.get("first_at"), f"{name}.first_at")
-    last_at = _finite(data.get("last_at"), f"{name}.last_at")
-    if last_at < first_at:
-        raise LearnedStateError(f"{name} first_at is after last_at")
-    return PhaseBin(
-        index=_integer(data.get("index"), f"{name}.index", maximum=DAY_BINS - 1),
-        weight=_finite(data.get("weight"), f"{name}.weight"),
-        count=count,
-        offset_sum=_finite(
-            data.get("offset_sum"),
-            f"{name}.offset_sum",
-            maximum=PHASE_BIN_SECONDS * count,
-        ),
-        first_at=first_at,
-        last_at=last_at,
-        uncertainty=_finite(
-            data.get("uncertainty"),
-            f"{name}.uncertainty",
-            maximum=PHASE_UNCERTAINTY_CAP,
-        ),
-        weight_before=_finite(data.get("weight_before"), f"{name}.weight_before"),
-    )
+def _ordered_unique(keys: list, name: str) -> None:
+    if keys != sorted(set(keys)):
+        raise LearnedStateError(f"{name} entries must be unique and ordered")
 
 
-def _histogram_from(value: object, name: str) -> tuple[PhaseBin, ...]:
-    bins = tuple(
-        _phase_bin_from(item, f"{name}[{index}]")
-        for index, item in enumerate(_sequence(value, name, maximum=DAY_BINS))
-    )
-    if [item.index for item in bins] != sorted({item.index for item in bins}):
-        raise LearnedStateError(f"{name} bins must be unique and ordered")
-    return bins
-
-
-def _period_histograms_to(values) -> list:
-    return [
-        {"period": period, "bins": [_phase_bin_to(item) for item in bins]}
-        for period, bins in values
-    ]
-
-
-def _period_histograms_from(value: object, name: str) -> tuple[
-    tuple[int, tuple[PhaseBin, ...]],
-    ...,
-]:
-    result = []
-    seen = set()
-    for index, item in enumerate(_sequence(value, name, maximum=len(CANDIDATE_PERIODS))):
-        data = _mapping(item, f"{name}[{index}]")
-        period = data.get("period")
-        if period not in CANDIDATE_PERIODS or period in seen:
-            raise LearnedStateError(f"{name}[{index}].period invalid")
-        seen.add(period)
-        result.append((period, _histogram_from(data.get("bins"), f"{name}[{index}].bins")))
-    if [period for period, _bins in result] != [p for p in CANDIDATE_PERIODS if p in seen]:
-        raise LearnedStateError(f"{name} periods must be ordered")
-    return tuple(result)
-
-
-def _streak_to(item: StreakSummary | None) -> dict | None:
+def _streak_to(item: StreakSummary | None) -> list | None:
     if item is None:
         return None
-    return {
-        "interval_count": item.interval_count,
-        "event_count": item.event_count,
-        "min_quality": item.min_quality,
-        "phase_estimate": item.phase_estimate,
-        "phase_spread": item.phase_spread,
-        "start_at": item.start_at,
-        "end_at": item.end_at,
-    }
+    return [
+        item.interval_count,
+        item.event_count,
+        item.min_quality,
+        item.phase_estimate,
+        item.phase_spread,
+        item.start_at,
+        item.end_at,
+    ]
 
 
 def _streak_from(value: object, name: str) -> StreakSummary | None:
     if value is None:
         return None
-    data = _mapping(value, name)
+    data = _array(value, name, length=7)
     return StreakSummary(
-        interval_count=_integer(data.get("interval_count"), f"{name}.interval_count", minimum=1),
-        event_count=_integer(data.get("event_count"), f"{name}.event_count", minimum=2),
-        min_quality=_finite(data.get("min_quality"), f"{name}.min_quality", maximum=1.0),
-        phase_estimate=_finite(data.get("phase_estimate"), f"{name}.phase_estimate"),
-        phase_spread=_finite(data.get("phase_spread"), f"{name}.phase_spread"),
-        start_at=_finite(data.get("start_at"), f"{name}.start_at"),
-        end_at=_finite(data.get("end_at"), f"{name}.end_at"),
+        _integer(data[0], f"{name}.interval_count", minimum=1),
+        _integer(data[1], f"{name}.event_count", minimum=2),
+        _finite(data[2], f"{name}.min_quality", maximum=1.0),
+        _finite(data[3], f"{name}.phase_estimate"),
+        _finite(data[4], f"{name}.phase_spread"),
+        _finite(data[5], f"{name}.start_at"),
+        _finite(data[6], f"{name}.end_at"),
     )
 
 
-def _interval_bin_to(item: IntervalBin) -> dict:
-    return {
-        "period": item.period,
-        "index": item.index,
-        "relationship_count": item.relationship_count,
-        "offset_sum": item.offset_sum,
-        "base_residual": item.base_residual,
-        "full_interval_count": item.full_interval_count,
-        "full_interval_residual": item.full_interval_residual,
-        "first_at": item.first_at,
-        "last_at": item.last_at,
-        "streak_count": item.streak_count,
-        "streak_bonus": item.streak_bonus,
-        "gate_bonus": item.gate_bonus,
-        "best_streak": _streak_to(item.best_streak),
-    }
+def _pool_bin_to(item: PhaseBin) -> list:
+    confirmation = item.confirmation
+    return [
+        item.index,
+        item.weight,
+        item.count,
+        item.offset_min,
+        item.offset_max,
+        item.first_at,
+        item.last_at,
+        item.uncertainty_min,
+        item.uncertainty_max,
+        item.weight_before,
+        [[PERIOD_INDEX[tag.period], tag.weight, tag.count] for tag in item.endpoints],
+        None
+        if confirmation is None
+        else [PERIOD_INDEX[confirmation.period], confirmation.weight, confirmation.count],
+    ]
+
+
+def _tag_from(value: object, name: str, count_limit: int, weight_limit: float) -> EndpointTag:
+    data = _array(value, name, length=3)
+    index = _integer(data[0], f"{name}.period", maximum=len(CANDIDATE_PERIODS) - 1)
+    return EndpointTag(
+        CANDIDATE_PERIODS[index],
+        _finite(data[1], f"{name}.weight", maximum=weight_limit),
+        _integer(data[2], f"{name}.count", minimum=1, maximum=count_limit),
+    )
+
+
+def _pool_bin_from(value: object, name: str) -> PhaseBin:
+    data = _array(value, name, length=12)
+    count = _integer(data[2], f"{name}.count", minimum=1)
+    weight = _finite(data[1], f"{name}.weight")
+    offset_min = _finite(data[3], f"{name}.offset_min", maximum=PHASE_BIN_SECONDS)
+    offset_max = _finite(data[4], f"{name}.offset_max", maximum=PHASE_BIN_SECONDS)
+    first_at = _finite(data[5], f"{name}.first_at")
+    last_at = _finite(data[6], f"{name}.last_at")
+    uncertainty_min = _finite(data[7], f"{name}.uncertainty_min", maximum=PHASE_UNCERTAINTY_CAP)
+    uncertainty_max = _finite(data[8], f"{name}.uncertainty_max", maximum=PHASE_UNCERTAINTY_CAP)
+    if offset_max < offset_min or last_at < first_at or uncertainty_max < uncertainty_min:
+        raise LearnedStateError(f"{name} extremes are inverted")
+    tags = tuple(
+        _tag_from(item, f"{name}.endpoints[{index}]", count, weight)
+        for index, item in enumerate(
+            _array(data[10], f"{name}.endpoints", maximum=len(CANDIDATE_PERIODS))
+        )
+    )
+    _ordered_unique([tag.period for tag in tags], f"{name}.endpoints")
+    confirmation = (
+        None if data[11] is None else _tag_from(data[11], f"{name}.confirmation", count, weight)
+    )
+    return PhaseBin(
+        index=_integer(data[0], f"{name}.index", maximum=DAY_BINS - 1),
+        weight=weight,
+        count=count,
+        offset_min=offset_min,
+        offset_max=offset_max,
+        first_at=first_at,
+        last_at=last_at,
+        uncertainty_min=uncertainty_min,
+        uncertainty_max=uncertainty_max,
+        weight_before=_finite(data[9], f"{name}.weight_before"),
+        endpoints=tags,
+        confirmation=confirmation,
+    )
+
+
+def _interval_bin_to(item: IntervalBin) -> list:
+    return [
+        item.period,
+        item.index,
+        item.relationship_count,
+        item.phase_min,
+        item.phase_max,
+        item.base_residual,
+        item.full_interval_count,
+        item.full_interval_residual,
+        item.first_at,
+        item.last_at,
+        item.streak_count,
+        item.streak_bonus,
+        item.gate_bonus,
+        item.streak_min,
+        item.streak_max,
+        _streak_to(item.best_streak),
+    ]
 
 
 def _interval_bins_from(value: object, name: str) -> tuple[IntervalBin, ...]:
     result = []
-    for index, item in enumerate(_sequence(value, name, maximum=PERIOD_BIN_TOTAL)):
+    for index, raw in enumerate(_array(value, name, maximum=INTERVAL_BIN_TOTAL)):
         label = f"{name}[{index}]"
-        data = _mapping(item, label)
-        period = data.get("period")
-        if period not in CANDIDATE_PERIODS:
-            raise LearnedStateError(f"{label}.period invalid")
-        count = _integer(data.get("relationship_count"), f"{label}.relationship_count")
+        data = _array(raw, label, length=16)
+        period = _period(data[0], f"{label}.period")
+        count = _integer(data[2], f"{label}.relationship_count")
+        streaks = _integer(data[10], f"{label}.streak_count")
+        phase_min = _optional_finite(data[3], f"{label}.phase_min", maximum=INTERVAL_BIN_SECONDS)
+        phase_max = _optional_finite(data[4], f"{label}.phase_max", maximum=INTERVAL_BIN_SECONDS)
+        if (count > 0) != (phase_min is not None and phase_max is not None):
+            raise LearnedStateError(f"{label} relationship phase extremes inconsistent")
+        if phase_min is not None and phase_max < phase_min:
+            raise LearnedStateError(f"{label} relationship phase extremes inverted")
+        bound = 4 * MAXIMUM_TOLERANCE + INTERVAL_BIN_SECONDS
+        streak_min = _optional_finite(
+            data[13],
+            f"{label}.streak_min",
+            minimum=-bound,
+            maximum=bound,
+        )
+        streak_max = _optional_finite(
+            data[14],
+            f"{label}.streak_max",
+            minimum=-bound,
+            maximum=bound,
+        )
+        if (streaks > 0) != (streak_min is not None and streak_max is not None):
+            raise LearnedStateError(f"{label} streak phase extremes inconsistent")
         result.append(
             IntervalBin(
                 period=period,
                 index=_integer(
-                    data.get("index"),
+                    data[1],
                     f"{label}.index",
-                    maximum=period // PHASE_BIN_SECONDS - 1,
+                    maximum=period // INTERVAL_BIN_SECONDS - 1,
                 ),
                 relationship_count=count,
-                offset_sum=_finite(
-                    data.get("offset_sum"),
-                    f"{label}.offset_sum",
-                    maximum=PHASE_BIN_SECONDS * max(1, count),
-                ),
-                base_residual=_finite(
-                    data.get("base_residual"),
-                    f"{label}.base_residual",
-                    maximum=1.0,
-                ),
+                phase_min=phase_min,
+                phase_max=phase_max,
+                base_residual=_finite(data[5], f"{label}.base_residual", maximum=1.0),
                 full_interval_count=_integer(
-                    data.get("full_interval_count"),
+                    data[6],
                     f"{label}.full_interval_count",
+                    maximum=count,
                 ),
                 full_interval_residual=_finite(
-                    data.get("full_interval_residual"),
+                    data[7],
                     f"{label}.full_interval_residual",
                     maximum=1.0,
                 ),
-                first_at=_optional_finite(data.get("first_at"), f"{label}.first_at"),
-                last_at=_optional_finite(data.get("last_at"), f"{label}.last_at"),
-                streak_count=_integer(data.get("streak_count"), f"{label}.streak_count"),
-                streak_bonus=_finite(data.get("streak_bonus"), f"{label}.streak_bonus"),
-                gate_bonus=_finite(data.get("gate_bonus"), f"{label}.gate_bonus"),
-                best_streak=_streak_from(data.get("best_streak"), f"{label}.best_streak"),
+                first_at=_optional_finite(data[8], f"{label}.first_at"),
+                last_at=_optional_finite(data[9], f"{label}.last_at"),
+                streak_count=streaks,
+                streak_bonus=_finite(data[11], f"{label}.streak_bonus"),
+                gate_bonus=_finite(data[12], f"{label}.gate_bonus"),
+                streak_min=streak_min,
+                streak_max=streak_max,
+                best_streak=_streak_from(data[15], f"{label}.best_streak"),
             )
         )
-    keys = [(item.period, item.index) for item in result]
-    if keys != sorted(set(keys)):
-        raise LearnedStateError(f"{name} entries must be unique and ordered")
+    _ordered_unique([(item.period, item.index) for item in result], name)
     return tuple(result)
+
+
+def _open_chain_to(item: OpenChain | None) -> dict | None:
+    if item is None:
+        return None
+    run = item.run
+    return {
+        "chain_id": item.chain_id,
+        "anchor_event_id": item.anchor_event_id,
+        "anchor": [
+            item.anchor_at,
+            item.anchor_index,
+            item.anchor_weight,
+            [PERIOD_INDEX[period] for period in item.anchor_high_periods],
+            item.anchor_confirmation_tagged,
+        ],
+        "run": None
+        if run is None
+        else [
+            run.period,
+            run.interval_count,
+            run.min_quality,
+            run.start_at,
+            run.end_at,
+            run.first_phase,
+            run.relationship_phase_min,
+            run.relationship_phase_max,
+            [
+                [value.key, value.count, value.deviation_min, value.deviation_max]
+                for value in run.residuals
+            ],
+        ],
+    }
+
+
+def _open_chain_from(value: object) -> OpenChain | None:
+    if value is None:
+        return None
+    data = _mapping(value, "open_chain")
+    anchor = _array(data.get("anchor"), "open_chain.anchor", length=5)
+    periods = tuple(
+        CANDIDATE_PERIODS[
+            _integer(item, "open_chain.anchor.periods[]", maximum=len(CANDIDATE_PERIODS) - 1)
+        ]
+        for item in _array(anchor[3], "open_chain.anchor.periods", maximum=len(CANDIDATE_PERIODS))
+    )
+    _ordered_unique(list(periods), "open_chain.anchor.periods")
+    if not isinstance(anchor[4], bool):
+        raise LearnedStateError("open_chain.anchor.confirmation must be a boolean")
+    run = None
+    if data.get("run") is not None:
+        raw = _array(data.get("run"), "open_chain.run", length=9)
+        period = _period(raw[0], "open_chain.run.period")
+        half = RUN_RESIDUAL_QUANTUM_SECONDS / 2
+        residuals = []
+        for index, item in enumerate(
+            _array(raw[8], "open_chain.run.residuals", maximum=RUN_RESIDUAL_KEY_LIMIT)
+        ):
+            entry = _array(item, f"open_chain.run.residuals[{index}]", length=4)
+            low = _finite(entry[2], "residual.deviation_min", minimum=-half, maximum=half)
+            high = _finite(entry[3], "residual.deviation_max", minimum=-half, maximum=half)
+            if high < low:
+                raise LearnedStateError("residual deviation extremes are inverted")
+            residuals.append(
+                RunResidual(
+                    _integer(
+                        entry[0],
+                        "residual.key",
+                        minimum=-RUN_RESIDUAL_KEY_RADIUS,
+                        maximum=RUN_RESIDUAL_KEY_RADIUS,
+                    ),
+                    _integer(entry[1], "residual.count", minimum=1),
+                    low,
+                    high,
+                )
+            )
+        _ordered_unique([item.key for item in residuals], "open_chain.run.residuals")
+        if not residuals:
+            raise LearnedStateError("open run needs residuals")
+        bound = 4 * MAXIMUM_TOLERANCE
+        run = OpenRun(
+            period=period,
+            interval_count=_integer(raw[1], "open_chain.run.interval_count", minimum=1),
+            min_quality=_finite(raw[2], "open_chain.run.min_quality", maximum=1.0),
+            start_at=_finite(raw[3], "open_chain.run.start_at"),
+            end_at=_finite(raw[4], "open_chain.run.end_at"),
+            first_phase=_finite(raw[5], "open_chain.run.first_phase", maximum=period),
+            relationship_phase_min=_finite(
+                raw[6],
+                "open_chain.run.phase_min",
+                minimum=-bound,
+                maximum=bound,
+            ),
+            relationship_phase_max=_finite(
+                raw[7],
+                "open_chain.run.phase_max",
+                minimum=-bound,
+                maximum=bound,
+            ),
+            residuals=tuple(residuals),
+        )
+    index = anchor[1]
+    return OpenChain(
+        chain_id=_string(data.get("chain_id"), "open_chain.chain_id"),
+        anchor_event_id=_string(data.get("anchor_event_id"), "open_chain.anchor_event_id"),
+        anchor_at=_finite(anchor[0], "open_chain.anchor.at"),
+        anchor_index=None
+        if index is None
+        else _integer(index, "open_chain.anchor.index", maximum=DAY_BINS - 1),
+        anchor_weight=_finite(anchor[2], "open_chain.anchor.weight", maximum=1.0),
+        anchor_high_periods=periods,
+        anchor_confirmation_tagged=anchor[4],
+        run=run,
+    )
 
 
 def learned_state_to_mapping(state: LearnedState) -> dict:
@@ -2191,73 +2785,61 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
     return {
         "schema_version": state.schema_version,
         "server_key": state.server_key,
+        "watermark": [
+            mark.at,
+            mark.event_id,
+            mark.folded_event_count,
+            mark.folded_learning_event_count,
+            mark.window_end_at,
+        ],
         "pool_weight_total": state.pool_weight_total,
-        "watermark": {
-            "at": mark.at,
-            "event_id": mark.event_id,
-            "folded_event_count": mark.folded_event_count,
-            "folded_learning_event_count": mark.folded_learning_event_count,
-            "window_end_at": mark.window_end_at,
-        },
-        "pool": [_phase_bin_to(item) for item in state.pool],
-        "high_endpoints": _period_histograms_to(state.high_endpoints),
+        "pool": [_pool_bin_to(item) for item in state.pool],
         "intervals": [_interval_bin_to(item) for item in state.intervals],
         "misses": [
-            {
-                "period": item.period,
-                "index": item.index,
-                "genuine_miss_count": item.genuine_miss_count,
-                "last_genuine_miss_at": item.last_genuine_miss_at,
-                "last_hit_at": item.last_hit_at,
-            }
+            [
+                item.period,
+                item.index,
+                item.phase_min,
+                item.phase_max,
+                item.genuine_miss_count,
+                item.last_genuine_miss_at,
+                item.last_hit_at,
+            ]
             for item in state.misses
         ],
         "divisors": [
-            {
-                "period": item.period,
-                "divisor": item.divisor,
-                "covered_window_count": item.covered_window_count,
-                "longer_interval_count": item.longer_interval_count,
-            }
+            [item.period, item.divisor, item.covered_window_count, item.longer_interval_count]
             for item in state.divisors
         ],
         "incumbent": None
         if incumbent is None
         else {
             "regime_id": incumbent.regime_id,
-            "period": incumbent.period,
-            "phase_offset": incumbent.phase_offset,
-            "phase_tolerance": incumbent.phase_tolerance,
-            "origin": incumbent.origin,
-            "authority_gate": incumbent.authority_gate,
-            "status": incumbent.status,
-            "high_authority": incumbent.high_authority,
-            "phase_authority": incumbent.phase_authority,
-            "combined_confidence": incumbent.combined_confidence,
-            "established_at": incumbent.established_at,
-            "last_aligned_evidence_at": incumbent.last_aligned_evidence_at,
+            "values": [
+                incumbent.period,
+                incumbent.phase_offset,
+                incumbent.phase_tolerance,
+                incumbent.high_authority,
+                incumbent.phase_authority,
+                incumbent.combined_confidence,
+                incumbent.established_at,
+                incumbent.last_aligned_evidence_at,
+            ],
+            "labels": [incumbent.origin, incumbent.authority_gate, incumbent.status],
             "defining_evidence_ids": list(incumbent.defining_evidence_ids),
             "reason_codes": list(incumbent.reason_codes),
         },
         "superseded": [
-            {
-                "period": item.period,
-                "phase_offset": item.phase_offset,
-                "phase_tolerance": item.phase_tolerance,
-                "superseded_at": item.superseded_at,
-            }
+            [item.period, item.phase_offset, item.phase_tolerance, item.superseded_at]
             for item in state.superseded
         ],
         "epoch": {
             "regime_id": epoch.regime_id,
-            "established_at": epoch.established_at,
+            "values": [epoch.established_at, epoch.confirmation_count, epoch.confirmation_residual],
             "challenger": [_interval_bin_to(item) for item in epoch.challenger],
-            "confirmation": [_interval_bin_to(item) for item in epoch.confirmation],
-            "confirmation_endpoints": _period_histograms_to(epoch.confirmation_endpoints),
-            "recovery": [
-                {"left_at": item.left_at, "right_at": item.right_at} for item in epoch.recovery
-            ],
+            "recovery": [[item.left_at, item.right_at] for item in epoch.recovery],
         },
+        "open_chain": _open_chain_to(state.open_chain),
     }
 
 
@@ -2265,205 +2847,185 @@ def learned_state_from_mapping(value: object) -> LearnedState:
     data = _mapping(value, "learned_state")
     if data.get("schema_version") != LEARNED_STATE_SCHEMA_VERSION:
         raise LearnedStateError("unsupported learned-state schema version")
-    server_key = _string(data.get("server_key"), "server_key")
-    mark = _mapping(data.get("watermark"), "watermark")
+    mark = _array(data.get("watermark"), "watermark", length=5)
     watermark = FoldWatermark(
-        at=_optional_finite(mark.get("at"), "watermark.at"),
-        event_id=_string(mark.get("event_id"), "watermark.event_id", optional=True),
-        folded_event_count=_integer(mark.get("folded_event_count"), "watermark.folded_event_count"),
-        folded_learning_event_count=_integer(
-            mark.get("folded_learning_event_count"), "watermark.folded_learning_event_count"
-        ),
-        window_end_at=_optional_finite(mark.get("window_end_at"), "watermark.window_end_at"),
+        at=_optional_finite(mark[0], "watermark.at"),
+        event_id=_string(mark[1], "watermark.event_id", optional=True),
+        folded_event_count=_integer(mark[2], "watermark.folded_event_count"),
+        folded_learning_event_count=_integer(mark[3], "watermark.folded_learning_event_count"),
+        window_end_at=_optional_finite(mark[4], "watermark.window_end_at"),
     )
     if (watermark.at is None) != (watermark.event_id is None):
         raise LearnedStateError("watermark time and event identity must be set together")
+    pool = tuple(
+        _pool_bin_from(item, f"pool[{index}]")
+        for index, item in enumerate(_array(data.get("pool"), "pool", maximum=DAY_BINS))
+    )
+    _ordered_unique([item.index for item in pool], "pool")
+    total = _finite(data.get("pool_weight_total"), "pool_weight_total")
+    if any(item.weight_before + item.weight > total + 1e-6 for item in pool):
+        raise LearnedStateError("pool bin domain accumulator exceeds the pool total")
 
     misses = []
-    for index, item in enumerate(_sequence(data.get("misses"), "misses", maximum=PERIOD_BIN_TOTAL)):
+    for index, raw in enumerate(_array(data.get("misses"), "misses", maximum=INTERVAL_BIN_TOTAL)):
         label = f"misses[{index}]"
-        entry = _mapping(item, label)
-        period = entry.get("period")
-        if period not in CANDIDATE_PERIODS:
-            raise LearnedStateError(f"{label}.period invalid")
+        entry = _array(raw, label, length=7)
+        period = _period(entry[0], f"{label}.period")
+        low = _finite(entry[2], f"{label}.phase_min", maximum=INTERVAL_BIN_SECONDS)
+        high = _finite(entry[3], f"{label}.phase_max", maximum=INTERVAL_BIN_SECONDS)
+        if high < low:
+            raise LearnedStateError(f"{label} phase extremes are inverted")
         misses.append(
             MissBin(
-                period=period,
-                index=_integer(
-                    entry.get("index"),
-                    f"{label}.index",
-                    maximum=period // PHASE_BIN_SECONDS - 1,
-                ),
-                genuine_miss_count=_integer(
-                    entry.get("genuine_miss_count"),
-                    f"{label}.genuine_miss_count",
-                ),
-                last_genuine_miss_at=_optional_finite(
-                    entry.get("last_genuine_miss_at"),
-                    f"{label}.last_genuine_miss_at",
-                ),
-                last_hit_at=_optional_finite(entry.get("last_hit_at"), f"{label}.last_hit_at"),
+                period,
+                _integer(entry[1], f"{label}.index", maximum=period // INTERVAL_BIN_SECONDS - 1),
+                low,
+                high,
+                _integer(entry[4], f"{label}.genuine_miss_count"),
+                _optional_finite(entry[5], f"{label}.last_genuine_miss_at"),
+                _optional_finite(entry[6], f"{label}.last_hit_at"),
             )
         )
-    if [(item.period, item.index) for item in misses] != sorted(
-        {(item.period, item.index) for item in misses}
-    ):
-        raise LearnedStateError("misses entries must be unique and ordered")
+    _ordered_unique([(item.period, item.index) for item in misses], "misses")
 
     divisors = []
-    for index, item in enumerate(
-        _sequence(data.get("divisors"), "divisors", maximum=len(DIVISOR_KEYS)),
+    for index, raw in enumerate(
+        _array(data.get("divisors"), "divisors", maximum=len(DIVISOR_KEYS)),
     ):
-        label = f"divisors[{index}]"
-        entry = _mapping(item, label)
-        key = (entry.get("period"), entry.get("divisor"))
-        if key not in DIVISOR_KEYS:
-            raise LearnedStateError(f"{label} is not a (period, divisor) pair")
+        entry = _array(raw, f"divisors[{index}]", length=4)
+        if (entry[0], entry[1]) not in DIVISOR_KEYS:
+            raise LearnedStateError(f"divisors[{index}] is not a (period, divisor) pair")
         divisors.append(
             DivisorEvidence(
-                key[0],
-                key[1],
-                _integer(entry.get("covered_window_count"), f"{label}.covered_window_count"),
-                _integer(entry.get("longer_interval_count"), f"{label}.longer_interval_count"),
+                entry[0],
+                entry[1],
+                _integer(entry[2], "divisor.covered_window_count"),
+                _integer(entry[3], "divisor.longer_interval_count"),
             )
         )
-    if [(item.period, item.divisor) for item in divisors] != sorted(
-        {(item.period, item.divisor) for item in divisors}
-    ):
-        raise LearnedStateError("divisors entries must be unique and ordered")
+    _ordered_unique([(item.period, item.divisor) for item in divisors], "divisors")
 
     incumbent = None
     if data.get("incumbent") is not None:
         entry = _mapping(data.get("incumbent"), "incumbent")
-        period = entry.get("period")
-        if period not in CANDIDATE_PERIODS:
-            raise LearnedStateError("incumbent.period invalid")
-        ids = _sequence(
-            entry.get("defining_evidence_ids"),
-            "incumbent.defining_evidence_ids",
-            maximum=RECENT_RING_CAPACITY,
-        )
-        reasons = _sequence(
-            entry.get("reason_codes"),
-            "incumbent.reason_codes",
-            maximum=MAX_REASON_CODES,
-        )
+        values = _array(entry.get("values"), "incumbent.values", length=8)
+        labels = _array(entry.get("labels"), "incumbent.labels", length=3)
+        period = _period(values[0], "incumbent.period")
         incumbent = RegimeKnowledge(
             regime_id=_string(entry.get("regime_id"), "incumbent.regime_id"),
             period=period,
-            phase_offset=_finite(
-                entry.get("phase_offset"),
-                "incumbent.phase_offset",
-                maximum=period,
-            ),
-            phase_tolerance=_finite(entry.get("phase_tolerance"), "incumbent.phase_tolerance"),
-            origin=_string(entry.get("origin"), "incumbent.origin"),
-            authority_gate=_string(entry.get("authority_gate"), "incumbent.authority_gate"),
-            status=_string(entry.get("status"), "incumbent.status"),
-            high_authority=_finite(
-                entry.get("high_authority"),
-                "incumbent.high_authority",
-                maximum=1.0,
-            ),
-            phase_authority=_finite(
-                entry.get("phase_authority"),
-                "incumbent.phase_authority",
-                maximum=1.0,
-            ),
-            combined_confidence=_finite(
-                entry.get("combined_confidence"),
-                "incumbent.combined_confidence",
-                maximum=1.0,
-            ),
-            established_at=_optional_finite(
-                entry.get("established_at"),
-                "incumbent.established_at",
-            ),
+            phase_offset=_finite(values[1], "incumbent.phase_offset", maximum=period),
+            phase_tolerance=_finite(values[2], "incumbent.phase_tolerance"),
+            origin=_string(labels[0], "incumbent.origin"),
+            authority_gate=_string(labels[1], "incumbent.authority_gate"),
+            status=_string(labels[2], "incumbent.status"),
+            high_authority=_finite(values[3], "incumbent.high_authority", maximum=1.0),
+            phase_authority=_finite(values[4], "incumbent.phase_authority", maximum=1.0),
+            combined_confidence=_finite(values[5], "incumbent.combined_confidence", maximum=1.0),
+            established_at=_optional_finite(values[6], "incumbent.established_at"),
             last_aligned_evidence_at=_optional_finite(
-                entry.get("last_aligned_evidence_at"),
+                values[7],
                 "incumbent.last_aligned_evidence_at",
             ),
             defining_evidence_ids=tuple(
-                _string(item, "incumbent.defining_evidence_ids[]") for item in ids
+                _string(item, "incumbent.defining_evidence_ids[]")
+                for item in _array(
+                    entry.get("defining_evidence_ids"),
+                    "incumbent.defining_evidence_ids",
+                    maximum=MAX_DEFINING_EVIDENCE_IDS,
+                )
             ),
-            reason_codes=tuple(_string(item, "incumbent.reason_codes[]") for item in reasons),
+            reason_codes=tuple(
+                _string(item, "incumbent.reason_codes[]")
+                for item in _array(
+                    entry.get("reason_codes"), "incumbent.reason_codes", maximum=MAX_REASON_CODES
+                )
+            ),
         )
 
     superseded = []
-    for index, item in enumerate(
-        _sequence(data.get("superseded"), "superseded", maximum=PERIOD_BIN_TOTAL),
+    for index, raw in enumerate(
+        _array(data.get("superseded"), "superseded", maximum=INTERVAL_BIN_TOTAL)
     ):
-        label = f"superseded[{index}]"
-        entry = _mapping(item, label)
-        period = entry.get("period")
-        if period not in CANDIDATE_PERIODS:
-            raise LearnedStateError(f"{label}.period invalid")
+        entry = _array(raw, f"superseded[{index}]", length=4)
+        period = _period(entry[0], f"superseded[{index}].period")
         superseded.append(
             SupersededRegime(
                 period,
-                _finite(entry.get("phase_offset"), f"{label}.phase_offset", maximum=period),
-                _finite(entry.get("phase_tolerance"), f"{label}.phase_tolerance"),
-                _finite(entry.get("superseded_at"), f"{label}.superseded_at"),
+                _finite(entry[1], "superseded.phase_offset", maximum=period),
+                _finite(entry[2], "superseded.phase_tolerance", maximum=period / 2),
+                _finite(entry[3], "superseded.superseded_at"),
             )
         )
-    if [item.key for item in superseded] != sorted({item.key for item in superseded}):
-        raise LearnedStateError("superseded entries must be unique and ordered")
+    _ordered_unique([item.key for item in superseded], "superseded")
 
     epoch_data = _mapping(data.get("epoch"), "epoch")
+    epoch_values = _array(epoch_data.get("values"), "epoch.values", length=3)
     recovery = []
-    for index, item in enumerate(
-        _sequence(
+    for index, raw in enumerate(
+        _array(
             epoch_data.get("recovery"),
             "epoch.recovery",
             maximum=ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS,
         )
     ):
-        entry = _mapping(item, f"epoch.recovery[{index}]")
-        left = _finite(entry.get("left_at"), f"epoch.recovery[{index}].left_at")
-        right = _finite(entry.get("right_at"), f"epoch.recovery[{index}].right_at")
+        entry = _array(raw, f"epoch.recovery[{index}]", length=2)
+        left = _finite(entry[0], "recovery.left_at")
+        right = _finite(entry[1], "recovery.right_at")
         if right <= left:
             raise LearnedStateError("recovery interval must have positive length")
         recovery.append(RecoveryInterval(left, right))
     epoch = EpochEvidence(
         regime_id=_string(epoch_data.get("regime_id"), "epoch.regime_id", optional=True),
-        established_at=_optional_finite(epoch_data.get("established_at"), "epoch.established_at"),
+        established_at=_optional_finite(epoch_values[0], "epoch.established_at"),
         challenger=_interval_bins_from(epoch_data.get("challenger"), "epoch.challenger"),
-        confirmation=_interval_bins_from(epoch_data.get("confirmation"), "epoch.confirmation"),
-        confirmation_endpoints=_period_histograms_from(
-            epoch_data.get("confirmation_endpoints"), "epoch.confirmation_endpoints"
-        ),
+        confirmation_count=_integer(epoch_values[1], "epoch.confirmation_count"),
+        confirmation_residual=_finite(epoch_values[2], "epoch.confirmation_residual", maximum=1.0),
         recovery=tuple(recovery),
     )
     state = LearnedState(
         schema_version=LEARNED_STATE_SCHEMA_VERSION,
-        server_key=server_key,
+        server_key=_string(data.get("server_key"), "server_key"),
         watermark=watermark,
-        pool_weight_total=_finite(data.get("pool_weight_total"), "pool_weight_total"),
-        pool=_histogram_from(data.get("pool"), "pool"),
-        high_endpoints=_period_histograms_from(data.get("high_endpoints"), "high_endpoints"),
+        pool_weight_total=total,
+        pool=pool,
         intervals=_interval_bins_from(data.get("intervals"), "intervals"),
         misses=tuple(misses),
         divisors=tuple(divisors),
         incumbent=incumbent,
         superseded=tuple(superseded),
         epoch=epoch,
+        open_chain=_open_chain_from(data.get("open_chain")),
     )
-    if any(
-        item.weight_before + item.weight > state.pool_weight_total + 1e-6 for item in state.pool
-    ):
-        raise LearnedStateError("pool bin domain accumulator exceeds the pool total")
     if learned_state_entry_count(state) > LEARNED_STATE_MAX_ENTRIES:
-        raise LearnedStateError("learned state exceeds its storage bound")
+        raise LearnedStateError("learned state exceeds its entry bound")
     return state
 
 
 def learned_state_json_bytes(state: LearnedState) -> bytes:
-    """Compact canonical JSON (for size measurement and round-trip tests)."""
+    """Compact canonical JSON; refuses a state exceeding the byte bound.
 
-    return json.dumps(
+    The byte bound is implied by the structural bounds, so a valid state can
+    never reach it: knowledge is never dropped to satisfy it.
+    """
+
+    payload = json.dumps(
         learned_state_to_mapping(state),
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("utf-8")
+    if len(payload) > LEARNED_STATE_MAX_JSON_BYTES:
+        raise LearnedStateError("learned state exceeds its serialised-size bound")
+    return payload
+
+
+def learned_state_from_json_bytes(payload: bytes) -> LearnedState:
+    if len(payload) > LEARNED_STATE_MAX_JSON_BYTES:
+        raise LearnedStateError("learned state exceeds its serialised-size bound")
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise LearnedStateError(f"invalid learned-state JSON: {exc}") from exc
+    return learned_state_from_mapping(value)
