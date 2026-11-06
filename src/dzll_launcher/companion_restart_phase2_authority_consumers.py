@@ -8,6 +8,7 @@ from enum import Enum
 
 from .companion_restart_phase2_authority import (
     COUNTDOWN_SUSPENSION_LATCH_REASON,
+    ISOLATED_OFF_PHASE_RESTART_REASON,
     SPARSE_ESTABLISHMENT_REASON,
     SPARSE_PERIOD_AMBIGUOUS_REASON,
     AuthorityCandidate,
@@ -875,16 +876,35 @@ def _safe_established_continuity_h2(
         and regime is not None
         and regime.origin is AuthorityOrigin.CONTINUITY
         and regime.status is RegimeRecordStatus.ESTABLISHED
-        and decision.state is RegimeState.ESTABLISHED
+        and _prediction_safe_incumbent_state(decision)
         and incumbent is not None
         and regime.regime_id == incumbent.regime_id
-        and decision.suspicion_level == 0
         and decision.cycle_visible
         and decision.prediction_usable
         and decision.countdown_safe
         and regime.candidate_period_seconds > 0
         and math.isfinite(regime.phase_offset)
         and not (candidate and candidate.harmonic_blockers)
+    )
+
+
+def _prediction_safe_incumbent_state(decision: AuthorityDecision) -> bool:
+    """A stable incumbent, or one whose only contradiction is learning evidence.
+
+    Stage 8.7a: authority marks a level-one state caused solely by one
+    isolated (phase-incoherent) off-phase restart with
+    ``ISOLATED_OFF_PHASE_RESTART_REASON``; it already keeps such a state
+    prediction-usable and countdown-safe.  Any other suspicion (a genuine
+    miss, a high contradiction, coherent off-phase or latent normal
+    challenger evidence, level two) still withholds H2 and sparse countdowns.
+    """
+
+    if decision.state is RegimeState.ESTABLISHED and decision.suspicion_level == 0:
+        return True
+    return bool(
+        decision.state is RegimeState.CHANGE_SUSPECTED
+        and decision.suspicion_level == 1
+        and ISOLATED_OFF_PHASE_RESTART_REASON in decision.reason_codes
     )
 
 
@@ -913,10 +933,9 @@ def _safe_established_sparse(
     return bool(
         _sparse_established_regime(regime)
         and regime.status is RegimeRecordStatus.ESTABLISHED
-        and decision.state is RegimeState.ESTABLISHED
+        and _prediction_safe_incumbent_state(decision)
         and incumbent is not None
         and regime.regime_id == incumbent.regime_id
-        and decision.suspicion_level == 0
         and decision.cycle_visible
         and decision.prediction_usable
         and decision.countdown_safe

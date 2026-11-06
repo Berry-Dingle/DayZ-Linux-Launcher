@@ -101,11 +101,21 @@ SPARSE_ESTABLISHMENT_REASON = "unknown_server_established_by_sparse_evidence"
 # remaining uncertainty.
 SPARSE_CONFIRMATION_INTERVAL_WEIGHT = 0.75
 SPARSE_CONFIRMATION_REASON = "sparse_regime_confirmed_by_full_interval"
-# Stage 8.7 recoverable off-phase anomaly: a single isolated off-phase restart
-# leaves the sparse consistency denominator once the original period and
-# phase have been re-observed (``_recovered_isolated_anomaly``).  The restart
-# itself is kept as evidence and in every off-phase diagnostic.
-SPARSE_ANOMALY_RECOVERED_REASON = "sparse_isolated_off_phase_anomaly_recovered"
+# Stage 8.7a proportional off-phase tolerance.  The existing SE3 phase gate
+# (``event-count cap x MAD band x consistency >= 0.85``) already accepts a
+# saturated, best-band candidate down to this consistency (0.85 / 0.95, about
+# 10.5 % off-phase weight).  Within it, off-phase restarts are deducted from
+# the aligned count as net evidence instead of scaling the magnitude, so the
+# 80 % milestone (which is the saturation asymptote of the sparse slot) stays
+# reachable and recovers as aligned restarts accumulate; below it, the
+# magnitude falls in proportion, as before.
+SPARSE_CONSISTENCY_TOLERANCE = SPARSE_PHASE_CONFIDENCE_MINIMUM / _event_count_cap(8)
+SPARSE_PROPORTIONAL_ANOMALY_REASON = "sparse_off_phase_restarts_within_proportional_tolerance"
+# Stage 8.7a: an established incumbent's only level-one contradiction is one
+# authentic off-phase restart that is phase-coherent with no other off-phase
+# restart.  It is learning evidence, not a challenger: safe H2/sparse
+# countdowns are kept (authority already marks the state prediction-usable).
+ISOLATED_OFF_PHASE_RESTART_REASON = "isolated_off_phase_restart_does_not_affect_prediction"
 # Stage 8.7 two-interval establishment against substantial conflicting
 # sparse evidence: the streak stays provisional (LIKELY) until one further
 # independent genuine restart confirms its period and phase.
@@ -432,7 +442,11 @@ class _SparseSupport:
     aligned: tuple[PhysicalRestartEvent, ...]
     effective: float
     quality_band: float
-    tolerated_anomaly_id: str | None = None
+    # The unchanged Stage 8.3 statistic (cap(effective) x band x consistency),
+    # still used by the SE3 phase gate.
+    phase_confidence: float = 0.0
+    off_phase_weight: float = 0.0
+    consistency: float = 0.0
 
 
 def _long_horizon_sparse_confidence(
@@ -466,8 +480,15 @@ def _sparse_support(
     restart is counted in both the continuous and the sparse slot.  Gaps
     are never interpreted (no relationships, no inferred restarts), so
     observations days apart remain independent evidence.  Consistency is
-    measured over the restarts from the first aligned one onwards, except a
-    single recovered, isolated off-phase anomaly (Stage 8.7).
+    measured over the restarts from the first aligned one onwards.
+
+    Stage 8.7a: the returned magnitude is
+    ``cap(effective - off_phase) x band x min(1, consistency / tolerance)``.
+    Off-phase restarts stay evidence: each cancels an aligned restart of equal
+    weight (net evidence), and when they exceed the proportion the SE3 phase
+    gate accepts (``SPARSE_CONSISTENCY_TOLERANCE``) the magnitude also falls
+    proportionally.  With no off-phase restart this is exactly the Stage 8.3
+    statistic, which is still returned as ``phase_confidence`` for SE3.
     """
 
     historical: set[str] = set()
@@ -493,17 +514,11 @@ def _sparse_support(
     first = min(_event_at(item) for item in aligned)
     effective = sum(_event_weight(item) for item in aligned)
     domain = tuple(item for item in pool if _event_at(item) >= first)
-    anomaly = _recovered_isolated_anomaly(
-        period=period,
-        phase_offset=phase_offset,
-        sparse=sparse,
-        domain=domain,
-        historical=historical,
-    )
-    total = sum(
+    total = sum(_event_weight(item) for item in domain)
+    off_phase_weight = sum(
         _event_weight(item)
         for item in domain
-        if anomaly is None or item.event_id != anomaly.event_id
+        if _sparse_off_phase(item, period=period, phase_offset=phase_offset)
     )
     mad = statistics.median(
         max(
@@ -513,17 +528,21 @@ def _sparse_support(
         for item in aligned
     )
     band = phase_quality_band(mad)
+    consistency = effective / total if total > 0 else 0.0
+    phase_confidence = _event_count_cap(effective) * band * consistency
     value = (
-        _event_count_cap(effective)
+        _event_count_cap(max(0.0, effective - off_phase_weight))
         * band
-        * (effective / total if total > 0 else 0.0)
+        * min(1.0, consistency / SPARSE_CONSISTENCY_TOLERANCE)
     )
     return _SparseSupport(
         round(min(1.0, max(0.0, value)), 6),
         aligned,
         effective,
         band,
-        anomaly.event_id if anomaly is not None else None,
+        round(min(1.0, max(0.0, phase_confidence)), 6),
+        round(off_phase_weight, 6),
+        round(consistency, 6),
     )
 
 
@@ -536,64 +555,14 @@ def _sparse_off_phase(
     )
 
 
-def _recovered_isolated_anomaly(
-    *,
-    period: int,
-    phase_offset: float,
-    sparse: _SparseEvidence,
-    domain: tuple[PhysicalRestartEvent, ...],
-    historical: set[str],
-) -> PhysicalRestartEvent | None:
-    """Stage 8.7: the one off-phase restart tolerated as a recovered anomaly.
+def _phase_coherent(left: PhysicalRestartEvent, right: PhysicalRestartEvent) -> bool:
+    """Whether two restarts share a phase at any candidate period."""
 
-    An off-phase restart in the consistency domain stays in the evidence (and
-    in every off-phase diagnostic); it only leaves the consistency
-    denominator when all of these hold:
-
-    * it is the only off-phase restart in the domain.  Two or more are a
-      persistent contradiction (the schema-3 off-grid change-evidence
-      threshold), so none of them is tolerated;
-    * it is isolated: no other off-phase restart anywhere in the horizon is
-      phase-coherent with it at any candidate period (coherent off-phase
-      restarts are a possible alternative schedule and remain contradiction);
-    * the original period and phase have since recovered: at least
-      ``ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS`` distinct aligned restarts
-      were observed strictly after it (the Stage 6 recovery count).  Gaps
-      are never interpreted, so only observed restarts count.
-
-    Until it has recovered, the anomaly lowers consistency as before.
-    """
-
-    off_phase = tuple(
-        item
-        for item in domain
-        if _sparse_off_phase(item, period=period, phase_offset=phase_offset)
+    return any(
+        abs(_signed_phase_residual(_event_at(left), _event_at(right), period))
+        <= max(_event_tolerance(period, left), _event_tolerance(period, right))
+        for period in CANDIDATE_PERIODS
     )
-    if len(off_phase) != 1:
-        return None
-    (anomaly,) = off_phase
-    anomaly_at = _event_at(anomaly)
-    for item in sparse.events:
-        if item.event_id == anomaly.event_id or not _sparse_off_phase(
-            item, period=period, phase_offset=phase_offset
-        ):
-            continue
-        if any(
-            abs(_signed_phase_residual(_event_at(item), anomaly_at, other))
-            <= max(_event_tolerance(other, item), _event_tolerance(other, anomaly))
-            for other in CANDIDATE_PERIODS
-        ):
-            return None
-    confirmations = sum(
-        1
-        for item in sparse.events
-        if item.event_id not in historical
-        and _event_at(item) > anomaly_at
-        and not _sparse_off_phase(item, period=period, phase_offset=phase_offset)
-    )
-    if confirmations < ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS:
-        return None
-    return anomaly
 
 
 def _sparse_structure_reasons(
@@ -633,7 +602,7 @@ def _sparse_structure_reasons(
         support.effective >= gate.established_events
         and times[-1] - times[0] >= gate.established_span
         and support.quality_band >= SPARSE_PHASE_QUALITY_BAND_MINIMUM
-        and support.value >= SPARSE_PHASE_CONFIDENCE_MINIMUM
+        and support.phase_confidence >= SPARSE_PHASE_CONFIDENCE_MINIMUM
     ):
         return (SPARSE_STRUCTURE_REASON,)
     return ()
@@ -1099,7 +1068,7 @@ def _sparse_reason_codes(normal: NormalCandidateEvidence) -> tuple[str, ...]:
         in {
             SPARSE_STRUCTURE_REASON,
             SPARSE_PERIOD_AMBIGUOUS_REASON,
-            SPARSE_ANOMALY_RECOVERED_REASON,
+            SPARSE_PROPORTIONAL_ANOMALY_REASON,
         }
     )
 
@@ -1208,8 +1177,9 @@ def _normal_candidate_evidence(
             LONG_HORIZON_SPARSE_REASON,
             *sparse_reasons,
             *(
-                (SPARSE_ANOMALY_RECOVERED_REASON,)
-                if support.tolerated_anomaly_id is not None
+                (SPARSE_PROPORTIONAL_ANOMALY_REASON,)
+                if support.off_phase_weight > 0
+                and support.consistency >= SPARSE_CONSISTENCY_TOLERANCE
                 else ()
             ),
         ),
@@ -2379,6 +2349,14 @@ def _incumbent_decision(
             "incumbent_high_authority_unchanged",
             "one_contradiction_does_not_hide_prediction",
         )
+        if (
+            not active_misses
+            and active_high_relationships == 0
+            and _isolated_off_phase_restart(
+                active_off_phase, incumbent=incumbent, events=events
+            )
+        ):
+            reasons = (*reasons, ISOLATED_OFF_PHASE_RESTART_REASON)
     else:
         state = (
             RegimeState.ESTABLISHED
@@ -2422,6 +2400,44 @@ def _incumbent_decision(
         suspicion_ids=suspicion_ids,
         selected_candidate=incumbent_candidate,
         reasons=reasons,
+    )
+
+
+def _isolated_off_phase_restart(
+    active_off_phase: tuple[str, ...],
+    *,
+    incumbent: RegimeRecord,
+    events: tuple[PhysicalRestartEvent, ...],
+) -> bool:
+    """Stage 8.7a: the level-one contradiction is one random admin restart.
+
+    Exactly one authentic off-phase restart since the incumbent's latest
+    aligned evidence, phase-coherent (at any candidate period) with no other
+    authentic restart that is off the incumbent's phase anywhere in the
+    horizon.  Coherent off-phase restarts are possible alternative-schedule
+    evidence and keep the existing level-one consumer treatment.
+    """
+
+    if len(active_off_phase) != 1:
+        return False
+    off_phase = tuple(
+        item
+        for item in events
+        if _authentic_event(item)
+        and _event_at(item) is not None
+        and _circular_distance(
+            _event_at(item), incumbent.phase_offset, incumbent.candidate_period_seconds
+        )
+        > incumbent.phase_tolerance
+    )
+    anomaly = next(
+        (item for item in off_phase if item.event_id == active_off_phase[0]), None
+    )
+    if anomaly is None:
+        return False
+    return not any(
+        item.event_id != anomaly.event_id and _phase_coherent(item, anomaly)
+        for item in off_phase
     )
 
 

@@ -48,6 +48,11 @@ domain; two-interval establishment held provisional against substantial
 conflicting sparse evidence until one more independent confirmation; every
 non-authentic outcome excluded as a relationship endpoint, including legacy
 persisted relationships) added the ``test_s87_*`` section.
+Stage 8.7a (proportional anomaly tolerance: off-phase restarts netted
+against aligned ones within the proportion the unchanged SE3 phase gate
+accepts; an isolated admin restart keeps safe H2/sparse countdowns) replaced
+the Stage 8.7 single-anomaly tests with the ``test_s87a_*`` section and
+updated three Stage 8.3 tests that encoded the ratio-only magnitude.
 Stage 8.4 (unified confidence presentation: Learning shows the evaluated
 schema-4 candidate's capped ``combined_confidence``; acquisition LIKELY is
 presented as Learning) added the ``test_s84_*`` section and updated the one
@@ -1545,6 +1550,22 @@ def sparse_support(step, period, phase=None):
     return candidate.aligned_normal_confidence
 
 
+def sparse_aligned_times(step, period, *, prior, phase=None):
+    """Canonical times of the restarts in a candidate's sparse aligned set."""
+
+    candidate = step.candidate(period, phase)
+    relationships = {item.relationship_id: item for item in step.relationships}
+    support = authority._sparse_support(
+        period=period,
+        phase_offset=candidate.phase_offset,
+        sparse=authority._sparse_evidence(step.events, prior),
+        excluded_event_ids=authority._relationship_endpoint_ids(
+            relationships[item] for item in candidate.high_relationship_ids
+        ),
+    )
+    return {item.canonical_phase_at for item in support.aligned}
+
+
 def test_s83_sparse_observations_accumulate_across_days_and_sessions():
     supports = []
     for count in (3, 5, 8):
@@ -1627,8 +1648,12 @@ def test_s83_normal_only_phase_comes_from_long_horizon_evidence():
 
     assert abs(((schema3_phase - at(20, 10)) + P3 / 2) % P3 - P3 / 2) < 60
     assert abs(((long_horizon.phase_offset - at(0, 9)) + P3 / 2) % P3 - P3 / 2) < 1
+    # Stage 8.7a: the two off-phase restarts are net evidence against, and
+    # 10/12 consistency is below the SE3-accepted proportion.
     assert long_horizon.aligned_normal_confidence == round(
-        scoring._event_count_cap(10) * (10 / 12), 6
+        scoring._event_count_cap(10 - 2)
+        * min(1.0, (10 / 12) / authority.SPARSE_CONSISTENCY_TOLERANCE),
+        6,
     )
     assert recent_candidate.regime_id != long_horizon.regime_id
 
@@ -1671,7 +1696,11 @@ def test_s83_alternative_periods_evaluate_the_same_restarts_independently():
     # 6 h phase is 12:00/18:00 (2 aligned of the 3 restarts from 12:00 on).
     assert sparse_support(step, P3) == 0
     assert abs(((six.phase_offset - at(0, 12)) + P3) % (2 * P3) - P3) < 1
-    assert six.aligned_normal_confidence == round(scoring._event_count_cap(2) * 2 / 3, 6)
+    assert six.aligned_normal_confidence == round(
+        scoring._event_count_cap(2 - 1)
+        * min(1.0, (2 / 3) / authority.SPARSE_CONSISTENCY_TOLERANCE),
+        6,
+    )
     assert not six.h1_gate and not six.h2_gate
     assert step.decision.selected_shadow_regime.candidate_period_seconds == P3
 
@@ -1696,8 +1725,14 @@ def test_s83_superseded_regime_evidence_does_not_strengthen_a_conflicting_regime
     with_history = pipeline.evaluate(persisted(replaced.decision))
 
     # Day-0 00:00 and 12:00 lie on the 4 h grid, but they were explained by
-    # the superseded 3 h regime: they count only without that history.
-    assert sparse_support(without_history, 4 * HOUR) > 0
+    # the superseded 3 h regime: they are aligned 4 h evidence only without
+    # that history (Stage 8.7a nets the off-phase day-0 restarts, so the
+    # magnitude itself is zero either way).
+    day0 = {at(0, 0), at(0, 12)}
+    assert day0 <= sparse_aligned_times(without_history, 4 * HOUR, prior=None)
+    assert not day0 & sparse_aligned_times(
+        with_history, 4 * HOUR, prior=persisted(replaced.decision)
+    )
     assert sparse_support(with_history, 4 * HOUR) == 0
     assert (
         with_history.decision.incumbent_shadow_regime.regime_id
@@ -2890,128 +2925,420 @@ def _three_hour_sparse(step):
     )
 
 
-# A genuine one-off administrator restart at 17:20 (off the 3 h grid by 40 min).
+# Stage 8.7a: proportional anomaly tolerance (replaces the Stage 8.7
+# single-recovered-anomaly rule).  Off-phase restarts stay evidence; they are
+# netted against aligned restarts within the proportion the existing SE3 phase
+# gate accepts, and scale the magnitude below it.
+
+# Genuine one-off administrator restarts, off the 3 h grid and pairwise
+# phase-incoherent at every candidate period.
+ADMIN_RESTARTS = ((17, 20), (13, 47), (22, 8))
 ADMIN_RESTART = at(3, 17, 20)
 
 
+def aligned_3h(count, start_day=0):
+    """``count`` sparse 3 h restarts, one per day, cycling all eight slots."""
+
+    return tuple(at(start_day + index, (3 * index) % 24) for index in range(count))
+
+
+def admin_restarts(count, days):
+    return tuple(at(day, *ADMIN_RESTARTS[index % 3]) for index, day in zip(range(count), days))
+
+
 def _anomaly_mid_history():
-    """Eight aligned 3 h restarts with the anomaly after the fourth: four
-    independent aligned restarts later re-confirm the original cycle."""
+    """Nine aligned 3 h restarts with one admin restart after the fourth."""
 
     pipeline = Pipeline()
     pipeline.sparse("aligned-a", SPARSE_DISCRIMINATING[:4])
     pipeline.sparse("admin", [ADMIN_RESTART])
-    pipeline.sparse("aligned-b", SPARSE_DISCRIMINATING[4:])
+    pipeline.sparse("aligned-b", SPARSE_DISCRIMINATING[4:] + (at(7, 9),))
     return pipeline
 
 
-def test_s87_eight_aligned_restarts_establish_despite_a_recovered_historical_anomaly():
-    pipeline = _anomaly_mid_history()
-    step = settled(pipeline)
-    value, shown = assert_sparse_established(step)
-    anomaly = next(item for item in step.events if item.canonical_phase_at == ADMIN_RESTART)
+def test_s87a_admin_restarts_are_pairwise_incoherent():
+    events = [
+        physical_event(index, at(20 + index, hour, minute), Session(f"c{index}", 0, 1), outcome=Outcome.CORROBORATED_OFFLINE_RESTART)
+        for index, (hour, minute) in enumerate(ADMIN_RESTARTS)
+    ]
+    assert not any(
+        authority._phase_coherent(left, right)
+        for index, left in enumerate(events)
+        for right in events[index + 1:]
+    )
+    assert authority.SPARSE_CONSISTENCY_TOLERANCE == pytest.approx(0.85 / 0.95)
+
+
+def test_s87a_eight_perfectly_aligned_sparse_restarts_establish_normally():
+    step = settled(sparse_pipeline())
+    _value, shown = assert_sparse_established(step)
     candidate = _three_hour_sparse(step)
-    occurrence = value.next_expected_restart_at
 
     assert shown["confidence_percent"] == 80
-    assert step.consumer(now=occurrence - 300).scheduled_warning_eligible
+    # No off-phase restart: exactly the Stage 8.3/8.5 statistic.
     assert candidate.aligned_normal_confidence == 0.95
-    assert authority.SPARSE_ANOMALY_RECOVERED_REASON in candidate.reason_codes
-    # The genuine off-phase restart is preserved as evidence and diagnostics.
-    assert scoring.event_learning_eligible(anomaly) and anomaly.outcome is Outcome.CORROBORATED_OFFLINE_RESTART
-    assert anomaly.event_id in _off_phase_ids(step)
-    # No restart is inferred: only the observed restarts exist, and no
-    # interval across the unobserved gaps is high evidence.
-    assert len(step.events) == 9
-    assert not any(item.high_authority_eligible for item in step.relationships)
+    assert authority.SPARSE_PROPORTIONAL_ANOMALY_REASON not in candidate.reason_codes
 
 
-def test_s87_off_phase_anomaly_introduces_uncertainty_then_recovers():
-    # Acquisition: the anomaly sits before the last aligned restart, so only
-    # one aligned restart follows it and it still counts as contradiction.
-    pipeline = Pipeline()
-    pipeline.sparse("aligned", SPARSE_DISCRIMINATING[:7])
-    pipeline.sparse("admin", [at(6, 10, 20)])
-    pipeline.sparse("eighth", [SPARSE_DISCRIMINATING[7]])
+def test_s87a_one_anomaly_then_further_aligned_evidence_establishes():
+    pipeline = sparse_pipeline()
+    pipeline.sparse("admin", [at(6, 17, 20)])
     uncertain = settled(pipeline)
     assert uncertain.decision.state is State.NORMAL_LEARNING
     assert_learning(panel(uncertain))
-    assert panel(uncertain)["confidence_percent"] == 71
-    assert authority.SPARSE_ANOMALY_RECOVERED_REASON not in _three_hour_sparse(uncertain).reason_codes
+    assert panel(uncertain)["confidence_percent"] == 76
+
     pipeline.sparse("ninth", [at(7, 9)])
-    recovered = pipeline.evaluate(persisted(uncertain.decision))
+    step = pipeline.evaluate(persisted(uncertain.decision))
+    value, shown = assert_sparse_established(step)
+    anomaly = next(item for item in step.events if item.canonical_phase_at == at(6, 17, 20))
+    candidate = _three_hour_sparse(step)
+
+    assert shown["confidence_percent"] == 80
+    assert step.consumer(now=value.next_expected_restart_at - 300).scheduled_warning_eligible
+    assert authority.SPARSE_PROPORTIONAL_ANOMALY_REASON in candidate.reason_codes
+    # The genuine off-phase restart is preserved as evidence and diagnostics.
+    assert anomaly.event_id in _off_phase_ids(step)
+    assert len(step.events) == 10
+    assert not any(item.high_authority_eligible for item in step.relationships)
+
+
+@pytest.mark.parametrize(
+    "aligned_count,anomaly_count",
+    [(9, 1), (20, 1), (20, 2), (50, 2), (98, 2)],
+)
+def test_s87a_occasional_anomalies_never_veto_a_strongly_supported_cycle(aligned_count, anomaly_count):
+    pipeline = Pipeline()
+    pipeline.sparse("aligned", aligned_3h(aligned_count))
+    pipeline.sparse("admin", admin_restarts(anomaly_count, (2, 5)))
+    step = settled(pipeline)
+    value, shown = assert_sparse_established(step)
+    regime = step.decision.incumbent_shadow_regime
+    occurrence = value.next_expected_restart_at
+
+    assert shown["confidence_percent"] == 80
+    assert regime.candidate_period_seconds == P3 and regime.phase_offset == 0.0
+    assert step.consumer(now=occurrence - 300).scheduled_warning_eligible
+    assert len(_off_phase_ids(step) & {item.event_id for item in step.events}) >= anomaly_count
+
+
+def test_s87a_large_histories_stay_usable_without_quadratic_pair_construction():
+    count = 400
+    pipeline = Pipeline()
+    pipeline.sparse("aligned", aligned_3h(count))
+    pipeline.sparse("admin", admin_restarts(6, (3, 50, 100, 150, 200, 300)))
+    step = pipeline.evaluate()
+
+    assert_sparse_established(step)
+    # Relationship extraction is bounded per event (lookahead window), so it
+    # grows linearly with the history.
+    assert len(step.relationships) < count
+
+    # The sparse statistic itself is one linear pass.  Twenty thousand aligned
+    # restarts with 2 % unrelated admin restarts saturate at the milestone,
+    # where the unchanged ratio statistic alone would be stuck below it.
+    session = Session("bulk", 0, 1)
+    base = physical_event(1, at(0, 0), session, outcome=Outcome.CORROBORATED_OFFLINE_RESTART)
+    events = tuple(
+        replace(base, event_id=f"aligned-{index}", canonical_phase_at=at(index // 8, (3 * index) % 24))
+        for index in range(20_000)
+    ) + tuple(
+        replace(base, event_id=f"admin-{index}", canonical_phase_at=at(5 * index + 1, 17, 20))
+        for index in range(400)
+    )
+    support = authority._sparse_support(
+        period=P3,
+        phase_offset=0.0,
+        sparse=authority._SparseEvidence(events=events, historical=()),
+        excluded_event_ids=frozenset(),
+    )
+    assert support.value == 0.95
+    assert round(authority.SPARSE_EVIDENCE_CEILING * support.value * 100) == 80
+    assert support.phase_confidence == round(0.95 * 20_000 / 20_400, 6)
+    assert round(authority.SPARSE_EVIDENCE_CEILING * support.phase_confidence * 100) < 80
+
+
+def test_s87a_anomalies_before_and_after_initial_establishment():
+    before = settled(_anomaly_mid_history())
+    assert_sparse_established(before)
+    assert panel(before)["confidence_percent"] == 80
+
+    pipeline = _anomaly_mid_history()
+    established_step = settled(pipeline)
+    pipeline.sparse("admin-after", [at(9, 13, 47)])
+    after = pipeline.evaluate(persisted(established_step.decision))
+    regime = after.decision.incumbent_shadow_regime
+
+    assert after.decision.state is State.CHANGE_SUSPECTED
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON in after.decision.reason_codes
+    assert regime.regime_id == established_step.decision.incumbent_shadow_regime.regime_id
+    assert after.consumer().countdown_visible
+    # Two anomalies against ten aligned restarts (17 %) exceed the tolerated
+    # proportion: the cycle is kept, but below the 80 % warning milestone.
+    pipeline.sparse("aligned-after", [at(10, 12)])
+    partial = pipeline.evaluate(persisted(after.decision))
+    assert partial.decision.state is State.ESTABLISHED and partial.consumer().countdown_visible
+    assert panel(partial)["confidence_percent"] < 80
+    # Further aligned evidence restores the proportion in place.
+    pipeline.sparse("aligned-more", aligned_3h(8, start_day=11))
+    recovered = pipeline.evaluate(persisted(partial.decision))
     assert_sparse_established(recovered)
     assert panel(recovered)["confidence_percent"] == 80
-
-    # Established regime: the anomaly lowers confidence (bounded level-one
-    # suspicion, unchanged Stage 8.5 consumer rules); two later aligned
-    # restarts restore it.
-    pipeline = sparse_pipeline()
-    steps = [settled(pipeline)]
-    for name, when in (("admin", at(7, 17, 20)), ("r1", at(8, 9)), ("r2", at(9, 12))):
-        pipeline.sparse(name, [when])
-        steps.append(pipeline.evaluate(persisted(steps[-1].decision)))
-    regime_ids = {item.decision.incumbent_shadow_regime.regime_id for item in steps}
-    assert [panel(item)["confidence_percent"] for item in steps] == [80, 71, 72, 80]
-    assert steps[1].decision.suspicion_level == 1
-    assert steps[1].decision.incumbent_shadow_regime.status is authority.RegimeRecordStatus.ESTABLISHED
-    assert steps[3].decision.suspicion_level == 0
-    assert_sparse_established(steps[3])
-    assert len(regime_ids) == 1
-    assert authority.SPARSE_ANOMALY_RECOVERED_REASON in _three_hour_sparse(steps[3]).reason_codes
+    assert recovered.decision.incumbent_shadow_regime.regime_id == regime.regime_id
 
 
-def test_s87_multiple_coherent_off_phase_observations_withhold_establishment():
+def test_s87a_unrelated_anomalies_over_weeks_each_recover_without_reset():
     pipeline = Pipeline()
-    pipeline.sparse("aligned-a", SPARSE_DISCRIMINATING[:3])
-    # The same off-grid clock time on two days: a coherent alternative.
-    pipeline.sparse("admin", [at(2, 17, 20), at(3, 17, 20)])
-    pipeline.sparse("aligned-b", SPARSE_DISCRIMINATING[3:] + (at(7, 9), at(8, 12)))
+    pipeline.sparse("aligned", aligned_3h(24))
+    steps = [settled(pipeline)]
+    regime = steps[0].decision.incumbent_shadow_regime
+    schedule = []
+    for week, (hour, minute) in enumerate(ADMIN_RESTARTS):
+        day = 28 + 7 * week
+        schedule.append((f"admin-{week}", at(day, hour, minute), True))
+        schedule += [
+            (f"aligned-{week}-{index}", at(day + 1 + index, (3 * index) % 24), False)
+            for index in range(4)
+        ]
+    for name, when, anomaly in schedule:
+        pipeline.sparse(name, [when])
+        step = pipeline.evaluate(persisted(steps[-1].decision))
+        steps.append(step)
+        current = step.decision.incumbent_shadow_regime
+        assert current.regime_id == regime.regime_id
+        assert current.established_at == regime.established_at
+        assert (current.candidate_period_seconds, current.phase_offset) == (P3, 0.0)
+        assert step.consumer().countdown_visible
+        if anomaly:
+            assert authority.ISOLATED_OFF_PHASE_RESTART_REASON in step.decision.reason_codes
+        else:
+            assert step.decision.state is State.ESTABLISHED
+            assert panel(step)["confidence_percent"] == 80
+    assert len(_off_phase_ids(steps[-1]) & {item.event_id for item in steps[-1].events}) == 3
+
+
+@pytest.mark.parametrize("aligned_count,anomaly_count", [(10, 2), (20, 4), (30, 6)])
+def test_s87a_persistent_significant_disagreement_prevents_establishment(aligned_count, anomaly_count):
+    days = tuple(1 + (aligned_count // anomaly_count) * index for index in range(anomaly_count))
+    pipeline = Pipeline()
+    pipeline.sparse("aligned", aligned_3h(aligned_count))
+    pipeline.sparse("admin", admin_restarts(anomaly_count, days))
     for step in rebuilds(pipeline, pipeline.evaluate()):
+        candidate = _three_hour_sparse(step)
         assert step.decision.state is State.NORMAL_LEARNING
         assert not step.consumer().countdown_visible
         assert panel(step)["confidence_percent"] <= 79
-        assert authority.SPARSE_ANOMALY_RECOVERED_REASON not in _three_hour_sparse(step).reason_codes
+        # The unchanged SE3 phase gate refuses this proportion.
+        assert authority.SPARSE_STRUCTURE_REASON not in candidate.reason_codes
+        assert authority.SPARSE_PROPORTIONAL_ANOMALY_REASON not in candidate.reason_codes
 
-    # A single off-phase restart coherent with an earlier one (outside the
-    # consistency domain) is not isolated either.
+    # Proportion, not lifetime count, decides: enough later aligned evidence
+    # brings the same anomalies within tolerance.
+    pipeline.sparse("later", aligned_3h(aligned_count, start_day=aligned_count + 1))
+    assert_sparse_established(settled(pipeline))
+
+
+def _h2_incumbent():
+    return three_hour_chain(3)
+
+
+def _sparse_thirty():
     pipeline = Pipeline()
-    pipeline.sparse("earlier", [at(-1, 17, 20)])
-    pipeline.sparse("aligned-a", SPARSE_DISCRIMINATING[:4])
-    pipeline.sparse("admin", [ADMIN_RESTART])
-    pipeline.sparse("aligned-b", SPARSE_DISCRIMINATING[4:])
-    step = settled(pipeline)
-    assert step.decision.state is State.NORMAL_LEARNING
-    assert authority.SPARSE_ANOMALY_RECOVERED_REASON not in _three_hour_sparse(step).reason_codes
+    pipeline.sparse("aligned", aligned_3h(30))
+    return pipeline
 
 
-@pytest.mark.parametrize("later_aligned", [2, 4, 8])
-def test_s87_persistent_off_phase_contradictions_are_not_ignored(later_aligned):
-    later = tuple(at(7 + index, (9 + 3 * index) % 24) for index in range(later_aligned))
-    # 17:20 and 13:47 are not phase-coherent at any candidate period.
-    unrelated = (at(2, 17, 20), at(3, 13, 47))
-    pipeline = Pipeline()
-    pipeline.sparse("aligned-a", SPARSE_DISCRIMINATING[:3])
-    pipeline.sparse("admin", unrelated)
-    pipeline.sparse("aligned-b", SPARSE_DISCRIMINATING[3:] + later)
-    step = settled(pipeline)
+INCUMBENT_BUILDERS = {
+    "sparse_eight": (sparse_pipeline, 76),
+    "sparse_thirty": (_sparse_thirty, 80),
+    "two_interval_h2": (_h2_incumbent, 80),
+    "three_interval_h3": (lambda: three_hour_chain(4), DISPLAY_CEILING_PERCENT),
+}
 
-    assert step.decision.state is State.NORMAL_LEARNING
-    assert not step.consumer().countdown_visible
-    assert panel(step)["confidence_percent"] <= 79
-    assert authority.SPARSE_ANOMALY_RECOVERED_REASON not in _three_hour_sparse(step).reason_codes
 
-    # A recovered anomaly does not license a further one: the second
-    # off-phase restart removes the tolerance again.
-    pipeline = _anomaly_mid_history()
+@pytest.mark.parametrize("name", sorted(INCUMBENT_BUILDERS))
+def test_s87a_established_regime_keeps_period_phase_and_predictions_after_isolated_admin_restart(name):
+    builder, after_percent = INCUMBENT_BUILDERS[name]
+    pipeline = builder()
     established_step = settled(pipeline)
-    pipeline.sparse("second-admin", [at(8, 13, 47)])
-    pipeline.sparse("after", later)
-    acquisition = Pipeline(list(pipeline.events), list(pipeline.coverage), pipeline.sequence)
-    assert acquisition.evaluate().decision.state is State.NORMAL_LEARNING
-    incumbent = pipeline.evaluate(persisted(established_step.decision))
-    assert authority.SPARSE_ANOMALY_RECOVERED_REASON not in _three_hour_sparse(incumbent).reason_codes
-    assert panel(incumbent)["confidence_percent"] < 80
+    before = established_step.decision.incumbent_shadow_regime
+    pipeline.sparse("admin", [at(40, 17, 20)])
+    step = pipeline.evaluate(persisted(established_step.decision))
+    value = step.consumer()
+    regime = step.decision.incumbent_shadow_regime
+
+    # Learning evidence, not a challenger: bounded level one, nothing erased.
+    assert step.decision.state is State.CHANGE_SUSPECTED and step.decision.suspicion_level == 1
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON in step.decision.reason_codes
+    assert (regime.regime_id, regime.candidate_period_seconds, regime.phase_offset) == (
+        before.regime_id, before.candidate_period_seconds, before.phase_offset,
+    )
+    assert value.presentation_state is Presentation.CONFIRMED_CYCLE
+    assert value.countdown_visible and value.countdown_safe
+    assert panel(step)["confidence_percent"] == after_percent
+    warning = step.consumer(now=value.next_expected_restart_at - 300).scheduled_warning_eligible
+    # The displayed-80 % warning rule (8.3a) is unchanged.
+    assert warning is (after_percent >= 80)
+
+    # The next aligned restart clears the suspicion; the cycle recovers in
+    # place (same regime, no re-acquisition).
+    pipeline.sparse("aligned", [at(41, 9)])
+    recovered = pipeline.evaluate(persisted(step.decision))
+    assert recovered.decision.state is State.ESTABLISHED and recovered.decision.suspicion_level == 0
+    assert recovered.decision.incumbent_shadow_regime.regime_id == before.regime_id
+    assert percent(recovered) >= 80
+    assert recovered.consumer(now=recovered.consumer().next_expected_restart_at - 300).scheduled_warning_eligible
+
+
+@pytest.mark.parametrize(
+    "second",
+    [pytest.param((17, 20), id="same_clock"), pytest.param((14, 20), id="three_hour_alternative_phase")],
+)
+@pytest.mark.parametrize("builder", [_h2_incumbent, sparse_pipeline], ids=["h2", "sparse"])
+def test_s87a_coherent_or_repeated_off_phase_restarts_keep_existing_suspicion(builder, second):
+    # Coherent: a second off-grid restart sharing a phase with the first (the
+    # same clock time, or the same alternative 3 h phase).  It is possible
+    # alternative-schedule evidence, so the existing level-one treatment
+    # (H2/sparse countdown withheld) applies.
+    pipeline = builder()
+    steps = [settled(pipeline)]
+    for name, when in (("admin-1", at(10, 17, 20)), ("aligned-1", at(11, 9)), ("admin-2", at(12, *second))):
+        pipeline.sparse(name, [when])
+        steps.append(pipeline.evaluate(persisted(steps[-1].decision)))
+    coherent = steps[-1]
+    assert coherent.decision.suspicion_level == 1
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in coherent.decision.reason_codes
+    assert not coherent.consumer().countdown_visible
+    pipeline.sparse("aligned-2", [at(13, 9)])
+    recovered = pipeline.evaluate(persisted(coherent.decision))
+    assert recovered.decision.state is State.ESTABLISHED and recovered.consumer().countdown_visible
+
+    # Two off-phase restarts with no aligned restart between them.
+    pipeline = builder()
+    steps = [settled(pipeline)]
+    for name, when in (("admin-1", at(10, 17, 20)), ("admin-2", at(11, 13, 47))):
+        pipeline.sparse(name, [when])
+        steps.append(pipeline.evaluate(persisted(steps[-1].decision)))
+    assert steps[-1].decision.suspicion_level == 1
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in steps[-1].decision.reason_codes
+    assert not steps[-1].consumer().countdown_visible
+
+
+def test_s87a_isolated_admin_restart_never_relaxes_other_suspicion():
+    # An in-phase genuine miss (not an off-phase restart) keeps the existing
+    # H2 treatment: level one withholds the H2 countdown.
+    pipeline = _h2_incumbent()
+    established_step = settled(pipeline)
+    ledger = (genuine_miss(P3, at(1, 0), key="incumbent-miss"),)
+    missed = pipeline.evaluate(persisted(established_step.decision), ledger=ledger)
+    assert missed.decision.suspicion_level == 1
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in missed.decision.reason_codes
+    assert not missed.consumer().countdown_visible
+
+
+def test_s87a_genuine_recent_challenger_is_detected_despite_a_large_incumbent_history():
+    def with_challenger(*sessions):
+        pipeline = Pipeline()
+        pipeline.sparse("history", aligned_3h(100))
+        incumbent = settled(pipeline)
+        assert_sparse_established(incumbent)
+        for index, times in enumerate(sessions):
+            pipeline.observe(f"challenger-{index}", times)
+        return incumbent, pipeline.evaluate(persisted(incumbent.decision))
+
+    _incumbent, level_two = with_challenger([at(101, 1), at(101, 5)], [at(101, 13), at(101, 17)])
+    assert level_two.decision.state is State.CHALLENGER_ACCUMULATING and level_two.decision.suspicion_level == 2
+    assert level_two.consumer().presentation_state is Presentation.SCHEDULE_CHANGE_SUSPECTED
+    assert not level_two.consumer().countdown_visible
+
+    incumbent, provisional = with_challenger([at(101, 1), at(101, 5), at(101, 9)])
+    assert provisional.decision.state is State.TRANSITION_CONFIRMED
+    assert provisional.consumer().presentation_state is Presentation.LIKELY_NEW_CYCLE
+    assert not provisional.consumer().countdown_visible
+    assert provisional.decision.incumbent_shadow_regime.regime_id == incumbent.decision.incumbent_shadow_regime.regime_id
+
+    _incumbent, superseded = with_challenger([at(101, 1), at(101, 5), at(101, 9), at(101, 13)])
+    assert superseded.decision.state is State.NEW_REGIME_ESTABLISHED
+    assert superseded.decision.incumbent_shadow_regime.candidate_period_seconds == 4 * HOUR
+
+
+def test_s87a_continuous_versus_sparse_conflict_safeguard_holds_with_large_sparse_history():
+    pipeline = Pipeline()
+    pipeline.sparse("history", aligned_3h(100))
+    pipeline.observe("four-hour", [at(101, 8), at(101, 12), at(101, 16)])
+    pending = settled(pipeline)
+    assert pending.decision.state is State.LIKELY
+    assert authority.TWO_INTERVAL_SPARSE_CONFLICT_REASON in pending.decision.reason_codes
+    assert not pending.consumer().countdown_visible
+
+    pipeline.sparse("confirmation", [at(102, 8)])
+    step = pipeline.evaluate(persisted(pending.decision))
+    assert step.decision.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert step.decision.incumbent_shadow_regime.regime_id == pending.decision.selected_shadow_regime.regime_id
+
+
+def test_s87a_clean_milestones_and_evidence_weights_are_unchanged():
+    clean = _three_hour_sparse(settled(sparse_pipeline()))
+    assert clean.aligned_normal_confidence == 0.95
+    assert panel(_sparse_plus_matching_interval()[1])["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    qv = settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    assert panel(qv)["confidence_percent"] == 80
+    assert panel(settled(sparse_pipeline(SPARSE_QV_TEN[:9], outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)))[
+        "confidence_percent"
+    ] <= 79
+    assert percent(three_hour_chain(3).evaluate()) == 80
+    assert percent(three_hour_chain(4).evaluate()) == DISPLAY_CEILING_PERCENT
+    session = Session("w", 0, 1)
+    weights = {
+        outcome: scoring._event_weight(physical_event(1, at(0, 0), session, outcome=outcome))
+        for outcome in _AUTHENTICITY
+    }
+    assert weights == {
+        Outcome.CORROBORATED_OFFLINE_RESTART: 1.0,
+        Outcome.CONFIRMED_OFFLINE_RESTART: 0.8,
+        Outcome.STRONG_QUERY_VISIBLE_RESTART: 0.8,
+        Outcome.PROBABLE_QUERY_VISIBLE_RESTART: 0.5,
+        Outcome.AMBIGUOUS_DRAIN: 0.0,
+    }
+
+
+@pytest.mark.parametrize("contamination", ["sleep_gap", "onset_unobserved"])
+def test_s87a_unobserved_or_interrupted_off_phase_incidents_stay_neutral(contamination):
+    pipeline = sparse_pipeline()
+    clean = settled(pipeline)
+    (event,) = pipeline.sparse("incident", [at(6, 17, 20)])
+    if contamination == "sleep_gap":
+        changed = replace(event, coverage_complete=False, lifecycle_interruption=detection.LifecycleMarker.SLEEP_GAP)
+    else:
+        changed = replace(event, coverage_complete=False)
+    pipeline.events[-1] = changed
+    step = settled(pipeline)
+
+    assert not scoring.event_learning_eligible(changed)
+    assert_sparse_established(step)
+    assert _three_hour_sparse(step).aligned_normal_confidence == _three_hour_sparse(clean).aligned_normal_confidence
+
+
+def test_s87a_warning_deduplication_and_regime_identity_survive_an_anomaly():
+    pipeline = _sparse_thirty()
+    established_step = settled(pipeline)
+    occurrence = established_step.consumer().next_expected_restart_at
+    due = occurrence - 300
+    first = established_step.consumer(now=due)
+    assert first.scheduled_pre_restart_alert_eligible
+    fired = frozenset({first.scheduled_warning_suppression_key})
+
+    # An isolated admin restart between the last aligned restart and the
+    # warning: same regime, same occurrence key, already fired.
+    pipeline.sparse("admin", [occurrence - 100 * 60])
+    step = pipeline.evaluate(persisted(established_step.decision))
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON in step.decision.reason_codes
+    again = step.consumer(now=due, fired_keys=fired)
+    assert again.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
+    assert not again.scheduled_pre_restart_alert_eligible
+    following = step.consumer(now=due + P3, fired_keys=fired)
+    assert following.scheduled_warning_suppression_key != first.scheduled_warning_suppression_key
+    assert following.scheduled_pre_restart_alert_eligible
 
 
 FOUR_HOUR_STREAK = (at(9, 8), at(9, 12), at(9, 16))
@@ -3345,7 +3672,8 @@ def test_s87_genuine_qv_and_oo_events_still_form_relationships():
 
 
 STAGE87_BUILDERS = {
-    "recovered_anomaly": _anomaly_mid_history,
+    "proportional_anomaly": _anomaly_mid_history,
+    "isolated_admin_after_establishment": lambda: _with(_sparse_thirty(), "admin", [at(40, 17, 20)]),
     "conflict_pending": _sparse_conflict_pipeline,
     "conflict_confirmed": lambda: _with(_sparse_conflict_pipeline(), "confirmation", [at(10, 8)]),
     "legacy_incidents": lambda: _with_incidents(three_hour_chain(4)),
