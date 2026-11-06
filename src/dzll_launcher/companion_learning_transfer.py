@@ -59,7 +59,7 @@ SERVER_FIELDS = frozenset({
     "normal_evidence_ledger", "high_evidence_ledger", "authority_candidates",
     "challenger_contexts", "regimes", "authority_decisions",
     "prior_authority_decision_id", "authority_decision", "consumer_state",
-    "migration_audit", "reason_codes",
+    "migration_audit", "reason_codes", "learned_state",
 })
 
 

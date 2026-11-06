@@ -9,6 +9,10 @@ Two comparisons, synthetic data only:
   learned state and the bounded schema-3 horizon only), reopening its JSON
   state at every step, against the full-history raw authority.
 
+Since Retention R4 the compact runs also prune folded raw evidence (the
+production default), so the per-rebuild comparisons below compare pruned
+compact records with full-history raw records.
+
 No runtime, profile or learning file is touched.
 """
 
@@ -208,6 +212,8 @@ def test_compact_authority_matches_raw_at_every_rebuild(name, monkeypatch):
         assert len(schema4.learned_state_ring_events(right, schema4.persisted_learned_state(right))) <= (
             learned.RECENT_RING_CAPACITY
         )
+        assert len(right["physical_events"]) <= schema4.RAW_EVENT_RETENTION_LIMIT
+        assert right["cadence_streaks"] == []
 
 
 @pytest.mark.parametrize("name", ["long_chain", "sparse_with_anomalies", "schedule_change", "stage6_recovery"])

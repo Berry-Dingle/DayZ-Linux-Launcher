@@ -122,15 +122,27 @@ SCHEMA4_APPLY_APPROVAL_TOKEN = "APPLY-SCHEMA4-PREPARED-STATE"
 # horizon (`_serialize_server` keeps samples on its latest 12 events).
 SCHEMA4_EVIDENCE_SAMPLE_EVENT_LIMIT = 12
 # Retention R2: every authoritative rebuild maintains the compact per-server
-# learned state (folded knowledge plus the bounded ring definition).  The
-# authority still evaluates the persisted raw collections; the compact state
-# is maintained alongside them so it is complete before raw history is pruned.
+# learned state (folded knowledge plus the bounded ring definition).
 LEARNED_STATE_PERSISTENCE_ENABLED = True
-# Retention R3: evaluate authority from the compact learned state plus the
-# bounded ring instead of the lifetime raw collections.  Off: the live
-# authority keeps evaluating raw history (see the R3 report for the reasons).
-COMPACT_AUTHORITY_ENABLED = False
+# Retention R3/R4: evaluate authority from the compact learned state plus the
+# bounded ring instead of the lifetime raw collections.  R4 enables it and,
+# with it, prunes folded raw evidence after every successful rebuild
+# (``prune_folded_raw_evidence``).  There is no automatic fallback to raw
+# history: a pruned record whose learned state is unusable is rejected.
+COMPACT_AUTHORITY_ENABLED = True
 LEARNED_STATE_REBUILT_REASON = "learned_state_rebuilt_from_persisted_history"
+# A record carrying this reason code has had folded raw evidence removed: its
+# learned state is the only copy of that knowledge and cannot be rebuilt.
+RAW_EVIDENCE_PRUNED_REASON = "raw_evidence_pruned_to_compact_ring"
+FOLDED_REFERENCE_CLEARED_REASON = "folded_evidence_reference_cleared"
+# Retention R4 raw-evidence bound: physical events per server, including the
+# open chain's anchor (the approved 80-event ring).
+RAW_EVENT_RETENTION_LIMIT = 80
+# Unfolded expected-window records are normally folded once a later restart
+# folds.  Without restarts (a schedule that stopped) they would accumulate,
+# so beyond this many unfolded records the oldest settled ones are folded.
+EXPECTED_WINDOW_RETENTION_LIMIT = 240
+EXPECTED_WINDOW_FOLD_SETTLE_SECONDS = 24 * 3600
 
 
 class Schema4Error(ValueError):
@@ -1409,6 +1421,10 @@ def rebuild_schema4_server_record(
         learned_state = advance_learned_state_after_decision(
             learned_state, decision=decision, windows=windows_ledger
         )
+        if COMPACT_AUTHORITY_ENABLED:
+            learned_state = fold_expected_window_overflow(
+                learned_state, windows_ledger, now=updated_at
+            )
         from .companion_restart_phase2_learned_state import learned_state_to_mapping
 
         fresh["learned_state"] = learned_state_to_mapping(learned_state)
@@ -1475,6 +1491,21 @@ def rebuild_schema4_server_record(
         "runtime_decision_id": decision.decision_id,
     })
     fresh["migration_audit"] = audit
+    if COMPACT_AUTHORITY_ENABLED and learned_state is not None:
+        # Retention R4: the learned state above already holds everything
+        # folded (it is persisted in this same record), so folded raw
+        # evidence is removed only now, after the decision and the compact
+        # update succeeded, and the record is validated as a whole below.
+        fresh.update(
+            prune_folded_raw_evidence(
+                fresh,
+                learned_state,
+                fresh_span_ids=fresh_span_ids,
+                fresh_chain_ids=fresh_chain_ids,
+                fresh_episode_ids=fresh_episode_ids,
+                sample_event_ids=schema3_sample_horizon_event_ids(schema3_record),
+            )
+        )
     issues = _validate_server_record(server_key, fresh)
     if issues:
         raise Schema4ValidationError(
@@ -1503,8 +1534,10 @@ def advance_learned_state_before_decision(
     resolution from the schema-3 recent window (only a clean window that
     starts after the divisor floor).  The authority then evaluates.
 
-    A missing state is built from the persisted history, which is still
-    retained at this stage; an unreadable one is rebuilt the same way.
+    A missing state of an unpruned record (schema-3 migration, or a record
+    written before R4) is built from its complete persisted history; an
+    unreadable one is rebuilt the same way.  A pruned record no longer holds
+    that history, so a missing or unreadable state is a validation error.
     Returns ``(state, rebuilt_from_invalid)``.
     """
 
@@ -1521,6 +1554,13 @@ def advance_learned_state_before_decision(
         if state is not None and state.server_key != server_key:
             state = None
         rebuilt = state is None
+    if state is None and _raw_evidence_pruned(existing_record):
+        # Folded raw evidence is gone: rebuilding from the ring alone would
+        # silently forget learned history.  Refuse instead of guessing.
+        raise Schema4ValidationError(
+            f"learned state of pruned schema-4 server {server_key} is missing or "
+            "unreadable and cannot be reconstructed from the retained ring"
+        )
     if state is None:
         state = learned.empty_learned_state(server_key)
     if prior is not None:
@@ -1621,6 +1661,226 @@ def learned_state_ring_events(
     from .companion_restart_phase2_learned_state import plan_ring_folding
 
     return plan_ring_folding(state, persisted_physical_events(record)).ring
+
+
+def _raw_evidence_pruned(record: Mapping[str, object]) -> bool:
+    reasons = record.get("reason_codes") if isinstance(record, Mapping) else None
+    return isinstance(reasons, (list, tuple)) and RAW_EVIDENCE_PRUNED_REASON in reasons
+
+
+def fold_expected_window_overflow(
+    state,
+    windows: Iterable[ExpectedWindowLedgerRecord],
+    *,
+    now: float,
+    limit: int = EXPECTED_WINDOW_RETENTION_LIMIT,
+    settle_seconds: float = EXPECTED_WINDOW_FOLD_SETTLE_SECONDS,
+):
+    """Fold the oldest unfolded expected windows beyond ``limit`` records.
+
+    Windows normally fold when a later restart folds.  Only when that does
+    not happen (no restarts, so windows keep accumulating) are the oldest
+    windows that ended at least ``settle_seconds`` ago folded, whole window
+    end times at a time, until at most ``limit`` unfolded records remain.
+    Folded windows are evaluated conservatively (any possibly in-phase
+    genuine miss keeps counting; folded hits count only when wholly aligned)
+    and a later revision of a folded window is ignored, which can only keep a
+    miss counting.
+    """
+
+    from .companion_restart_phase2_learned_state import fold_windows
+
+    mark = state.watermark.window_end_at
+    unfolded = [
+        item
+        for item in windows
+        if item.server_key == state.server_key
+        and (mark is None or item.window_end_at > mark)
+    ]
+    if len(unfolded) <= limit:
+        return state
+    settled_before = float(now) - float(settle_seconds)
+    remaining = len(unfolded)
+    cutoff = None
+    for end in sorted({item.window_end_at for item in unfolded}):
+        if remaining <= limit or end > settled_before:
+            break
+        remaining -= sum(1 for item in unfolded if item.window_end_at == end)
+        cutoff = end
+    if cutoff is None:
+        return state
+    return fold_windows(state, [item for item in unfolded if item.window_end_at <= cutoff])
+
+
+def prune_folded_raw_evidence(
+    record: Mapping[str, object],
+    state,
+    *,
+    fresh_span_ids: Iterable[str] = (),
+    fresh_chain_ids: Iterable[str] = (),
+    fresh_episode_ids: Iterable[str] = (),
+    sample_event_ids: Iterable[str] = (),
+    capacity: int = RAW_EVENT_RETENTION_LIMIT,
+) -> dict:
+    """Reduce a rebuilt record's raw evidence to what the compact path reads.
+
+    ``state`` must be the learned state persisted in the same record: every
+    removed item is already folded into it (or can never be folded, see
+    below), so nothing is deleted before its learning information is held
+    compactly.  Retained:
+
+    * physical events: the ring (unfolded restarts plus the open chain's
+      anchor, at most ``capacity``), plus unfolded events without a schedule
+      phase in any remaining capacity (they never carry learning evidence);
+    * relationships: exactly the compact authority's unfolded set (high and
+      full-interval relationships until their right endpoint folds, normal
+      ones until their left endpoint folds).  A relationship whose left
+      endpoint folded before it (other than the anchor) is never folded by
+      ``fold_unit`` either, so dropping it loses nothing;
+    * expected windows: lineages not yet folded (ending after the window
+      watermark), with their ancestors;
+    * no cadence streaks: the compact path derives streaks from the ring's
+      relationships and the learned state's streak summaries;
+    * continuity chains, spans and episode evidence: the current schema-3
+      projection plus the reference closure of the retained objects.
+
+    References from retained objects to removed evidence are cleared: regime
+    defining evidence, a retained window's qualifying event or outage
+    reference, and generic-recovery alert records of removed events (such an
+    event can never again be the live recovery event; the runtime also
+    refuses to reserve one).  Scheduled-warning records are keyed by regime
+    and occurrence and are untouched.  Returns replacement fields.
+    """
+
+    from .companion_restart_phase2_learned_state import compact_authority_inputs
+
+    events = persisted_physical_events(record)
+    relationships = persisted_interval_relationships(record)
+    windows = persisted_expected_window_ledger(record)
+    inputs = compact_authority_inputs(state, events, relationships, windows)
+    keep_events = {item.event_id for item in inputs.ring_events}
+    if len(keep_events) > capacity:
+        raise Schema4ValidationError("compact ring exceeds the raw event retention limit")
+    folded_at = state.watermark.at
+    phaseless = sorted(
+        (
+            item
+            for item in events
+            if item.canonical_phase_at is None
+            and item.event_id not in keep_events
+            and (folded_at is None or item.finalized_at > folded_at)
+        ),
+        key=lambda item: (item.finalized_at, item.event_id),
+        reverse=True,
+    )
+    keep_events.update(item.event_id for item in phaseless[: capacity - len(keep_events)])
+    keep_relationships = {
+        item.relationship_id
+        for item in inputs.ring_relationships
+        if all(
+            ref in keep_events
+            for ref in (item.left_event_id, item.right_event_id, *item.intervening_event_ids)
+        )
+    }
+    by_window = {item.result_id: item for item in windows}
+    keep_windows: set[str] = set()
+    for item in inputs.ring_windows:
+        cursor = item
+        while cursor is not None and cursor.result_id not in keep_windows:
+            keep_windows.add(cursor.result_id)
+            parent = cursor.supersedes_result_id
+            cursor = by_window.get(parent) if parent is not None else None
+
+    def kept(name: str, field: str, wanted: set[str]) -> list[dict]:
+        return [
+            copy.deepcopy(dict(item))
+            for item in record.get(name, ())
+            if isinstance(item, Mapping) and item.get(field) in wanted
+        ]
+
+    result: dict[str, object] = {
+        "physical_events": kept("physical_events", "event_id", keep_events),
+        "interval_relationships": kept(
+            "interval_relationships", "relationship_id", keep_relationships
+        ),
+        "cadence_streaks": [],
+        "expected_window_results": kept("expected_window_results", "result_id", keep_windows),
+    }
+    result.update(
+        retain_schema4_evidence(
+            {**record, **result},
+            fresh_span_ids=fresh_span_ids,
+            fresh_chain_ids=fresh_chain_ids,
+            fresh_episode_ids=fresh_episode_ids,
+            sample_event_ids=sample_event_ids,
+        )
+    )
+    merged = {**record, **result}
+    span_ids = _collection_ids(merged.get("continuity_spans"), "reference_id")
+    episode_ids = _collection_ids(merged.get("expected_window_episode_evidence"), "evidence_id")
+    cleared = False
+    for window in result["expected_window_results"]:
+        qualifying = window.get("qualifying_finalized_event_id")
+        refs = list(window.get("overlapping_outage_episode_ids", ()))
+        live_refs = [ref for ref in refs if ref in keep_events | span_ids | episode_ids]
+        if (qualifying is not None and qualifying not in keep_events) or live_refs != refs:
+            if qualifying is not None and qualifying not in keep_events:
+                window["qualifying_finalized_event_id"] = None
+            window["overlapping_outage_episode_ids"] = live_refs
+            window["reason_codes"] = sorted(
+                set(window.get("reason_codes", ())) | {FOLDED_REFERENCE_CLEARED_REASON}
+            )
+            cleared = True
+    evidence = keep_events | keep_relationships | keep_windows
+    regimes = []
+    for item in record.get("regimes", ()):
+        regime = copy.deepcopy(dict(item))
+        defining = list(regime.get("defining_evidence_ids", ()))
+        retained = [ref for ref in defining if ref in evidence]
+        if retained != defining:
+            regime["defining_evidence_ids"] = retained
+            cleared = True
+        regimes.append(regime)
+    result["regimes"] = regimes
+    consumer = record.get("consumer_state")
+    if isinstance(consumer, Mapping):
+        consumer = copy.deepcopy(dict(consumer))
+        alerts = [item for item in consumer.get("alert_records", ()) if isinstance(item, Mapping)]
+        dropped = {
+            item.get("record_id")
+            for item in alerts
+            if item.get("namespace") == AuthoritySuppressionKind.GENERIC_RECOVERY.value
+            and item.get("physical_event_id") not in keep_events
+        }
+        changed = True
+        while changed:
+            changed = False
+            for item in alerts:
+                if (
+                    item.get("record_id") not in dropped
+                    and item.get("supersedes_record_id") in dropped
+                ):
+                    dropped.add(item.get("record_id"))
+                    changed = True
+        if dropped:
+            consumer["alert_records"] = [
+                item for item in alerts if item.get("record_id") not in dropped
+            ]
+            meta = dict(consumer.get("compaction_metadata") or {})
+            meta["compacted_record_count"] = int(meta.get("compacted_record_count", 0)) + len(
+                dropped
+            )
+            consumer["compaction_metadata"] = meta
+            consumer["reason_codes"] = sorted(
+                set(consumer.get("reason_codes", ()))
+                | {"generic_recovery_records_of_folded_events_pruned"}
+            )
+        result["consumer_state"] = consumer
+    reasons = set(record.get("reason_codes", ())) | {RAW_EVIDENCE_PRUNED_REASON}
+    if cleared:
+        reasons.add(FOLDED_REFERENCE_CLEARED_REASON)
+    result["reason_codes"] = sorted(reasons)
+    return result
 
 
 def schema3_sample_horizon_event_ids(
@@ -2505,6 +2765,19 @@ def _validate_server_record(server_key: str, record: object) -> list[Schema4Vali
                 add("learned_state_server_mismatch", "learned state belongs to another server")
         except LearnedStateError as exc:
             add("invalid_learned_state", str(exc))
+    if _raw_evidence_pruned(record):
+        if record.get("learned_state") is None:
+            add(
+                "learned_state_missing_after_pruning",
+                "pruned record has no learned state holding its folded evidence",
+            )
+        if isinstance(record.get("physical_events"), list) and (
+            len(record["physical_events"]) > RAW_EVENT_RETENTION_LIMIT
+        ):
+            add(
+                "raw_event_retention_exceeded",
+                f"pruned record retains {len(record['physical_events'])} physical events",
+            )
     consumer_errors = validate_consumer_state(
         record.get("consumer_state"),
         server_key=server_key,

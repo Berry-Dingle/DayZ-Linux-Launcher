@@ -14,6 +14,7 @@ from typing import Callable, Mapping
 from .companion_restart_phase2_authority_consumers import (
     AuthorityConsumerDecision,
     AuthoritySuppressionKey,
+    AuthoritySuppressionKind,
 )
 from .companion_restart_phase2_consumer_state import (
     AlertActionOutcome,
@@ -400,6 +401,21 @@ class AuthoritativeSchema4Runtime:
             record = self._state.get("servers", {}).get(decision.server_key)
             if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
                 raise Schema4ValidationError("consumer server is unavailable or quarantined")
+            if key.kind is AuthoritySuppressionKind.GENERIC_RECOVERY and key.event_id not in {
+                item.get("event_id")
+                for item in record.get("physical_events", ())
+                if isinstance(item, Mapping)
+            }:
+                # Retention R4: an event outside the retained ring was folded
+                # and its recovery records pruned; it can never be a live
+                # recovery event again, so it is never alertable again.
+                return ConsumerAlertReservation(
+                    False,
+                    key,
+                    None,
+                    None,
+                    ("generic_recovery_event_not_retained", "at_most_once_delivery"),
+                )
             ledger = consumer_ledger_from_mapping(
                 record.get("consumer_state"), server_key=decision.server_key
             )

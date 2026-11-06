@@ -6,6 +6,12 @@ The persisted ``learned_state`` plus its bounded ring is then evaluated with
 the compact evaluators and compared with the raw-history authority decision
 that the same rebuild produced.  Old raw evidence is removed from synthetic
 fixtures only.  No runtime, profile or learning file is touched.
+
+Since Retention R4 the production default is compact authority with folded
+raw evidence pruned.  This module checks learned-state maintenance against
+the raw-history authority, so every test here runs the R2 configuration
+(raw authority, nothing pruned); R4 behaviour is tested in
+``test_companion_restart_compact_cutover``.
 """
 
 from __future__ import annotations
@@ -29,6 +35,11 @@ HOUR = scoring.HOUR
 P3 = 3 * HOUR
 P4 = 4 * HOUR
 Outcome = s8.Outcome
+
+
+@pytest.fixture(autouse=True)
+def _raw_authority_reference(monkeypatch):
+    monkeypatch.setattr(schema4, "COMPACT_AUTHORITY_ENABLED", False)
 
 
 # --------------------------------------------------------------------------
