@@ -12,6 +12,7 @@ from .companion_restart_phase2_continuity import (
     CadenceStreak,
     IntervalRelationship,
     RelationshipKind,
+    relationship_endpoint_outcome_eligible,
 )
 from .companion_restart_phase2_detection import EventOutcome, PhysicalRestartEvent
 from .companion_restart_phase2_expected_windows import (
@@ -100,6 +101,17 @@ SPARSE_ESTABLISHMENT_REASON = "unknown_server_established_by_sparse_evidence"
 # remaining uncertainty.
 SPARSE_CONFIRMATION_INTERVAL_WEIGHT = 0.75
 SPARSE_CONFIRMATION_REASON = "sparse_regime_confirmed_by_full_interval"
+# Stage 8.7 recoverable off-phase anomaly: a single isolated off-phase restart
+# leaves the sparse consistency denominator once the original period and
+# phase have been re-observed (``_recovered_isolated_anomaly``).  The restart
+# itself is kept as evidence and in every off-phase diagnostic.
+SPARSE_ANOMALY_RECOVERED_REASON = "sparse_isolated_off_phase_anomaly_recovered"
+# Stage 8.7 two-interval establishment against substantial conflicting
+# sparse evidence: the streak stays provisional (LIKELY) until one further
+# independent genuine restart confirms its period and phase.
+TWO_INTERVAL_SPARSE_CONFLICT_REASON = (
+    "two_interval_establishment_awaits_confirmation_against_sparse_conflict"
+)
 # A full interval that is not high-eligible (query-visible endpoints) may still
 # confirm a sparse-established regime when its only high-ineligibility is the
 # endpoint evidence class; continuity, coverage, query health, identity,
@@ -333,9 +345,11 @@ def evaluate_authority(
 
     if not isinstance(server_key, str) or not server_key:
         raise ValueError("server_key must be a non-empty string")
-    relationship_values = _unique_relationships(relationships, server_key)
-    streak_values = _unique_streaks(streaks, server_key)
     event_values = _unique_events(events, server_key)
+    relationship_values = _endpoint_eligible_relationships(
+        _unique_relationships(relationships, server_key), event_values
+    )
+    streak_values = _unique_streaks(streaks, server_key)
     window_values = _latest_window_records(expected_window_ledger, server_key)
     sparse = _sparse_evidence(event_values, prior_decision)
     candidates, normal_ledger, high_ledger = _build_ledgers(
@@ -418,6 +432,7 @@ class _SparseSupport:
     aligned: tuple[PhysicalRestartEvent, ...]
     effective: float
     quality_band: float
+    tolerated_anomaly_id: str | None = None
 
 
 def _long_horizon_sparse_confidence(
@@ -451,7 +466,8 @@ def _sparse_support(
     restart is counted in both the continuous and the sparse slot.  Gaps
     are never interpreted (no relationships, no inferred restarts), so
     observations days apart remain independent evidence.  Consistency is
-    measured over the restarts from the first aligned one onwards.
+    measured over the restarts from the first aligned one onwards, except a
+    single recovered, isolated off-phase anomaly (Stage 8.7).
     """
 
     historical: set[str] = set()
@@ -476,8 +492,18 @@ def _sparse_support(
         return _SparseSupport(0.0, (), 0.0, 0.0)
     first = min(_event_at(item) for item in aligned)
     effective = sum(_event_weight(item) for item in aligned)
+    domain = tuple(item for item in pool if _event_at(item) >= first)
+    anomaly = _recovered_isolated_anomaly(
+        period=period,
+        phase_offset=phase_offset,
+        sparse=sparse,
+        domain=domain,
+        historical=historical,
+    )
     total = sum(
-        _event_weight(item) for item in pool if _event_at(item) >= first
+        _event_weight(item)
+        for item in domain
+        if anomaly is None or item.event_id != anomaly.event_id
     )
     mad = statistics.median(
         max(
@@ -493,8 +519,81 @@ def _sparse_support(
         * (effective / total if total > 0 else 0.0)
     )
     return _SparseSupport(
-        round(min(1.0, max(0.0, value)), 6), aligned, effective, band
+        round(min(1.0, max(0.0, value)), 6),
+        aligned,
+        effective,
+        band,
+        anomaly.event_id if anomaly is not None else None,
     )
+
+
+def _sparse_off_phase(
+    item: PhysicalRestartEvent, *, period: int, phase_offset: float
+) -> bool:
+    return (
+        abs(_signed_phase_residual(_event_at(item), phase_offset, period))
+        > _event_tolerance(period, item)
+    )
+
+
+def _recovered_isolated_anomaly(
+    *,
+    period: int,
+    phase_offset: float,
+    sparse: _SparseEvidence,
+    domain: tuple[PhysicalRestartEvent, ...],
+    historical: set[str],
+) -> PhysicalRestartEvent | None:
+    """Stage 8.7: the one off-phase restart tolerated as a recovered anomaly.
+
+    An off-phase restart in the consistency domain stays in the evidence (and
+    in every off-phase diagnostic); it only leaves the consistency
+    denominator when all of these hold:
+
+    * it is the only off-phase restart in the domain.  Two or more are a
+      persistent contradiction (the schema-3 off-grid change-evidence
+      threshold), so none of them is tolerated;
+    * it is isolated: no other off-phase restart anywhere in the horizon is
+      phase-coherent with it at any candidate period (coherent off-phase
+      restarts are a possible alternative schedule and remain contradiction);
+    * the original period and phase have since recovered: at least
+      ``ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS`` distinct aligned restarts
+      were observed strictly after it (the Stage 6 recovery count).  Gaps
+      are never interpreted, so only observed restarts count.
+
+    Until it has recovered, the anomaly lowers consistency as before.
+    """
+
+    off_phase = tuple(
+        item
+        for item in domain
+        if _sparse_off_phase(item, period=period, phase_offset=phase_offset)
+    )
+    if len(off_phase) != 1:
+        return None
+    (anomaly,) = off_phase
+    anomaly_at = _event_at(anomaly)
+    for item in sparse.events:
+        if item.event_id == anomaly.event_id or not _sparse_off_phase(
+            item, period=period, phase_offset=phase_offset
+        ):
+            continue
+        if any(
+            abs(_signed_phase_residual(_event_at(item), anomaly_at, other))
+            <= max(_event_tolerance(other, item), _event_tolerance(other, anomaly))
+            for other in CANDIDATE_PERIODS
+        ):
+            return None
+    confirmations = sum(
+        1
+        for item in sparse.events
+        if item.event_id not in historical
+        and _event_at(item) > anomaly_at
+        and not _sparse_off_phase(item, period=period, phase_offset=phase_offset)
+    )
+    if confirmations < ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS:
+        return None
+    return anomaly
 
 
 def _sparse_structure_reasons(
@@ -996,7 +1095,12 @@ def _sparse_reason_codes(normal: NormalCandidateEvidence) -> tuple[str, ...]:
     return tuple(
         item
         for item in normal.reason_codes
-        if item in {SPARSE_STRUCTURE_REASON, SPARSE_PERIOD_AMBIGUOUS_REASON}
+        if item
+        in {
+            SPARSE_STRUCTURE_REASON,
+            SPARSE_PERIOD_AMBIGUOUS_REASON,
+            SPARSE_ANOMALY_RECOVERED_REASON,
+        }
     )
 
 
@@ -1103,6 +1207,11 @@ def _normal_candidate_evidence(
             "off_phase_spacing_not_incumbent_reinforcement",
             LONG_HORIZON_SPARSE_REASON,
             *sparse_reasons,
+            *(
+                (SPARSE_ANOMALY_RECOVERED_REASON,)
+                if support.tolerated_anomaly_id is not None
+                else ()
+            ),
         ),
     )
 
@@ -1394,7 +1503,21 @@ def _acquisition_decision(
                 candidates=candidates, windows=windows, events=events
             ),
         )
-        if streak is not None:
+        conflict_pending = bool(
+            streak is not None
+            and sparse is not None
+            and _two_interval_sparse_conflict_pending(
+                selected_candidate,
+                streak=streak,
+                candidates=candidates,
+                normal_score=normal_score,
+                windows=windows,
+                relationship_map=relationship_map,
+                events=events,
+                sparse=sparse,
+            )
+        )
+        if streak is not None and not conflict_pending:
             return selected_decision(
                 state=RegimeState.ESTABLISHED,
                 selected=regime_for(
@@ -1413,7 +1536,10 @@ def _acquisition_decision(
             selected=regime_for(selected_candidate, status=RegimeRecordStatus.LIKELY),
             selected_candidate=selected_candidate,
             usable=False,
-            reasons=("unknown_server_likely_by_h2",),
+            reasons=(
+                "unknown_server_likely_by_h2",
+                *((TWO_INTERVAL_SPARSE_CONFLICT_REASON,) if conflict_pending else ()),
+            ),
         )
 
     if sparse_choice is not None:
@@ -1570,6 +1696,128 @@ def _two_interval_establishing_streak(
     ):
         return None
     return streak
+
+
+def _two_interval_sparse_conflict_pending(
+    candidate: AuthorityCandidate,
+    *,
+    streak: CadenceStreak,
+    candidates: tuple[AuthorityCandidate, ...],
+    normal_score: ScheduleScore,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    events: tuple[PhysicalRestartEvent, ...],
+    sparse: _SparseEvidence,
+) -> bool:
+    """Stage 8.7: a two-interval streak against substantial sparse conflict.
+
+    The conflict is substantial when a conflicting candidate (another
+    period, or a phase outside tolerance) is credible sparse evidence in its
+    own right, measured without the streak's restarts: it meets the existing
+    sparse establishment structure (SE1-SE5: count, span, phase precision,
+    period refutation and no harmonic blocker, so weak or ambiguous evidence
+    never qualifies) and has no active in-phase genuine miss since its first
+    aligned restart (SE6).  This is the competitor test the sparse gate
+    itself applies, mirrored.
+
+    The streak is then still provisional until one more independent genuine
+    restart confirms its period and phase: a third consecutive interval, or
+    an authentic restart observed after the streak, aligned with its phase,
+    that is physically distinct from every streak endpoint.  Restarts are
+    never inferred across unobserved gaps.
+    """
+
+    endpoint_ids = frozenset(
+        value
+        for identity in streak.relationship_ids
+        if identity in relationship_map
+        for value in (
+            relationship_map[identity].left_event_id,
+            relationship_map[identity].right_event_id,
+        )
+    )
+    if not _substantial_sparse_conflict(
+        candidate,
+        excluded_event_ids=endpoint_ids,
+        candidates=candidates,
+        normal_score=normal_score,
+        windows=windows,
+        relationship_map=relationship_map,
+        sparse=sparse,
+    ):
+        return False
+    if streak.interval_count >= 3:
+        return False
+    period = candidate.candidate_period_seconds
+    endpoint_times = tuple(
+        _event_at(item)
+        for item in events
+        if item.event_id in endpoint_ids and _event_at(item) is not None
+    )
+    for item in events:
+        when = _event_at(item)
+        if (
+            item.event_id in endpoint_ids
+            or when is None
+            or when <= streak.end_at
+            or not _authentic_event(item)
+            or _event_weight(item) <= 0
+            or _sparse_off_phase(item, period=period, phase_offset=candidate.phase_offset)
+        ):
+            continue
+        tolerance = _event_tolerance(period, item)
+        if all(abs(when - value) > tolerance for value in endpoint_times):
+            return False
+    return True
+
+
+def _substantial_sparse_conflict(
+    candidate: AuthorityCandidate,
+    *,
+    excluded_event_ids: frozenset[str],
+    candidates: tuple[AuthorityCandidate, ...],
+    normal_score: ScheduleScore,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    sparse: _SparseEvidence,
+) -> bool:
+    for item in candidates:
+        if item.candidate_id == candidate.candidate_id or not _candidates_conflict(
+            item, candidate
+        ):
+            continue
+        period = item.candidate_period_seconds
+        support = _sparse_support(
+            period=period,
+            phase_offset=item.phase_offset,
+            sparse=sparse,
+            excluded_event_ids=excluded_event_ids
+            | _relationship_endpoint_ids(
+                relationship_map[value]
+                for value in item.high_relationship_ids
+                if value in relationship_map
+            ),
+        )
+        if not support.aligned or SPARSE_STRUCTURE_REASON not in _sparse_structure_reasons(
+            period=period,
+            support=support,
+            normal_candidate=normal_score.candidate(period),
+            windows=windows,
+        ):
+            continue
+        first = min(_event_at(value) for value in support.aligned)
+        if any(
+            window.outcome is ExpectedWindowOutcome.GENUINE_MISS
+            and window.negative_penalty_active
+            and window.candidate_period_seconds == period
+            and window.expected_at >= first
+            and _circular_distance(window.expected_phase_offset, item.phase_offset, period)
+            <= item.phase_tolerance
+            for window in windows
+        ):
+            continue
+        return True
+    return False
 
 
 def _continuity_upgrade_qualifies(
@@ -3083,6 +3331,35 @@ def _unique_relationships(
                 item.candidate_period_seconds,
                 item.relationship_id,
             ),
+        )
+    )
+
+
+def _endpoint_eligible_relationships(
+    relationships: tuple[IntervalRelationship, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+) -> tuple[IntervalRelationship, ...]:
+    """Stage 8.7: ignore relationships whose endpoint is a non-authentic outcome.
+
+    Extraction no longer creates them, but schema-4 relationships are
+    immutable by ID and unioned on rebuild, so legacy persisted records
+    (created before Stages 8.6/8.7) may still name an unconfirmed drain,
+    uncertain A2S interruption, service interruption, incomplete or expired
+    episode as an endpoint.  They stay persisted as diagnostics; authority
+    simply never reads them as normal interval or challenger evidence.  Such
+    relationships can never be high-eligible (endpoint class), so high
+    evidence and streaks are unaffected.  The intervening-episode blocking
+    of other relationships is carried on those relationships and unchanged.
+    """
+
+    event_by_id = {item.event_id: item for item in events}
+    return tuple(
+        item
+        for item in relationships
+        if all(
+            event_by_id.get(value) is None
+            or relationship_endpoint_outcome_eligible(event_by_id[value])
+            for value in (item.left_event_id, item.right_event_id)
         )
     )
 

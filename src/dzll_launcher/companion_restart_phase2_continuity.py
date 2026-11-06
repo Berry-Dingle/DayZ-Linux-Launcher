@@ -581,7 +581,7 @@ def extract_interval_relationships(
         if (
             not event_learning_eligible(left)
             or _schedule_neutral_attribution_anomaly(left)
-            or _unconfirmed_drain(left)
+            or not relationship_endpoint_outcome_eligible(left)
         ):
             continue
         left_at = _event_at(left)
@@ -593,7 +593,7 @@ def extract_interval_relationships(
             if (
                 not event_learning_eligible(right)
                 or _schedule_neutral_attribution_anomaly(right)
-                or _unconfirmed_drain(right)
+                or not relationship_endpoint_outcome_eligible(right)
             ):
                 continue
             right_at = _event_at(right)
@@ -1252,14 +1252,28 @@ def _authentic_physical_event(event: PhysicalRestartEvent) -> bool:
     }
 
 
-def _unconfirmed_drain(event: PhysicalRestartEvent) -> bool:
-    """Stage 8.6: an unconfirmed player drain is never a relationship endpoint.
+NON_AUTHENTIC_ENDPOINT_OUTCOMES = frozenset(
+    {
+        EventOutcome.AMBIGUOUS_DRAIN,
+        EventOutcome.UNCERTAIN_A2S_INTERRUPTION,
+        EventOutcome.SERVICE_INTERRUPTION,
+        EventOutcome.INCOMPLETE,
+        EventOutcome.EXPIRED,
+    }
+)
 
-    It remains in the event sequence, so it still blocks any interval that
-    spans it as an unobservable intervening episode (neutral blocking).
+
+def relationship_endpoint_outcome_eligible(event: PhysicalRestartEvent) -> bool:
+    """Whether an event's outcome may be an interval relationship endpoint.
+
+    Stage 8.6 excluded unconfirmed player drains; Stage 8.7 extends this to
+    every non-authentic outcome (uncertain A2S interruptions, service
+    interruptions, incomplete and expired episodes).  Such events remain in
+    the event sequence and in diagnostics, so they still block any interval
+    that spans them exactly as before (neutral blocking).
     """
 
-    return event.outcome is EventOutcome.AMBIGUOUS_DRAIN
+    return event.outcome not in NON_AUTHENTIC_ENDPOINT_OUTCOMES
 
 
 def _schedule_neutral_attribution_anomaly(event: PhysicalRestartEvent) -> bool:
