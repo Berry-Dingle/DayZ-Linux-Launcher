@@ -513,11 +513,17 @@ def test_spotty_aligned_normal_evidence_only_refines_remaining_uncertainty():
     expected = round(scoring._event_count_cap(6.4), 6)
     assert updated.high_authority == original.high_authority
     assert updated.aligned_normal_confidence == expected
+    # Stage 8.5: sparse ceiling S = 0.84; sparse evidence still fills only
+    # the remaining uncertainty and never changes high authority.
+    ceiling = authority.SPARSE_EVIDENCE_CEILING
     assert updated.combined_confidence == pytest.approx(
-        original.high_authority + (1 - original.high_authority) * 0.10 * expected,
+        original.high_authority + (1 - original.high_authority) * ceiling * expected,
         abs=1e-6,
     )
-    assert updated.combined_confidence - updated.high_authority <= 0.10
+    assert (
+        updated.combined_confidence - updated.high_authority
+        <= ceiling * (1 - updated.high_authority) + 1e-6
+    )
 
 
 def test_schema3_recent_window_scores_no_longer_feed_sparse_magnitude():

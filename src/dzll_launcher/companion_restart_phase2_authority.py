@@ -20,6 +20,7 @@ from .companion_restart_phase2_expected_windows import (
 )
 from .companion_restart_phase2_scoring import (
     CANDIDATE_PERIODS,
+    GATES as SCHEDULE_GATES,
     PHASE_UNCERTAINTY_CAP,
     CandidateScore,
     ScheduleScore,
@@ -74,8 +75,42 @@ TWO_INTERVAL_ESTABLISHMENT_REASON = "unknown_server_established_by_two_interval_
 # Persistent marker on a regime whose origin was upgraded NORMAL -> CONTINUITY.
 ORIGIN_UPGRADE_REASON = "normal_origin_upgraded_to_continuity"
 # Stage 8.3 long-horizon sparse evidence (the ``aligned_normal`` input of the
-# unchanged combined formula; its 0.10 ceiling is unchanged).
+# unchanged combined formula).
 LONG_HORIZON_SPARSE_REASON = "long_horizon_per_event_sparse_statistic_v1"
+# Stage 8.5 sparse ceiling S in ``combined = 1 - (1 - high)(1 - S * a)``.  It is
+# the smallest two-decimal value for which eight strong, consistent sparse
+# restarts (a = event-count cap 0.95, saturated) reach the displayed 80 %
+# milestone: 0.84 * 0.95 = 0.798.  Sparse evidence alone can never exceed
+# 0.798, so it never reaches the 95 % (strong confirmation) milestone.
+SPARSE_EVIDENCE_CEILING = 0.84
+# Stage 8.5 sparse establishment (initial acquisition only, D8-7).
+SPARSE_ESTABLISHMENT_MINIMUM_PERCENT = 80
+SPARSE_PHASE_CONFIDENCE_MINIMUM = 0.85
+SPARSE_PHASE_QUALITY_BAND_MINIMUM = 0.9
+SPARSE_COMPETITOR_MARGIN = 0.05
+SPARSE_STRUCTURE_REASON = "sparse_establishment_structure_satisfied"
+SPARSE_PERIOD_AMBIGUOUS_REASON = "sparse_period_or_harmonic_ambiguity_unresolved"
+# Persistent marker on a regime (and its acquisition decision) established
+# from sparse evidence.
+SPARSE_ESTABLISHMENT_REASON = "unknown_server_established_by_sparse_evidence"
+# Stage 8.5 strong confirmation of a sparse-established regime.  A fully
+# observed matching interval that was not establishment evidence carries the
+# weight the continuous path gives the interval that extends an established
+# two-interval streak to three: authority 0.80 -> 0.95 removes 75 % of the
+# remaining uncertainty.
+SPARSE_CONFIRMATION_INTERVAL_WEIGHT = 0.75
+SPARSE_CONFIRMATION_REASON = "sparse_regime_confirmed_by_full_interval"
+# A full interval that is not high-eligible (query-visible endpoints) may still
+# confirm a sparse-established regime when its only high-ineligibility is the
+# endpoint evidence class; continuity, coverage, query health, identity,
+# residual and intervening-episode requirements all still apply.
+_FULL_INTERVAL_PERMITTED_HIGH_INELIGIBILITY = frozenset(
+    {
+        "high_ineligible_endpoint_class",
+        "high_ineligible_direct_outage_contract",
+        "high_ineligible_authenticity",
+    }
+)
 
 
 class AuthorityGate(str, Enum):
@@ -377,6 +412,14 @@ def _sparse_evidence(
     )
 
 
+@dataclass(frozen=True)
+class _SparseSupport:
+    value: float
+    aligned: tuple[PhysicalRestartEvent, ...]
+    effective: float
+    quality_band: float
+
+
 def _long_horizon_sparse_confidence(
     *,
     period: int,
@@ -384,6 +427,21 @@ def _long_horizon_sparse_confidence(
     sparse: _SparseEvidence,
     excluded_event_ids: frozenset[str],
 ) -> float:
+    return _sparse_support(
+        period=period,
+        phase_offset=phase_offset,
+        sparse=sparse,
+        excluded_event_ids=excluded_event_ids,
+    ).value
+
+
+def _sparse_support(
+    *,
+    period: int,
+    phase_offset: float,
+    sparse: _SparseEvidence,
+    excluded_event_ids: frozenset[str],
+) -> _SparseSupport:
     """Per-event sparse support for one candidate (period, phase).
 
     Reuses the schema-3 per-event phase statistic: event-count cap x MAD
@@ -415,7 +473,7 @@ def _long_horizon_sparse_confidence(
         <= _event_tolerance(period, item)
     )
     if not aligned:
-        return 0.0
+        return _SparseSupport(0.0, (), 0.0, 0.0)
     first = min(_event_at(item) for item in aligned)
     effective = sum(_event_weight(item) for item in aligned)
     total = sum(
@@ -428,12 +486,58 @@ def _long_horizon_sparse_confidence(
         )
         for item in aligned
     )
+    band = phase_quality_band(mad)
     value = (
         _event_count_cap(effective)
-        * phase_quality_band(mad)
+        * band
         * (effective / total if total > 0 else 0.0)
     )
-    return round(min(1.0, max(0.0, value)), 6)
+    return _SparseSupport(
+        round(min(1.0, max(0.0, value)), 6), aligned, effective, band
+    )
+
+
+def _sparse_structure_reasons(
+    *,
+    period: int,
+    support: _SparseSupport,
+    normal_candidate: CandidateScore,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+) -> tuple[str, ...]:
+    """Per-candidate sparse establishment structure (SE1-SE5).
+
+    SE1 effective aligned restarts and SE2 aligned span use the existing
+    schema-3 establishment gate table.  SE3 needs the existing phase
+    precision.  SE4 requires the aligned restarts to refute every longer
+    candidate period that is a multiple of this one (same-clock repeats can
+    never do that), and SE5 reuses the existing H3 harmonic divisor blockers.
+    SE4/SE5 failures mark the period as ambiguous.
+    """
+
+    if not support.aligned:
+        return ()
+    times = sorted(_event_at(item) for item in support.aligned)
+    refuted = all(
+        any(
+            _circular_distance(value, times[0], multiple)
+            > candidate_phase_tolerance(multiple)
+            for value in times
+        )
+        for multiple in CANDIDATE_PERIODS
+        if multiple > period and multiple % period == 0
+    )
+    _h2_harmonic, h3_harmonic = _harmonic_blockers(period, normal_candidate, windows)
+    if not refuted or h3_harmonic:
+        return (SPARSE_PERIOD_AMBIGUOUS_REASON,)
+    gate = SCHEDULE_GATES[period]
+    if (
+        support.effective >= gate.established_events
+        and times[-1] - times[0] >= gate.established_span
+        and support.quality_band >= SPARSE_PHASE_QUALITY_BAND_MINIMUM
+        and support.value >= SPARSE_PHASE_CONFIDENCE_MINIMUM
+    ):
+        return (SPARSE_STRUCTURE_REASON,)
+    return ()
 
 
 def _relationship_endpoint_ids(
@@ -680,7 +784,7 @@ def _authority_candidate(
     )
     aligned_normal = normal.aligned_normal_confidence
     combined = high_authority + (1.0 - high_authority) * min(
-        0.10, 0.10 * aligned_normal
+        SPARSE_EVIDENCE_CEILING, SPARSE_EVIDENCE_CEILING * aligned_normal
     )
 
     h2_harmonic, h3_harmonic = _harmonic_blockers(
@@ -747,6 +851,7 @@ def _authority_candidate(
         reasons.add("h3_gate_passed")
     if h4:
         reasons.add("h4_gate_passed")
+    reasons.update(_sparse_reason_codes(normal))
     reasons.update(h2_harmonic)
     reasons.update(h3_harmonic)
     if any(
@@ -863,7 +968,11 @@ def _normal_only_candidate(
             high_phase_authority=0.0,
             aligned_normal_confidence=round(normal.aligned_normal_confidence, 6),
             combined_confidence=round(
-                min(0.10, 0.10 * normal.aligned_normal_confidence), 6
+                min(
+                    SPARSE_EVIDENCE_CEILING,
+                    SPARSE_EVIDENCE_CEILING * normal.aligned_normal_confidence,
+                ),
+                6,
             ),
             h1_gate=False,
             h2_gate=False,
@@ -876,9 +985,18 @@ def _normal_only_candidate(
             reason_codes=(
                 "normal_only_candidate",
                 "normal_evidence_cannot_manufacture_high_gate",
+                *_sparse_reason_codes(normal),
             ),
         ),
         normal,
+    )
+
+
+def _sparse_reason_codes(normal: NormalCandidateEvidence) -> tuple[str, ...]:
+    return tuple(
+        item
+        for item in normal.reason_codes
+        if item in {SPARSE_STRUCTURE_REASON, SPARSE_PERIOD_AMBIGUOUS_REASON}
     )
 
 
@@ -906,11 +1024,18 @@ def _normal_candidate_evidence(
     # Stage 8.3: the sparse input is the long-horizon per-event statistic over
     # persisted restarts, not schema-3's recent-window (7 day / 16 event)
     # pair-derived confidence, which also re-counted continuous intervals.
-    aligned_confidence = _long_horizon_sparse_confidence(
+    support = _sparse_support(
         period=period,
         phase_offset=phase_offset,
         sparse=sparse,
         excluded_event_ids=excluded_event_ids,
+    )
+    aligned_confidence = support.value
+    sparse_reasons = _sparse_structure_reasons(
+        period=period,
+        support=support,
+        normal_candidate=normal_candidate,
+        windows=windows,
     )
     misses = tuple(
         item.result_id
@@ -977,6 +1102,7 @@ def _normal_candidate_evidence(
             "normal_reinforcement_bounded",
             "off_phase_spacing_not_incumbent_reinforcement",
             LONG_HORIZON_SPARSE_REASON,
+            *sparse_reasons,
         ),
     )
 
@@ -1022,10 +1148,12 @@ def _transition_decision(
             relationship_map=relationship_map,
             streaks=streaks,
             previous=previous_incumbent,
+            sparse=sparse,
         )
 
     incumbent_candidate = _matching_candidate(previous_incumbent, candidates)
     incumbent = previous_incumbent
+    confirmation_reasons: tuple[str, ...] = ()
     if incumbent_candidate is not None:
         upgrade = bool(
             previous_incumbent.origin is AuthorityOrigin.NORMAL
@@ -1036,6 +1164,29 @@ def _transition_decision(
                 event_map=event_map,
             )
         )
+        if (
+            not upgrade
+            and previous_incumbent.origin is AuthorityOrigin.NORMAL
+            and SPARSE_ESTABLISHMENT_REASON in previous_incumbent.reason_codes
+        ):
+            confirmed = _sparse_confirmed_candidate(
+                incumbent_candidate,
+                regime=previous_incumbent,
+                relationships=relationships,
+                relationship_map=relationship_map,
+                event_map=event_map,
+                sparse=sparse,
+            )
+            if confirmed is not incumbent_candidate:
+                candidates = tuple(
+                    confirmed
+                    if item.candidate_id == incumbent_candidate.candidate_id
+                    else item
+                    for item in candidates
+                )
+                ranked = tuple(sorted(candidates, key=_candidate_rank, reverse=True))
+                incumbent_candidate = confirmed
+                confirmation_reasons = (SPARSE_CONFIRMATION_REASON,)
         incumbent = _regime_from_candidate(
             incumbent_candidate,
             status=RegimeRecordStatus.ESTABLISHED,
@@ -1046,7 +1197,7 @@ def _transition_decision(
         (ORIGIN_UPGRADE_REASON,)
         if ORIGIN_UPGRADE_REASON in incumbent.reason_codes
         else ()
-    )
+    ) + confirmation_reasons
 
     return _incumbent_decision(
         server_key=server_key,
@@ -1083,6 +1234,7 @@ def _acquisition_decision(
     relationship_map: dict[str, IntervalRelationship],
     streaks: tuple[CadenceStreak, ...],
     previous: RegimeRecord | None,
+    sparse: _SparseEvidence | None = None,
 ) -> AuthorityDecision:
     """Initial acquisition for an unknown server or a never-established LIKELY one.
 
@@ -1100,10 +1252,19 @@ def _acquisition_decision(
         status: RegimeRecordStatus,
         origin: AuthorityOrigin = AuthorityOrigin.CONTINUITY,
         established_at: float | None = None,
+        extra_reasons: tuple[str, ...] = (),
     ) -> RegimeRecord:
         regime = _regime_from_candidate(candidate, status=status, origin=origin)
         if established_at is not None and regime.established_at is None:
             regime = replace(regime, established_at=established_at)
+        if extra_reasons:
+            regime = replace(
+                regime,
+                reason_codes=tuple(
+                    [*regime.reason_codes]
+                    + [item for item in extra_reasons if item not in regime.reason_codes]
+                ),
+            )
         if previous is not None and not _candidate_conflicts_regime(candidate, previous):
             reasons = list(regime.reason_codes)
             if (
@@ -1160,6 +1321,68 @@ def _acquisition_decision(
             reasons=("unknown_server_established_by_h3",),
         )
 
+    sparse_choice = (
+        _sparse_establishing_candidate(
+            candidates=candidates,
+            windows=windows,
+            relationship_map=relationship_map,
+            sparse=sparse,
+        )
+        if sparse is not None
+        else None
+    )
+
+    def sparse_decision() -> AuthorityDecision:
+        sparse_candidate, sparse_established_at = sparse_choice
+
+        def sparse_regime(candidate: AuthorityCandidate) -> RegimeRecord:
+            return regime_for(
+                candidate,
+                status=RegimeRecordStatus.ESTABLISHED,
+                origin=AuthorityOrigin.NORMAL,
+                established_at=sparse_established_at,
+                extra_reasons=(SPARSE_ESTABLISHMENT_REASON,),
+            )
+
+        # Intervals that were never establishment evidence confirm at once,
+        # so the first decision equals every later identical rebuild.
+        confirmed = _sparse_confirmed_candidate(
+            sparse_candidate,
+            regime=sparse_regime(sparse_candidate),
+            relationships=tuple(relationship_map.values()),
+            relationship_map=relationship_map,
+            event_map=event_map,
+            sparse=sparse,
+        )
+        reasons: tuple[str, ...] = (SPARSE_ESTABLISHMENT_REASON,)
+        decision_candidates = candidates
+        if confirmed is not sparse_candidate:
+            reasons = (SPARSE_ESTABLISHMENT_REASON, SPARSE_CONFIRMATION_REASON)
+            decision_candidates = tuple(
+                confirmed if item.candidate_id == sparse_candidate.candidate_id else item
+                for item in candidates
+            )
+        selected = sparse_regime(confirmed)
+        return _decision(
+            server_key=server_key,
+            state=RegimeState.ESTABLISHED,
+            selected=selected,
+            incumbent=selected,
+            regimes=(selected,),
+            candidates=decision_candidates,
+            contexts=(),
+            strongest=None,
+            normal_ledger=normal_ledger,
+            high_ledger=high_ledger,
+            cycle_visible=True,
+            prediction_usable=True,
+            countdown_safe=True,
+            suspicion_level=0,
+            suspicion_ids=(),
+            selected_candidate=confirmed,
+            reasons=reasons,
+        )
+
     if high_h2:
         selected_candidate = high_h2[0]
         streak = _two_interval_establishing_streak(
@@ -1183,6 +1406,8 @@ def _acquisition_decision(
                 usable=True,
                 reasons=(TWO_INTERVAL_ESTABLISHMENT_REASON,),
             )
+        if sparse_choice is not None:
+            return sparse_decision()
         return selected_decision(
             state=RegimeState.LIKELY,
             selected=regime_for(selected_candidate, status=RegimeRecordStatus.LIKELY),
@@ -1191,25 +1416,25 @@ def _acquisition_decision(
             reasons=("unknown_server_likely_by_h2",),
         )
 
+    if sparse_choice is not None:
+        return sparse_decision()
+
     if normal_score.selected_period_seconds is not None:
         selected_candidate = _normal_selected_candidate(normal_score, ranked)
         if selected_candidate is not None:
-            status = (
-                RegimeRecordStatus.ESTABLISHED
-                if normal_score.prediction_usable
-                else RegimeRecordStatus.LIKELY
-            )
+            # Stage 8.5: a schema-3 selection identifies a LIKELY normal
+            # regime only.  Normal-origin establishment comes from the
+            # schema-4 sparse establishment gate above, so its confidence,
+            # countdown and warning follow one model.
             return selected_decision(
-                state=(
-                    RegimeState.ESTABLISHED
-                    if status is RegimeRecordStatus.ESTABLISHED
-                    else RegimeState.LIKELY
-                ),
+                state=RegimeState.LIKELY,
                 selected=regime_for(
-                    selected_candidate, status=status, origin=AuthorityOrigin.NORMAL
+                    selected_candidate,
+                    status=RegimeRecordStatus.LIKELY,
+                    origin=AuthorityOrigin.NORMAL,
                 ),
                 selected_candidate=selected_candidate,
-                usable=normal_score.prediction_usable,
+                usable=False,
                 reasons=("normal_scorer_remains_available_for_unknown_server",),
             )
 
@@ -1374,6 +1599,220 @@ def _continuity_upgrade_qualifies(
             contradictions=None,
         )
         is not None
+    )
+
+
+def _sparse_establishing_candidate(
+    *,
+    candidates: tuple[AuthorityCandidate, ...],
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    sparse: _SparseEvidence,
+) -> tuple[AuthorityCandidate, float] | None:
+    """Stage 8.5 sparse establishment gate (acquisition only).
+
+    A candidate qualifies when its sparse structure holds (SE1-SE5, encoded
+    as a candidate reason code), it has no harmonic blocker, no active
+    genuine miss at its period and phase since its first aligned restart
+    (SE6), and its sparse slot alone (``S * a``) displays at the 80 %
+    milestone (SE7).  Continuous intervals never help establish a sparse
+    regime; they confirm it.  It is withheld when any conflicting schedule
+    is H2, or another conflicting candidate meets the sparse structure with
+    comparable support.  ``established_at`` is its latest aligned sparse
+    restart.
+    """
+
+    qualifying = []
+    for candidate in candidates:
+        if (
+            SPARSE_STRUCTURE_REASON not in candidate.reason_codes
+            or candidate.harmonic_blockers
+            or int(
+                round(
+                    SPARSE_EVIDENCE_CEILING
+                    * min(1.0, candidate.aligned_normal_confidence)
+                    * 100
+                )
+            )
+            < SPARSE_ESTABLISHMENT_MINIMUM_PERCENT
+        ):
+            continue
+        period = candidate.candidate_period_seconds
+        support = _sparse_support(
+            period=period,
+            phase_offset=candidate.phase_offset,
+            sparse=sparse,
+            excluded_event_ids=_relationship_endpoint_ids(
+                relationship_map[item]
+                for item in candidate.high_relationship_ids
+                if item in relationship_map
+            ),
+        )
+        if not support.aligned:
+            continue
+        times = [_event_at(item) for item in support.aligned]
+        contradicted = any(
+            item.outcome is ExpectedWindowOutcome.GENUINE_MISS
+            and item.negative_penalty_active
+            and item.candidate_period_seconds == period
+            and item.expected_at >= min(times)
+            and _circular_distance(item.expected_phase_offset, candidate.phase_offset, period)
+            <= candidate.phase_tolerance
+            for item in windows
+        )
+        if contradicted:
+            continue
+        qualifying.append((candidate, max(times)))
+    if not qualifying:
+        return None
+    best, established_at = max(
+        qualifying,
+        key=lambda item: (
+            item[0].combined_confidence,
+            item[0].aligned_normal_confidence,
+            item[0].regime_id,
+        ),
+    )
+    for item in candidates:
+        if item.candidate_id == best.candidate_id or not _candidates_conflict(item, best):
+            continue
+        if item.h2_gate:
+            return None
+        if (
+            SPARSE_STRUCTURE_REASON in item.reason_codes
+            and item.aligned_normal_confidence
+            >= best.aligned_normal_confidence - SPARSE_COMPETITOR_MARGIN
+        ):
+            return None
+    return best, established_at
+
+
+def _candidates_conflict(left: AuthorityCandidate, right: AuthorityCandidate) -> bool:
+    period = right.candidate_period_seconds
+    return bool(
+        left.candidate_period_seconds != period
+        or _circular_distance(left.phase_offset, right.phase_offset, period)
+        > right.phase_tolerance
+    )
+
+
+def _full_interval_quality(
+    relationship: IntervalRelationship,
+    event_map: dict[str, PhysicalRestartEvent],
+) -> float:
+    """Quality of a fully observed DIRECT interval between genuine restarts.
+
+    High-eligible (offline-observed) intervals qualify as they are.  An
+    interval that is high-ineligible only because of its endpoint evidence
+    class (query-visible restarts) qualifies when everything else holds:
+    one continuity chain, continuous healthy coverage and query health, no
+    intervening authentic or unobservable episode, residual within tolerance
+    and both endpoints individually authentic, learning-eligible restarts.
+    It never becomes high-eligible.  The quality is the existing
+    relationship formula (authenticity, coverage ratio, phase fit).
+    """
+
+    left = event_map.get(relationship.left_event_id)
+    right = event_map.get(relationship.right_event_id)
+    if (
+        left is None
+        or right is None
+        or relationship.relationship_kind is not RelationshipKind.DIRECT
+        or relationship.multiplier != 1
+        or relationship.intervening_event_ids
+        or not relationship.continuity_qualified
+        or relationship.tolerance_seconds <= 0
+        or not all(_authentic_event(item) and _event_weight(item) > 0 for item in (left, right))
+    ):
+        return 0.0
+    if not relationship.high_authority_eligible:
+        ineligible = {
+            item
+            for item in relationship.reason_codes
+            if item.startswith("high_ineligible_")
+        }
+        if not ineligible or not ineligible <= _FULL_INTERVAL_PERMITTED_HIGH_INELIGIBILITY:
+            return 0.0
+    auth_quality = min(1.0, min(left.authenticity, right.authenticity) / 0.85)
+    coverage_quality = min(1.0, relationship.observed_ratio / 0.98)
+    phase_fit = 1.0 - 0.20 * min(
+        1.0, abs(relationship.signed_residual_seconds) / relationship.tolerance_seconds
+    )
+    return round(max(0.0, min(auth_quality, coverage_quality, phase_fit)), 6)
+
+
+def _sparse_confirmed_candidate(
+    candidate: AuthorityCandidate,
+    *,
+    regime: RegimeRecord,
+    relationships: tuple[IntervalRelationship, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    event_map: dict[str, PhysicalRestartEvent],
+    sparse: _SparseEvidence,
+) -> AuthorityCandidate:
+    """Strong confirmation of a sparse-established regime (display magnitude).
+
+    Fully observed matching intervals that are not establishment evidence
+    add ``1 - prod(1 - 0.75 q)`` in the continuous slot (in place of, never
+    added to, the candidate's own high authority).  High-eligible intervals
+    never enter the sparse slot (their endpoints are excluded), so they are
+    never establishment evidence and always confirm.  Other full intervals
+    (query-visible endpoints, which are sparse evidence) confirm only when
+    they end after establishment.  Confirming endpoints leave the sparse
+    slot, so no restart counts in both.  Two matching timestamps across an
+    unobserved gap are not an interval and never confirm.  Gates, high
+    authority and identities are unchanged.
+    """
+
+    established_at = regime.established_at
+    if established_at is None:
+        return candidate
+    period = regime.candidate_period_seconds
+    confirming = []
+    for item in relationships:
+        if (
+            item.candidate_period_seconds != period
+            or (not item.high_authority_eligible and item.right_at <= established_at)
+            or _circular_distance(
+                _relationship_phase_value(item, period), regime.phase_offset, period
+            )
+            > regime.phase_tolerance
+        ):
+            continue
+        quality = _full_interval_quality(item, event_map)
+        if quality > 0:
+            confirming.append((item, quality))
+    if not confirming:
+        return candidate
+    residual = 1.0
+    for _item, quality in confirming:
+        residual *= 1.0 - SPARSE_CONFIRMATION_INTERVAL_WEIGHT * quality
+    confirmation = min(HIGH_AUTHORITY_CAP, 1.0 - residual)
+    excluded = _relationship_endpoint_ids(
+        [
+            *(
+                relationship_map[value]
+                for value in candidate.high_relationship_ids
+                if value in relationship_map
+            ),
+            *(item for item, _quality in confirming),
+        ]
+    )
+    support = _sparse_support(
+        period=period,
+        phase_offset=candidate.phase_offset,
+        sparse=sparse,
+        excluded_event_ids=excluded,
+    )
+    continuous = max(candidate.high_authority, confirmation)
+    combined = continuous + (1.0 - continuous) * min(
+        SPARSE_EVIDENCE_CEILING, SPARSE_EVIDENCE_CEILING * support.value
+    )
+    combined = round(max(candidate.combined_confidence, combined), 6)
+    return replace(
+        candidate,
+        combined_confidence=combined,
+        reason_codes=tuple(sorted({*candidate.reason_codes, SPARSE_CONFIRMATION_REASON})),
     )
 
 
@@ -2252,6 +2691,8 @@ def _regime_from_candidate(
             reasons.append(ORIGIN_UPGRADE_REASON)
         elif ORIGIN_UPGRADE_REASON in existing.reason_codes:
             reasons.append(ORIGIN_UPGRADE_REASON)
+        if SPARSE_ESTABLISHMENT_REASON in existing.reason_codes:
+            reasons.append(SPARSE_ESTABLISHMENT_REASON)
     gate = candidate.highest_gate if origin is AuthorityOrigin.CONTINUITY else AuthorityGate.NORMAL
     return RegimeRecord(
         schema_version=AUTHORITY_SCHEMA_VERSION,

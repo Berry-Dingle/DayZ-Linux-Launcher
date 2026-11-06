@@ -8,6 +8,8 @@ from enum import Enum
 
 from .companion_restart_phase2_authority import (
     COUNTDOWN_SUSPENSION_LATCH_REASON,
+    SPARSE_ESTABLISHMENT_REASON,
+    SPARSE_PERIOD_AMBIGUOUS_REASON,
     AuthorityCandidate,
     AuthorityDecision,
     AuthorityGate,
@@ -337,11 +339,15 @@ def evaluate_authority_consumers(
         candidate,
         gate,
     )
+    sparse_regime = _sparse_established_regime(regime)
+    safe_established_sparse = _safe_established_sparse(decision, regime, candidate)
     presentation, visible, suspended, suspension_reason = _presentation(
         decision,
         gate,
         policy,
         safe_established_continuity_h2=safe_established_continuity_h2,
+        sparse_regime=sparse_regime,
+        safe_established_sparse=safe_established_sparse,
     )
     period = regime.candidate_period_seconds if regime is not None and visible else None
     label = _cycle_label(period) if period is not None else None
@@ -398,7 +404,8 @@ def evaluate_authority_consumers(
             phase_offset=regime.phase_offset,
             now=policy.now,
         )
-        if (safe_h3 or safe_established_continuity_h2) and regime is not None
+        if (safe_h3 or safe_established_continuity_h2 or safe_established_sparse)
+        and regime is not None
         else normal.raw_predicted_occurrence_at
         if safe_established_normal_schedule and normal is not None
         else None
@@ -408,6 +415,7 @@ def evaluate_authority_consumers(
         safe_h3
         or safe_established_continuity_h2
         or safe_established_normal_schedule
+        or safe_established_sparse
     )
 
     warning_key = None
@@ -419,7 +427,7 @@ def evaluate_authority_consumers(
         and policy.server_online_healthy
         and prediction is not None
         and (
-            not safe_established_continuity_h2
+            not (safe_established_continuity_h2 or safe_established_sparse)
             or confidence_display_percent(decision.combined_confidence)
             >= SCHEDULED_WARNING_MINIMUM_CONFIDENCE_PERCENT
         )
@@ -471,6 +479,7 @@ def evaluate_authority_consumers(
 
     normal_schedule_confidence_display = bool(
         gate is AuthorityGate.NORMAL
+        and not sparse_regime
         and policy.normal_pattern_supported
         and presentation
         in {
@@ -524,6 +533,8 @@ def evaluate_authority_consumers(
         reasons.add("safe_established_normal_schedule_available")
     if safe_established_continuity_h2 and countdown_visible:
         reasons.add("safe_established_continuity_h2_prediction_available")
+    if safe_established_sparse and countdown_visible:
+        reasons.add("safe_established_sparse_prediction_available")
     elif gate is AuthorityGate.H2:
         reasons.add("h2_countdown_withheld")
     if suspended:
@@ -558,6 +569,7 @@ def evaluate_authority_consumers(
             phase_available
             or safe_established_continuity_h2
             or safe_established_normal_schedule
+            or safe_established_sparse
         ),
         next_expected_restart_at=prediction,
         countdown_visible=countdown_visible,
@@ -779,6 +791,8 @@ def _presentation(
     policy: AuthorityConsumerPolicyInput,
     *,
     safe_established_continuity_h2: bool,
+    sparse_regime: bool = False,
+    safe_established_sparse: bool = False,
 ) -> tuple[AuthorityPresentationKey, bool, bool, str | None]:
     state = decision.state
     if state is RegimeState.UNKNOWN:
@@ -796,6 +810,21 @@ def _presentation(
         return AuthorityPresentationKey.PATTERN_ONLY, False, False, None
     if safe_established_continuity_h2:
         return AuthorityPresentationKey.CONFIRMED_CYCLE, True, False, None
+    if safe_established_sparse:
+        return AuthorityPresentationKey.CONFIRMED_CYCLE, True, False, None
+    if (
+        sparse_regime
+        and state is RegimeState.ESTABLISHED
+        and gate is AuthorityGate.NORMAL
+    ):
+        # Stage 8.5: a sparse-established regime never falls back to the
+        # legacy schema-3 schedule display; an unsafe one is suspended.
+        return (
+            AuthorityPresentationKey.PREDICTION_TEMPORARILY_SUSPENDED,
+            True,
+            True,
+            "sparse_established_prediction_unsafe",
+        )
     if (
         state in {RegimeState.LIKELY, RegimeState.ESTABLISHED}
         and gate is AuthorityGate.NORMAL
@@ -859,6 +888,46 @@ def _safe_established_continuity_h2(
     )
 
 
+def _sparse_established_regime(regime: RegimeRecord | None) -> bool:
+    return bool(
+        regime is not None
+        and regime.origin is AuthorityOrigin.NORMAL
+        and SPARSE_ESTABLISHMENT_REASON in regime.reason_codes
+    )
+
+
+def _safe_established_sparse(
+    decision: AuthorityDecision,
+    regime: RegimeRecord | None,
+    candidate: AuthorityCandidate | None,
+) -> bool:
+    """Stage 8.5: a sparse-established incumbent under the H2 safety contract.
+
+    The regime was established by the authority sparse gate (persistent
+    reason code); its matching candidate must still be unambiguous (no
+    harmonic blocker, period alternatives refuted) and there must be no
+    suspicion.  The countdown uses the regime's own period and phase.
+    """
+
+    incumbent = decision.incumbent_shadow_regime
+    return bool(
+        _sparse_established_regime(regime)
+        and regime.status is RegimeRecordStatus.ESTABLISHED
+        and decision.state is RegimeState.ESTABLISHED
+        and incumbent is not None
+        and regime.regime_id == incumbent.regime_id
+        and decision.suspicion_level == 0
+        and decision.cycle_visible
+        and decision.prediction_usable
+        and decision.countdown_safe
+        and regime.candidate_period_seconds > 0
+        and math.isfinite(regime.phase_offset)
+        and candidate is not None
+        and not candidate.harmonic_blockers
+        and SPARSE_PERIOD_AMBIGUOUS_REASON not in candidate.reason_codes
+    )
+
+
 def _learning_confidence(
     decision: AuthorityDecision,
     regime: RegimeRecord | None,
@@ -890,7 +959,9 @@ def _learning_confidence(
         else regime.combined_confidence
     )
     ambiguous = evaluated is not None and bool(
-        evaluated.harmonic_blockers or _competing_schedule(decision, evaluated)
+        evaluated.harmonic_blockers
+        or SPARSE_PERIOD_AMBIGUOUS_REASON in evaluated.reason_codes
+        or _competing_schedule(decision, evaluated)
     )
     cap, cap_reason = (
         (LEARNING_CONFIDENCE_AMBIGUITY_CAP, LEARNING_CONFIDENCE_AMBIGUITY_CAP_REASON)
