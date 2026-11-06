@@ -736,6 +736,133 @@ def test_two_interval_establishment_is_confirmed_with_countdown_and_warning():
     assert value.scheduled_pre_restart_alert_eligible
 
 
+def _with_confidence(decision, confidence):
+    """The same authority decision with its selected candidate's confidence
+    set (decision and candidate kept consistent; gates untouched)."""
+
+    regime = decision.selected_shadow_regime
+    candidates = tuple(
+        replace(item, combined_confidence=confidence)
+        if item.regime_id == regime.regime_id
+        else item
+        for item in decision.candidates
+    )
+    return replace(decision, candidates=candidates, combined_confidence=confidence)
+
+
+def _warning_at_due_time(decision, **kwargs):
+    regime = decision.selected_shadow_regime
+    occurrence = consumers4.next_phase_occurrence(
+        period_seconds=regime.candidate_period_seconds,
+        phase_offset=regime.phase_offset,
+        now=BASE + 100,
+    )
+    return consumers4.evaluate_authority_consumers(
+        _policy(decision, now=occurrence - 300, restart_alert_enabled=True, **kwargs)
+    )
+
+
+def test_confidence_display_percent_matches_panel_rounding():
+    assert consumers4.confidence_display_percent(0.7949) == 79
+    assert consumers4.confidence_display_percent(0.795) == 80
+    assert consumers4.confidence_display_percent(0.799) == 80
+    assert consumers4.SCHEDULED_WARNING_MINIMUM_CONFIDENCE_PERCENT == 80
+
+
+@pytest.mark.parametrize(
+    "confidence,eligible",
+    [
+        (0.7949, False),
+        (0.79499, False),
+        (0.7950, True),
+        (0.7990, True),
+        (0.8000, True),
+    ],
+)
+def test_established_two_interval_warning_boundary_is_displayed_eighty_percent(
+    confidence, eligible
+):
+    """Stage 8.3a: an established, prediction-safe continuity-H2 cycle is
+    warning-eligible exactly when its displayed confidence is 80 %."""
+
+    decision = _with_confidence(_authority(3), confidence)
+    value = _warning_at_due_time(decision)
+    summary = consumers4.authority_consumer_summary(value, now=BASE + 100)
+
+    assert decision.state is authority.RegimeState.ESTABLISHED
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.CONFIRMED_CYCLE
+    assert value.countdown_visible and value.countdown_safe
+    assert "safe_established_continuity_h2_prediction_available" in value.reason_codes
+    assert summary["confidence_percent"] == (80 if eligible else 79)
+    assert value.scheduled_warning_eligible is eligible
+    assert value.scheduled_pre_restart_alert_eligible is eligible
+    # Stored confidence is not rounded.
+    assert value.confidence_display_value == confidence
+
+
+def test_likely_cycle_above_rounding_boundary_gets_no_warning():
+    decision = _with_confidence(_likely_h2(), 0.81)
+    value = _warning_at_due_time(decision)
+
+    assert decision.state is authority.RegimeState.LIKELY
+    assert value.presentation_state is consumers4.AuthorityPresentationKey.LIKELY_CYCLE
+    assert not value.countdown_visible
+    assert not value.scheduled_warning_eligible
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        pytest.param(
+            {"state": authority.RegimeState.CHANGE_SUSPECTED, "suspicion_level": 1},
+            id="suspected_change_level_one",
+        ),
+        pytest.param(
+            {
+                "state": authority.RegimeState.CHALLENGER_ACCUMULATING,
+                "suspicion_level": 2,
+                "prediction_usable": False,
+                "countdown_safe": False,
+            },
+            id="suspended_level_two",
+        ),
+        pytest.param(
+            {
+                "state": authority.RegimeState.TRANSITION_CONFIRMED,
+                "suspicion_level": 2,
+                "prediction_usable": False,
+                "countdown_safe": False,
+            },
+            id="provisional_transition",
+        ),
+        pytest.param({"prediction_usable": False}, id="prediction_unusable"),
+        pytest.param({"countdown_safe": False}, id="countdown_unsafe"),
+    ],
+)
+def test_unsafe_or_suspended_cycle_above_rounding_boundary_gets_no_warning(override):
+    decision = replace(_with_confidence(_authority(3), 0.799), **override)
+    value = _warning_at_due_time(decision)
+
+    assert not value.countdown_safe
+    assert not value.scheduled_warning_eligible
+    assert not value.scheduled_pre_restart_alert_eligible
+
+
+def test_harmonic_blocked_cycle_above_rounding_boundary_gets_no_warning():
+    base = _with_confidence(_authority(3), 0.799)
+    regime = base.selected_shadow_regime
+    candidates = tuple(
+        replace(item, harmonic_blockers=("high_harmonic_divisor_unresolved_10800",))
+        if item.regime_id == regime.regime_id
+        else item
+        for item in base.candidates
+    )
+    value = _warning_at_due_time(replace(base, candidates=candidates))
+
+    assert not value.countdown_safe
+    assert not value.scheduled_warning_eligible
+
+
 def test_established_continuity_h2_retains_confirmed_cycle_eta_and_warning():
     decision = _established_continuity_h2()
     regime = decision.selected_shadow_regime

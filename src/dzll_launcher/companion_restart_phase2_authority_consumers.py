@@ -32,6 +32,11 @@ SUSPECTED_CHANGE_CHALLENGER_CONFIDENCE_REASON = (
 SUSPECTED_CHANGE_CONFIDENCE_UNAVAILABLE_REASON = (
     "suspected_change_challenger_confidence_unavailable"
 )
+# Stage 8.3a: an established continuity-H2 cycle is warning-eligible at the
+# displayed 80 % milestone.  Eligibility uses the panel's own rounding
+# (``confidence_display_percent``), so internal confidence >= 0.795 (79.5 %,
+# which rounds to 80) qualifies.  Stored confidence is never rounded.
+SCHEDULED_WARNING_MINIMUM_CONFIDENCE_PERCENT = 80
 SCHEMA4_AUTHORITY_CONSUMER_SHADOW_ENABLED_DEFAULT = False
 SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED_DEFAULT = False
 
@@ -255,6 +260,17 @@ class AuthorityConsumerResolution:
     diagnostic: str
 
 
+def confidence_display_percent(value: float) -> int:
+    """The user-facing whole-number confidence percentage.
+
+    This is the rounding the panel summary has always used (Python ``round``,
+    half to even).  The scheduled-warning milestone compares this same value,
+    so the warning and the displayed percentage cannot disagree.
+    """
+
+    return int(round(value * 100))
+
+
 def next_phase_occurrence(*, period_seconds: int, phase_offset: float, now: float) -> float:
     """Return the first phase occurrence strictly after ``now``."""
 
@@ -387,7 +403,8 @@ def evaluate_authority_consumers(
         and prediction is not None
         and (
             not safe_established_continuity_h2
-            or decision.combined_confidence >= 0.80
+            or confidence_display_percent(decision.combined_confidence)
+            >= SCHEDULED_WARNING_MINIMUM_CONFIDENCE_PERCENT
         )
     )
     warning_due = False
@@ -673,7 +690,9 @@ def authority_consumer_summary(
         is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
     )
     return {
-        "confidence_percent": int(round(decision.confidence_display_value * 100)),
+        "confidence_percent": confidence_display_percent(
+            decision.confidence_display_value
+        ),
         "confidence_kind": (
             "schedule"
             if normal_schedule_confidence

@@ -34,7 +34,8 @@ Stage 8.2 (continuous confidence milestones: streak-bonus magnitude 0.10,
 H1-H4 gates kept on their 0.08 calibration) converted the S01 warning and S02
 95 % tests and added the ``test_s82_*`` section.
 Stage 8.3 (long-horizon per-event sparse input, ceiling unchanged) added the
-``test_s83_*`` section.
+``test_s83_*`` section.  Stage 8.3a (scheduled warning follows the displayed
+80 % milestone, internal >= 0.795) converted the realistic-jitter warning test.
 """
 
 from __future__ import annotations
@@ -81,11 +82,7 @@ STAGE_8_5 = (
     "Stage 8.5 (sparse ceiling S and SE1-SE7 sparse establishment; "
     "builds on the Stage 8.3 long-horizon per-event sparse input)"
 )
-OPERATOR_DECISION_8_3 = (
-    "operator decision after Stage 8.3: removing the duplicated schema-3 term "
-    "leaves two-interval magnitude below 0.80 for any timing jitter "
-    "(warning threshold vs magnitude)"
-)
+
 STAGE_8_6 = "Stage 8.6 (QV refinements: queue return, ambiguous-drain learning)"
 
 # The user-facing ceiling (``server_companion_ui`` caps at 95 %).
@@ -1726,8 +1723,10 @@ def test_s83_sparse_only_evidence_cannot_establish_before_stage_8_5():
     assert not value.countdown_visible and not value.scheduled_warning_eligible
 
 
-@expected_failure(OPERATOR_DECISION_8_3, "a two-interval streak with 5 s timing jitter has combined 0.798986 < 0.80, so no scheduled warning")
 def test_s83_two_interval_establishment_with_realistic_jitter_enables_warning():
+    """Regression (Stage 8.3a): 5 s timing jitter gives combined 0.798986,
+    displayed 80 %, and the warning follows the displayed milestone."""
+
     pipeline = Pipeline()
     pipeline.observe("jitter", [at(0, 9), at(0, 12) + 5, at(0, 15)])
     step = pipeline.evaluate()
@@ -1735,7 +1734,32 @@ def test_s83_two_interval_establishment_with_realistic_jitter_enables_warning():
     due = step.consumer(now=occurrence - 300)
 
     assert step.decision.reason_codes == (authority.TWO_INTERVAL_ESTABLISHMENT_REASON,)
+    assert step.decision.combined_confidence == 0.798986
+    assert percent(step) == 80
     assert due.scheduled_warning_eligible, step.decision.combined_confidence
+    assert due.scheduled_pre_restart_alert_eligible
+
+
+def test_s83a_jitter_warning_is_at_most_once_across_settle_and_reopen():
+    pipeline = Pipeline()
+    pipeline.observe("jitter", [at(0, 9), at(0, 12) + 5, at(0, 15)])
+    first_step = pipeline.evaluate()
+    occurrence = first_step.consumer().next_expected_restart_at
+    due = occurrence - 300
+    first = first_step.consumer(now=due)
+    fired = frozenset({first.scheduled_warning_suppression_key})
+    settled_step = pipeline.evaluate(persisted(first_step.decision))
+    reopened = pipeline.evaluate(persisted(settled_step.decision))
+
+    assert first.scheduled_pre_restart_alert_eligible
+    for later in (first_step, settled_step, reopened):
+        value = later.consumer(now=due, fired_keys=fired)
+        assert value.scheduled_warning_eligible
+        assert value.scheduled_warning_suppression_key == first.scheduled_warning_suppression_key
+        assert not value.scheduled_pre_restart_alert_eligible
+    following = reopened.consumer(now=due + P3, fired_keys=fired)
+    assert following.scheduled_warning_suppression_key != first.scheduled_warning_suppression_key
+    assert following.scheduled_pre_restart_alert_eligible
 
 
 @pytest.mark.parametrize(
