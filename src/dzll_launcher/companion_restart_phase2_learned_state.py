@@ -92,7 +92,7 @@ from .companion_restart_phase2_scoring import (
 )
 
 
-LEARNED_STATE_SCHEMA_VERSION = 2
+LEARNED_STATE_SCHEMA_VERSION = 3
 PHASE_BIN_SECONDS = 60
 DAY_BINS = DAY // PHASE_BIN_SECONDS
 # Relationship, miss and superseded-regime bins.  Never wider than the
@@ -130,6 +130,7 @@ LEARNED_STATE_MAX_ENTRIES = (
     + INTERVAL_BIN_TOTAL  # epoch challenger evidence
     + INTERVAL_BIN_TOTAL  # expected-window outcomes
     + INTERVAL_BIN_TOTAL  # superseded regimes
+    + INTERVAL_BIN_TOTAL  # non-high (normal) relationships
     + len(DIVISOR_KEYS)
     + ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS
     + RUN_RESIDUAL_KEY_LIMIT  # the single open streak
@@ -141,7 +142,7 @@ LEARNED_STATE_MAX_ENTRIES = (
 # one separator, every string the maximum validated length plus quotes.
 _NUMBER = 25
 _STRING = MAX_STRING_LENGTH * 6 + 3  # worst-case JSON escaping of non-ASCII
-_POOL_BIN_NUMBERS = 10 + 3 * len(CANDIDATE_PERIODS) + 2
+_POOL_BIN_NUMBERS = 10 + 8 * len(CANDIDATE_PERIODS) + 3 + 2 * len(CANDIDATE_PERIODS)
 _INTERVAL_BIN_NUMBERS = 17 + 7
 LEARNED_STATE_MAX_JSON_BYTES = (
     4096  # keys, brackets and scalar fields
@@ -149,7 +150,8 @@ LEARNED_STATE_MAX_JSON_BYTES = (
     + 2 * INTERVAL_BIN_TOTAL * (_INTERVAL_BIN_NUMBERS * _NUMBER + 8)
     + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)
     + INTERVAL_BIN_TOTAL * (4 * _NUMBER + 4)
-    + len(DIVISOR_KEYS) * (4 * _NUMBER + 4)
+    + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)
+    + len(DIVISOR_KEYS) * (6 * _NUMBER + 4)
     + ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS * (2 * _NUMBER + 4)
     + RUN_RESIDUAL_KEY_LIMIT * (4 * _NUMBER + 4)
     + 40 * _NUMBER  # open chain and incumbent numbers
@@ -169,11 +171,23 @@ class LearnedStateError(ValueError):
 
 @dataclass(frozen=True)
 class EndpointTag:
-    """Folded restarts in a bin that are endpoints at one period."""
+    """Folded restarts in a bin that are endpoints at one period.
+
+    For high-relationship tags (not confirmation tags) the tag also records
+    the time span of the tagged restarts and the earliest *untagged* restart
+    of the bin with the running pool and tagged totals just before it was
+    folded.  Excluding a candidate's own endpoints therefore moves the
+    consistency-domain start to the exact earliest remaining restart.
+    """
 
     period: int
     weight: float
     count: int
+    first_tagged_at: float | None = None
+    last_tagged_at: float | None = None
+    untagged_first_at: float | None = None
+    untagged_weight_before: float | None = None
+    untagged_tagged_before: float | None = None
 
 
 @dataclass(frozen=True)
@@ -201,6 +215,12 @@ class PhaseBin:
     weight_before: float
     endpoints: tuple[EndpointTag, ...] = ()
     confirmation: EndpointTag | None = None
+    # Running tagged (endpoint) weight per period just before the bin's first
+    # restart was folded (only periods with a non-zero total).
+    tagged_before: tuple[tuple[int, float], ...] = ()
+
+    def tagged_before_at(self, period: int) -> float:
+        return next((value for key, value in self.tagged_before if key == period), 0.0)
 
     @property
     def seconds_min(self) -> float:
@@ -279,11 +299,39 @@ class MissBin:
 
 
 @dataclass(frozen=True)
+class NormalBin:
+    """Folded non-high relationships at one (period, 5-minute phase bin).
+
+    Folded once, when the relationship's left endpoint is folded (its right
+    endpoints are already in the ring then).  Used for the latent
+    normal-challenger context, which counts aligned normal relationships.
+    """
+
+    period: int
+    index: int
+    count: int
+    phase_min: float
+    phase_max: float
+    first_at: float
+    last_at: float
+
+
+@dataclass(frozen=True)
 class DivisorEvidence:
+    """Phase-anchored divisor resolution learned from a clean schema-3 window.
+
+    ``phase_offset`` is the period candidate's phase when it was learned and
+    ``observed_at`` the latest restart of that window.  Any later authentic
+    restart at one of the period's divisor midpoints (and not at its own
+    phase) contradicts and removes it.
+    """
+
     period: int
     divisor: int
     covered_window_count: int
     longer_interval_count: int
+    phase_offset: float = 0.0
+    observed_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -396,6 +444,12 @@ class LearnedState:
     superseded: tuple[SupersededRegime, ...] = ()
     epoch: EpochEvidence = field(default_factory=EpochEvidence)
     open_chain: OpenChain | None = None
+    normal_relationships: tuple[NormalBin, ...] = ()
+    # Running tagged (high-endpoint) weight per period, in fold order.
+    tagged_weight_totals: tuple[tuple[int, float], ...] = ()
+    # Divisor resolution is re-learned only from schema-3 windows that start
+    # after this instant (latest contradiction or supersession).
+    divisor_floor_at: float | None = None
 
 
 def empty_learned_state(server_key: str) -> LearnedState:
@@ -413,6 +467,7 @@ def learned_state_entry_count(state: LearnedState) -> int:
         + len(state.misses)
         + len(state.superseded)
         + len(state.divisors)
+        + len(state.normal_relationships)
         + len(state.epoch.recovery)
         + (len(run.residuals) if run is not None else 0)
         + (state.incumbent is not None)
@@ -553,6 +608,41 @@ def _high_direct(relationship: IntervalRelationship) -> bool:
         relationship.high_authority_eligible
         and relationship.relationship_kind is RelationshipKind.DIRECT
     )
+
+
+def divisor_contradicted(entry: DivisorEvidence, at: float) -> bool:
+    """A restart at a divisor midpoint of the period (not at its own phase)."""
+
+    period, divisor = entry.period, entry.divisor
+    if _circular_distance(at, entry.phase_offset, period) <= candidate_phase_tolerance(period):
+        return False
+    tolerance = max(candidate_phase_tolerance(period), candidate_phase_tolerance(divisor))
+    return any(
+        _circular_distance(at, entry.phase_offset + step * divisor, period) <= tolerance
+        for step in range(1, period // divisor)
+    )
+
+
+def _invalidate_divisors(
+    divisors: tuple[DivisorEvidence, ...], events: Iterable[PhysicalRestartEvent]
+) -> tuple[tuple[DivisorEvidence, ...], float | None]:
+    """Drop divisor evidence contradicted by later authentic restarts."""
+
+    kept = []
+    latest = None
+    candidates = [
+        _event_at(item) for item in events if _authentic_event(item) and _event_at(item) is not None
+    ]
+    for entry in divisors:
+        contradictions = [
+            at for at in candidates if at > entry.observed_at and divisor_contradicted(entry, at)
+        ]
+        if contradictions:
+            first = min(contradictions)
+            latest = first if latest is None else max(latest, first)
+            continue
+        kept.append(entry)
+    return tuple(kept), latest
 
 
 # --------------------------------------------------------------------------
@@ -891,6 +981,44 @@ def _tag_bin(
     pool[index] = value
 
 
+def _tag_anchor(
+    pool: dict[int, PhaseBin], index: int, at: float, weight: float, period: int
+) -> None:
+    """Tag the (latest) open-chain anchor as a high endpoint after the fact."""
+
+    value = pool[index]
+    tags = {item.period: item for item in value.endpoints}
+    previous = tags.get(period)
+    if previous is None:
+        untagged = (
+            (value.first_at, value.weight_before, value.tagged_before_at(period))
+            if value.count > 1 and value.first_at < at
+            else (None, None, None)
+        )
+        tags[period] = EndpointTag(period, weight, 1, at, at, *untagged)
+    else:
+        untagged = (
+            previous.untagged_first_at,
+            previous.untagged_weight_before,
+            previous.untagged_tagged_before,
+        )
+        if previous.untagged_first_at is not None and previous.untagged_first_at >= at:
+            # The anchor is the newest restart: if it was the earliest untagged
+            # one, no untagged restart remains in the bin.
+            untagged = (None, None, None)
+        tags[period] = replace(
+            previous,
+            weight=previous.weight + weight,
+            count=previous.count + 1,
+            first_tagged_at=min(previous.first_tagged_at or at, at),
+            last_tagged_at=max(previous.last_tagged_at or at, at),
+            untagged_first_at=untagged[0],
+            untagged_weight_before=untagged[1],
+            untagged_tagged_before=untagged[2],
+        )
+    pool[index] = replace(value, endpoints=tuple(tags[key] for key in sorted(tags)))
+
+
 def _interval_bin_add_relationship(
     existing: IntervalBin | None,
     relationship: IntervalRelationship,
@@ -1016,41 +1144,6 @@ def fold_unit(
     incumbent = state.incumbent
     last_aligned = None if incumbent is None else incumbent.last_aligned_evidence_at
 
-    pool_total = state.pool_weight_total
-    learning_count = 0
-    for event in ordered:
-        at = _event_at(event)
-        if _sparse_usable(event):
-            learning_count += 1
-            weight = _event_weight(event)
-            uncertainty = _capped_uncertainty(event.phase_uncertainty)
-            index, offset = _day_bin(at)
-            existing = pool.get(index)
-            if existing is None:
-                pool[index] = PhaseBin(
-                    index, weight, 1, offset, offset, at, at, uncertainty, uncertainty, pool_total
-                )
-            else:
-                pool[index] = replace(
-                    existing,
-                    weight=existing.weight + weight,
-                    count=existing.count + 1,
-                    offset_min=min(existing.offset_min, offset),
-                    offset_max=max(existing.offset_max, offset),
-                    first_at=min(existing.first_at, at),
-                    last_at=max(existing.last_at, at),
-                    uncertainty_min=min(existing.uncertainty_min, uncertainty),
-                    uncertainty_max=max(existing.uncertainty_max, uncertainty),
-                )
-            pool_total += weight
-        if (
-            incumbent is not None
-            and _authentic_event(event)
-            and _circular_distance(at, incumbent.phase_offset, incumbent.period)
-            <= incumbent.phase_tolerance
-        ):
-            last_aligned = at if last_aligned is None else max(last_aligned, at)
-
     def left_ok(relationship: IntervalRelationship) -> bool:
         return relationship.left_event_id in accepted or relationship.left_event_id == anchor_id
 
@@ -1066,41 +1159,30 @@ def fold_unit(
         key=lambda item: (item.left_at, item.right_at, item.relationship_id),
     )
     tagged: set[tuple[int, str]] = set()
-    confirmation_tagged: set[str] = set()
+    confirmation_tagged: dict[str, int] = {}
     high_items: list[tuple[IntervalRelationship, float]] = []
+    anchor_new_periods: list[int] = []
+    anchor_confirmation_period: int | None = None
 
     def tag(event_id: str, *, period: int | None = None, confirmation: int | None = None) -> None:
-        nonlocal anchor_confirmation_tagged
+        """Record tags; they are applied in time order after this pass."""
+
+        nonlocal anchor_confirmation_tagged, anchor_confirmation_period
         event = context[event_id]
         if not _sparse_usable(event):
             return
-        index = _day_bin(_event_at(event))[0]
         if event_id == anchor_id:
             if period is not None and period not in anchor_high_periods:
                 anchor_high_periods.add(period)
-                _tag_bin(pool, index, _event_weight(event), period=period, confirmation_period=None)
+                anchor_new_periods.append(period)
             if confirmation is not None and not anchor_confirmation_tagged:
                 anchor_confirmation_tagged = True
-                _tag_bin(
-                    pool,
-                    index,
-                    _event_weight(event),
-                    period=None,
-                    confirmation_period=confirmation,
-                )
+                anchor_confirmation_period = confirmation
             return
         if period is not None and (period, event_id) not in tagged:
             tagged.add((period, event_id))
-            _tag_bin(pool, index, _event_weight(event), period=period, confirmation_period=None)
         if confirmation is not None and event_id not in confirmation_tagged:
-            confirmation_tagged.add(event_id)
-            _tag_bin(
-                pool,
-                index,
-                _event_weight(event),
-                period=None,
-                confirmation_period=confirmation,
-            )
+            confirmation_tagged[event_id] = confirmation
 
     for relationship in folded:
         period = relationship.candidate_period_seconds
@@ -1160,6 +1242,142 @@ def fold_unit(
 
     if stale is not None:
         close(stale)
+    # Apply tags and fold restarts in time order (exact untagged tracking).
+    totals = dict(state.tagged_weight_totals)
+    if anchor_id is not None and anchor_new_periods and open_chain.anchor_index in pool:
+        for period in anchor_new_periods:
+            _tag_anchor(
+                pool,
+                open_chain.anchor_index,
+                open_chain.anchor_at,
+                open_chain.anchor_weight,
+                period,
+            )
+            totals[period] = totals.get(period, 0.0) + open_chain.anchor_weight
+    pool_total = state.pool_weight_total
+    learning_count = 0
+    for event in ordered:
+        at = _event_at(event)
+        if _sparse_usable(event):
+            learning_count += 1
+            weight = _event_weight(event)
+            uncertainty = _capped_uncertainty(event.phase_uncertainty)
+            index, offset = _day_bin(at)
+            existing = pool.get(index)
+            snapshot = dict(totals)
+            if existing is None:
+                pool[index] = PhaseBin(
+                    index,
+                    weight,
+                    1,
+                    offset,
+                    offset,
+                    at,
+                    at,
+                    uncertainty,
+                    uncertainty,
+                    pool_total,
+                    tagged_before=tuple(
+                        (key, value) for key, value in sorted(snapshot.items()) if value > 0
+                    ),
+                )
+            else:
+                pool[index] = replace(
+                    existing,
+                    weight=existing.weight + weight,
+                    count=existing.count + 1,
+                    offset_min=min(existing.offset_min, offset),
+                    offset_max=max(existing.offset_max, offset),
+                    first_at=min(existing.first_at, at),
+                    last_at=max(existing.last_at, at),
+                    uncertainty_min=min(existing.uncertainty_min, uncertainty),
+                    uncertainty_max=max(existing.uncertainty_max, uncertainty),
+                )
+            event_periods = {period for period, event_id in tagged if event_id == event.event_id}
+            tags = {item.period: item for item in pool[index].endpoints}
+            for period in sorted(event_periods):
+                previous = tags.get(period)
+                if previous is None:
+                    untagged = (
+                        (
+                            existing.first_at,
+                            existing.weight_before,
+                            existing.tagged_before_at(period),
+                        )
+                        if existing is not None
+                        else (None, None, None)
+                    )
+                    tags[period] = EndpointTag(period, weight, 1, at, at, *untagged)
+                else:
+                    tags[period] = replace(
+                        previous,
+                        weight=previous.weight + weight,
+                        count=previous.count + 1,
+                        last_tagged_at=at,
+                    )
+                totals[period] = totals.get(period, 0.0) + weight
+            for period, value in list(tags.items()):
+                if period not in event_periods and value.untagged_first_at is None:
+                    tags[period] = replace(
+                        value,
+                        untagged_first_at=at,
+                        untagged_weight_before=pool_total,
+                        untagged_tagged_before=snapshot.get(period, 0.0),
+                    )
+            pool[index] = replace(pool[index], endpoints=tuple(tags[key] for key in sorted(tags)))
+            pool_total += weight
+        if (
+            incumbent is not None
+            and _authentic_event(event)
+            and _circular_distance(at, incumbent.phase_offset, incumbent.period)
+            <= incumbent.phase_tolerance
+        ):
+            last_aligned = at if last_aligned is None else max(last_aligned, at)
+    # Confirmation tags (epoch-scoped) keep the conservative bin-level rule.
+    if anchor_confirmation_period is not None and open_chain.anchor_index in pool:
+        _tag_bin(
+            pool,
+            open_chain.anchor_index,
+            open_chain.anchor_weight,
+            period=None,
+            confirmation_period=anchor_confirmation_period,
+        )
+    for event_id, period in sorted(confirmation_tagged.items()):
+        event = accepted.get(event_id) or context[event_id]
+        index = _day_bin(_event_at(event))[0]
+        if index in pool:
+            _tag_bin(pool, index, _event_weight(event), period=None, confirmation_period=period)
+
+    normal_bins = {(item.period, item.index): item for item in state.normal_relationships}
+    for relationship in {
+        item.relationship_id: item
+        for item in relationships
+        if item.server_key == state.server_key
+        and item.left_event_id in accepted
+        and not _high_direct(item)
+    }.values():
+        period = relationship.candidate_period_seconds
+        index, offset = _interval_bin(_relationship_phase_value(relationship, period), period)
+        existing = normal_bins.get((period, index))
+        normal_bins[(period, index)] = (
+            NormalBin(period, index, 1, offset, offset, relationship.left_at, relationship.right_at)
+            if existing is None
+            else replace(
+                existing,
+                count=existing.count + 1,
+                phase_min=min(existing.phase_min, offset),
+                phase_max=max(existing.phase_max, offset),
+                first_at=min(existing.first_at, relationship.left_at),
+                last_at=max(existing.last_at, relationship.right_at),
+            )
+        )
+    divisors, contradicted_at = _invalidate_divisors(state.divisors, ordered)
+    divisor_floor_at = state.divisor_floor_at
+    if contradicted_at is not None:
+        divisor_floor_at = (
+            contradicted_at if divisor_floor_at is None else max(divisor_floor_at, contradicted_at)
+        )
+
     new_anchor = ordered[-1] if chain_open and chain_id else None
     open_run = None
     for run in _build_runs(high_items, seed):
@@ -1209,6 +1427,12 @@ def fold_unit(
             recovery=_greedy_recovery(recovery),
         ),
         open_chain=next_open,
+        normal_relationships=tuple(normal_bins[key] for key in sorted(normal_bins)),
+        tagged_weight_totals=tuple(
+            (key, value) for key, value in sorted(totals.items()) if value > 0
+        ),
+        divisors=divisors,
+        divisor_floor_at=divisor_floor_at,
     )
 
 
@@ -1291,32 +1515,84 @@ def fold_windows(
     )
 
 
-def fold_divisor_resolution(state: LearnedState, score) -> LearnedState:
-    """Retain the best divisor resolution the schema-3 scorer has observed.
+def invalidate_contradicted_divisors(
+    state: LearnedState, events: Iterable[PhysicalRestartEvent]
+) -> LearnedState:
+    """Remove divisor evidence contradicted by (unfolded) authentic restarts.
 
-    Per (period, divisor) the largest covered-window and longer-interval
-    counts persist for the current regime epoch (reset on supersession).
-    Equal to the live recomputation while live evidence exists; durable after
-    schema-3 coverage expires (the intended persistent-knowledge semantics).
+    Raises the divisor floor to the contradiction, so a schema-3 window that
+    still contains pre-contradiction evidence cannot re-establish it.
     """
 
+    mark = _watermark_key(state)
+    values = [
+        item for item in events if item.server_key == state.server_key and _newer(item, mark)
+    ]
+    divisors, contradicted_at = _invalidate_divisors(state.divisors, values)
+    if contradicted_at is None:
+        return state
+    floor = state.divisor_floor_at
+    return replace(
+        state,
+        divisors=divisors,
+        divisor_floor_at=contradicted_at if floor is None else max(floor, contradicted_at),
+    )
+
+
+def fold_divisor_resolution(
+    state: LearnedState, score, recent_events: Iterable[PhysicalRestartEvent] = ()
+) -> LearnedState:
+    """Learn divisor resolution only from a clean, current schema-3 window.
+
+    ``recent_events`` are the schema-3 scorer's recent-window events (the only
+    events its divisor resolution is computed from).  Resolution is learned
+    for (period, divisor) only when the live scorer has it established, the
+    window contains no restart at a divisor midpoint of the period's phase
+    (it is not already contradicted), and the window starts after the
+    divisor floor (the latest contradiction or supersession), so an old
+    schema-3 window can never re-establish stale resolution.  Counts are the
+    best observed within the same phase; a different phase starts afresh.
+    The scorer's thresholds are unchanged.
+    """
+
+    events = [item for item in recent_events if _event_at(item) is not None]
+    if not events:
+        return state
+    window_start = min(_event_at(item) for item in events)
+    window_end = max(_event_at(item) for item in events)
+    floor = state.divisor_floor_at
+    if floor is not None and window_start <= floor:
+        return state
+    authentic = [_event_at(item) for item in events if _authentic_event(item)]
     stored = {(item.period, item.divisor): item for item in state.divisors}
     for candidate in getattr(score, "candidates", ()):
+        phase = candidate.phase_offset
+        if phase is None:
+            continue
+        period = candidate.period_seconds
         for item in candidate.divisor_resolution:
-            key = (candidate.period_seconds, item.divisor_seconds)
-            if key not in DIVISOR_KEYS:
+            key = (period, item.divisor_seconds)
+            if key not in DIVISOR_KEYS or not item.established_resolved:
+                continue
+            probe = DivisorEvidence(
+                period, item.divisor_seconds, 0, 0, phase % period, window_start
+            )
+            if any(divisor_contradicted(probe, at) for at in authentic):
                 continue
             previous = stored.get(key)
-            windows = max(
-                item.covered_window_count,
-                previous.covered_window_count if previous else 0,
+            if previous is not None and (
+                _circular_distance(previous.phase_offset, phase, period)
+                > candidate_phase_tolerance(period)
+            ):
+                previous = None
+            stored[key] = DivisorEvidence(
+                period,
+                item.divisor_seconds,
+                max(item.covered_window_count, previous.covered_window_count if previous else 0),
+                max(item.longer_interval_count, previous.longer_interval_count if previous else 0),
+                previous.phase_offset if previous is not None else phase % period,
+                max(window_end, previous.observed_at if previous is not None else window_end),
             )
-            longer = max(
-                item.longer_interval_count,
-                previous.longer_interval_count if previous else 0,
-            )
-            if windows or longer:
-                stored[key] = DivisorEvidence(key[0], key[1], windows, longer)
     values = tuple(stored[key] for key in sorted(stored))
     return state if values == state.divisors else replace(state, divisors=values)
 
@@ -1408,6 +1684,12 @@ def observe_decision(state: LearnedState, decision: AuthorityDecision) -> Learne
         )
         if open_chain is not None:
             open_chain = replace(open_chain, anchor_confirmation_tagged=False)
+    divisors = state.divisors
+    divisor_floor_at = state.divisor_floor_at
+    if supersession_seen:
+        boundary = max(item.superseded_at for item in superseded.values())
+        divisors = ()
+        divisor_floor_at = boundary if divisor_floor_at is None else max(divisor_floor_at, boundary)
     return replace(
         state,
         pool=pool,
@@ -1415,7 +1697,8 @@ def observe_decision(state: LearnedState, decision: AuthorityDecision) -> Learne
         superseded=tuple(superseded[item] for item in sorted(superseded)),
         epoch=epoch,
         open_chain=open_chain,
-        divisors=() if supersession_seen else state.divisors,
+        divisors=divisors,
+        divisor_floor_at=divisor_floor_at,
     )
 
 
@@ -1614,15 +1897,26 @@ def compact_sparse_support(
 
     entries: list[tuple[_Entry, str, float, bool]] = []
     removed: list[tuple[float, float]] = []
+    # Domain anchors per folded bin: (pool total before, tagged total before).
+    befores: dict[int, tuple[float, float]] = {}
+    other_tags: list[EndpointTag] = []
     for item in state.pool:
         entry = _bin_entry(item)
         state_class, mad_value = _classify(entry, phase_offset, period)
         weight, count = item.weight, item.count
+        first_at = item.first_at
+        before = (item.weight_before, item.tagged_before_at(period))
+        tag = item.tag(period)
         if state_class == _ALIGNED:
             removals = []
-            tag = item.tag(period)
             if exclude_folded_high_endpoints and tag is not None:
-                removals.append((tag.weight, tag.count, item.first_at))
+                # The candidate's own endpoints leave the pool; the domain
+                # starts at the earliest remaining restart (exact).
+                weight -= tag.weight
+                count -= tag.count
+                if tag.untagged_first_at is not None:
+                    first_at = tag.untagged_first_at
+                    before = (tag.untagged_weight_before or 0.0, tag.untagged_tagged_before or 0.0)
             if exclude_folded_confirmation_endpoints and item.confirmation is not None:
                 removals.append((item.confirmation.weight, item.confirmation.count, item.first_at))
             if anchor_index == item.index:
@@ -1631,9 +1925,22 @@ def compact_sparse_support(
                 weight -= removed_weight
                 count -= removed_count
                 removed.append((removed_weight, removed_at))
+        elif exclude_folded_high_endpoints and tag is not None:
+            other_tags.append(tag)
         if count <= 0 or weight <= _EPSILON:
             continue
-        entry = _bin_entry(item, weight=weight, count=count)
+        entry = _Entry(
+            item.seconds_min,
+            item.seconds_max,
+            weight,
+            count,
+            first_at,
+            item.last_at,
+            item.uncertainty_min,
+            item.uncertainty_max,
+            item,
+        )
+        befores[item.index] = before
         entries.append((entry, state_class, mad_value, explained(entry)))
     for event in ring_sparse_events(state, ring_events):
         if event.event_id in excluded:
@@ -1661,7 +1968,22 @@ def compact_sparse_support(
         if entry.source is None and entry.first_at >= first
     )
     if anchor_entry.source is not None:
-        folded_total = state.pool_weight_total - anchor_entry.source.weight_before
+        pool_before, tagged_before = befores[anchor_entry.source.index]
+        # Exact: every restart folded at or after the first aligned one.
+        folded_total = state.pool_weight_total - pool_before
+        if exclude_folded_high_endpoints:
+            # Excluded endpoints folded at or after the domain start: all
+            # period-P tagged weight since then, minus tags of bins that stay
+            # in the pool (over-estimated, so the domain is never too small).
+            tagged_since = next(
+                (value for key, value in state.tagged_weight_totals if key == period), 0.0
+            ) - tagged_before
+            tagged_since -= sum(
+                item.weight
+                for item in other_tags
+                if item.last_tagged_at is None or item.last_tagged_at >= first
+            )
+            folded_total -= max(0.0, tagged_since)
         folded_total -= sum(weight for weight, at in removed if at >= first)
     else:
         folded_total = 0.0
@@ -1762,51 +2084,79 @@ def compact_harmonic_blockers(
     period: int,
     normal_candidate: CandidateScore | None = None,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
+    *,
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+    phase_offset: float | None = None,
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """``authority._harmonic_blockers`` from persisted plus live evidence."""
+    """``authority._harmonic_blockers`` from live plus persisted evidence.
+
+    A divisor is resolved when the live schema-3 resolution resolves it
+    (exactly the raw rule), or when persisted divisor evidence does: learned
+    from a clean window at a compatible phase and never contradicted since
+    (folded contradictions removed it at fold time; unfolded ring restarts
+    are checked here).  The scorer's thresholds are unchanged, so persisted
+    evidence only keeps resolution through inactivity; it can never resolve
+    a divisor that live or contradicting evidence leaves unresolved.
+    """
 
     if period not in HARMONIC_PERIODS:
         return (), ()
-    stored = {item.divisor: item for item in state.divisors if item.period == period}
+    mark = _watermark_key(state)
+    unfolded = [
+        _event_at(item)
+        for item in ring_events
+        if item.server_key == state.server_key
+        and _newer(item, mark)
+        and _authentic_event(item)
+    ]
+    stored = {
+        item.divisor: item
+        for item in state.divisors
+        if item.period == period
+        and (
+            phase_offset is None
+            or _circular_distance(item.phase_offset, phase_offset, period)
+            <= candidate_phase_tolerance(period)
+        )
+        and not any(at > item.observed_at and divisor_contradicted(item, at) for at in unfolded)
+    }
     live = (
         {item.divisor_seconds: item for item in normal_candidate.divisor_resolution}
         if normal_candidate is not None
         else {}
     )
-    mark = state.watermark.window_end_at
+    window_mark = state.watermark.window_end_at
     ring_misses = [
         item
         for item in latest_window_records(ring_windows)
         if item.outcome is ExpectedWindowOutcome.GENUINE_MISS
         and item.negative_penalty_active
-        and (mark is None or item.window_end_at > mark)
+        and (window_mark is None or item.window_end_at > window_mark)
     ]
     h2: list[str] = []
     h3: list[str] = []
     for divisor in (value for value in CANDIDATE_PERIODS if value < period and period % value == 0):
         persisted = stored.get(divisor)
         current = live.get(divisor)
-        windows = max(
-            persisted.covered_window_count if persisted else 0,
-            current.covered_window_count if current else 0,
-        )
-        intervals = max(
-            persisted.longer_interval_count if persisted else 0,
-            current.longer_interval_count if current else 0,
-        )
         midpoints = sum(
             item.genuine_miss_count for item in state.misses if item.period == divisor
-        ) + sum(
-            item.candidate_period_seconds == divisor for item in ring_misses
-        )
+        ) + sum(item.candidate_period_seconds == divisor for item in ring_misses)
         established = bool(
-            (windows >= 2 and intervals >= 2)
-            or (current is not None and current.established_resolved)
+            (current is not None and current.established_resolved)
+            or (
+                persisted is not None
+                and persisted.covered_window_count >= 2
+                and persisted.longer_interval_count >= 2
+            )
             or midpoints >= 1
         )
         high = bool(
-            (windows >= 4 and intervals >= 3)
-            or (current is not None and current.high_resolved)
+            (current is not None and current.high_resolved)
+            or (
+                persisted is not None
+                and persisted.covered_window_count >= 4
+                and persisted.longer_interval_count >= 3
+            )
             or midpoints >= 2
         )
         if not established:
@@ -1816,6 +2166,119 @@ def compact_harmonic_blockers(
     return tuple(h2), tuple(h3)
 
 
+def ring_normal_relationships(
+    state: LearnedState, relationships: Iterable[IntervalRelationship]
+) -> tuple[IntervalRelationship, ...]:
+    """Non-high relationships not yet folded (left endpoint unfolded)."""
+
+    mark = _watermark_key(state)
+    values = {
+        item.relationship_id: item
+        for item in relationships
+        if item.server_key == state.server_key
+        and not _high_direct(item)
+        and (mark is None or (item.left_at, item.left_event_id) > mark)
+    }
+    return tuple(
+        sorted(
+            values.values(),
+            key=lambda item: (item.left_at, item.right_at, item.relationship_id),
+        )
+    )
+
+
+@dataclass(frozen=True)
+class FoldedNormalSummary:
+    count: int
+    first_at: float | None
+    last_at: float | None
+
+
+def compact_folded_normal_relationships(
+    state: LearnedState, *, period: int, phase_offset: float, tolerance: float
+) -> FoldedNormalSummary:
+    """Folded normal relationships possibly aligned with a phase (superset)."""
+
+    values = [
+        item
+        for item in state.normal_relationships
+        if item.period == period
+        and _range_abs(
+            item.index * INTERVAL_BIN_SECONDS + item.phase_min,
+            item.index * INTERVAL_BIN_SECONDS + item.phase_max,
+            phase_offset,
+            period,
+        )[0]
+        <= tolerance
+    ]
+    return FoldedNormalSummary(
+        sum(item.count for item in values),
+        min((item.first_at for item in values), default=None),
+        max((item.last_at for item in values), default=None),
+    )
+
+
+def compact_folded_off_phase_ids(
+    state: LearnedState, *, period: int, phase_offset: float, tolerance: float, since: float
+) -> tuple[str, ...]:
+    """Bounded references to folded restarts possibly off-phase after ``since``.
+
+    One reference per folded minute bin whose latest restart is after
+    ``since`` and whose range is not wholly within tolerance (conservative:
+    a possibly off-phase restart keeps suspicion and prevents isolation).
+    """
+
+    return tuple(
+        f"learned-off-phase:{item.index}"
+        for item in state.pool
+        if item.last_at > since
+        and _range_abs(item.seconds_min, item.seconds_max, phase_offset, period)[1] > tolerance
+    )
+
+
+def compact_folded_miss_ids(
+    state: LearnedState, *, period: int, phase_offset: float, tolerance: float, since: float
+) -> tuple[str, ...]:
+    """Bounded references to folded genuine misses possibly in phase after ``since``."""
+
+    return tuple(
+        f"learned-miss:{item.period}:{item.index}"
+        for item in state.misses
+        if item.period == period
+        and item.last_genuine_miss_at is not None
+        and item.last_genuine_miss_at > since
+        and _range_abs(
+            item.index * INTERVAL_BIN_SECONDS + item.phase_min,
+            item.index * INTERVAL_BIN_SECONDS + item.phase_max,
+            phase_offset,
+            period,
+        )[0]
+        <= tolerance
+    )
+
+
+def compact_folded_restart_after(
+    state: LearnedState,
+    *,
+    period: int,
+    phase_offset: float,
+    tolerance: float,
+    after: float,
+    aligned: bool,
+) -> bool:
+    """Whether a folded restart after ``after`` may be aligned (or off-phase)."""
+
+    for item in state.pool:
+        if item.last_at <= after:
+            continue
+        smallest, largest = _range_abs(item.seconds_min, item.seconds_max, phase_offset, period)
+        if aligned and smallest <= tolerance + item.uncertainty_max:
+            return True
+        if not aligned and largest > tolerance:
+            return True
+    return False
+
+
 def compact_sparse_structure_reasons(
     state: LearnedState,
     *,
@@ -1823,6 +2286,8 @@ def compact_sparse_structure_reasons(
     support: CompactSparseSupport,
     normal_candidate: CandidateScore | None = None,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+    phase_offset: float | None = None,
 ) -> tuple[str, ...]:
     """``authority._sparse_structure_reasons`` (SE1-SE5).
 
@@ -1842,7 +2307,14 @@ def compact_sparse_structure_reasons(
         for multiple in CANDIDATE_PERIODS
         if multiple > period and multiple % period == 0
     )
-    _h2, h3 = compact_harmonic_blockers(state, period, normal_candidate, ring_windows)
+    _h2, h3 = compact_harmonic_blockers(
+        state,
+        period,
+        normal_candidate,
+        ring_windows,
+        ring_events=ring_events,
+        phase_offset=phase_offset,
+    )
     if not refuted or h3:
         return (SPARSE_PERIOD_AMBIGUOUS_REASON,)
     gate = SCHEDULE_GATES[period]
@@ -1937,6 +2409,9 @@ class CompactCandidate:
     excludes_anchor: bool
     sparse_reason_codes: tuple[str, ...]
     longest_streak: int
+    ring_relationship_ids: tuple[str, ...] = ()
+    ring_relationship_qualities: tuple[tuple[str, float], ...] = ()
+    streaks: tuple[StreakSummary, ...] = ()
 
 
 @dataclass
@@ -2104,6 +2579,8 @@ def compact_candidates(
                 period,
                 normal_candidate,
                 ring_windows,
+                ring_events=ring_events,
+                phase_offset=phase_offset,
             )
             has_h2_streak = any(
                 item.interval_count >= 2 and item.event_count >= 3 for item in summaries
@@ -2146,6 +2623,8 @@ def compact_candidates(
                 support=support,
                 normal_candidate=normal_candidate,
                 ring_windows=ring_windows,
+                ring_events=ring_events,
+                phase_offset=phase_offset,
             )
             firsts = [item.left_at for item in ring_rels] + [
                 item.first_at for item in folded if item.first_at is not None
@@ -2179,6 +2658,12 @@ def compact_candidates(
                     excludes_anchor=excludes_anchor,
                     sparse_reason_codes=sparse_reasons,
                     longest_streak=max((item.interval_count for item in summaries), default=0),
+                    ring_relationship_ids=tuple(item.relationship_id for item in ring_rels),
+                    ring_relationship_qualities=tuple(
+                        (item.relationship_id, round(qualities[item.relationship_id], 6))
+                        for item in ring_rels
+                    ),
+                    streaks=tuple(summaries),
                 )
             )
     return tuple(sorted(results, key=lambda item: (item.period, item.phase_offset)))
@@ -2191,6 +2676,18 @@ def compact_sparse_confirmation(
     ring_events: Iterable[PhysicalRestartEvent] = (),
     ring_relationships: Iterable[IntervalRelationship] = (),
 ) -> float:
+    return compact_sparse_confirmation_details(
+        state, candidate, ring_events=ring_events, ring_relationships=ring_relationships
+    )[0]
+
+
+def compact_sparse_confirmation_details(
+    state: LearnedState,
+    candidate: CompactCandidate,
+    *,
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+    ring_relationships: Iterable[IntervalRelationship] = (),
+) -> tuple[float, bool]:
     """``authority._sparse_confirmed_candidate`` combined value (Stage 8.5).
 
     Folded high full intervals confirm only from bins wholly within the
@@ -2200,7 +2697,7 @@ def compact_sparse_confirmation(
 
     incumbent = state.incumbent
     if incumbent is None or incumbent.established_at is None:
-        return candidate.combined_confidence
+        return candidate.combined_confidence, False
     period = incumbent.period
     established_at = incumbent.established_at
     ring_events = tuple(ring_events)
@@ -2248,7 +2745,7 @@ def compact_sparse_confirmation(
             confirming = True
             excluded.update((relationship.left_event_id, relationship.right_event_id))
     if not confirming:
-        return candidate.combined_confidence
+        return candidate.combined_confidence, False
     confirmation = min(HIGH_AUTHORITY_CAP, 1.0 - residual)
     support = compact_sparse_support(
         state,
@@ -2264,7 +2761,7 @@ def compact_sparse_confirmation(
     combined = continuous + (1.0 - continuous) * min(
         SPARSE_EVIDENCE_CEILING, SPARSE_EVIDENCE_CEILING * support.value
     )
-    return round(max(candidate.combined_confidence, combined), 6)
+    return round(max(candidate.combined_confidence, combined), 6), True
 
 
 def compact_last_aligned_evidence_at(
@@ -2414,6 +2911,66 @@ def compact_recovery_confirmations(
     return min(selected, ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS)
 
 
+@dataclass(frozen=True)
+class CompactAuthorityInputs:
+    """The bounded raw evidence the compact authority reads besides the state."""
+
+    ring_events: tuple[PhysicalRestartEvent, ...]
+    ring_relationships: tuple[IntervalRelationship, ...]
+    ring_windows: tuple[ExpectedWindowLedgerRecord, ...]
+
+
+def compact_authority_inputs(
+    state: LearnedState,
+    events: Iterable[PhysicalRestartEvent],
+    relationships: Iterable[IntervalRelationship],
+    windows: Iterable[ExpectedWindowLedgerRecord] = (),
+) -> CompactAuthorityInputs:
+    """Ring events (with the anchor), unfolded relationships and windows.
+
+    High (and full-interval) relationships are unfolded until their right
+    endpoint folds; normal relationships until their left endpoint folds.
+    Expected windows are unfolded until they end at or before the window
+    watermark.  Everything here is bounded by the ring.
+    """
+
+    ring = plan_ring_folding(state, events).ring
+    ring_map = _ring_map(state, ring)
+    high = _ring_relationships(state, relationships, ring_map)
+    normal = ring_normal_relationships(state, relationships)
+    values = {item.relationship_id: item for item in (*high, *normal)}
+    mark = state.watermark.window_end_at
+    window_values = tuple(
+        item for item in windows if mark is None or item.window_end_at > mark
+    )
+    return CompactAuthorityInputs(
+        ring,
+        tuple(
+            sorted(
+                values.values(),
+                key=lambda item: (item.left_at, item.right_at, item.relationship_id),
+            )
+        ),
+        window_values,
+    )
+
+
+def knowledge_for_regime(state: LearnedState, regime: RegimeRecord) -> LearnedState:
+    """The state with incumbent knowledge describing ``regime``.
+
+    Keeps the stored last aligned evidence when it is the same regime;
+    otherwise derives it from bins wholly aligned with the regime.
+    """
+
+    previous = state.incumbent
+    last_aligned = (
+        previous.last_aligned_evidence_at
+        if previous is not None and previous.regime_id == regime.regime_id
+        else _folded_last_aligned(state, regime)
+    )
+    return replace(state, incumbent=_knowledge_from_regime(regime, last_aligned=last_aligned))
+
+
 # --------------------------------------------------------------------------
 # Serialisation: positional arrays, strict structural and byte bounds
 # --------------------------------------------------------------------------
@@ -2523,25 +3080,62 @@ def _pool_bin_to(item: PhaseBin) -> list:
         item.uncertainty_min,
         item.uncertainty_max,
         item.weight_before,
-        [[PERIOD_INDEX[tag.period], tag.weight, tag.count] for tag in item.endpoints],
+        [
+            [
+                PERIOD_INDEX[tag.period],
+                tag.weight,
+                tag.count,
+                tag.first_tagged_at,
+                tag.last_tagged_at,
+                tag.untagged_first_at,
+                tag.untagged_weight_before,
+                tag.untagged_tagged_before,
+            ]
+            for tag in item.endpoints
+        ],
         None
         if confirmation is None
         else [PERIOD_INDEX[confirmation.period], confirmation.weight, confirmation.count],
+        [[PERIOD_INDEX[key], value] for key, value in item.tagged_before],
     ]
 
 
 def _tag_from(value: object, name: str, count_limit: int, weight_limit: float) -> EndpointTag:
-    data = _array(value, name, length=3)
+    if not isinstance(value, list) or len(value) not in (3, 8):
+        raise LearnedStateError(f"{name} must have 3 or 8 fields")
+    data = value
     index = _integer(data[0], f"{name}.period", maximum=len(CANDIDATE_PERIODS) - 1)
+    extra = [None] * 5
+    if len(data) == 8:
+        extra = [
+            _optional_finite(data[3], f"{name}.first_tagged_at"),
+            _optional_finite(data[4], f"{name}.last_tagged_at"),
+            _optional_finite(data[5], f"{name}.untagged_first_at"),
+            _optional_finite(data[6], f"{name}.untagged_weight_before"),
+            _optional_finite(data[7], f"{name}.untagged_tagged_before"),
+        ]
     return EndpointTag(
         CANDIDATE_PERIODS[index],
         _finite(data[1], f"{name}.weight", maximum=weight_limit),
         _integer(data[2], f"{name}.count", minimum=1, maximum=count_limit),
+        *extra,
     )
 
 
+def _period_values_from(value: object, name: str) -> tuple[tuple[int, float], ...]:
+    values = []
+    for index, item in enumerate(_array(value, name, maximum=len(CANDIDATE_PERIODS))):
+        entry = _array(item, f"{name}[{index}]", length=2)
+        period = CANDIDATE_PERIODS[
+            _integer(entry[0], f"{name}[{index}].period", maximum=len(CANDIDATE_PERIODS) - 1)
+        ]
+        values.append((period, _finite(entry[1], f"{name}[{index}].value")))
+    _ordered_unique([period for period, _value in values], name)
+    return tuple(values)
+
+
 def _pool_bin_from(value: object, name: str) -> PhaseBin:
-    data = _array(value, name, length=12)
+    data = _array(value, name, length=13)
     count = _integer(data[2], f"{name}.count", minimum=1)
     weight = _finite(data[1], f"{name}.weight")
     offset_min = _finite(data[3], f"{name}.offset_min", maximum=PHASE_BIN_SECONDS)
@@ -2575,6 +3169,7 @@ def _pool_bin_from(value: object, name: str) -> PhaseBin:
         weight_before=_finite(data[9], f"{name}.weight_before"),
         endpoints=tags,
         confirmation=confirmation,
+        tagged_before=_period_values_from(data[12], f"{name}.tagged_before"),
     )
 
 
@@ -2793,6 +3388,9 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
             mark.window_end_at,
         ],
         "pool_weight_total": state.pool_weight_total,
+        "tagged_weight_totals": [
+            [PERIOD_INDEX[key], value] for key, value in state.tagged_weight_totals
+        ],
         "pool": [_pool_bin_to(item) for item in state.pool],
         "intervals": [_interval_bin_to(item) for item in state.intervals],
         "misses": [
@@ -2808,8 +3406,28 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
             for item in state.misses
         ],
         "divisors": [
-            [item.period, item.divisor, item.covered_window_count, item.longer_interval_count]
+            [
+                item.period,
+                item.divisor,
+                item.covered_window_count,
+                item.longer_interval_count,
+                item.phase_offset,
+                item.observed_at,
+            ]
             for item in state.divisors
+        ],
+        "divisor_floor_at": state.divisor_floor_at,
+        "normal_relationships": [
+            [
+                item.period,
+                item.index,
+                item.count,
+                item.phase_min,
+                item.phase_max,
+                item.first_at,
+                item.last_at,
+            ]
+            for item in state.normal_relationships
         ],
         "incumbent": None
         if incumbent is None
@@ -2892,7 +3510,7 @@ def learned_state_from_mapping(value: object) -> LearnedState:
     for index, raw in enumerate(
         _array(data.get("divisors"), "divisors", maximum=len(DIVISOR_KEYS)),
     ):
-        entry = _array(raw, f"divisors[{index}]", length=4)
+        entry = _array(raw, f"divisors[{index}]", length=6)
         if (entry[0], entry[1]) not in DIVISOR_KEYS:
             raise LearnedStateError(f"divisors[{index}] is not a (period, divisor) pair")
         divisors.append(
@@ -2901,9 +3519,37 @@ def learned_state_from_mapping(value: object) -> LearnedState:
                 entry[1],
                 _integer(entry[2], "divisor.covered_window_count"),
                 _integer(entry[3], "divisor.longer_interval_count"),
+                _finite(entry[4], "divisor.phase_offset", maximum=entry[0]),
+                _finite(entry[5], "divisor.observed_at"),
             )
         )
     _ordered_unique([(item.period, item.divisor) for item in divisors], "divisors")
+
+    normal_bins = []
+    for index, raw in enumerate(
+        _array(data.get("normal_relationships"), "normal_relationships", maximum=INTERVAL_BIN_TOTAL)
+    ):
+        label = f"normal_relationships[{index}]"
+        entry = _array(raw, label, length=7)
+        period = _period(entry[0], f"{label}.period")
+        low = _finite(entry[3], f"{label}.phase_min", maximum=INTERVAL_BIN_SECONDS)
+        high = _finite(entry[4], f"{label}.phase_max", maximum=INTERVAL_BIN_SECONDS)
+        first_at = _finite(entry[5], f"{label}.first_at")
+        last_at = _finite(entry[6], f"{label}.last_at")
+        if high < low or last_at < first_at:
+            raise LearnedStateError(f"{label} extremes are inverted")
+        normal_bins.append(
+            NormalBin(
+                period,
+                _integer(entry[1], f"{label}.index", maximum=period // INTERVAL_BIN_SECONDS - 1),
+                _integer(entry[2], f"{label}.count", minimum=1),
+                low,
+                high,
+                first_at,
+                last_at,
+            )
+        )
+    _ordered_unique([(item.period, item.index) for item in normal_bins], "normal_relationships")
 
     incumbent = None
     if data.get("incumbent") is not None:
@@ -2996,6 +3642,11 @@ def learned_state_from_mapping(value: object) -> LearnedState:
         superseded=tuple(superseded),
         epoch=epoch,
         open_chain=_open_chain_from(data.get("open_chain")),
+        normal_relationships=tuple(normal_bins),
+        divisor_floor_at=_optional_finite(data.get("divisor_floor_at"), "divisor_floor_at"),
+        tagged_weight_totals=_period_values_from(
+            data.get("tagged_weight_totals"), "tagged_weight_totals"
+        ),
     )
     if learned_state_entry_count(state) > LEARNED_STATE_MAX_ENTRIES:
         raise LearnedStateError("learned state exceeds its entry bound")

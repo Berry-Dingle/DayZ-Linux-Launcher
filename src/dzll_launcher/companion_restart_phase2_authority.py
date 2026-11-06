@@ -4,7 +4,7 @@ import hashlib
 import json
 import math
 import statistics
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Iterable
 
@@ -291,6 +291,39 @@ class ChallengerContext:
     first_evidence_at: float
     last_evidence_at: float
     reason_codes: tuple[str, ...]
+    # Retention R3: relationships folded into the compact learned state are
+    # counted here (their raw IDs are no longer referenced).  Always zero on
+    # the raw-history path.
+    folded_high_relationship_count: int = 0
+    folded_normal_relationship_count: int = 0
+
+
+def context_high_relationship_count(context: "ChallengerContext") -> int:
+    """High relationships behind a challenger context, folded ones included."""
+
+    return len(context.high_relationship_ids) + context.folded_high_relationship_count
+
+
+COMPACT_EVIDENCE_REASON = "compact_learned_state_evidence"
+
+
+@dataclass
+class _Compact:
+    """Compact-authority evaluation context (Retention R3).
+
+    ``state`` is the learned state (folded knowledge); the ring tuples are the
+    bounded unfolded raw evidence.  ``candidates`` maps each compact high
+    candidate's ID to its compact evaluation, so later stages can read folded
+    evidence that has no raw IDs.
+    """
+
+    state: object
+    ring_events: tuple
+    ring_relationships: tuple
+    ring_windows: tuple
+    normal_score: object
+    candidates: dict = field(default_factory=dict)
+    challenger_view: tuple | None = None
 
 
 @dataclass(frozen=True)
@@ -350,8 +383,16 @@ def evaluate_authority(
     expected_window_ledger: Iterable[ExpectedWindowLedgerRecord] = (),
     events: Iterable[PhysicalRestartEvent] = (),
     prior_decision: AuthorityDecision | None = None,
+    learned_state: object | None = None,
 ) -> AuthorityDecision:
-    """Build one immutable shadow decision without mutating any input state."""
+    """Build one immutable shadow decision without mutating any input state.
+
+    With ``learned_state`` (Retention R3) the evidence arguments are the
+    bounded ring (unfolded events including the open-chain anchor, unfolded
+    relationships and windows); folded evidence is read from the learned
+    state through the compact evaluators.  The decision state machine is the
+    same in both modes.
+    """
 
     if not isinstance(server_key, str) or not server_key:
         raise ValueError("server_key must be a non-empty string")
@@ -361,16 +402,36 @@ def evaluate_authority(
     )
     streak_values = _unique_streaks(streaks, server_key)
     window_values = _latest_window_records(expected_window_ledger, server_key)
-    sparse = _sparse_evidence(event_values, prior_decision)
-    candidates, normal_ledger, high_ledger = _build_ledgers(
-        server_key=server_key,
-        normal_score=normal_score,
-        relationships=relationship_values,
-        streaks=streak_values,
-        windows=window_values,
-        events=event_values,
-        sparse=sparse,
-    )
+    compact = None
+    if learned_state is not None:
+        compact = _Compact(
+            state=learned_state,
+            ring_events=event_values,
+            ring_relationships=relationship_values,
+            ring_windows=window_values,
+            normal_score=normal_score,
+        )
+    sparse = _sparse_evidence(event_values, prior_decision, compact=compact)
+    if compact is None:
+        candidates, normal_ledger, high_ledger = _build_ledgers(
+            server_key=server_key,
+            normal_score=normal_score,
+            relationships=relationship_values,
+            streaks=streak_values,
+            windows=window_values,
+            events=event_values,
+            sparse=sparse,
+        )
+    else:
+        candidates, normal_ledger, high_ledger = _compact_ledgers(
+            server_key=server_key,
+            normal_score=normal_score,
+            relationships=relationship_values,
+            windows=window_values,
+            events=event_values,
+            sparse=sparse,
+            compact=compact,
+        )
     return _transition_decision(
         server_key=server_key,
         normal_score=normal_score,
@@ -383,6 +444,7 @@ def evaluate_authority(
         relationships=relationship_values,
         streaks=streak_values,
         sparse=sparse,
+        compact=compact,
     )
 
 
@@ -399,10 +461,13 @@ class _SparseEvidence:
 
     events: tuple[PhysicalRestartEvent, ...]
     historical: tuple[tuple[RegimeRecord, frozenset[str]], ...]
+    compact: "_Compact | None" = None
 
 
 def _sparse_evidence(
-    events: tuple[PhysicalRestartEvent, ...], prior: AuthorityDecision | None
+    events: tuple[PhysicalRestartEvent, ...],
+    prior: AuthorityDecision | None,
+    compact: "_Compact | None" = None,
 ) -> _SparseEvidence:
     usable = tuple(
         item
@@ -411,6 +476,9 @@ def _sparse_evidence(
         and _event_weight(item) > 0
         and _event_at(item) is not None
     )
+    if compact is not None:
+        # Superseded-regime separation lives in the learned state.
+        return _SparseEvidence(events=usable, historical=(), compact=compact)
     historical = []
     for regime in prior.regimes if prior is not None else ():
         if (
@@ -447,6 +515,21 @@ class _SparseSupport:
     phase_confidence: float = 0.0
     off_phase_weight: float = 0.0
     consistency: float = 0.0
+    # Compact path: aligned-time bounds and the compact support itself.
+    bounds: tuple[float, float] | None = None
+    compact_support: object | None = None
+    compact: "_Compact | None" = None
+
+
+def _support_bounds(support: "_SparseSupport") -> tuple[float, float] | None:
+    """(first, last) aligned restart time, or ``None`` when nothing aligns."""
+
+    if support.compact_support is not None:
+        return support.bounds
+    if not support.aligned:
+        return None
+    times = [_event_at(item) for item in support.aligned]
+    return min(times), max(times)
 
 
 def _long_horizon_sparse_confidence(
@@ -470,6 +553,7 @@ def _sparse_support(
     phase_offset: float,
     sparse: _SparseEvidence,
     excluded_event_ids: frozenset[str],
+    candidate: "AuthorityCandidate | None" = None,
 ) -> _SparseSupport:
     """Per-event sparse support for one candidate (period, phase).
 
@@ -491,6 +575,14 @@ def _sparse_support(
     statistic, which is still returned as ``phase_confidence`` for SE3.
     """
 
+    if sparse.compact is not None:
+        return _compact_sparse_support(
+            period=period,
+            phase_offset=phase_offset,
+            compact=sparse.compact,
+            excluded_event_ids=excluded_event_ids,
+            candidate=candidate,
+        )
     historical: set[str] = set()
     for regime, explained in sparse.historical:
         if (
@@ -582,6 +674,19 @@ def _sparse_structure_reasons(
     SE4/SE5 failures mark the period as ambiguous.
     """
 
+    if support.compact_support is not None:
+        from .companion_restart_phase2_learned_state import compact_sparse_structure_reasons
+
+        compact = support.compact
+        return compact_sparse_structure_reasons(
+            compact.state,
+            period=period,
+            support=support.compact_support,
+            normal_candidate=normal_candidate,
+            ring_windows=compact.ring_windows,
+            ring_events=compact.ring_events,
+            phase_offset=None,
+        )
     if not support.aligned:
         return ()
     times = sorted(_event_at(item) for item in support.aligned)
@@ -733,6 +838,27 @@ def _build_ledgers(
             candidate_values.append(candidate)
             normal_values.append(normal)
 
+    return _assemble_ledgers(
+        server_key=server_key,
+        candidate_values=candidate_values,
+        normal_values=normal_values,
+        windows=windows,
+        high=high,
+        streaks=streaks,
+    )
+
+
+def _assemble_ledgers(
+    *,
+    server_key: str,
+    candidate_values: list,
+    normal_values: list,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    high: tuple[IntervalRelationship, ...],
+    streaks: tuple[CadenceStreak, ...],
+) -> tuple[
+    tuple[AuthorityCandidate, ...], NormalEvidenceLedger, HighEvidenceLedger
+]:
     candidates = tuple(sorted(candidate_values, key=_candidate_sort_key))
     normal_candidates = tuple(
         sorted(
@@ -975,6 +1101,7 @@ def _normal_only_candidate(
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     events: tuple[PhysicalRestartEvent, ...],
     sparse: _SparseEvidence,
+    compact: "_Compact | None" = None,
 ) -> tuple[AuthorityCandidate, NormalCandidateEvidence]:
     period = normal_candidate.period_seconds
     phase = float(phase) % period
@@ -990,30 +1117,54 @@ def _normal_only_candidate(
         sparse=sparse,
         excluded_event_ids=frozenset(),
     )
-    defining = normal.aligned_relationship_ids or (
-        f"normal-candidate-{period}-{round(phase, 6)}",
-    )
-    regime_id = _stable_id(
-        "authority-normal-regime",
-        AUTHORITY_SEMANTIC_VERSION,
-        server_key,
-        period,
-        _normalized_phase_cluster(phase, tolerance, period),
-        defining,
-    )
-    candidate_id = _stable_id(
-        "authority-normal-candidate",
-        AUTHORITY_SEMANTIC_VERSION,
-        regime_id,
-        normal.aligned_normal_confidence,
-        normal.aligned_relationship_ids,
-    )
     times = [
         value
         for item in relationships
         if item.relationship_id in normal.aligned_relationship_ids
         for value in (item.left_at, item.right_at)
     ]
+    if compact is None:
+        defining = normal.aligned_relationship_ids or (
+            f"normal-candidate-{period}-{round(phase, 6)}",
+        )
+        regime_id = _stable_id(
+            "authority-normal-regime",
+            AUTHORITY_SEMANTIC_VERSION,
+            server_key,
+            period,
+            _normalized_phase_cluster(phase, tolerance, period),
+            defining,
+        )
+        candidate_id = _stable_id(
+            "authority-normal-candidate",
+            AUTHORITY_SEMANTIC_VERSION,
+            regime_id,
+            normal.aligned_normal_confidence,
+            normal.aligned_relationship_ids,
+        )
+    else:
+        # Compact identity: stable under folding (no relationship IDs).
+        from .companion_restart_phase2_learned_state import compact_folded_normal_relationships
+
+        defining = ()
+        regime_id = _stable_id(
+            "authority-compact-normal-regime",
+            AUTHORITY_SEMANTIC_VERSION,
+            server_key,
+            period,
+            _normalized_phase_cluster(phase, tolerance, period),
+        )
+        candidate_id = _stable_id(
+            "authority-compact-normal-candidate",
+            AUTHORITY_SEMANTIC_VERSION,
+            regime_id,
+            round(phase, 6),
+            normal.aligned_normal_confidence,
+        )
+        folded = compact_folded_normal_relationships(
+            compact.state, period=period, phase_offset=phase, tolerance=tolerance
+        )
+        times.extend(value for value in (folded.first_at, folded.last_at) if value is not None)
     return (
         AuthorityCandidate(
             schema_version=AUTHORITY_SCHEMA_VERSION,
@@ -1084,6 +1235,7 @@ def _normal_candidate_evidence(
     events: tuple[PhysicalRestartEvent, ...],
     sparse: _SparseEvidence,
     excluded_event_ids: frozenset[str],
+    compact_support: tuple[float, tuple[str, ...], bool] | None = None,
 ) -> NormalCandidateEvidence:
     aligned_relationships = tuple(
         item
@@ -1097,19 +1249,26 @@ def _normal_candidate_evidence(
     # Stage 8.3: the sparse input is the long-horizon per-event statistic over
     # persisted restarts, not schema-3's recent-window (7 day / 16 event)
     # pair-derived confidence, which also re-counted continuous intervals.
-    support = _sparse_support(
-        period=period,
-        phase_offset=phase_offset,
-        sparse=sparse,
-        excluded_event_ids=excluded_event_ids,
-    )
-    aligned_confidence = support.value
-    sparse_reasons = _sparse_structure_reasons(
-        period=period,
-        support=support,
-        normal_candidate=normal_candidate,
-        windows=windows,
-    )
+    if compact_support is not None:
+        aligned_confidence, sparse_reasons, proportional = compact_support
+    else:
+        support = _sparse_support(
+            period=period,
+            phase_offset=phase_offset,
+            sparse=sparse,
+            excluded_event_ids=excluded_event_ids,
+        )
+        aligned_confidence = support.value
+        sparse_reasons = _sparse_structure_reasons(
+            period=period,
+            support=support,
+            normal_candidate=normal_candidate,
+            windows=windows,
+        )
+        proportional = bool(
+            support.off_phase_weight > 0
+            and support.consistency >= SPARSE_CONSISTENCY_TOLERANCE
+        )
     misses = tuple(
         item.result_id
         for item in windows
@@ -1176,12 +1335,7 @@ def _normal_candidate_evidence(
             "off_phase_spacing_not_incumbent_reinforcement",
             LONG_HORIZON_SPARSE_REASON,
             *sparse_reasons,
-            *(
-                (SPARSE_PROPORTIONAL_ANOMALY_REASON,)
-                if support.off_phase_weight > 0
-                and support.consistency >= SPARSE_CONSISTENCY_TOLERANCE
-                else ()
-            ),
+            *((SPARSE_PROPORTIONAL_ANOMALY_REASON,) if proportional else ()),
         ),
     )
 
@@ -1199,6 +1353,7 @@ def _transition_decision(
     relationships: tuple[IntervalRelationship, ...] = (),
     streaks: tuple[CadenceStreak, ...] = (),
     sparse: _SparseEvidence | None = None,
+    compact: "_Compact | None" = None,
 ) -> AuthorityDecision:
     if sparse is None:
         sparse = _sparse_evidence(events, prior)
@@ -1228,6 +1383,7 @@ def _transition_decision(
             streaks=streaks,
             previous=previous_incumbent,
             sparse=sparse,
+            compact=compact,
         )
 
     incumbent_candidate = _matching_candidate(previous_incumbent, candidates)
@@ -1236,11 +1392,15 @@ def _transition_decision(
     if incumbent_candidate is not None:
         upgrade = bool(
             previous_incumbent.origin is AuthorityOrigin.NORMAL
-            and _continuity_upgrade_qualifies(
-                incumbent_candidate,
-                streaks=streaks,
-                relationship_map=relationship_map,
-                event_map=event_map,
+            and (
+                _continuity_upgrade_qualifies(
+                    incumbent_candidate,
+                    streaks=streaks,
+                    relationship_map=relationship_map,
+                    event_map=event_map,
+                )
+                if compact is None
+                else _compact_continuity_upgrade_qualifies(incumbent_candidate, compact)
             )
         )
         if (
@@ -1248,13 +1408,19 @@ def _transition_decision(
             and previous_incumbent.origin is AuthorityOrigin.NORMAL
             and SPARSE_ESTABLISHMENT_REASON in previous_incumbent.reason_codes
         ):
-            confirmed = _sparse_confirmed_candidate(
-                incumbent_candidate,
-                regime=previous_incumbent,
-                relationships=relationships,
-                relationship_map=relationship_map,
-                event_map=event_map,
-                sparse=sparse,
+            confirmed = (
+                _sparse_confirmed_candidate(
+                    incumbent_candidate,
+                    regime=previous_incumbent,
+                    relationships=relationships,
+                    relationship_map=relationship_map,
+                    event_map=event_map,
+                    sparse=sparse,
+                )
+                if compact is None
+                else _compact_sparse_confirmed_candidate(
+                    incumbent_candidate, regime=previous_incumbent, compact=compact
+                )
             )
             if confirmed is not incumbent_candidate:
                 candidates = tuple(
@@ -1296,6 +1462,7 @@ def _transition_decision(
         incumbent_candidate=incumbent_candidate,
         upgrade_reasons=upgrade_reasons,
         sparse=sparse,
+        compact=compact,
     )
 
 
@@ -1314,6 +1481,7 @@ def _acquisition_decision(
     streaks: tuple[CadenceStreak, ...],
     previous: RegimeRecord | None,
     sparse: _SparseEvidence | None = None,
+    compact: "_Compact | None" = None,
 ) -> AuthorityDecision:
     """Initial acquisition for an unknown server or a never-established LIKELY one.
 
@@ -1425,13 +1593,19 @@ def _acquisition_decision(
 
         # Intervals that were never establishment evidence confirm at once,
         # so the first decision equals every later identical rebuild.
-        confirmed = _sparse_confirmed_candidate(
-            sparse_candidate,
-            regime=sparse_regime(sparse_candidate),
-            relationships=tuple(relationship_map.values()),
-            relationship_map=relationship_map,
-            event_map=event_map,
-            sparse=sparse,
+        confirmed = (
+            _sparse_confirmed_candidate(
+                sparse_candidate,
+                regime=sparse_regime(sparse_candidate),
+                relationships=tuple(relationship_map.values()),
+                relationship_map=relationship_map,
+                event_map=event_map,
+                sparse=sparse,
+            )
+            if compact is None
+            else _compact_sparse_confirmed_candidate(
+                sparse_candidate, regime=sparse_regime(sparse_candidate), compact=compact
+            )
         )
         reasons: tuple[str, ...] = (SPARSE_ESTABLISHMENT_REASON,)
         decision_candidates = candidates
@@ -1464,14 +1638,19 @@ def _acquisition_decision(
 
     if high_h2:
         selected_candidate = high_h2[0]
-        streak = _two_interval_establishing_streak(
-            selected_candidate,
-            streaks=streaks,
-            relationship_map=relationship_map,
-            event_map=event_map,
-            contradictions=_AcquisitionContradictions(
-                candidates=candidates, windows=windows, events=events
-            ),
+        contradictions = _AcquisitionContradictions(
+            candidates=candidates, windows=windows, events=events
+        )
+        streak = (
+            _two_interval_establishing_streak(
+                selected_candidate,
+                streaks=streaks,
+                relationship_map=relationship_map,
+                event_map=event_map,
+                contradictions=contradictions,
+            )
+            if compact is None
+            else _compact_two_interval_streak(selected_candidate, compact, contradictions)
         )
         conflict_pending = bool(
             streak is not None
@@ -1767,15 +1946,25 @@ def _substantial_sparse_conflict(
                 for value in item.high_relationship_ids
                 if value in relationship_map
             ),
+            candidate=item,
         )
-        if not support.aligned or SPARSE_STRUCTURE_REASON not in _sparse_structure_reasons(
+        bounds = _support_bounds(support)
+        if bounds is None or SPARSE_STRUCTURE_REASON not in _sparse_structure_reasons(
             period=period,
             support=support,
             normal_candidate=normal_score.candidate(period),
             windows=windows,
         ):
             continue
-        first = min(_event_at(value) for value in support.aligned)
+        first = bounds[0]
+        if _compact_miss_since(
+            sparse.compact,
+            period=period,
+            phase_offset=item.phase_offset,
+            tolerance=item.phase_tolerance,
+            since=first,
+        ):
+            continue
         if any(
             window.outcome is ExpectedWindowOutcome.GENUINE_MISS
             and window.negative_penalty_active
@@ -1865,11 +2054,19 @@ def _sparse_establishing_candidate(
                 for item in candidate.high_relationship_ids
                 if item in relationship_map
             ),
+            candidate=candidate,
         )
-        if not support.aligned:
+        bounds = _support_bounds(support)
+        if bounds is None:
             continue
-        times = [_event_at(item) for item in support.aligned]
-        contradicted = any(
+        times = list(bounds)
+        contradicted = _compact_miss_since(
+            sparse.compact,
+            period=period,
+            phase_offset=candidate.phase_offset,
+            tolerance=candidate.phase_tolerance,
+            since=min(times),
+        ) or any(
             item.outcome is ExpectedWindowOutcome.GENUINE_MISS
             and item.negative_penalty_active
             and item.candidate_period_seconds == period
@@ -2053,10 +2250,25 @@ def _incumbent_decision(
     incumbent_candidate: AuthorityCandidate | None,
     upgrade_reasons: tuple[str, ...],
     sparse: _SparseEvidence,
+    compact: "_Compact | None" = None,
 ) -> AuthorityDecision:
     """The established-incumbent path: suspicion, challengers and transitions."""
 
-    last_aligned_at = _last_aligned_evidence_at(incumbent, events, windows)
+    suspicion_events = events
+    incumbent_state = None
+    if compact is None:
+        last_aligned_at = _last_aligned_evidence_at(incumbent, events, windows)
+    else:
+        from .companion_restart_phase2_learned_state import (
+            compact_last_aligned_evidence_at,
+            knowledge_for_regime,
+        )
+
+        incumbent_state = knowledge_for_regime(compact.state, incumbent)
+        last_aligned_at = compact_last_aligned_evidence_at(
+            incumbent_state, ring_events=compact.ring_events, ring_windows=compact.ring_windows
+        )
+        suspicion_events = _compact_unfolded_events(compact)
     active_misses = tuple(
         item.result_id
         for item in windows
@@ -2073,7 +2285,7 @@ def _incumbent_decision(
     )
     active_off_phase = tuple(
         item.event_id
-        for item in events
+        for item in suspicion_events
         if _authentic_event(item)
         and _event_at(item) is not None
         and _event_at(item) > last_aligned_at
@@ -2084,7 +2296,43 @@ def _incumbent_decision(
         )
         > incumbent.phase_tolerance
     )
-    contexts = tuple(
+    if compact is not None:
+        from .companion_restart_phase2_learned_state import (
+            compact_folded_miss_ids,
+            compact_folded_off_phase_ids,
+        )
+
+        folded_arguments = dict(
+            period=incumbent.candidate_period_seconds,
+            phase_offset=incumbent.phase_offset,
+            tolerance=incumbent.phase_tolerance,
+            since=last_aligned_at,
+        )
+        active_misses = (
+            *active_misses,
+            *compact_folded_miss_ids(incumbent_state, **folded_arguments),
+        )
+        active_off_phase = (
+            *active_off_phase,
+            *compact_folded_off_phase_ids(incumbent_state, **folded_arguments),
+        )
+        contexts = _compact_challenger_contexts(
+            incumbent=incumbent,
+            ranked=ranked,
+            normal_ledger=normal_ledger,
+            normal_score=normal_score,
+            active_misses=active_misses,
+            events=events,
+            compact=compact,
+        )
+        recovery = {
+            item.context_id: _compact_recovery_confirmations(item, incumbent_state, compact)
+            for item in contexts
+        }
+    else:
+        contexts = None
+        recovery = None
+    contexts = contexts if contexts is not None else tuple(
         _challenger_context(
             incumbent=incumbent,
             candidate=_post_establishment_view(
@@ -2107,7 +2355,7 @@ def _incumbent_decision(
         for item in ranked
         if _candidate_conflicts_regime(item, incumbent)
     )
-    recovery = {
+    recovery = recovery if recovery is not None else {
         item.context_id: _original_cycle_recovery_confirmations(
             incumbent=incumbent,
             context=item,
@@ -2284,11 +2532,12 @@ def _incumbent_decision(
         )
 
     active_high_relationships = max(
-        (len(item.high_relationship_ids) for item in active_contexts), default=0
+        (context_high_relationship_count(item) for item in active_contexts), default=0
     )
     coherent_strong_contradictions = active_high_relationships >= 2
     has_normal_context = any(
         item.normal_context_strength > 0
+        or item.folded_normal_relationship_count > 0
         or bool(
             set(item.normal_relationship_ids).difference(
                 item.high_relationship_ids
@@ -2324,7 +2573,7 @@ def _incumbent_decision(
                     (
                         len(recovery[item.context_id])
                         for item in active_contexts
-                        if len(item.high_relationship_ids) >= 2
+                        if context_high_relationship_count(item) >= 2
                     ),
                     default=0,
                 )
@@ -2352,8 +2601,12 @@ def _incumbent_decision(
         if (
             not active_misses
             and active_high_relationships == 0
-            and _isolated_off_phase_restart(
-                active_off_phase, incumbent=incumbent, events=events
+            and (
+                _isolated_off_phase_restart(
+                    active_off_phase, incumbent=incumbent, events=events
+                )
+                if compact is None
+                else _compact_isolated_off_phase_restart(active_off_phase, incumbent_state, compact)
             )
         ):
             reasons = (*reasons, ISOLATED_OFF_PHASE_RESTART_REASON)
@@ -2537,6 +2790,8 @@ def _challenger_context(
     normal_context_strength: float,
     active_miss_ids: tuple[str, ...],
     events: tuple[PhysicalRestartEvent, ...],
+    folded_high_relationship_count: int = 0,
+    folded_normal_relationship_count: int = 0,
 ) -> ChallengerContext:
     if candidate.h3_gate:
         authorization = ChallengerAuthorization.ESTABLISHED
@@ -2614,6 +2869,8 @@ def _challenger_context(
         first_evidence_at=candidate.first_evidence_at,
         last_evidence_at=candidate.last_evidence_at,
         reason_codes=tuple(sorted(reasons)),
+        folded_high_relationship_count=folded_high_relationship_count,
+        folded_normal_relationship_count=folded_normal_relationship_count,
     )
 
 
@@ -2802,7 +3059,7 @@ def _credible_suspension_context(context: ChallengerContext) -> bool:
         context.authorization_state is not ChallengerAuthorization.ESTABLISHED
         and (
             context.high_confirmation_present
-            or len(context.high_relationship_ids) >= 2
+            or context_high_relationship_count(context) >= 2
         )
     )
 
@@ -2824,7 +3081,7 @@ def _context_activity(
         return bool(post_establishment or recent)
     if context.high_confirmation_present:
         return bool((post_establishment or recent) and not recovered)
-    if len(context.high_relationship_ids) >= 2:
+    if context_high_relationship_count(context) >= 2:
         # A level-2 context that has actually suspended the countdown stays
         # credible until the original cycle is reconfirmed twice; a single
         # aligned restart no longer clears it.  Contexts that never suspended
@@ -3432,3 +3689,605 @@ def _circular_distance(left: float, right: float, period: int) -> float:
 def _stable_id(*parts: object) -> str:
     payload = json.dumps(parts, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# Compact-authority evidence access (Retention R3)
+# --------------------------------------------------------------------------
+
+
+def _compact_unfolded_events(compact: _Compact) -> tuple[PhysicalRestartEvent, ...]:
+    """Ring events not yet folded (the open chain's anchor is folded)."""
+
+    mark = compact.state.watermark
+    if mark.at is None:
+        return compact.ring_events
+    key = (mark.at, mark.event_id or "")
+    return tuple(
+        item
+        for item in compact.ring_events
+        if _event_at(item) is not None and (_event_at(item), item.event_id) > key
+    )
+
+
+def _compact_sparse_support(
+    *,
+    period: int,
+    phase_offset: float,
+    compact: _Compact,
+    excluded_event_ids: frozenset[str],
+    candidate: "AuthorityCandidate | None",
+) -> _SparseSupport:
+    from .companion_restart_phase2_learned_state import compact_sparse_support
+
+    info = compact.candidates.get(candidate.candidate_id) if candidate is not None else None
+    open_chain = compact.state.open_chain
+    anchor = open_chain.anchor_event_id if open_chain is not None else None
+    excluded = frozenset(excluded_event_ids)
+    value = compact_sparse_support(
+        compact.state,
+        period=period,
+        phase_offset=phase_offset,
+        ring_events=compact.ring_events,
+        excluded_ring_event_ids=excluded,
+        exclude_folded_high_endpoints=bool(info is not None and info.has_folded_evidence),
+        exclude_anchor=anchor is not None and anchor in excluded,
+    )
+    return _SparseSupport(
+        value=value.value,
+        aligned=(),
+        effective=value.effective,
+        quality_band=value.quality_band,
+        phase_confidence=value.phase_confidence,
+        off_phase_weight=value.off_phase_weight,
+        consistency=value.consistency,
+        bounds=(
+            (value.first_aligned_at, value.last_aligned_at) if value.aligned_count else None
+        ),
+        compact_support=value,
+        compact=compact,
+    )
+
+
+def _compact_miss_since(
+    compact: "_Compact | None",
+    *,
+    period: int,
+    phase_offset: float,
+    tolerance: float,
+    since: float,
+) -> bool:
+    """A folded genuine miss possibly in phase at or after ``since``."""
+
+    if compact is None:
+        return False
+    from .companion_restart_phase2_learned_state import compact_genuine_miss_since
+
+    return compact_genuine_miss_since(
+        compact.state,
+        period=period,
+        phase_offset=phase_offset,
+        phase_tolerance=tolerance,
+        since=since,
+    )
+
+
+def _compact_ledgers(
+    *,
+    server_key: str,
+    normal_score: ScheduleScore,
+    relationships: tuple[IntervalRelationship, ...],
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    sparse: _SparseEvidence,
+    compact: _Compact,
+) -> tuple[
+    tuple[AuthorityCandidate, ...], NormalEvidenceLedger, HighEvidenceLedger
+]:
+    """``_build_ledgers`` over folded knowledge plus the ring."""
+
+    from .companion_restart_phase2_learned_state import compact_candidates, compact_phase_proposal
+
+    state = compact.state
+    candidate_values: list[AuthorityCandidate] = []
+    normal_values: list[NormalCandidateEvidence] = []
+    for info in compact_candidates(
+        state,
+        ring_events=events,
+        ring_relationships=relationships,
+        normal_score=normal_score,
+        ring_windows=windows,
+    ):
+        candidate, normal = _authority_candidate_from_compact(
+            server_key=server_key,
+            info=info,
+            normal_score=normal_score,
+            relationships=relationships,
+            windows=windows,
+            events=events,
+            sparse=sparse,
+            compact=compact,
+        )
+        compact.candidates[candidate.candidate_id] = info
+        candidate_values.append(candidate)
+        normal_values.append(normal)
+    for period in CANDIDATE_PERIODS:
+        normal_candidate = normal_score.candidate(period)
+        has_relationships = bool(
+            any(item.candidate_period_seconds == period for item in relationships)
+            or any(item.period == period for item in state.normal_relationships)
+            or any(item.period == period for item in state.intervals)
+        )
+        phases = []
+        if normal_candidate.phase_offset is not None and bool(
+            normal_candidate.fundamental_period_confidence > 0
+            or normal_candidate.phase_confidence > 0
+            or has_relationships
+        ):
+            phases.append(float(normal_candidate.phase_offset) % period)
+        long_horizon_phase, _mad, aligned_count, _recent = compact_phase_proposal(
+            state, period=period, ring_events=events
+        )
+        if long_horizon_phase is not None and aligned_count > 0:
+            phases.append(float(long_horizon_phase) % period)
+        for phase in phases:
+            if any(
+                _circular_distance(item.phase_offset, phase, period) <= item.phase_tolerance
+                for item in candidate_values
+                if item.candidate_period_seconds == period
+            ):
+                continue
+            candidate, normal = _normal_only_candidate(
+                server_key=server_key,
+                normal_candidate=normal_candidate,
+                phase=phase,
+                relationships=relationships,
+                windows=windows,
+                events=events,
+                sparse=sparse,
+                compact=compact,
+            )
+            candidate_values.append(candidate)
+            normal_values.append(normal)
+    high = tuple(
+        item
+        for item in relationships
+        if item.high_authority_eligible and item.relationship_kind is RelationshipKind.DIRECT
+    )
+    return _assemble_ledgers(
+        server_key=server_key,
+        candidate_values=candidate_values,
+        normal_values=normal_values,
+        windows=windows,
+        high=high,
+        streaks=(),
+    )
+
+
+def _authority_candidate_from_compact(
+    *,
+    server_key: str,
+    info,
+    normal_score: ScheduleScore,
+    relationships: tuple[IntervalRelationship, ...],
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    sparse: _SparseEvidence,
+    compact: _Compact,
+) -> tuple[AuthorityCandidate, NormalCandidateEvidence]:
+    """An ``AuthorityCandidate`` for one compact high candidate.
+
+    Numbers come from the compact evaluator (exact running products, streak
+    bonuses and gates).  References are ring-only; identity is compact:
+    period, normalised phase cluster and the earliest evidence time, which
+    folding never changes.
+    """
+
+    from .companion_restart_phase2_learned_state import compact_sparse_support
+
+    period = info.period
+    tolerance = candidate_phase_tolerance(period)
+    phase = info.phase_offset
+    support = compact_sparse_support(
+        compact.state,
+        period=period,
+        phase_offset=phase,
+        ring_events=events,
+        excluded_ring_event_ids=info.ring_endpoint_ids,
+        exclude_folded_high_endpoints=info.has_folded_evidence,
+        exclude_anchor=info.excludes_anchor,
+    )
+    normal = _normal_candidate_evidence(
+        period=period,
+        phase_offset=phase,
+        tolerance=tolerance,
+        normal_candidate=normal_score.candidate(period),
+        relationships=relationships,
+        windows=windows,
+        events=events,
+        sparse=sparse,
+        excluded_event_ids=info.ring_endpoint_ids,
+        compact_support=(
+            info.aligned_normal_confidence,
+            info.sparse_reason_codes,
+            bool(
+                support.off_phase_weight > 0
+                and support.consistency >= SPARSE_CONSISTENCY_TOLERANCE
+            ),
+        ),
+    )
+    regime_id = _stable_id(
+        "authority-compact-regime",
+        AUTHORITY_SEMANTIC_VERSION,
+        server_key,
+        period,
+        _normalized_phase_cluster(phase, tolerance, period),
+        round(info.first_evidence_at or 0.0, 3),
+    )
+    gates = (info.h1_gate, info.h2_gate, info.h3_gate, info.h4_gate)
+    candidate_id = _stable_id(
+        "authority-compact-candidate",
+        AUTHORITY_SEMANTIC_VERSION,
+        regime_id,
+        round(phase, 6),
+        info.relationship_count,
+        info.base_authority,
+        info.streak_bonus,
+        info.aligned_normal_confidence,
+        info.harmonic_blockers,
+        gates,
+    )
+    reasons = {
+        "bounded_high_authority_formula_v1",
+        "normal_reinforcement_remaining_uncertainty_only",
+        "phase_authority_separate",
+        "maximal_streak_bonus_only",
+        COMPACT_EVIDENCE_REASON,
+        *_sparse_reason_codes(normal),
+        *info.harmonic_blockers,
+    }
+    for name, passed in zip(("h1", "h2", "h3", "h4"), gates):
+        if passed:
+            reasons.add(f"{name}_gate_passed")
+    candidate = AuthorityCandidate(
+        schema_version=AUTHORITY_SCHEMA_VERSION,
+        semantic_version=AUTHORITY_SEMANTIC_VERSION,
+        candidate_id=candidate_id,
+        regime_id=regime_id,
+        server_key=server_key,
+        candidate_period_seconds=period,
+        phase_offset=round(phase, 6),
+        phase_spread=round(info.phase_spread, 6),
+        phase_tolerance=round(tolerance, 6),
+        high_relationship_ids=info.ring_relationship_ids,
+        maximal_streak_ids=(),
+        relationship_quality_values=info.ring_relationship_qualities,
+        base_authority=info.base_authority,
+        streak_bonus=info.streak_bonus,
+        streak_bonus_values=(),
+        high_authority=info.high_authority,
+        phase_quality=info.phase_quality,
+        high_phase_authority=info.high_phase_authority,
+        aligned_normal_confidence=info.aligned_normal_confidence,
+        combined_confidence=info.combined_confidence,
+        h1_gate=info.h1_gate,
+        h2_gate=info.h2_gate,
+        h3_gate=info.h3_gate,
+        h4_gate=info.h4_gate,
+        harmonic_blockers=info.harmonic_blockers,
+        defining_evidence_ids=(),
+        first_evidence_at=info.first_evidence_at if info.first_evidence_at is not None else 0.0,
+        last_evidence_at=info.last_evidence_at if info.last_evidence_at is not None else 0.0,
+        reason_codes=tuple(sorted(reasons)),
+    )
+    return candidate, normal
+
+
+@dataclass(frozen=True)
+class _CompactStreak:
+    start_at: float
+    end_at: float
+    interval_count: int
+    relationship_ids: tuple[str, ...]
+
+
+def _compact_two_interval_streak(
+    candidate: AuthorityCandidate,
+    compact: _Compact,
+    contradictions: "_AcquisitionContradictions | None",
+) -> _CompactStreak | None:
+    """``_two_interval_establishing_streak`` over compact streak summaries.
+
+    Streaks are the candidate's ring runs, the open run and folded closed
+    streaks (all exact interval counts and minimum qualities).  Folded
+    contradictions are conservative: a folded miss or restart that may be
+    in phase (or off phase) counts.
+    """
+
+    if (
+        not candidate.h2_gate
+        or candidate.harmonic_blockers
+        or candidate.phase_quality < TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM
+    ):
+        return None
+    info = compact.candidates.get(candidate.candidate_id)
+    if info is None:
+        return None
+    qualifying = [
+        item
+        for item in info.streaks
+        if item.interval_count >= 2 and item.event_count >= 3 and item.min_quality > 0.0
+    ]
+    best = max(qualifying, key=lambda item: (item.end_at, item.interval_count), default=None)
+    if best is None:
+        return None
+    relationship_map = {item.relationship_id: item for item in compact.ring_relationships}
+    streak = _CompactStreak(
+        best.start_at,
+        best.end_at,
+        best.interval_count,
+        tuple(
+            identity
+            for identity in info.ring_relationship_ids
+            if identity in relationship_map
+            and best.start_at <= relationship_map[identity].left_at
+            and relationship_map[identity].right_at <= best.end_at
+        ),
+    )
+    if contradictions is None:
+        return streak
+    period = candidate.candidate_period_seconds
+    tolerance = candidate.phase_tolerance
+    if any(
+        item.h2_gate
+        and item.candidate_id != candidate.candidate_id
+        and (
+            item.candidate_period_seconds != period
+            or _circular_distance(item.phase_offset, candidate.phase_offset, period) > tolerance
+        )
+        for item in contradictions.candidates
+    ):
+        return None
+    if any(
+        item.outcome is ExpectedWindowOutcome.GENUINE_MISS
+        and item.negative_penalty_active
+        and item.candidate_period_seconds == period
+        and _circular_distance(item.expected_phase_offset, candidate.phase_offset, period)
+        <= tolerance
+        and item.expected_at >= streak.start_at
+        for item in contradictions.windows
+    ) or _compact_miss_since(
+        compact,
+        period=period,
+        phase_offset=candidate.phase_offset,
+        tolerance=tolerance,
+        since=streak.start_at,
+    ):
+        return None
+    from .companion_restart_phase2_learned_state import compact_folded_restart_after
+
+    if any(
+        _authentic_event(item)
+        and _event_at(item) is not None
+        and _event_at(item) > streak.end_at
+        and _circular_distance(_event_at(item), candidate.phase_offset, period) > tolerance
+        for item in contradictions.events
+    ) or compact_folded_restart_after(
+        compact.state,
+        period=period,
+        phase_offset=candidate.phase_offset,
+        tolerance=tolerance,
+        after=streak.end_at,
+        aligned=False,
+    ):
+        return None
+    return streak
+
+
+def _compact_continuity_upgrade_qualifies(candidate: AuthorityCandidate, compact: _Compact) -> bool:
+    if candidate.harmonic_blockers:
+        return False
+    if candidate.h3_gate:
+        return True
+    return _compact_two_interval_streak(candidate, compact, None) is not None
+
+
+def _compact_sparse_confirmed_candidate(
+    candidate: AuthorityCandidate, *, regime: RegimeRecord, compact: _Compact
+) -> AuthorityCandidate:
+    """``_sparse_confirmed_candidate`` via the compact confirmation."""
+
+    from .companion_restart_phase2_learned_state import (
+        EpochEvidence,
+        compact_sparse_confirmation_details,
+        knowledge_for_regime,
+    )
+
+    info = compact.candidates.get(candidate.candidate_id)
+    if info is None or regime.established_at is None:
+        return candidate
+    state = knowledge_for_regime(compact.state, regime)
+    epoch_key = (state.epoch.regime_id, state.epoch.established_at)
+    if epoch_key != (regime.regime_id, regime.established_at):
+        state = replace(state, epoch=EpochEvidence(regime.regime_id, regime.established_at))
+    value, confirming = compact_sparse_confirmation_details(
+        state, info, ring_events=compact.ring_events, ring_relationships=compact.ring_relationships
+    )
+    if not confirming:
+        return candidate
+    return replace(
+        candidate,
+        combined_confidence=round(max(candidate.combined_confidence, value), 6),
+        reason_codes=tuple(sorted({*candidate.reason_codes, SPARSE_CONFIRMATION_REASON})),
+    )
+
+
+def _compact_challenger_view(compact: _Compact) -> tuple:
+    if compact.challenger_view is None:
+        from .companion_restart_phase2_learned_state import compact_candidates
+
+        compact.challenger_view = compact_candidates(
+            compact.state,
+            ring_events=compact.ring_events,
+            ring_relationships=compact.ring_relationships,
+            normal_score=compact.normal_score,
+            ring_windows=compact.ring_windows,
+            challenger=True,
+        )
+    return compact.challenger_view
+
+
+def _compact_post_establishment_view(
+    candidate: AuthorityCandidate, *, incumbent: RegimeRecord, compact: _Compact
+) -> tuple[AuthorityCandidate, int]:
+    """``_post_establishment_view`` from the epoch challenger evidence.
+
+    Returns the view and the number of its high relationships that are
+    folded (counted, not referenced).
+    """
+
+    info = compact.candidates.get(candidate.candidate_id)
+    full_count = (
+        info.relationship_count if info is not None else len(candidate.high_relationship_ids)
+    )
+    folded_full = full_count - len(candidate.high_relationship_ids)
+    established_at = incumbent.established_at
+    if established_at is None or full_count == 0:
+        return candidate, folded_full
+    epoch = compact.state.epoch
+    view_values = (
+        _compact_challenger_view(compact)
+        if (epoch.regime_id, epoch.established_at) == (incumbent.regime_id, established_at)
+        else ()
+    )
+    period = candidate.candidate_period_seconds
+    matches = [
+        item
+        for item in view_values
+        if item.period == period
+        and _circular_distance(item.phase_offset, candidate.phase_offset, period)
+        <= candidate.phase_tolerance
+    ]
+    reasons = tuple(sorted({*candidate.reason_codes, HISTORICAL_CHALLENGER_EVIDENCE_REASON}))
+    if not matches:
+        return (
+            replace(
+                candidate,
+                high_relationship_ids=(),
+                maximal_streak_ids=(),
+                high_authority=0.0,
+                high_phase_authority=0.0,
+                h1_gate=False,
+                h2_gate=False,
+                h3_gate=False,
+                h4_gate=False,
+                reason_codes=reasons,
+            ),
+            0,
+        )
+    view = max(matches, key=lambda item: (item.relationship_count, item.high_authority))
+    if view.relationship_count >= full_count:
+        return candidate, folded_full
+    return (
+        replace(
+            candidate,
+            high_relationship_ids=view.ring_relationship_ids,
+            maximal_streak_ids=(),
+            high_authority=view.high_authority,
+            high_phase_authority=view.high_phase_authority,
+            h1_gate=view.h1_gate,
+            h2_gate=view.h2_gate,
+            h3_gate=view.h3_gate,
+            h4_gate=view.h4_gate,
+            first_evidence_at=(
+                view.first_evidence_at
+                if view.first_evidence_at is not None
+                else candidate.first_evidence_at
+            ),
+            last_evidence_at=(
+                view.last_evidence_at
+                if view.last_evidence_at is not None
+                else candidate.last_evidence_at
+            ),
+            reason_codes=reasons,
+        ),
+        view.relationship_count - len(view.ring_relationship_ids),
+    )
+
+
+def _compact_challenger_contexts(
+    *,
+    incumbent: RegimeRecord,
+    ranked: tuple[AuthorityCandidate, ...],
+    normal_ledger: NormalEvidenceLedger,
+    normal_score: ScheduleScore,
+    active_misses: tuple[str, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    compact: _Compact,
+) -> tuple[ChallengerContext, ...]:
+    from .companion_restart_phase2_learned_state import compact_folded_normal_relationships
+
+    contexts = []
+    for item in ranked:
+        if not _candidate_conflicts_regime(item, incumbent):
+            continue
+        view, folded_high = _compact_post_establishment_view(
+            item, incumbent=incumbent, compact=compact
+        )
+        folded_normal = compact_folded_normal_relationships(
+            compact.state,
+            period=item.candidate_period_seconds,
+            phase_offset=item.phase_offset,
+            tolerance=item.phase_tolerance,
+        )
+        contexts.append(
+            _challenger_context(
+                incumbent=incumbent,
+                candidate=view,
+                normal=_normal_for_candidate(normal_ledger, item),
+                normal_context_strength=_schema3_context_strength(normal_score, item),
+                active_miss_ids=active_misses,
+                events=events,
+                folded_high_relationship_count=max(0, folded_high),
+                folded_normal_relationship_count=folded_normal.count,
+            )
+        )
+    return tuple(contexts)
+
+
+def _compact_recovery_confirmations(
+    context: ChallengerContext, incumbent_state, compact: _Compact
+) -> tuple[str, ...]:
+    if context.authorization_state is ChallengerAuthorization.ESTABLISHED:
+        return ()
+    from .companion_restart_phase2_learned_state import compact_recovery_confirmations
+
+    count = compact_recovery_confirmations(
+        incumbent_state,
+        challenger_last_evidence_at=context.last_evidence_at,
+        ring_events=compact.ring_events,
+        ring_relationships=compact.ring_relationships,
+    )
+    return tuple(f"learned-recovery:{index}" for index in range(count))
+
+
+def _compact_isolated_off_phase_restart(
+    active_off_phase: tuple[str, ...], incumbent_state, compact: _Compact
+) -> bool:
+    if len(active_off_phase) != 1:
+        return False
+    anomaly = next(
+        (
+            item
+            for item in _compact_unfolded_events(compact)
+            if item.event_id == active_off_phase[0]
+        ),
+        None,
+    )
+    if anomaly is None:
+        return False
+    from .companion_restart_phase2_learned_state import compact_isolated_off_phase_restart
+
+    return compact_isolated_off_phase_restart(
+        incumbent_state, anomaly, ring_events=compact.ring_events
+    )

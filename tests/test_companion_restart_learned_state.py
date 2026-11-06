@@ -76,6 +76,16 @@ def stream(events, relationships, *, capacity, state=None, ring=(), batch=1):
     return state, ring, peak
 
 
+def recent_events(events):
+    """The schema-3 scorer's recent window (its divisor-resolution input)."""
+
+    return scoring._recent_events(scoring._unique_events(events))
+
+
+def fold_divisors(state, step):
+    return learned.fold_divisor_resolution(state, step.score, recent_events(step.events))
+
+
 def phase_match(left, right, period, tolerance=1.0):
     return authority._circular_distance(left, right, period) <= tolerance
 
@@ -323,7 +333,7 @@ def _folded(step, mode):
 def test_compact_evaluation_matches_raw_authority(name, mode):
     step = SCENARIOS[name]().evaluate()
     state, ring = _folded(step, mode)
-    state = learned.fold_divisor_resolution(state, step.score)
+    state = fold_divisors(state, step)
 
     assert_high_parity(step, state, ring)
     assert_sparse_parity(step, state, ring)
@@ -366,7 +376,7 @@ def test_continuous_chains_fold_with_a_bounded_ring_and_raw_parity(count):
     assert candidate.h3_gate and candidate.h4_gate
     # 0.97 internally; the panel caps the displayed value at 95 %.
     assert display(candidate.combined_confidence) >= 95
-    assert learned.learned_state_entry_count(state) <= 12
+    assert learned.learned_state_entry_count(state) <= 20
 
 
 @pytest.mark.parametrize("count", [5000])
@@ -901,7 +911,7 @@ def test_compact_evaluation_has_no_time_input():
 
 def test_learning_survives_round_trip_and_months_of_inactivity_unchanged():
     step = _mixed_sparse_and_chain().evaluate()
-    state = learned.fold_divisor_resolution(fold_events(step, step.events), step.score)
+    state = fold_divisors(fold_events(step, step.events), step)
     state = learned.observe_decision(state, s8.settled(_mixed_sparse_and_chain()).decision)
     reopened = learned.learned_state_from_json_bytes(learned.learned_state_json_bytes(state))
 
@@ -921,7 +931,8 @@ def test_learning_survives_round_trip_and_months_of_inactivity_unchanged():
 
 def test_harmonic_divisor_resolution_persists_after_coverage_expiry():
     step = _six_hour_chain().evaluate()
-    state = learned.fold_divisor_resolution(fold_events(step, step.events), step.score)
+    state = fold_divisors(fold_events(step, step.events), step)
+    assert {(item.period, item.divisor) for item in state.divisors} == {(P6, 2 * HOUR), (P6, P3)}
     expired = scoring.RestartScheduleScorer().score(
         step.events,
         scoring.CoverageTimeline(()),
@@ -1004,10 +1015,8 @@ def test_epoch_resets_on_new_incumbent_and_divisors_reset_on_supersession():
     pipeline, replaced = s8._superseded_three_hour()
     original = s8.settled(s8.Pipeline(events=list(pipeline.events[:7]), coverage=list(pipeline.coverage[:1])))
     step = pipeline.evaluate(s8.persisted(replaced.decision))
-    state = learned.observe_decision(
-        learned.fold_divisor_resolution(learned.empty_learned_state(s8.SERVER), _six_hour_chain().evaluate().score),
-        original.decision,
-    )
+    six = _six_hour_chain().evaluate()
+    state = learned.observe_decision(fold_divisors(learned.empty_learned_state(s8.SERVER), six), original.decision)
     assert state.divisors and state.epoch.regime_id == original.decision.incumbent_shadow_regime.regime_id
     changed = learned.observe_decision(state, step.decision)
 
@@ -1015,6 +1024,10 @@ def test_epoch_resets_on_new_incumbent_and_divisors_reset_on_supersession():
     assert changed.epoch.regime_id == changed.incumbent.regime_id
     assert changed.epoch.challenger == () and changed.epoch.recovery == ()
     assert changed.divisors == ()
+    superseded_at = max(item.superseded_at for item in changed.superseded)
+    assert changed.divisor_floor_at == superseded_at
+    # A schema-3 window that started before the boundary cannot re-establish it.
+    assert learned.fold_divisor_resolution(changed, six.score, recent_events(six.events)).divisors == ()
 
 
 # --------------------------------------------------------------------------
@@ -1047,8 +1060,8 @@ def test_storage_is_bounded_regardless_of_observation_count():
 
 
 def test_entry_bound_is_compact():
-    assert learned.LEARNED_STATE_MAX_ENTRIES == 1440 + 4 * 420 + 9 + 2 + 721 + 2
-    assert learned.LEARNED_STATE_MAX_ENTRIES < 4000
+    assert learned.LEARNED_STATE_MAX_ENTRIES == 1440 + 5 * 420 + 9 + 2 + 721 + 2
+    assert learned.LEARNED_STATE_MAX_ENTRIES < 4500
 
 
 def _maximal_state():
@@ -1100,7 +1113,16 @@ def _maximal_state():
         pool=pool,
         intervals=interval_bins(),
         misses=misses,
-        divisors=tuple(learned.DivisorEvidence(period, divisor, 10**9, 10**9) for period, divisor in learned.DIVISOR_KEYS),
+        divisors=tuple(
+            learned.DivisorEvidence(period, divisor, 10**9, 10**9, 1234.5678901234567, time_value)
+            for period, divisor in learned.DIVISOR_KEYS
+        ),
+        normal_relationships=tuple(
+            learned.NormalBin(period, index, 10**9, long, 299.12345678901234, time_value, time_value)
+            for period in scoring.CANDIDATE_PERIODS
+            for index in range(period // learned.INTERVAL_BIN_SECONDS)
+        ),
+        divisor_floor_at=time_value,
         incumbent=learned.RegimeKnowledge(
             text, P3, 1234.5678901234567, 540.1234567890123, text[:32], text[:32], text[:32],
             0.97, 0.97, 0.97, time_value, time_value, (text,) * 3, (text,) * learned.MAX_REASON_CODES,

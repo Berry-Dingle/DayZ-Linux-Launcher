@@ -25,6 +25,7 @@ from .companion_restart_phase2_authority import (
     _candidate_rank,
     _context_rank,
     _matching_candidate,
+    context_high_relationship_count,
 )
 from .companion_restart_phase2_consumers import ConsumerDecision
 
@@ -1057,7 +1058,7 @@ def _suspected_change_challenger_confidence(
         if COUNTDOWN_SUSPENSION_LATCH_REASON in item.reason_codes
         and item.incumbent_regime_id == incumbent.regime_id
         and item.authorization_state is not ChallengerAuthorization.ESTABLISHED
-        and len(item.high_relationship_ids) >= 2
+        and context_high_relationship_count(item) >= 2
     ]
     context = max(relevant, key=_context_rank, default=None)
     if context is None:

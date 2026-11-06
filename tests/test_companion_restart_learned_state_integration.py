@@ -476,32 +476,66 @@ def test_authoritative_runtime_persists_and_reopens_learned_state(tmp_path):
     assert not unchanged
 
 
-def test_persisted_divisor_resolution_diverges_after_a_cycle_change():
-    """Blocker evidence (R2): the persisted best divisor resolution is not yet
-    safe for authority.  After a 6 h regime is superseded by a 3 h schedule,
-    raw recomputation re-blocks the 6 h harmonic; the persisted maximum keeps
-    it resolved.  Authority therefore does not consume it (operator decision
-    and a contradiction rule are required)."""
+def test_divisor_resolution_is_invalidated_by_a_cycle_change_and_never_re_established():
+    """R3 correction of the R2 blocker: after a 6 h regime is superseded by a
+    3 h schedule, restarts at the 6 h divisor midpoints contradict and remove
+    the persisted resolution, the supersession floors it, and the still-stale
+    schema-3 window cannot re-establish it.  At every rebuild the compact
+    harmonic blockers are at least as strict as the raw recomputation, and
+    after the old coverage expires the 6 h harmonic stays blocked."""
 
     pipeline = s8.Pipeline()
     pipeline.observe("six", [s8.at(0, 0) + index * 6 * HOUR for index in range(8)])
     record = drive(pipeline, every=4)
+    assert {(item.period, item.divisor) for item in schema4.persisted_learned_state(record).divisors} == {
+        (6 * HOUR, 2 * HOUR),
+        (6 * HOUR, P3),
+    }
     three = [s8.at(3, 0) + index * P3 for index in range(24)]
     for count in range(1, len(three) + 1):  # one rebuild per new restart, runtime-like
         step = s8.Pipeline(events=list(pipeline.events), coverage=list(pipeline.coverage), sequence=pipeline.sequence)
         step.observe("three", three[:count])
         record = rebuild(record, step.events, step.coverage)
+        state = schema4.persisted_learned_state(record)
+        score = raw_score(record)
+        ring = schema4.learned_state_ring_events(record, state)
+        raw_blockers = authority._harmonic_blockers(6 * HOUR, score.candidate(6 * HOUR), ())
+        compact_blockers = learned.compact_harmonic_blockers(
+            state, 6 * HOUR, score.candidate(6 * HOUR), ring_events=ring
+        )
+        assert set(raw_blockers[1]) <= set(compact_blockers[1]), count
+        assert set(raw_blockers[0]) <= set(compact_blockers[0]), count
+        if count >= 2:
+            # The first 3 h-divisor midpoint restart (03:00) removed that
+            # divisor's resolution; the 2 h divisor is not contradicted by a
+            # 3 h schedule (03:00/09:00 are not 2 h midpoints) and may stand,
+            # but the 6 h harmonic needs every divisor and stays blocked.
+            assert (6 * HOUR, P3) not in {(item.period, item.divisor) for item in state.divisors}, count
+            assert state.divisor_floor_at is not None
+    assert schema4.persisted_authority_decision(record).incumbent_shadow_regime.candidate_period_seconds == P3
+    expired = scoring.RestartScheduleScorer().score(
+        (), scoring.CoverageTimeline(()), now=record["migration_audit"]["runtime_updated_at"] + 200 * scoring.DAY,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
+    assert learned.compact_harmonic_blockers(state, 6 * HOUR, expired.candidate(6 * HOUR))[1]
+
+
+def test_clean_divisor_resolution_survives_coverage_expiry():
+    pipeline = s8.Pipeline()
+    pipeline.observe("six", [s8.at(0, 0) + index * 6 * HOUR for index in range(8)])
+    record = drive(pipeline, every=4)
     state = schema4.persisted_learned_state(record)
-    score = raw_score(record)
+    expired = scoring.RestartScheduleScorer().score(
+        (), scoring.CoverageTimeline(()), now=record["migration_audit"]["runtime_updated_at"] + 200 * scoring.DAY,
+        phase_recency_policy=scoring.PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
+    )
     incumbent = schema4.persisted_authority_decision(record).incumbent_shadow_regime
 
-    assert incumbent.candidate_period_seconds == P3
-    raw_blockers = authority._harmonic_blockers(6 * HOUR, score.candidate(6 * HOUR), ())
-    compact_blockers = learned.compact_harmonic_blockers(state, 6 * HOUR, score.candidate(6 * HOUR))
-    # Raw recomputation blocks the 6 h harmonic again; the persisted maximum
-    # (re-folded from schema-3's still-stale window after the supersession
-    # reset) does not.  Consuming it would unblock an ambiguous period.
-    assert raw_blockers[1]
-    assert not compact_blockers[1]
-    # Authority output is unaffected: it is the raw recomputation.
-    assert record["authority_decision"]["state"] in {"established", "new_regime_established"}
+    assert authority._harmonic_blockers(6 * HOUR, expired.candidate(6 * HOUR), ())[1]  # raw: lost
+    assert learned.compact_harmonic_blockers(
+        state, 6 * HOUR, expired.candidate(6 * HOUR), phase_offset=incumbent.phase_offset
+    ) == ((), ())  # compact: kept, never contradicted
+    # A different phase never borrows it.
+    assert learned.compact_harmonic_blockers(
+        state, 6 * HOUR, expired.candidate(6 * HOUR), phase_offset=(incumbent.phase_offset + P3) % (6 * HOUR)
+    )[1]

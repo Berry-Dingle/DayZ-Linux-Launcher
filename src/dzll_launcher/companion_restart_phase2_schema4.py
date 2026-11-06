@@ -126,6 +126,10 @@ SCHEMA4_EVIDENCE_SAMPLE_EVENT_LIMIT = 12
 # authority still evaluates the persisted raw collections; the compact state
 # is maintained alongside them so it is complete before raw history is pruned.
 LEARNED_STATE_PERSISTENCE_ENABLED = True
+# Retention R3: evaluate authority from the compact learned state plus the
+# bounded ring instead of the lifetime raw collections.  Off: the live
+# authority keeps evaluating raw history (see the R3 report for the reasons).
+COMPACT_AUTHORITY_ENABLED = False
 LEARNED_STATE_REBUILT_REASON = "learned_state_rebuilt_from_persisted_history"
 
 
@@ -1366,26 +1370,44 @@ def rebuild_schema4_server_record(
         prior = persisted_authority_decision(existing_record)
     except (KeyError, TypeError, ValueError, Schema4Error):
         prior = None
-    decision = evaluate_authority(
-        server_key=server_key,
-        normal_score=score,
-        relationships=relationships,
-        streaks=streaks,
-        expected_window_ledger=windows_ledger,
-        events=events,
-        prior_decision=prior,
-    )
+    learned_state = None
+    learned_rebuilt = False
+    if LEARNED_STATE_PERSISTENCE_ENABLED or COMPACT_AUTHORITY_ENABLED:
+        from .companion_restart_phase2_scoring import _recent_events, _unique_events
 
-    if LEARNED_STATE_PERSISTENCE_ENABLED:
-        learned_state, learned_rebuilt = maintain_learned_state(
+        learned_state, learned_rebuilt = advance_learned_state_before_decision(
             existing_record,
             server_key=server_key,
             prior=prior,
-            decision=decision,
             score=score,
             relationships=relationships,
             events=events,
+            recent_events=_recent_events(_unique_events(runtime.events)),
+        )
+    if COMPACT_AUTHORITY_ENABLED:
+        decision = evaluate_compact_authority(
+            learned_state,
+            server_key=server_key,
+            normal_score=score,
+            relationships=relationships,
             windows=windows_ledger,
+            events=events,
+            prior=prior,
+        )
+    else:
+        decision = evaluate_authority(
+            server_key=server_key,
+            normal_score=score,
+            relationships=relationships,
+            streaks=streaks,
+            expected_window_ledger=windows_ledger,
+            events=events,
+            prior_decision=prior,
+        )
+
+    if learned_state is not None:
+        learned_state = advance_learned_state_after_decision(
+            learned_state, decision=decision, windows=windows_ledger
         )
         from .companion_restart_phase2_learned_state import learned_state_to_mapping
 
@@ -1461,27 +1483,25 @@ def rebuild_schema4_server_record(
     return fresh
 
 
-def maintain_learned_state(
+def advance_learned_state_before_decision(
     existing_record: Mapping[str, object],
     *,
     server_key: str,
     prior: AuthorityDecision | None,
-    decision: AuthorityDecision,
     score,
     relationships,
     events,
-    windows,
+    recent_events=(),
 ):
-    """Advance the compact learned state by one authoritative rebuild.
+    """Advance the compact learned state up to the authority decision.
 
     Order (the R1a contract): observe the previous decision so epoch-scoped
     evidence is attributed to the incumbent in force when it was observed;
     fold every unit that leaves the strict ring (watermark-protected, so each
-    physical restart and relationship is credited once); fold the best
-    schema-3 divisor resolution; observe the new decision (regime boundaries,
-    epoch reset, which also resets divisor resolution on supersession); fold
-    expected windows that end at or before the event
-    watermark (their lineages can no longer gain restart evidence).
+    physical restart and relationship is credited once; folding also removes
+    divisor evidence contradicted by a folded restart); fold divisor
+    resolution from the schema-3 recent window (only a clean window that
+    starts after the divisor floor).  The authority then evaluates.
 
     A missing state is built from the persisted history, which is still
     retained at this stage; an unreadable one is rebuilt the same way.
@@ -1507,15 +1527,81 @@ def maintain_learned_state(
         state = learned.observe_decision(state, prior)
     plan = learned.plan_ring_folding(state, events)
     state = learned.apply_fold_plan(state, plan, relationships)
-    # Divisor resolution is folded before the new decision is observed, so a
-    # supersession in this rebuild resets it (it is epoch-scoped knowledge).
-    state = learned.fold_divisor_resolution(state, score)
+    state = learned.invalidate_contradicted_divisors(state, plan.ring)
+    state = learned.fold_divisor_resolution(state, score, recent_events)
+    return state, rebuilt
+
+
+def advance_learned_state_after_decision(state, *, decision: AuthorityDecision, windows):
+    """Observe the new decision (regime boundaries, epoch reset, divisor floor
+    on supersession) and fold expected windows that end at or before the event
+    watermark (their lineages can no longer gain restart evidence)."""
+
+    from . import companion_restart_phase2_learned_state as learned
+
     state = learned.observe_decision(state, decision)
     if state.watermark.at is not None:
         state = learned.fold_windows(
             state, [item for item in windows if item.window_end_at <= state.watermark.at]
         )
-    return state, rebuilt
+    return state
+
+
+def maintain_learned_state(
+    existing_record: Mapping[str, object],
+    *,
+    server_key: str,
+    prior: AuthorityDecision | None,
+    decision: AuthorityDecision,
+    score,
+    relationships,
+    events,
+    windows,
+    recent_events=(),
+):
+    """Both phases around an already computed decision (R2 compatibility)."""
+
+    state, rebuilt = advance_learned_state_before_decision(
+        existing_record,
+        server_key=server_key,
+        prior=prior,
+        score=score,
+        relationships=relationships,
+        events=events,
+        recent_events=recent_events,
+    )
+    return advance_learned_state_after_decision(state, decision=decision, windows=windows), rebuilt
+
+
+def evaluate_compact_authority(
+    state,
+    *,
+    server_key: str,
+    normal_score,
+    relationships,
+    windows,
+    events,
+    prior: AuthorityDecision | None,
+) -> AuthorityDecision:
+    """Schema-4 authority over the learned state plus its bounded ring.
+
+    ``events``, ``relationships`` and ``windows`` may be the full persisted
+    collections or only the ring: only unfolded items are passed on.
+    """
+
+    from .companion_restart_phase2_learned_state import compact_authority_inputs
+
+    inputs = compact_authority_inputs(state, events, relationships, windows)
+    return evaluate_authority(
+        server_key=server_key,
+        normal_score=normal_score,
+        relationships=inputs.ring_relationships,
+        streaks=(),
+        expected_window_ledger=inputs.ring_windows,
+        events=inputs.ring_events,
+        prior_decision=prior,
+        learned_state=state,
+    )
 
 
 def persisted_learned_state(record: Mapping[str, object]):
@@ -2591,6 +2677,8 @@ def _challenger_from(value: Mapping[str, object]) -> ChallengerContext:
         high_confirmation_present=bool(value["high_confirmation_present"]), authorization_state=ChallengerAuthorization(value["authorization_state"]),
         regime_change_status=ChallengerStatus(value["regime_change_status"]), first_evidence_at=float(value["first_evidence_at"]),
         last_evidence_at=float(value["last_evidence_at"]), reason_codes=tuple(value.get("reason_codes", ())),
+        folded_high_relationship_count=int(value.get("folded_high_relationship_count", 0)),
+        folded_normal_relationship_count=int(value.get("folded_normal_relationship_count", 0)),
     )
 
 
