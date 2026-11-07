@@ -1315,12 +1315,23 @@ def test_window_has_one_central_startup_completion_contract():
 def test_window_live_result_has_no_pre_cutover_immediate_recovery_branch():
     from dzll_launcher.window import DZLLWindow
 
-    tree = ast.parse(
-        textwrap.dedent(inspect.getsource(DZLLWindow._apply_server_companion_live_result))
-    )
-    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    # R8: the handler finishes in ``_finish_server_companion_live_result``
+    # (run once the learning authority is current); scan both halves.
+    trees = [
+        ast.parse(textwrap.dedent(inspect.getsource(method)))
+        for method in (
+            DZLLWindow._apply_server_companion_live_result,
+            DZLLWindow._finish_server_companion_live_result,
+        )
+    ]
+    names = {
+        node.id for tree in trees for node in ast.walk(tree) if isinstance(node, ast.Name)
+    }
     attributes = {
-        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        node.attr
+        for tree in trees
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Attribute)
     }
 
     assert "SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED" not in names

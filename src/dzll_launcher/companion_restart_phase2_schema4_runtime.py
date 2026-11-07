@@ -197,6 +197,28 @@ class ConsumerAlertReservation:
     reason_codes: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class Schema4RebuildResult:
+    """Outcome of one per-server learning rebuild (R8).
+
+    ``changed`` is True when a semantically different record was installed
+    (and the server marked dirty).  ``staged_schema3_bytes`` are the
+    canonical bytes of the schema-3 runtime record the rebuild consumed.
+    """
+
+    server_key: str
+    changed: bool
+    staged_schema3_bytes: bytes
+    rebuild_seconds: float = 0.0
+    rebased: int = 0
+
+
+# Sentinel for "no installed record" so the install-time identity check can
+# distinguish a missing record from any installed object.
+_NO_RECORD = object()
+_MAX_REBUILD_REBASES = 8
+
+
 class Schema4WriterLock:
     """Single-process/OS advisory ownership for one schema-4 active file."""
 
@@ -293,6 +315,24 @@ class _WriteJob:
     dirty_keys: set[str]
 
 
+@dataclass
+class _RebuildJob:
+    """One ordered per-server rebuild (R8).
+
+    ``base`` is the installed (immutable, copy-on-write) record the rebuild
+    starts from, or ``_NO_RECORD``.  ``schema3_record`` is a detached copy
+    owned by the job.  The worker reads only these two objects.
+    """
+
+    server_key: str
+    base: object
+    schema3_record: dict
+    updated_at: float
+    durable_reason: str
+    ticket: Schema4WriteTicket
+    rebased: int = 0
+
+
 @dataclass(frozen=True)
 class _Completion:
     kind: str
@@ -304,6 +344,7 @@ class _Completion:
     report: Schema4ValidationReport | None = None
     owner_callback: Callable[[object, BaseException | None], None] | None = None
     duration: float = 0.0
+    rebuild_job: "_RebuildJob | None" = None
 
 
 class _Schema4DiskWriter:
@@ -431,12 +472,19 @@ class _Schema4PersistenceWorker:
     waiting one (it contains every earlier staged change), so queued work is
     bounded, writes are never reordered and stale state can never overwrite
     newer state.  Every coalesced request keeps its ticket.
+
+    R8: the same thread also runs per-server learning rebuilds, strictly in
+    submission order and never coalesced (each rebuild advances the learned
+    state and decision history, so none may be skipped).  The runtime keeps
+    at most one rebuild per server in flight, so this queue is bounded by
+    the number of servers with pending work.
     """
 
     def __init__(self, backend: "AuthoritativeSchema4Runtime") -> None:
         self._backend = backend
         self._cond = threading.Condition()
         self._pending: _WriteJob | None = None
+        self._rebuilds: collections.deque = collections.deque()
         self._aux: collections.deque = collections.deque()
         self._busy = False
         self._stopping = False
@@ -445,6 +493,10 @@ class _Schema4PersistenceWorker:
         self.completed_writes = 0
         self.max_write_seconds = 0.0
         self.total_write_seconds = 0.0
+        self.completed_rebuilds = 0
+        self.max_rebuild_seconds = 0.0
+        self.total_rebuild_seconds = 0.0
+        self.max_rebuild_queue_depth = 0
         self._thread = threading.Thread(
             target=self._run,
             name="dzll-companion-persistence",
@@ -459,7 +511,21 @@ class _Schema4PersistenceWorker:
     @property
     def busy(self) -> bool:
         with self._cond:
-            return bool(self._busy or self._pending is not None or self._aux)
+            return bool(
+                self._busy or self._pending is not None or self._aux or self._rebuilds
+            )
+
+    def submit_rebuild(self, job: "_RebuildJob") -> None:
+        with self._cond:
+            if self._stopping:
+                raise Schema4RuntimeError("persistence worker is stopping")
+            if not self._thread.is_alive():
+                raise Schema4RuntimeError("persistence worker stopped unexpectedly")
+            self._rebuilds.append(job)
+            self.max_rebuild_queue_depth = max(
+                self.max_rebuild_queue_depth, len(self._rebuilds)
+            )
+            self._cond.notify_all()
 
     def submit(self, job: _WriteJob) -> None:
         with self._cond:
@@ -487,7 +553,7 @@ class _Schema4PersistenceWorker:
     def wait_idle(self, timeout: float | None = None) -> bool:
         deadline = None if timeout is None else time.monotonic() + timeout
         with self._cond:
-            while self._busy or self._pending is not None or self._aux:
+            while self._busy or self._pending is not None or self._aux or self._rebuilds:
                 remaining = None if deadline is None else deadline - time.monotonic()
                 if remaining is not None and remaining <= 0:
                     return False
@@ -505,12 +571,20 @@ class _Schema4PersistenceWorker:
         while True:
             with self._cond:
                 while (
-                    self._pending is None and not self._aux and not self._stopping
+                    self._pending is None
+                    and not self._aux
+                    and not self._rebuilds
+                    and not self._stopping
                 ):
                     self._cond.wait()
                 job = None
                 task = None
-                if self._pending is not None:
+                rebuild = None
+                if self._rebuilds:
+                    # Rebuilds first: GTK-thread ordered learning work waits
+                    # on them, and a later write then includes their result.
+                    rebuild = self._rebuilds.popleft()
+                elif self._pending is not None:
                     job, self._pending = self._pending, None
                 elif self._aux:
                     task = self._aux.popleft()
@@ -518,7 +592,24 @@ class _Schema4PersistenceWorker:
                     return
                 self._busy = True
             try:
-                if job is not None:
+                if rebuild is not None:
+                    if self._discard:
+                        completion = _Completion(
+                            kind="rebuild",
+                            tickets=(rebuild.ticket,),
+                            error=Schema4RuntimeError(
+                                "persistence stopped before this rebuild was attempted"
+                            ),
+                            rebuild_job=rebuild,
+                        )
+                    else:
+                        completion = self._backend._compute_server_rebuild(rebuild)
+                        self.completed_rebuilds += 1
+                        self.max_rebuild_seconds = max(
+                            self.max_rebuild_seconds, completion.duration
+                        )
+                        self.total_rebuild_seconds += completion.duration
+                elif job is not None:
                     if self._discard:
                         completion = _Completion(
                             kind="write",
@@ -538,12 +629,20 @@ class _Schema4PersistenceWorker:
                 else:
                     completion = task()
             except BaseException as exc:  # defensive: tasks capture errors
-                completion = _Completion(
-                    kind="write" if job is not None else "aux",
-                    sequences=tuple(job.sequences) if job is not None else (),
-                    tickets=tuple(job.tickets) if job is not None else (),
-                    error=exc,
-                )
+                if rebuild is not None:
+                    completion = _Completion(
+                        kind="rebuild",
+                        tickets=(rebuild.ticket,),
+                        error=exc,
+                        rebuild_job=rebuild,
+                    )
+                else:
+                    completion = _Completion(
+                        kind="write" if job is not None else "aux",
+                        sequences=tuple(job.sequences) if job is not None else (),
+                        tickets=tuple(job.tickets) if job is not None else (),
+                        error=exc,
+                    )
             finally:
                 with self._cond:
                     self._busy = False
@@ -606,6 +705,10 @@ class AuthoritativeSchema4Runtime:
         self._post_to_owner: Callable[[Callable[[], object]], object] | None = None
         self._completions: collections.deque = collections.deque()
         self._completion_ready = threading.Event()
+        # R8: rebuild jobs submitted to the worker and not yet applied on
+        # the owner thread.
+        self._rebuilds_in_flight = 0
+        self._rebuild_rebase_count = 0
 
     @classmethod
     def open(
@@ -659,9 +762,13 @@ class AuthoritativeSchema4Runtime:
 
     @property
     def write_in_progress(self) -> bool:
-        return bool(self._submitted) or (
+        return bool(self._submitted or self._rebuilds_in_flight) or (
             self._worker is not None and self._worker.busy
         )
+
+    @property
+    def rebuild_in_progress(self) -> bool:
+        return bool(self._rebuilds_in_flight)
 
     def persistence_stats(self) -> dict:
         worker = self._worker
@@ -673,6 +780,15 @@ class AuthoritativeSchema4Runtime:
             "coalesced_requests": 0 if worker is None else worker.coalesced_requests,
             "max_write_seconds": 0.0 if worker is None else worker.max_write_seconds,
             "total_write_seconds": 0.0 if worker is None else worker.total_write_seconds,
+            "rebuilds": 0 if worker is None else worker.completed_rebuilds,
+            "max_rebuild_seconds": 0.0 if worker is None else worker.max_rebuild_seconds,
+            "total_rebuild_seconds": (
+                0.0 if worker is None else worker.total_rebuild_seconds
+            ),
+            "max_rebuild_queue_depth": (
+                0 if worker is None else worker.max_rebuild_queue_depth
+            ),
+            "rebuild_rebases": self._rebuild_rebase_count,
         }
 
     def schema3_projection(self) -> dict:
@@ -1178,76 +1294,294 @@ class AuthoritativeSchema4Runtime:
 
         self._ensure_open()
         with self._mutex:
-            assert self._state is not None
-            existing = self._state.get("servers", {}).get(server_key)
-            snapshot = self._state.get("schema3_snapshot")
-            snapshot_servers = (
-                snapshot.get("servers") if isinstance(snapshot, Mapping) else None
+            existing = self._prepare_server_rebuild_locked(server_key)
+            rebuilt, entry = self._rebuild_server_record(
+                server_key,
+                {} if existing is _NO_RECORD else existing,
+                schema3_record,
+                updated_at=updated_at,
+                durable_reason=durable_reason,
             )
-            if not isinstance(snapshot_servers, Mapping):
-                raise Schema4ValidationError(
-                    "schema-4 state has no writable schema-3 server projection"
-                )
-            block = self._server_write_block_locked(server_key)
-            if block is not None:
-                raise Schema4ServerWriteRejected(
-                    server_key,
-                    block[0],
-                    f"schema-4 server {server_key!r} is unavailable or quarantined",
-                    validation_codes=block[1],
-                )
-            existing_for_rebuild: Mapping[str, object] = (
-                {} if existing is None else existing
-            )
-            try:
-                rebuilt = rebuild_schema4_server_record(
-                    existing_for_rebuild,
-                    schema3_record,
-                    server_key=server_key,
-                    updated_at=updated_at,
-                )
-            except Schema4Error as exc:
-                # Deterministic for this record: one server's evidence cannot
-                # be rebuilt.  The stored record and all other servers stay
-                # intact and writable.
-                raise Schema4ServerWriteRejected(
-                    server_key,
-                    "server_rebuild_rejected",
-                    f"{type(exc).__name__}: {exc}",
-                ) from exc
-            before = canonical_json_bytes(existing_for_rebuild)
-            after = canonical_json_bytes(rebuilt)
-            if before == after:
+            if rebuilt is None:
                 return False
-            reasons = set(rebuilt.get("reason_codes", ()))
-            reasons.add(str(durable_reason))
-            rebuilt["reason_codes"] = sorted(reasons)
-            self._validate_record_for_server(server_key, rebuilt)
-            entry = copy.deepcopy(dict(schema3_record))
-            legacy = rebuilt.get("legacy_schema3_record")
-            if isinstance(legacy, dict) and legacy == entry:
-                # Share the identical mapping (R6 stores it once on disk);
-                # neither copy is ever mutated after installation.
-                entry = legacy
-            candidate_snapshot = dict(snapshot)
-            candidate_snapshot_servers = dict(snapshot_servers)
-            candidate_snapshot_servers[server_key] = entry
-            candidate_snapshot["servers"] = candidate_snapshot_servers
-            candidate_snapshot["updated_at"] = max(
-                int(updated_at),
-                int(candidate_snapshot.get("created_at", 0) or 0),
+            self._install_server_rebuild_locked(
+                server_key, rebuilt, entry, updated_at=updated_at
             )
-            servers = dict(self._state.get("servers", {}))
-            servers[server_key] = rebuilt
-            candidate = dict(self._state)
-            candidate["servers"] = servers
-            candidate["schema3_snapshot"] = candidate_snapshot
-            candidate["updated_at"] = max(
-                int(updated_at), int(candidate.get("created_at", 0) or 0)
-            )
-            self._state = candidate
-            self._dirty_servers.add(server_key)
             return True
+
+    # ------------------------------------------------------------------
+    # R8: per-server rebuilds on the ordered worker
+    # ------------------------------------------------------------------
+
+    def _prepare_server_rebuild_locked(self, server_key: str) -> object:
+        """Owner thread: refuse an unwritable server; return the base record."""
+
+        assert self._state is not None
+        snapshot = self._state.get("schema3_snapshot")
+        snapshot_servers = (
+            snapshot.get("servers") if isinstance(snapshot, Mapping) else None
+        )
+        if not isinstance(snapshot_servers, Mapping):
+            raise Schema4ValidationError(
+                "schema-4 state has no writable schema-3 server projection"
+            )
+        block = self._server_write_block_locked(server_key)
+        if block is not None:
+            raise Schema4ServerWriteRejected(
+                server_key,
+                block[0],
+                f"schema-4 server {server_key!r} is unavailable or quarantined",
+                validation_codes=block[1],
+            )
+        existing = self._state.get("servers", {}).get(server_key)
+        return _NO_RECORD if existing is None else existing
+
+    @classmethod
+    def _rebuild_server_record(
+        cls,
+        server_key: str,
+        existing_for_rebuild: Mapping[str, object],
+        schema3_record: Mapping[str, object],
+        *,
+        updated_at: float,
+        durable_reason: str,
+    ) -> tuple[dict | None, dict | None]:
+        """Pure: rebuild, compare and validate one record.
+
+        Reads only its arguments (an immutable installed record and a
+        detached schema-3 copy), so it may run on the persistence worker.
+        Returns ``(None, None)`` when the rebuilt record is semantically
+        unchanged.
+        """
+
+        try:
+            rebuilt = rebuild_schema4_server_record(
+                existing_for_rebuild,
+                schema3_record,
+                server_key=server_key,
+                updated_at=updated_at,
+            )
+        except Schema4Error as exc:
+            # Deterministic for this record: one server's evidence cannot
+            # be rebuilt.  The stored record and all other servers stay
+            # intact and writable.
+            raise Schema4ServerWriteRejected(
+                server_key,
+                "server_rebuild_rejected",
+                f"{type(exc).__name__}: {exc}",
+            ) from exc
+        before = canonical_json_bytes(existing_for_rebuild)
+        after = canonical_json_bytes(rebuilt)
+        if before == after:
+            return None, None
+        reasons = set(rebuilt.get("reason_codes", ()))
+        reasons.add(str(durable_reason))
+        rebuilt["reason_codes"] = sorted(reasons)
+        cls._validate_record_for_server(server_key, rebuilt)
+        entry = copy.deepcopy(dict(schema3_record))
+        legacy = rebuilt.get("legacy_schema3_record")
+        if isinstance(legacy, dict) and legacy == entry:
+            # Share the identical mapping (R6 stores it once on disk);
+            # neither copy is ever mutated after installation.
+            entry = legacy
+        return rebuilt, entry
+
+    def _install_server_rebuild_locked(
+        self,
+        server_key: str,
+        rebuilt: dict,
+        entry: dict,
+        *,
+        updated_at: float,
+    ) -> None:
+        """Owner thread: copy-on-write install of one validated record."""
+
+        assert self._state is not None
+        snapshot = self._state["schema3_snapshot"]
+        candidate_snapshot = dict(snapshot)
+        candidate_snapshot_servers = dict(snapshot["servers"])
+        candidate_snapshot_servers[server_key] = entry
+        candidate_snapshot["servers"] = candidate_snapshot_servers
+        candidate_snapshot["updated_at"] = max(
+            int(updated_at),
+            int(candidate_snapshot.get("created_at", 0) or 0),
+        )
+        servers = dict(self._state.get("servers", {}))
+        servers[server_key] = rebuilt
+        candidate = dict(self._state)
+        candidate["servers"] = servers
+        candidate["schema3_snapshot"] = candidate_snapshot
+        candidate["updated_at"] = max(
+            int(updated_at), int(candidate.get("created_at", 0) or 0)
+        )
+        self._state = candidate
+        self._dirty_servers.add(server_key)
+
+    def submit_server_rebuild(
+        self,
+        server_key: str,
+        schema3_record: Mapping[str, object],
+        *,
+        updated_at: float,
+        durable_reason: str,
+        callback: Callable[[Schema4WriteTicket], None] | None = None,
+    ) -> Schema4WriteTicket:
+        """Rebuild one server without blocking the owner thread (R8).
+
+        An unwritable (quarantined/unavailable) server or a missing schema-3
+        projection is refused synchronously, exactly as
+        ``update_server_from_schema3``.  Otherwise the rebuild, canonical
+        comparison and per-record validation run on the persistence worker
+        (inline when background writes are off); the validated record is
+        installed copy-on-write on the owner thread, and the ticket then
+        resolves with a ``Schema4RebuildResult`` (or the failure).  The
+        caller must keep at most one rebuild per server in flight.
+
+        ``schema3_record`` must be detached from live state (never mutated
+        afterwards); the job owns it.
+        """
+
+        self._ensure_open()
+        ticket = Schema4WriteTicket()
+        if callback is not None:
+            ticket.add_callback(callback)
+        key = str(server_key)
+        with self._mutex:
+            base = self._prepare_server_rebuild_locked(key)
+            job = _RebuildJob(
+                server_key=key,
+                base=base,
+                schema3_record=schema3_record,  # type: ignore[arg-type]
+                updated_at=float(updated_at),
+                durable_reason=str(durable_reason),
+                ticket=ticket,
+            )
+            worker = self._worker
+            self._rebuilds_in_flight += 1
+        if worker is None:
+            self._apply_completion(self._compute_server_rebuild(job))
+            return ticket
+        try:
+            worker.submit_rebuild(job)
+        except BaseException as exc:
+            self._apply_completion(
+                _Completion(
+                    kind="rebuild", tickets=(ticket,), error=exc, rebuild_job=job
+                )
+            )
+        return ticket
+
+    def _compute_server_rebuild(self, job: _RebuildJob) -> _Completion:
+        """Worker (or inline): the expensive, read-only part of a rebuild."""
+
+        started = time.perf_counter()
+        try:
+            base = {} if job.base is _NO_RECORD else job.base
+            rebuilt, entry = self._rebuild_server_record(
+                job.server_key,
+                base,  # type: ignore[arg-type]
+                job.schema3_record,
+                updated_at=job.updated_at,
+                durable_reason=job.durable_reason,
+            )
+            staged = canonical_json_bytes(job.schema3_record)
+        except BaseException as exc:
+            return _Completion(
+                kind="rebuild",
+                tickets=(job.ticket,),
+                error=exc,
+                duration=time.perf_counter() - started,
+                rebuild_job=job,
+            )
+        return _Completion(
+            kind="rebuild",
+            tickets=(job.ticket,),
+            result=(rebuilt, entry, staged),
+            duration=time.perf_counter() - started,
+            rebuild_job=job,
+        )
+
+    def _apply_rebuild_completion(self, completion: _Completion) -> bool:
+        """Owner thread: install a computed rebuild; False when re-submitted."""
+
+        job = completion.rebuild_job
+        assert job is not None
+        ticket = job.ticket
+        error = completion.error
+        result: Schema4RebuildResult | None = None
+        resubmit = None
+        with self._mutex:
+            if error is None and (self._closed or self._state is None):
+                error = Schema4RuntimeError(
+                    "authoritative schema-4 runtime is closed"
+                )
+            if error is None:
+                current = self._state["servers"].get(job.server_key)
+                current = _NO_RECORD if current is None else current
+                if current is not job.base:
+                    # The record changed outside the ordered per-server
+                    # queue (maintenance compaction or a test hook).  Never
+                    # install a rebuild of a stale base: recompute on the
+                    # current record instead.
+                    if job.rebased >= _MAX_REBUILD_REBASES:
+                        error = Schema4RuntimeError(
+                            "per-server rebuild base kept changing"
+                        )
+                    else:
+                        try:
+                            base = self._prepare_server_rebuild_locked(
+                                job.server_key
+                            )
+                        except BaseException as exc:
+                            error = exc
+                        else:
+                            self._rebuild_rebase_count += 1
+                            resubmit = _RebuildJob(
+                                server_key=job.server_key,
+                                base=base,
+                                schema3_record=job.schema3_record,
+                                updated_at=job.updated_at,
+                                durable_reason=job.durable_reason,
+                                ticket=ticket,
+                                rebased=job.rebased + 1,
+                            )
+                else:
+                    rebuilt, entry, staged = completion.result  # type: ignore[misc]
+                    if rebuilt is not None:
+                        self._install_server_rebuild_locked(
+                            job.server_key,
+                            rebuilt,
+                            entry,
+                            updated_at=job.updated_at,
+                        )
+                    result = Schema4RebuildResult(
+                        server_key=job.server_key,
+                        changed=rebuilt is not None,
+                        staged_schema3_bytes=staged,
+                        rebuild_seconds=completion.duration,
+                        rebased=job.rebased,
+                    )
+            if resubmit is None:
+                self._rebuilds_in_flight = max(0, self._rebuilds_in_flight - 1)
+            worker = self._worker
+        if resubmit is not None:
+            if worker is None:
+                self._apply_completion(self._compute_server_rebuild(resubmit))
+                return False
+            try:
+                worker.submit_rebuild(resubmit)
+            except BaseException as exc:
+                self._apply_completion(
+                    _Completion(
+                        kind="rebuild",
+                        tickets=(ticket,),
+                        error=exc,
+                        rebuild_job=resubmit,
+                    )
+                )
+            return False
+        ticket._resolve(result, error)
+        return True
 
     def replace_server_record(
         self, server_key: str, record: Mapping[str, object], *, reason: str
@@ -1436,6 +1770,9 @@ class AuthoritativeSchema4Runtime:
             if self._worker is None or not self._worker.alive:
                 self.process_completions()
                 if not ticket.done:
+                    if self._worker is not None and self._rebuilds_in_flight:
+                        # A dead worker never reports queued rebuilds.
+                        self._rebuilds_in_flight = 0
                     ticket._resolve(
                         None,
                         Schema4RuntimeError("persistence worker is not running"),
@@ -1453,8 +1790,18 @@ class AuthoritativeSchema4Runtime:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             self.process_completions()
-            if not self._submitted and (
-                self._worker is None or not self._worker.busy
+            if (
+                self._rebuilds_in_flight
+                and self._worker is not None
+                and not self._worker.alive
+                and not self._completions
+            ):
+                # A dead worker never reports queued rebuilds.
+                self._rebuilds_in_flight = 0
+            if (
+                not self._submitted
+                and not self._rebuilds_in_flight
+                and (self._worker is None or not self._worker.busy)
             ):
                 self.process_completions()
                 return True
@@ -1498,6 +1845,9 @@ class AuthoritativeSchema4Runtime:
     def _apply_completion(self, completion: _Completion) -> None:
         if completion.kind == "noop":
             return
+        if completion.kind == "rebuild":
+            self._apply_rebuild_completion(completion)
+            return
         if completion.kind == "aux":
             if completion.owner_callback is not None:
                 try:
@@ -1536,6 +1886,14 @@ class AuthoritativeSchema4Runtime:
         if self._closed:
             return None
         try:
+            if (
+                flush
+                and self.enabled
+                and self._rebuilds_in_flight
+                and self._worker is not None
+            ):
+                # R8: install in-flight rebuilds so the final write has them.
+                self.wait_idle()
             return self.flush() if flush and self.enabled and self.dirty else None
         finally:
             worker = self._worker

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import collections
+import copy
 import logging
 import math
 import time
@@ -100,6 +102,14 @@ MAX_FULL_DETAIL_SERVERS = 32
 MAX_COMPACT_DETAIL_SERVERS = 250
 COMPACT_EVENT_LIMIT = 12
 COLD_EVENT_LIMIT = 2
+# R8: ordered per-server authority work (rebuilds and the owner-thread work
+# that must observe them).  Polling backpressure keeps this tiny in practice
+# (a handful of entries); beyond the bound the owner thread waits for the
+# worker instead of dropping mandatory work.
+MAX_AUTHORITY_QUEUE_OPS = 256
+# Owner-thread time slice for draining queued ordered work after a rebuild
+# is installed; the remainder continues in a later main-loop callback.
+AUTHORITY_DRAIN_SLICE_SECONDS = 0.008
 
 
 from .companion_restart_phase2_schema4 import canonical_json_bytes
@@ -302,6 +312,27 @@ class _ServerRuntime:
             self.incomplete_episodes = []
 
 
+@dataclass
+class _AuthorityOp:
+    """One entry of a server's ordered authority queue (R8).
+
+    ``rebuild`` entries carry a detached schema-3 record captured at the
+    logical save point; ``owner`` entries are owner-thread callables that
+    must observe every earlier rebuild of the same server (authority-reading
+    consumer evaluation, alert dispatch, presentation, window continuations).
+    ``external`` marks window-supplied callables, which never run once the
+    runtime is shutting down.
+    """
+
+    kind: str
+    run: Callable[[], object] | None = None
+    schema3_record: dict | None = None
+    updated_at: float = 0.0
+    durable_reason: str = ""
+    external: bool = False
+    enqueued_at: float = 0.0
+
+
 class Phase2RestartRuntime:
     """Application-facing coordinator for the pure Phase 2 components.
 
@@ -355,6 +386,21 @@ class Phase2RestartRuntime:
         self._schema4_staged_runtime_server_keys: dict[str, bytes] = {}
         self._server_persistence_blocks: dict[str, ServerPersistenceBlock] = {}
         self._persistence_listener: Callable[[], None] | None = None
+        # R8: per-server ordered authority work.  At most one rebuild per
+        # server is in flight; queued entries wait behind it in order.
+        self._authority_queues: dict[str, collections.deque] = {}
+        self._authority_inflight: dict[str, object] = {}
+        self._authority_draining: set[str] = set()
+        self._authority_continuations: set[str] = set()
+        self._post_to_owner: Callable[[Callable[[], object]], object] | None = None
+        self._authority_stats = {
+            "max_queue_depth": 0,
+            "deferred_owner_ops": 0,
+            "background_rebuilds": 0,
+            "max_rebuild_latency_seconds": 0.0,
+            "backpressure_waits": 0,
+            "drain_continuations": 0,
+        }
         self._servers: dict[str, _ServerRuntime] = {}
         self._shutdown = False
         self._load_servers(float(time.time() if now is None else now))
@@ -1153,6 +1199,10 @@ class Phase2RestartRuntime:
         if self._shutdown:
             return
         self._shutdown = True
+        # R8: finish every queued and in-flight per-server rebuild, in order,
+        # so mandatory finalized events are staged.  Queued window work is
+        # skipped from now on; queued alert dispatches are never started.
+        self._drain_authority_work_for_shutdown()
         # Background writes: apply every outstanding completion first so the
         # shutdown save point sees the true persistence status (a retryable
         # failure is retried below, an ambiguous one is not).
@@ -1167,6 +1217,7 @@ class Phase2RestartRuntime:
                     monotonic_at=monotonic_at,
                 )
             self._persist_server(server, force=True, now=wall_at)
+        self._drain_authority_work_for_shutdown()
         backend = self._authoritative_schema4_backend
         if backend is not None:
             self._drain_background_writes()
@@ -1196,6 +1247,10 @@ class Phase2RestartRuntime:
         backend = self._authoritative_schema4_backend
         if not self.authoritative_schema4_runtime_enabled or backend is None:
             raise RuntimeError("authoritative schema-4 learning export is unavailable")
+        if self.authority_work_pending_any:
+            # R8: export what the synchronous path would have: every save
+            # point so far rebuilt and installed.
+            self.wait_for_authority_idle()
         return backend.export_snapshot()
 
     def export_authoritative_schema4_snapshot_async(
@@ -1210,7 +1265,23 @@ class Phase2RestartRuntime:
         backend = self._authoritative_schema4_backend
         if not self.authoritative_schema4_runtime_enabled or backend is None:
             raise RuntimeError("authoritative schema-4 learning export is unavailable")
-        backend.export_snapshot_async(callback)
+        # R8: start the export only once every queued rebuild is installed.
+        self._when_all_authority_current(
+            lambda: backend.export_snapshot_async(callback)
+        )
+
+    def _when_all_authority_current(self, callback: Callable[[], object]) -> None:
+        pending = sorted(
+            key
+            for key in set(self._authority_queues) | set(self._authority_inflight)
+            if not self._authority_current(key)
+        )
+        if not pending:
+            callback()
+            return
+        self._schedule_owner_op(
+            pending[0], lambda: self._when_all_authority_current(callback)
+        )
 
     def authority_consumer_shadow_snapshot(self, server_key: str) -> object | None:
         """Return an in-memory Stage 3B1 comparison; never a production input."""
@@ -1291,6 +1362,64 @@ class Phase2RestartRuntime:
             return finish(AuthorityConsumerActionResult(
                 False, False, "schema3", None, None, ("production_cutover_disabled",)
             ))
+        server_key = str(server_key)
+        if not self._authority_current(server_key):
+            if kind not in {"scheduled_warning", "generic_recovery"}:
+                raise ValueError("unsupported authority consumer action kind")
+            # R8: a rebuild of this server is pending, so its consumer
+            # resolution and record are not yet those the synchronous path
+            # would read here.  Dispatch in order once they are; the final
+            # result (and any fallback decision) goes to ``on_result``.
+            requested = self._servers.get(server_key)
+            session_at_request = (
+                requested.monitoring_session_id if requested is not None else ""
+            )
+
+            def not_dispatched(reason: str) -> None:
+                finish(AuthorityConsumerActionResult(
+                    False, False, "schema4", None, None, (reason, "at_most_once_delivery")
+                ))
+
+            def dispatch_when_current() -> None:
+                if self._shutdown:
+                    not_dispatched("shutdown_before_dispatch")
+                    return
+                current = self._servers.get(server_key)
+                if (
+                    current.monitoring_session_id if current is not None else ""
+                ) != session_at_request:
+                    # Stopped, switched away or restarted: never dispatch a
+                    # request from an earlier monitoring session.
+                    not_dispatched("monitoring_session_changed_before_dispatch")
+                    return
+                if still_wanted is not None:
+                    try:
+                        wanted = bool(still_wanted())
+                    except Exception:
+                        wanted = False
+                    if not wanted:
+                        not_dispatched("no_longer_wanted_before_reservation")
+                        return
+                self.dispatch_authority_consumer_action(
+                    server_key,
+                    kind=kind,
+                    now=now,
+                    action=action,
+                    after_reservation=after_reservation,
+                    after_dispatch=after_dispatch,
+                    on_result=on_result,
+                    still_wanted=still_wanted,
+                )
+
+            self._schedule_owner_op(server_key, dispatch_when_current)
+            return AuthorityConsumerActionResult(
+                False,
+                False,
+                "schema4",
+                None,
+                None,
+                ("authority_rebuild_pending", "at_most_once_delivery"),
+            )
         resolution = self._authority_consumer_resolutions.get(str(server_key))
         if resolution is None or resolution.source is not CutoverSource.SCHEMA4:
             return finish(AuthorityConsumerActionResult(
@@ -1469,7 +1598,13 @@ class Phase2RestartRuntime:
                 ),
             ))
 
-        ticket.add_callback(reservation_durable)
+        # R8: the completion staging mutates this server's record, so it is
+        # ordered behind any rebuild of the server queued meanwhile.
+        ticket.add_callback(
+            lambda done: self._schedule_owner_op(
+                server_key, lambda: reservation_durable(done)
+            )
+        )
         return AuthorityConsumerActionResult(
             True,
             False,
@@ -1898,13 +2033,21 @@ class Phase2RestartRuntime:
             self.schema4_authority_consumer_shadow_enabled
             or self.schema4_authority_production_cutover_enabled
         ):
-            self._evaluate_authority_consumer_shadow(
-                server,
-                schema3_decision=decision,
-                now=now,
-                server_online_healthy=server_online_healthy,
-                restart_alert_enabled=restart_alert_enabled,
-                event=event,
+            # R8: the schema-4 consumer reads the backend authority, so it
+            # must observe every earlier rebuild of this server.  Its inputs
+            # are captured now (the logical evaluation point); it runs at
+            # once when no rebuild is pending, else in order after them.
+            self._schedule_owner_op(
+                server.key,
+                lambda: self._evaluate_authority_consumer_shadow(
+                    server,
+                    schema3_decision=decision,
+                    score=score,
+                    now=now,
+                    server_online_healthy=server_online_healthy,
+                    restart_alert_enabled=restart_alert_enabled,
+                    event=event,
+                ),
             )
         return decision
 
@@ -1913,6 +2056,7 @@ class Phase2RestartRuntime:
         server: _ServerRuntime,
         *,
         schema3_decision: ConsumerDecision,
+        score: ScheduleScore | None,
         now: float,
         server_online_healthy: bool,
         restart_alert_enabled: bool,
@@ -1949,8 +2093,8 @@ class Phase2RestartRuntime:
                 else frozenset()
             )
             selected = None
-            if server.score is not None and server.score.selected_period_seconds is not None:
-                selected = server.score.candidate(server.score.selected_period_seconds)
+            if score is not None and score.selected_period_seconds is not None:
+                selected = score.candidate(score.selected_period_seconds)
             unresolved_required_divisor = bool(
                 selected is not None
                 and GATES[selected.period_seconds].require_divisors
@@ -1964,10 +2108,10 @@ class Phase2RestartRuntime:
             )
             normal_prediction_evidence = (
                 NormalPredictionEvidence(
-                    selected_period_seconds=server.score.selected_period_seconds,
-                    incumbent_period_seconds=server.score.incumbent_period_seconds,
+                    selected_period_seconds=score.selected_period_seconds,
+                    incumbent_period_seconds=score.incumbent_period_seconds,
                     schedule_existence_confidence=(
-                        server.score.schedule_existence_confidence
+                        score.schedule_existence_confidence
                     ),
                     fundamental_period_confidence=(
                         selected.fundamental_period_confidence
@@ -1978,19 +2122,19 @@ class Phase2RestartRuntime:
                         selected.strict_direct_interval_count
                     ),
                     unresolved_competitor=bool(
-                        server.score.unresolved_competitors
+                        score.unresolved_competitors
                     ),
                     unresolved_divisor_or_harmonic=(
                         unresolved_required_divisor
                     ),
                     regime_stable=(
-                        server.score.regime_status is RegimeStatus.STABLE
+                        score.regime_status is RegimeStatus.STABLE
                     ),
                     latest_aligned_phase_at=(
                         selected.recent_phase_observation_at
                     ),
                     raw_predicted_occurrence_at=_next_prediction(
-                        server.score, now
+                        score, now
                     ),
                     recent_strong_anomaly=bool(
                         selected.strong_covered_contradiction
@@ -1998,7 +2142,7 @@ class Phase2RestartRuntime:
                         in schema3_decision.prediction_reasons
                     ),
                 )
-                if server.score is not None and selected is not None
+                if score is not None and selected is not None
                 else None
             )
             consumer = evaluate_authority_consumers(
@@ -2230,7 +2374,16 @@ class Phase2RestartRuntime:
         ):
             return False
         backend.enable_background_writes(post_to_owner)
+        self._post_to_owner = post_to_owner
         return True
+
+    def _drain_authority_work_for_shutdown(self) -> None:
+        if not self.authority_work_pending_any:
+            return
+        try:
+            self.wait_for_authority_idle()
+        except Exception:
+            logger.exception("Server Companion learning rebuild drain failed")
 
     def _drain_background_writes(self) -> None:
         backend = self._authoritative_schema4_backend
@@ -2246,7 +2399,10 @@ class Phase2RestartRuntime:
         """True while a schema-4 write is queued or running."""
 
         backend = self._authoritative_schema4_backend
-        return bool(backend is not None and backend.write_in_progress)
+        return bool(
+            (backend is not None and backend.write_in_progress)
+            or self.authority_work_pending_any
+        )
 
     def set_persistence_status_listener(
         self, listener: Callable[[], None] | None
@@ -2305,7 +2461,9 @@ class Phase2RestartRuntime:
         backend = self._authoritative_schema4_backend
         if backend is None:
             return
-        if backend.dirty:
+        if backend.dirty or self.authority_work_pending_any:
+            # R8: a queued or in-flight rebuild is a save point not yet
+            # staged; its own later write completes the bookkeeping.
             return
         durable_runtime_keys = dict(self._schema4_staged_runtime_server_keys)
         self._schema4_staged_runtime_server_keys.clear()
@@ -2333,6 +2491,7 @@ class Phase2RestartRuntime:
         backend = self._authoritative_schema4_backend
         return bool(
             not server.dirty
+            and self._authority_current(server.key)
             and (backend is None or not backend.dirty)
         )
 
@@ -2350,6 +2509,8 @@ class Phase2RestartRuntime:
             return False
         if not force and now - server.last_saved_at < PERSIST_HEARTBEAT_SECONDS:
             return False
+        if backend is not None and self._background_rebuilds_enabled():
+            return self._persist_server_background(server, force=force, now=now)
         if backend is not None:
             schema3_record = _serialize_server(server)
             try:
@@ -2403,6 +2564,348 @@ class Phase2RestartRuntime:
         server.dirty = False
         server.last_saved_at = now
         return True
+
+    # ------------------------------------------------------------------
+    # R8: per-server learning rebuilds off the owner (GTK) thread
+    # ------------------------------------------------------------------
+    #
+    # Synchronous reference: every save point rebuilt the server's schema-4
+    # record before returning, so any later authority read (consumer
+    # evaluation, alert dispatch, presentation) observed it.  In background
+    # mode a save point instead appends a rebuild to the server's ordered
+    # queue; owner-thread work that reads authority is appended behind it
+    # and runs only after every earlier rebuild of that server has been
+    # installed.  The sequence of record mutations per server is therefore
+    # identical to the synchronous one, only later.  Inline mode never
+    # queues and is unchanged.
+
+    def _background_rebuilds_enabled(self) -> bool:
+        backend = self._authoritative_schema4_backend
+        return bool(
+            backend is not None
+            and self.authoritative_schema4_runtime_enabled
+            and getattr(backend, "background_writes_enabled", False)
+        )
+
+    def _authority_current(self, server_key: str) -> bool:
+        return (
+            server_key not in self._authority_inflight
+            and not self._authority_queues.get(server_key)
+        )
+
+    def authority_work_pending(self, server_key: str) -> bool:
+        """True while a rebuild or ordered authority work for the server is queued."""
+
+        return not self._authority_current(str(server_key))
+
+    @property
+    def authority_work_pending_any(self) -> bool:
+        return bool(self._authority_inflight) or any(
+            bool(queue) for queue in self._authority_queues.values()
+        )
+
+    def authority_queue_stats(self) -> dict:
+        stats = dict(self._authority_stats)
+        stats["pending_servers"] = sorted(
+            key
+            for key in set(self._authority_queues) | set(self._authority_inflight)
+            if not self._authority_current(key)
+        )
+        stats["queued_ops"] = sum(len(item) for item in self._authority_queues.values())
+        return stats
+
+    def when_authority_current(
+        self, server_key: str, callback: Callable[[], object]
+    ) -> bool:
+        """Run ``callback`` on the owner thread once the server's authority is current.
+
+        Runs it immediately (returning True) when no rebuild or ordered
+        work is pending for ``server_key``; otherwise queues it behind that
+        work and returns False.  Queued window callbacks never run once the
+        runtime is shutting down.
+        """
+
+        return self._schedule_owner_op(str(server_key), callback, external=True)
+
+    def _schedule_owner_op(
+        self,
+        server_key: str,
+        callback: Callable[[], object],
+        *,
+        external: bool = False,
+    ) -> bool:
+        if self._authority_current(server_key):
+            callback()
+            return True
+        self._enqueue_authority_op(
+            server_key,
+            _AuthorityOp(
+                "owner",
+                run=callback,
+                external=external,
+                enqueued_at=time.perf_counter(),
+            ),
+        )
+        self._authority_stats["deferred_owner_ops"] += 1
+        return False
+
+    def _enqueue_authority_op(self, server_key: str, op: _AuthorityOp) -> None:
+        queue = self._authority_queues.setdefault(server_key, collections.deque())
+        queue.append(op)
+        depth = len(queue)
+        if depth > self._authority_stats["max_queue_depth"]:
+            self._authority_stats["max_queue_depth"] = depth
+        if depth > MAX_AUTHORITY_QUEUE_OPS and server_key not in self._authority_draining:
+            # Bounded: never drop mandatory work; wait for the worker instead.
+            self._authority_stats["backpressure_waits"] += 1
+            self._wait_for_authority_work(
+                lambda: len(self._authority_queues.get(server_key) or ())
+                <= MAX_AUTHORITY_QUEUE_OPS // 2
+            )
+
+    def _persist_server_background(
+        self, server: _ServerRuntime, *, force: bool, now: float
+    ) -> bool:
+        backend = self._authoritative_schema4_backend
+        assert backend is not None
+        try:
+            block = backend.server_write_block(server.key)
+        except Exception as exc:
+            self._record_schema4_persistence_failure(exc)
+            self._notify_persistence_listener()
+            return False
+        if block is not None:
+            # Quarantined/unavailable: refused synchronously, as before R8.
+            self._block_server_persistence(
+                server.key,
+                reason_code=block[0],
+                detail=f"schema-4 server {server.key!r} is unavailable or quarantined",
+                validation_codes=block[1],
+                now=now,
+            )
+            return False
+        # Detached copy: the job owns it, and later in-place runtime
+        # mutations (session dicts, diagnostics) can never reach the worker.
+        schema3_record = copy.deepcopy(_serialize_server(server))
+        op = _AuthorityOp(
+            "rebuild",
+            schema3_record=schema3_record,
+            updated_at=float(now),
+            durable_reason=(
+                "schema4_chain_or_event_durable_update"
+                if force
+                else "schema4_coalesced_runtime_update"
+            ),
+            enqueued_at=time.perf_counter(),
+        )
+        # The backend now tracks this state's durability; a failure re-marks
+        # the server dirty (as R7 background writes do).
+        server.dirty = False
+        server.last_saved_at = now
+        if self._authority_current(server.key):
+            self._start_authority_rebuild(server.key, op)
+        else:
+            self._enqueue_authority_op(server.key, op)
+        return True
+
+    def _start_authority_rebuild(self, server_key: str, op: _AuthorityOp) -> None:
+        """Submit one queued rebuild; at most one per server is in flight."""
+
+        backend = self._authoritative_schema4_backend
+        if (
+            backend is None
+            or not self.persistence_enabled
+            or server_key in self._server_persistence_blocks
+        ):
+            # Persistence stopped, or this server became known-rejected
+            # after the save point was queued: as in the synchronous path,
+            # a known-rejected server is never retried.
+            return
+        self._authority_inflight[server_key] = op
+        self._authority_stats["background_rebuilds"] += 1
+        try:
+            backend.submit_server_rebuild(
+                server_key,
+                op.schema3_record,
+                updated_at=op.updated_at,
+                durable_reason=op.durable_reason,
+                callback=lambda done: self._on_authority_rebuild_complete(
+                    server_key, op, done
+                ),
+            )
+        except Exception as exc:
+            if self._authority_inflight.get(server_key) is op:
+                del self._authority_inflight[server_key]
+            self._handle_authority_rebuild_failure(server_key, exc, now=op.updated_at)
+
+    def _handle_authority_rebuild_failure(
+        self, server_key: str, exc: BaseException, *, now: float
+    ) -> None:
+        before = (self.persistence_status, self.persistence_error)
+        if not self._isolate_server_write_rejection(exc, now=now):
+            self._record_schema4_persistence_failure(exc)
+        item = self._servers.get(server_key)
+        if item is not None:
+            # Not staged: exactly as a failed synchronous save point.
+            item.dirty = True
+        if (self.persistence_status, self.persistence_error) != before:
+            self._notify_persistence_listener()
+
+    def _on_authority_rebuild_complete(
+        self, server_key: str, op: _AuthorityOp, done
+    ) -> None:
+        """Owner thread: the rebuilt record is installed (or failed)."""
+
+        if self._authority_inflight.get(server_key) is op:
+            del self._authority_inflight[server_key]
+        try:
+            latency = time.perf_counter() - op.enqueued_at
+            if latency > self._authority_stats["max_rebuild_latency_seconds"]:
+                self._authority_stats["max_rebuild_latency_seconds"] = latency
+            if done.error is not None:
+                self._handle_authority_rebuild_failure(
+                    server_key, done.error, now=op.updated_at
+                )
+            elif server_key not in self._server_persistence_blocks:
+                backend = self._authoritative_schema4_backend
+                result = done.result
+                self._schema4_staged_runtime_server_keys[server_key] = (
+                    result.staged_schema3_bytes
+                )
+                try:
+                    backend.flush_async(
+                        lambda written: self._on_schema4_write_complete(
+                            written, now=op.updated_at
+                        )
+                    )
+                except Exception as exc:
+                    self._record_schema4_persistence_failure(exc)
+                    self._notify_persistence_listener()
+        finally:
+            self._drain_authority_queue(
+                server_key, budget=AUTHORITY_DRAIN_SLICE_SECONDS
+            )
+
+    def _continue_authority_drain(self, server_key: str) -> bool:
+        self._authority_continuations.discard(server_key)
+        self._drain_authority_queue(server_key, budget=AUTHORITY_DRAIN_SLICE_SECONDS)
+        return False
+
+    def _drain_authority_queue(
+        self, server_key: str, *, budget: float | None = None
+    ) -> None:
+        """Run queued work in order until a rebuild is in flight or none is left.
+
+        With ``budget`` (seconds) and an owner-thread scheduler, the drain
+        yields after the slice and continues in a later main-loop callback,
+        so a backlog never becomes one long GTK callback.  The server stays
+        not-current meanwhile, so new work still queues behind it in order.
+        """
+
+        if server_key in self._authority_draining:
+            return
+        self._authority_draining.add(server_key)
+        started = time.perf_counter()
+        progressed = False
+        try:
+            while server_key not in self._authority_inflight:
+                queue = self._authority_queues.get(server_key)
+                if not queue:
+                    break
+                if (
+                    budget is not None
+                    and progressed
+                    and self._post_to_owner is not None
+                    and not self._shutdown
+                    and time.perf_counter() - started >= budget
+                ):
+                    if server_key not in self._authority_continuations:
+                        self._authority_continuations.add(server_key)
+                        self._authority_stats["drain_continuations"] += 1
+                        try:
+                            self._post_to_owner(
+                                lambda: self._continue_authority_drain(server_key)
+                            )
+                        except Exception:
+                            # No scheduler: finish the drain now instead.
+                            self._authority_continuations.discard(server_key)
+                            budget = None
+                            continue
+                    break
+                op = queue.popleft()
+                progressed = True
+                if op.kind == "rebuild":
+                    self._start_authority_rebuild(server_key, op)
+                    continue
+                # Work scheduled while this entry runs belongs to it, so it
+                # must precede the remaining (logically later) entries.
+                self._authority_queues[server_key] = collections.deque()
+                try:
+                    if not (op.external and self._shutdown):
+                        op.run()
+                except Exception:
+                    logger.exception("Server Companion ordered learning work failed")
+                finally:
+                    nested = self._authority_queues.get(server_key)
+                    if nested is None:
+                        nested = collections.deque()
+                    nested.extend(queue)
+                    self._authority_queues[server_key] = nested
+            if not self._authority_queues.get(server_key):
+                self._authority_queues.pop(server_key, None)
+        finally:
+            self._authority_draining.discard(server_key)
+
+    def _wait_for_authority_work(
+        self, done: Callable[[], bool], timeout: float | None = None
+    ) -> bool:
+        """Owner thread: pump completions until ``done()`` (shutdown/tests/backpressure)."""
+
+        backend = self._authoritative_schema4_backend
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not done():
+            if backend is None:
+                return False
+            inflight = tuple(self._authority_inflight)
+            if not inflight:
+                # Nothing in flight but work queued: drain it now.
+                for key in tuple(self._authority_queues):
+                    self._drain_authority_queue(key)
+                if not self._authority_inflight:
+                    if done():
+                        return True
+                    if not any(self._authority_queues.values()):
+                        return done()
+                continue
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            backend.wait_idle(
+                0.05 if remaining is None else min(0.05, max(0.0, remaining))
+            )
+            if (
+                getattr(backend, "_worker", None) is not None
+                and not backend._worker.alive
+                and self._authority_inflight
+                and not backend.rebuild_in_progress
+            ):
+                # A dead worker never reports: fail the in-flight rebuilds.
+                for key, op in tuple(self._authority_inflight.items()):
+                    del self._authority_inflight[key]
+                    self._handle_authority_rebuild_failure(
+                        key,
+                        RuntimeError("persistence worker is not running"),
+                        now=op.updated_at,
+                    )
+                    self._drain_authority_queue(key)
+        return True
+
+    def wait_for_authority_idle(self, timeout: float | None = None) -> bool:
+        """Owner thread: block until no rebuild or ordered work is pending."""
+
+        return self._wait_for_authority_work(
+            lambda: not self.authority_work_pending_any, timeout
+        )
 
     def _compact_global_history(self, *, active_key: str, now: float) -> None:
         """Bound total state while retaining compact knowledge for old identities."""

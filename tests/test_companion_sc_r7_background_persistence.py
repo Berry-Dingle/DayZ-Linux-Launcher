@@ -192,6 +192,9 @@ def _gated_install(monkeypatch):
 def _eligible_warning(value, key, occurrence):
     """Force a schema-4 scheduled-warning opportunity (policy is not under test)."""
 
+    # R8: edit the resolution only once every pending rebuild is installed
+    # (otherwise the queued evaluation would overwrite the forced one).
+    value.wait_for_authority_idle()
     value.decision(key, now=occurrence - 600)
     resolution = value._authority_consumer_resolutions[key]
     decision = resolution.selected_output

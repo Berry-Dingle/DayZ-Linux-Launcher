@@ -2742,6 +2742,43 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         self.set_server_companion_server(obj, persist=False)
 
+    def _companion_authority_work_pending(self, key) -> bool:
+        """R8: a learning rebuild or ordered learning work is pending for ``key``."""
+
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        probe = getattr(runtime, "authority_work_pending", None)
+        if not key or not callable(probe):
+            return False
+        try:
+            return probe(key) is True
+        except Exception:
+            return False
+
+    def _run_when_companion_authority_current(self, key, callback) -> bool:
+        """R8: run ``callback`` now, or in order once ``key``'s learning rebuilds are installed.
+
+        Returns True when it ran immediately.  Without a background-capable
+        runtime (or without a key) it always runs immediately.
+        """
+
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        schedule = getattr(runtime, "when_authority_current", None)
+        if (
+            not key
+            or not callable(schedule)
+            or not DZLLWindow._companion_authority_work_pending(self, key)
+        ):
+            callback()
+            return True
+        try:
+            return schedule(key, callback) is True
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                f"restart-learning ordered work unavailable; running now: {exc!r}"
+            )
+            callback()
+            return True
+
     def _companion_session_pending_durability(self, key) -> bool:
         runtime = getattr(self, "_companion_restart_phase2", None)
         probe = getattr(runtime, "monitoring_session_pending_durability", None)
@@ -3094,6 +3131,21 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return phase2_alert_usability(None)
 
     def _refresh_server_companion_restart_learning_summary(self) -> None:
+        key_of = getattr(self, "_server_companion_restart_learning_key", None)
+        key = key_of() if callable(key_of) else None
+        if key and DZLLWindow._companion_authority_work_pending(self, key):
+            # R8: present the rebuilt authority, not the one it replaces.
+            def refresh_when_current() -> None:
+                if bool(getattr(self, "_shutdown_cleanup_done", False)):
+                    return
+                if self._server_companion_restart_learning_key() != key:
+                    return
+                DZLLWindow._refresh_server_companion_restart_learning_summary(self)
+
+            DZLLWindow._run_when_companion_authority_current(
+                self, key, refresh_when_current
+            )
+            return
         DZLLWindow._surface_restart_learning_persistence_notice(self)
         panel = getattr(self, "server_companion_panel", None)
         if panel is not None:
@@ -4037,6 +4089,20 @@ class DZLLWindow(Gtk.ApplicationWindow):
     ):
         if token != int(getattr(self, "_server_companion_poll_token", 0)):
             return False
+        pending_key = self._server_companion_restart_learning_key()
+        if pending_key and DZLLWindow._companion_authority_work_pending(self, pending_key):
+            # R8: an earlier poll's finish (or its learning rebuild) is still
+            # pending.  Apply this result after it, in order, so window state
+            # is read and updated exactly as with synchronous rebuilds.  The
+            # poll stays in flight meanwhile, which also pauses new polls.
+            DZLLWindow._run_when_companion_authority_current(
+                self,
+                pending_key,
+                lambda: DZLLWindow._apply_server_companion_live_result(
+                    self, token, info, confirmed_recovery=confirmed_recovery
+                ),
+            )
+            return False
         self._server_companion_poll_inflight = False
         if not self._server_companion_should_poll():
             return False
@@ -4130,6 +4196,100 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 # R7: a session whose start is still being committed in the
                 # background becomes usable once its write completes.
                 self._record_server_companion_monitor_started(key)
+        return DZLLWindow._finish_server_companion_live_result_when_current(
+            self,
+            token=token,
+            key=key,
+            info=info,
+            snapshot=snapshot,
+            now=now,
+            now_wall=now_wall,
+            disposition=disposition,
+            confirmed_offline=confirmed_offline,
+            confirmed_recovery=confirmed_recovery,
+            guard=guard,
+            phase2_update=phase2_update,
+        )
+
+    def _finish_server_companion_live_result_when_current(
+        self,
+        *,
+        token: int,
+        key,
+        info: dict,
+        snapshot: dict,
+        now: float,
+        now_wall: float,
+        disposition,
+        confirmed_offline: bool,
+        confirmed_recovery: dict | None,
+        guard,
+        phase2_update,
+    ):
+        """R8: finish a poll result once the server's learning authority is current.
+
+        The observation has already been ingested (and its learning rebuild
+        queued).  Everything after it reads the rebuilt authority or depends
+        on window state that the next poll reads, so it runs at once when no
+        rebuild is pending and otherwise in order after the rebuild is
+        installed, on the GTK thread.  A deferred finish whose poll was
+        superseded (server switch, stop, clear, shutdown) is dropped: its
+        evidence is already saved, but it never alerts or updates the
+        presentation of a different monitoring session.
+        """
+
+        state = {"deferred": False}
+
+        def finish() -> None:
+            if state["deferred"] and not DZLLWindow._server_companion_deferred_result_current(
+                self, token, key
+            ):
+                self._debug_server_companion_alert(
+                    "deferred poll result dropped after monitoring changed: "
+                    f"server={key!r} generation={token}"
+                )
+                return
+            DZLLWindow._finish_server_companion_live_result(
+                self,
+                token=token,
+                key=key,
+                info=info,
+                snapshot=snapshot,
+                now=now,
+                now_wall=now_wall,
+                disposition=disposition,
+                confirmed_offline=confirmed_offline,
+                confirmed_recovery=confirmed_recovery,
+                guard=guard,
+                phase2_update=phase2_update,
+            )
+
+        if not DZLLWindow._run_when_companion_authority_current(self, key, finish):
+            state["deferred"] = True
+        return False
+
+    def _server_companion_deferred_result_current(self, token: int, key) -> bool:
+        return bool(
+            not bool(getattr(self, "_shutdown_cleanup_done", False))
+            and int(token) == int(getattr(self, "_server_companion_poll_token", 0) or 0)
+            and self._server_companion_restart_learning_key() == key
+        )
+
+    def _finish_server_companion_live_result(
+        self,
+        *,
+        token: int,
+        key,
+        info: dict,
+        snapshot: dict,
+        now: float,
+        now_wall: float,
+        disposition,
+        confirmed_offline: bool,
+        confirmed_recovery: dict | None,
+        guard,
+        phase2_update,
+    ):
         if disposition in {
             LiveResultDisposition.NEUTRAL,
             LiveResultDisposition.PROTOCOL_FAILURE,
@@ -4471,6 +4631,19 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._debug_server_companion_alert(f"Phase 2 event policy failed safely: {exc!r}")
                 continue
             if SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
+                dispatch_state = {"returned": False}
+
+                def recovery_result(
+                    result, decision=decision, dispatch_state=dispatch_state
+                ) -> None:
+                    # R8: a dispatch ordered behind a pending learning
+                    # rebuild reports here; a schema-3 safe fallback then
+                    # runs in the same order the synchronous path used.
+                    if dispatch_state["returned"] and result.source != "schema4":
+                        DZLLWindow._dispatch_phase2_schema3_recovery(
+                            self, key, decision, snapshot
+                        )
+
                 result = self._companion_restart_phase2.dispatch_authority_consumer_action(
                     key,
                     kind="generic_recovery",
@@ -4481,28 +4654,33 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         )
                         is None
                     ),
+                    on_result=recovery_result,
                     still_wanted=lambda: (
                         not bool(getattr(self, "_shutdown_cleanup_done", False))
                         and self._server_companion_restart_learning_key() == key
                     ),
                 )
+                dispatch_state["returned"] = True
                 if result.source == "schema4":
                     continue
-            action = decision.preferred_recovery_action
-            key_to_record = None
-            alert_type = "back online"
-            if action is RecoveryAction.QUERY_VISIBLE_RECOVERY:
-                key_to_record = decision.query_visible_key
-                alert_type = "query-visible rejoin"
-            elif action is RecoveryAction.SCHEDULED_RECOVERY:
-                key_to_record = decision.scheduled_event_key
-                alert_type = "scheduled restart recovery"
-            elif action is RecoveryAction.GENERIC_RECOVERY:
-                key_to_record = decision.generic_recovery_key
-            if key_to_record is not None:
-                self._server_companion_alert_back_online(snapshot, alert_type=alert_type)
-                self._companion_restart_phase2.mark_fired(key, key_to_record, now=time.time())
+            DZLLWindow._dispatch_phase2_schema3_recovery(self, key, decision, snapshot)
         self._refresh_server_companion_restart_learning_summary()
+
+    def _dispatch_phase2_schema3_recovery(self, key, decision, snapshot) -> None:
+        action = decision.preferred_recovery_action
+        key_to_record = None
+        alert_type = "back online"
+        if action is RecoveryAction.QUERY_VISIBLE_RECOVERY:
+            key_to_record = decision.query_visible_key
+            alert_type = "query-visible rejoin"
+        elif action is RecoveryAction.SCHEDULED_RECOVERY:
+            key_to_record = decision.scheduled_event_key
+            alert_type = "scheduled restart recovery"
+        elif action is RecoveryAction.GENERIC_RECOVERY:
+            key_to_record = decision.generic_recovery_key
+        if key_to_record is not None:
+            self._server_companion_alert_back_online(snapshot, alert_type=alert_type)
+            self._companion_restart_phase2.mark_fired(key, key_to_record, now=time.time())
 
     @staticmethod
     def _server_companion_is_validated_query_visible_recovery(event) -> bool:
@@ -4544,6 +4722,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return
         if SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED:
             action_result: dict[str, object] = {}
+            warning_state = {"returned": False}
 
             def play_schema4_warning() -> bool:
                 ok, message = self._play_server_companion_restart_warning_sound()
@@ -4555,6 +4734,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 # with inline persistence, or after the reservation's durable
                 # commit with background persistence.
                 if result.source != "schema4":
+                    # R8: a dispatch ordered behind a pending learning
+                    # rebuild takes the schema-3 safe fallback here.
+                    if warning_state["returned"]:
+                        DZLLWindow._play_phase2_schema3_warning(self, key, decision)
                     return
                 message = action_result.get("message")
                 self._set_server_companion_alert_audio_status(
@@ -4575,8 +4758,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     )
                 ),
             )
+            warning_state["returned"] = True
             if result.source == "schema4":
                 return
+        DZLLWindow._play_phase2_schema3_warning(self, key, decision)
+
+    def _play_phase2_schema3_warning(self, key, decision) -> None:
         if not decision.warning_eligible or decision.warning_key is None:
             self._debug_server_companion_alert(
                 "restart-warning skipped: "
