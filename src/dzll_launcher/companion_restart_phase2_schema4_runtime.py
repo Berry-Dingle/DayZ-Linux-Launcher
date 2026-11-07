@@ -42,6 +42,7 @@ from .companion_restart_phase2_schema4 import (
     Schema4LoadResult,
     Schema4ValidationError,
     Schema4VersionError,
+    _validate_server_record,
     canonical_json_bytes,
     compact_schema4_state,
     deserialize_schema4_bytes,
@@ -68,6 +69,32 @@ class Schema4WriterLockError(Schema4RuntimeError):
 
 class Schema4GenerationConflict(Schema4RuntimeError):
     """The active file changed since this runtime loaded it."""
+
+
+class Schema4ServerWriteRejected(Schema4ValidationError):
+    """One server's record cannot be written; the store and other servers are intact.
+
+    Raised before any in-memory or on-disk change for that server: the target
+    record is quarantined or unavailable, or its rebuilt record failed
+    per-server validation.  It is never raised for root, I/O or whole-store
+    failures, which remain global.
+    """
+
+    def __init__(
+        self,
+        server_key: str,
+        reason_code: str,
+        detail: str,
+        *,
+        validation_codes: tuple[str, ...] = (),
+    ) -> None:
+        self.server_key = str(server_key)
+        self.reason_code = str(reason_code)
+        self.detail = str(detail)
+        self.validation_codes = tuple(str(item) for item in validation_codes)
+        super().__init__(
+            f"schema-4 server {self.server_key!r} {self.reason_code}: {self.detail}"
+        )
 
 
 class Schema4WriteFailurePhase(str, Enum):
@@ -366,7 +393,13 @@ class AuthoritativeSchema4Runtime:
             assert self._state is not None
             record = self._state.get("servers", {}).get(decision.server_key)
             if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
-                raise Schema4ValidationError("consumer server is unavailable or quarantined")
+                raise Schema4ServerWriteRejected(
+                    decision.server_key,
+                    "server_quarantined"
+                    if isinstance(record, Mapping)
+                    else "server_unavailable",
+                    "consumer server is unavailable or quarantined",
+                )
             ledger = consumer_ledger_from_mapping(
                 record.get("consumer_state"), server_key=decision.server_key
             )
@@ -389,7 +422,11 @@ class AuthoritativeSchema4Runtime:
             candidate["servers"][decision.server_key]["consumer_state"] = (
                 consumer_ledger_to_mapping(updated)
             )
-            serialize_schema4_state(candidate)
+            self._validate_candidate_for_server(
+                candidate,
+                decision.server_key,
+                candidate["servers"][decision.server_key],
+            )
             self._state = candidate
             self._dirty_servers.add(decision.server_key)
             return True
@@ -410,7 +447,13 @@ class AuthoritativeSchema4Runtime:
             assert self._state is not None
             record = self._state.get("servers", {}).get(decision.server_key)
             if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
-                raise Schema4ValidationError("consumer server is unavailable or quarantined")
+                raise Schema4ServerWriteRejected(
+                    decision.server_key,
+                    "server_quarantined"
+                    if isinstance(record, Mapping)
+                    else "server_unavailable",
+                    "consumer server is unavailable or quarantined",
+                )
             if key.kind is AuthoritySuppressionKind.GENERIC_RECOVERY and key.event_id not in {
                 item.get("event_id")
                 for item in record.get("physical_events", ())
@@ -472,7 +515,11 @@ class AuthoritativeSchema4Runtime:
             candidate["servers"][decision.server_key]["consumer_state"] = (
                 consumer_ledger_to_mapping(ledger)
             )
-            serialize_schema4_state(candidate)
+            self._validate_candidate_for_server(
+                candidate,
+                decision.server_key,
+                candidate["servers"][decision.server_key],
+            )
             self._state = candidate
             self._dirty_servers.add(decision.server_key)
             written = self.flush()
@@ -549,7 +596,11 @@ class AuthoritativeSchema4Runtime:
             candidate["servers"][decision.server_key]["consumer_state"] = (
                 consumer_ledger_to_mapping(ledger)
             )
-            serialize_schema4_state(candidate)
+            self._validate_candidate_for_server(
+                candidate,
+                decision.server_key,
+                candidate["servers"][decision.server_key],
+            )
             self._state = candidate
             self._dirty_servers.add(decision.server_key)
             return self.flush()
@@ -589,6 +640,72 @@ class AuthoritativeSchema4Runtime:
             recovery=self._recovery,
         )
 
+    def server_write_block(self, server_key: str) -> tuple[str, tuple[str, ...]] | None:
+        """Return why this server's record must not be written, or ``None``.
+
+        A quarantined or otherwise unwritable record is preserved verbatim
+        and never rebuilt, so its invalid evidence is neither trusted nor
+        silently replaced by fresh learning.
+        """
+
+        self._ensure_open()
+        with self._mutex:
+            return self._server_write_block_locked(str(server_key))
+
+    def _server_write_block_locked(
+        self, server_key: str
+    ) -> tuple[str, tuple[str, ...]] | None:
+        assert self._state is not None
+        existing = self._state.get("servers", {}).get(server_key)
+        if existing is None:
+            snapshot = self._state.get("schema3_snapshot")
+            snapshot_servers = (
+                snapshot.get("servers") if isinstance(snapshot, Mapping) else None
+            )
+            if isinstance(snapshot_servers, Mapping) and server_key in snapshot_servers:
+                return ("server_unavailable", ())
+            return None
+        if not isinstance(existing, Mapping):
+            return ("server_unavailable", ())
+        status = existing.get("authority_status")
+        if status in SCHEMA4_RUNTIME_WRITABLE_AUTHORITY_STATUSES:
+            return None
+        codes: tuple[str, ...] = ()
+        errors = existing.get("validation_errors")
+        if isinstance(errors, list):
+            codes = tuple(
+                sorted(
+                    {
+                        str(item.get("code"))
+                        for item in errors
+                        if isinstance(item, Mapping) and item.get("code")
+                    }
+                )
+            )
+        return (
+            "server_quarantined" if status == "quarantined" else "server_not_writable",
+            codes,
+        )
+
+    @staticmethod
+    def _validate_candidate_for_server(
+        candidate: dict, server_key: str, record: Mapping[str, object]
+    ) -> None:
+        """Strictly validate ``candidate``; attribute record-only failures."""
+
+        try:
+            serialize_schema4_state(candidate)
+        except Schema4ValidationError as exc:
+            issues = _validate_server_record(server_key, record)
+            if not issues:
+                raise
+            raise Schema4ServerWriteRejected(
+                server_key,
+                "server_record_validation_failed",
+                "; ".join(item.detail for item in issues)[:512],
+                validation_codes=tuple(sorted({item.code for item in issues})),
+            ) from exc
+
     def note_healthy_poll(self, _server_key: str) -> None:
         """Healthy poll-only activity is intentionally non-durable."""
 
@@ -617,31 +734,33 @@ class AuthoritativeSchema4Runtime:
                 raise Schema4ValidationError(
                     "schema-4 state has no writable schema-3 server projection"
                 )
-            if existing is None:
-                if server_key in snapshot_servers:
-                    raise Schema4ValidationError(
-                        f"schema-4 server {server_key!r} is unavailable"
-                    )
-                existing_for_rebuild: Mapping[str, object] = {}
-            elif not isinstance(existing, Mapping):
-                raise Schema4ValidationError(
-                    f"schema-4 server {server_key!r} is unavailable or quarantined"
+            block = self._server_write_block_locked(server_key)
+            if block is not None:
+                raise Schema4ServerWriteRejected(
+                    server_key,
+                    block[0],
+                    f"schema-4 server {server_key!r} is unavailable or quarantined",
+                    validation_codes=block[1],
                 )
-            elif (
-                existing.get("authority_status")
-                not in SCHEMA4_RUNTIME_WRITABLE_AUTHORITY_STATUSES
-            ):
-                raise Schema4ValidationError(
-                    f"schema-4 server {server_key!r} is unavailable or quarantined"
-                )
-            else:
-                existing_for_rebuild = existing
-            rebuilt = rebuild_schema4_server_record(
-                existing_for_rebuild,
-                schema3_record,
-                server_key=server_key,
-                updated_at=updated_at,
+            existing_for_rebuild: Mapping[str, object] = (
+                {} if existing is None else existing
             )
+            try:
+                rebuilt = rebuild_schema4_server_record(
+                    existing_for_rebuild,
+                    schema3_record,
+                    server_key=server_key,
+                    updated_at=updated_at,
+                )
+            except Schema4Error as exc:
+                # Deterministic for this record: one server's evidence cannot
+                # be rebuilt.  The stored record and all other servers stay
+                # intact and writable.
+                raise Schema4ServerWriteRejected(
+                    server_key,
+                    "server_rebuild_rejected",
+                    f"{type(exc).__name__}: {exc}",
+                ) from exc
             before = canonical_json_bytes(existing_for_rebuild)
             after = canonical_json_bytes(rebuilt)
             if before == after:
@@ -662,7 +781,7 @@ class AuthoritativeSchema4Runtime:
             candidate["updated_at"] = max(
                 int(updated_at), int(candidate.get("created_at", 0) or 0)
             )
-            serialize_schema4_state(candidate)
+            self._validate_candidate_for_server(candidate, server_key, rebuilt)
             self._state = candidate
             self._dirty_servers.add(server_key)
             return True

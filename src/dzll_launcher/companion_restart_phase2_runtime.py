@@ -235,6 +235,17 @@ class RuntimeNotice:
 
 
 @dataclass(frozen=True)
+class ServerPersistenceBlock:
+    """Why one server's learning is not being saved; other servers are unaffected."""
+
+    server_key: str
+    reason_code: str
+    detail: str
+    validation_codes: tuple[str, ...]
+    blocked_at: float
+
+
+@dataclass(frozen=True)
 class AuthorityConsumerActionResult:
     attempted: bool
     emitted: bool
@@ -335,6 +346,7 @@ class Phase2RestartRuntime:
         )
         self.persistence_error: str | None = migration.error
         self._schema4_staged_runtime_server_keys: set[str] = set()
+        self._server_persistence_blocks: dict[str, ServerPersistenceBlock] = {}
         self._servers: dict[str, _ServerRuntime] = {}
         self._shutdown = False
         self._load_servers(float(time.time() if now is None else now))
@@ -485,6 +497,92 @@ class Phase2RestartRuntime:
         }
 
     @property
+    def server_persistence_blocks(self) -> dict[str, ServerPersistenceBlock]:
+        """Per-server persistence isolation diagnostics (copy)."""
+
+        return dict(self._server_persistence_blocks)
+
+    def server_persistence_block(self, server_key: str) -> ServerPersistenceBlock | None:
+        """Return why ``server_key`` cannot be saved, consulting the backend once."""
+
+        key = str(server_key or "").strip()
+        block = self._server_persistence_blocks.get(key)
+        if block is not None or not key:
+            return block
+        backend = self._authoritative_schema4_backend
+        if backend is None or not self.authoritative_schema4_runtime_enabled:
+            return None
+        try:
+            found = backend.server_write_block(key)
+        except Exception:
+            return None
+        if found is None:
+            return None
+        reason, codes = found
+        return self._block_server_persistence(
+            key,
+            reason_code=reason,
+            detail="stored learning record is preserved but cannot be used or updated",
+            validation_codes=codes,
+            now=time.time(),
+        )
+
+    def _block_server_persistence(
+        self,
+        server_key: str,
+        *,
+        reason_code: str,
+        detail: str,
+        validation_codes: tuple[str, ...] = (),
+        now: float,
+    ) -> ServerPersistenceBlock:
+        existing = self._server_persistence_blocks.get(server_key)
+        if existing is not None:
+            return existing
+        block = ServerPersistenceBlock(
+            server_key=server_key,
+            reason_code=str(reason_code),
+            detail=str(detail),
+            validation_codes=tuple(validation_codes),
+            blocked_at=float(now),
+        )
+        self._server_persistence_blocks[server_key] = block
+        self._schema4_staged_runtime_server_keys.discard(server_key)
+        logger.warning(
+            "Server Companion learning for server %s is not being saved "
+            "(%s%s): %s. Other servers continue to learn and save.",
+            server_key,
+            block.reason_code,
+            (
+                "; validation: " + ",".join(block.validation_codes)
+                if block.validation_codes
+                else ""
+            ),
+            block.detail,
+        )
+        return block
+
+    def _isolate_server_write_rejection(
+        self, exc: BaseException, *, now: float
+    ) -> bool:
+        """Record a server-specific rejection without disabling persistence."""
+
+        from .companion_restart_phase2_schema4_runtime import (
+            Schema4ServerWriteRejected,
+        )
+
+        if not isinstance(exc, Schema4ServerWriteRejected):
+            return False
+        self._block_server_persistence(
+            exc.server_key,
+            reason_code=exc.reason_code,
+            detail=exc.detail,
+            validation_codes=exc.validation_codes,
+            now=now,
+        )
+        return True
+
+    @property
     def pending_notice(self) -> RuntimeNotice | None:
         result = self.migration
         if self.persistence_status in {
@@ -558,6 +656,10 @@ class Phase2RestartRuntime:
         poll_generation: int,
     ) -> str:
         if not self.persistence_enabled:
+            return ""
+        if self.server_persistence_block(server_key) is not None:
+            # A quarantined or rejected server never starts a learning
+            # session: its stored record is neither trusted nor replaced.
             return ""
         server = self._server(server_key)
         if (
@@ -646,7 +748,10 @@ class Phase2RestartRuntime:
             if not self._server_state_is_durable(server):
                 return ""
             server.monitoring_session_durable = True
-        if not self.persistence_enabled:
+        if (
+            not self.persistence_enabled
+            or server.key in self._server_persistence_blocks
+        ):
             server.monitoring_sessions[:] = [
                 item for item in server.monitoring_sessions
                 if item.get("session_id") != session_id
@@ -670,6 +775,8 @@ class Phase2RestartRuntime:
         """Return a matching active session, creating one only when required."""
 
         if not self.persistence_enabled:
+            return "", False
+        if self.server_persistence_block(server_key) is not None:
             return "", False
         server = self._servers.get(str(server_key))
         generation = _nonnegative_int(poll_generation, 0)
@@ -789,6 +896,10 @@ class Phase2RestartRuntime:
     ) -> RuntimeUpdate:
         if not self.persistence_enabled:
             return RuntimeUpdate(accepted=False, rejected_reason="learning_disabled")
+        if str(server_key) in self._server_persistence_blocks:
+            return RuntimeUpdate(
+                accepted=False, rejected_reason="server_persistence_blocked"
+            )
         server = self._servers.get(str(server_key))
         if (
             server is None
@@ -814,6 +925,10 @@ class Phase2RestartRuntime:
     def ingest_sample(self, sample: ObservationSample) -> RuntimeUpdate:
         if not self.persistence_enabled:
             return RuntimeUpdate(accepted=False, rejected_reason="learning_disabled")
+        if sample.server_key in self._server_persistence_blocks:
+            return RuntimeUpdate(
+                accepted=False, rejected_reason="server_persistence_blocked"
+            )
         server = self._servers.get(sample.server_key)
         if (
             server is None
@@ -1139,6 +1254,15 @@ class Phase2RestartRuntime:
                 created_at=now,
             )
         except Exception as exc:
+            if self._isolate_server_write_rejection(exc, now=now):
+                return AuthorityConsumerActionResult(
+                    False,
+                    False,
+                    "schema4",
+                    key.serialize(),
+                    None,
+                    ("server_persistence_blocked", "at_most_once_delivery"),
+                )
             self._record_schema4_persistence_failure(exc)
             raise
         self._record_schema4_persistence_success(
@@ -1735,8 +1859,13 @@ class Phase2RestartRuntime:
                 and backend is not None
                 and valid
                 and server_online_healthy
+                and server.key not in self._server_persistence_blocks
             ):
-                backend.record_consumer_decision(consumer, created_at=now)
+                try:
+                    backend.record_consumer_decision(consumer, created_at=now)
+                except Exception as exc:
+                    if not self._isolate_server_write_rejection(exc, now=now):
+                        raise
             comparison = compare_authority_consumers(schema3_decision, consumer)
             self._authority_consumer_comparisons[server.key] = comparison
             if (
@@ -1971,6 +2100,9 @@ class Phase2RestartRuntime:
     def _persist_server(self, server: _ServerRuntime, *, force: bool, now: float) -> bool:
         if not self.persistence_enabled or not server.dirty:
             return False
+        if server.key in self._server_persistence_blocks:
+            # Known-rejected: never retry writing this server this session.
+            return False
         backend = self._authoritative_schema4_backend
         # Schema 4 persists completed durable evidence, not a growing healthy
         # poll edge.  A later event, lifecycle close, expected-window result,
@@ -1991,7 +2123,12 @@ class Phase2RestartRuntime:
                         else "schema4_coalesced_runtime_update"
                     ),
                 )
-                self._schema4_staged_runtime_server_keys.add(server.key)
+            except Exception as exc:
+                if not self._isolate_server_write_rejection(exc, now=now):
+                    self._record_schema4_persistence_failure(exc)
+                return False
+            self._schema4_staged_runtime_server_keys.add(server.key)
+            try:
                 result = backend.flush() if force else None
             except Exception as exc:
                 self._record_schema4_persistence_failure(exc)
