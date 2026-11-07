@@ -2754,11 +2754,26 @@ class DZLLWindow(Gtk.ApplicationWindow):
         except Exception:
             return False
 
-    def _run_when_companion_authority_current(self, key, callback) -> bool:
+    def _companion_authority_intake_paused(self, key) -> bool:
+        """R8a: learning intake for ``key`` is paused while its backlog drains."""
+
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        probe = getattr(runtime, "authority_intake_paused", None)
+        if not key or not callable(probe):
+            return False
+        try:
+            return probe(key) is True
+        except Exception:
+            return False
+
+    def _run_when_companion_authority_current(self, key, callback):
         """R8: run ``callback`` now, or in order once ``key``'s learning rebuilds are installed.
 
-        Returns True when it ran immediately.  Without a background-capable
-        runtime (or without a key) it always runs immediately.
+        Returns True when it ran immediately and False when it was queued.
+        Without a background-capable runtime (or without a key) it always
+        runs immediately.  R8a: returns None when the runtime refused it
+        (backlog at its bound); it is then dropped, never run against stale
+        learning state.
         """
 
         runtime = getattr(self, "_companion_restart_phase2", None)
@@ -2774,10 +2789,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return schedule(key, callback) is True
         except Exception as exc:
             self._debug_server_companion_alert(
-                f"restart-learning ordered work unavailable; running now: {exc!r}"
+                f"restart-learning ordered work refused; dropped: {exc!r}"
             )
-            callback()
-            return True
+            return None
 
     def _companion_session_pending_durability(self, key) -> bool:
         runtime = getattr(self, "_companion_restart_phase2", None)
@@ -2918,11 +2932,34 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 lambda: DZLLWindow._on_companion_persistence_status_changed(self)
             )
             runtime.enable_background_persistence(post_to_owner=GLib.idle_add)
+            settled = getattr(runtime, "set_authority_settled_listener", None)
+            if callable(settled):
+                settled(
+                    lambda key: DZLLWindow._on_companion_authority_settled(self, key)
+                )
         except Exception as exc:
             logger.warning(
                 "Server Companion background persistence unavailable; "
                 "writes stay synchronous: %r",
                 exc,
+            )
+
+    def _on_companion_authority_settled(self, key) -> None:
+        """R8a: re-present once a server's backlog has drained after a coalesced refresh."""
+
+        again = getattr(self, "_server_companion_refresh_again", None)
+        if not isinstance(again, set) or key not in again:
+            return
+        again.discard(key)
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return
+        if self._server_companion_restart_learning_key() != key:
+            return
+        try:
+            self._refresh_server_companion_restart_learning_summary()
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                f"restart-learning refresh after backlog failed safely: {exc!r}"
             )
 
     def _on_companion_persistence_status_changed(self) -> None:
@@ -3135,16 +3172,42 @@ class DZLLWindow(Gtk.ApplicationWindow):
         key = key_of() if callable(key_of) else None
         if key and DZLLWindow._companion_authority_work_pending(self, key):
             # R8: present the rebuilt authority, not the one it replaces.
+            # R8a: at most one deferred refresh is queued per server (it
+            # reads the state current when it runs).
+            queued = getattr(self, "_server_companion_refresh_queued", None)
+            if not isinstance(queued, set):
+                queued = set()
+                self._server_companion_refresh_queued = queued
+            if key in queued:
+                again = getattr(self, "_server_companion_refresh_again", None)
+                if not isinstance(again, set):
+                    again = set()
+                    self._server_companion_refresh_again = again
+                again.add(key)
+                return
+            queued.add(key)
+
             def refresh_when_current() -> None:
+                queued.discard(key)
                 if bool(getattr(self, "_shutdown_cleanup_done", False)):
                     return
                 if self._server_companion_restart_learning_key() != key:
                     return
                 DZLLWindow._refresh_server_companion_restart_learning_summary(self)
 
-            DZLLWindow._run_when_companion_authority_current(
+            outcome = DZLLWindow._run_when_companion_authority_current(
                 self, key, refresh_when_current
             )
+            if outcome is not False:
+                queued.discard(key)
+            if outcome is None:
+                # R8a: refused while intake is paused; re-present once the
+                # backlog has drained (authority-settled listener).
+                again = getattr(self, "_server_companion_refresh_again", None)
+                if not isinstance(again, set):
+                    again = set()
+                    self._server_companion_refresh_again = again
+                again.add(key)
             return
         DZLLWindow._surface_restart_learning_persistence_notice(self)
         panel = getattr(self, "server_companion_panel", None)
@@ -4062,6 +4125,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
             or not self._server_companion_should_poll()
         ):
             return
+        if DZLLWindow._companion_authority_intake_paused(
+            self, self._server_companion_restart_learning_key()
+        ):
+            # R8a: the learning backlog for this server is draining; the poll
+            # timer keeps ticking and polling resumes once capacity returns.
+            self._debug_server_companion_alert(
+                "poll skipped: restart-learning intake paused while queued "
+                "learning updates drain"
+            )
+            return
         snapshot = dict(self._server_companion_snapshot or {})
         ip = str(snapshot.get("ip") or "")
         qport = int(snapshot.get("qport") or 0)
@@ -4095,13 +4168,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
             # pending.  Apply this result after it, in order, so window state
             # is read and updated exactly as with synchronous rebuilds.  The
             # poll stays in flight meanwhile, which also pauses new polls.
-            DZLLWindow._run_when_companion_authority_current(
+            queued = DZLLWindow._run_when_companion_authority_current(
                 self,
                 pending_key,
                 lambda: DZLLWindow._apply_server_companion_live_result(
                     self, token, info, confirmed_recovery=confirmed_recovery
                 ),
             )
+            if queued is None:
+                # R8a: refused at the bound; drop this result like a lost
+                # poll so polling continues once capacity returns.
+                self._server_companion_poll_inflight = False
             return False
         self._server_companion_poll_inflight = False
         if not self._server_companion_should_poll():
@@ -4264,7 +4341,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 phase2_update=phase2_update,
             )
 
-        if not DZLLWindow._run_when_companion_authority_current(self, key, finish):
+        if DZLLWindow._run_when_companion_authority_current(self, key, finish) is False:
             state["deferred"] = True
         return False
 

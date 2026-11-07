@@ -103,10 +103,16 @@ MAX_COMPACT_DETAIL_SERVERS = 250
 COMPACT_EVENT_LIMIT = 12
 COLD_EVENT_LIMIT = 2
 # R8: ordered per-server authority work (rebuilds and the owner-thread work
-# that must observe them).  Polling backpressure keeps this tiny in practice
-# (a handful of entries); beyond the bound the owner thread waits for the
-# worker instead of dropping mandatory work.
+# that must observe them).  Poll handling keeps this to a handful of entries
+# in practice.  R8a: the owner thread never waits for the worker because of
+# queue depth.  At the pause mark the server's learning intake is paused (new
+# polls, new monitoring sessions and window work are refused; evaluations
+# coalesce); it resumes at the resume mark.  While paused only bounded
+# mandatory work can still be queued (one session end, alert bookkeeping), so
+# the queue stays below the hard bound without dropping mandatory work.
 MAX_AUTHORITY_QUEUE_OPS = 256
+AUTHORITY_INTAKE_PAUSE_OPS = 192
+AUTHORITY_INTAKE_RESUME_OPS = 64
 # Owner-thread time slice for draining queued ordered work after a rebuild
 # is installed; the remainder continues in a later main-loop callback.
 AUTHORITY_DRAIN_SLICE_SECONDS = 0.008
@@ -312,6 +318,10 @@ class _ServerRuntime:
             self.incomplete_episodes = []
 
 
+class AuthorityBacklogFull(RuntimeError):
+    """R8a: a server's ordered learning work reached its hard bound."""
+
+
 @dataclass
 class _AuthorityOp:
     """One entry of a server's ordered authority queue (R8).
@@ -331,6 +341,7 @@ class _AuthorityOp:
     durable_reason: str = ""
     external: bool = False
     enqueued_at: float = 0.0
+    coalesce: str | None = None
 
 
 class Phase2RestartRuntime:
@@ -398,9 +409,18 @@ class Phase2RestartRuntime:
             "deferred_owner_ops": 0,
             "background_rebuilds": 0,
             "max_rebuild_latency_seconds": 0.0,
-            "backpressure_waits": 0,
+            "intake_pauses": 0,
+            "hard_bound_exceeded": 0,
+            "coalesced_evaluations": 0,
+            "external_refused": 0,
             "drain_continuations": 0,
         }
+        self._authority_intake_paused: set[str] = set()
+        self._authority_detached_depth: dict[str, int] = {}
+        # Servers whose session start was refused while intake was paused;
+        # the window re-ensures them on the next rejected poll.
+        self._intake_refused_sessions: set[str] = set()
+        self._authority_settled_listener: Callable[[str], None] | None = None
         self._servers: dict[str, _ServerRuntime] = {}
         self._shutdown = False
         self._load_servers(float(time.time() if now is None else now))
@@ -738,6 +758,12 @@ class Phase2RestartRuntime:
             # A quarantined or rejected server never starts a learning
             # session: its stored record is neither trusted nor replaced.
             return ""
+        if str(server_key) in self._authority_intake_paused:
+            # R8a: no new session while the backlog drains; the window
+            # re-ensures it on the next rejected poll after intake resumes.
+            self._intake_refused_sessions.add(str(server_key))
+            return ""
+        self._intake_refused_sessions.discard(str(server_key))
         server = self._server(server_key)
         if (
             server.monitoring_session_id
@@ -878,6 +904,12 @@ class Phase2RestartRuntime:
         """A session was created but its start is not yet known durable."""
 
         server = self._servers.get(str(server_key))
+        if (
+            str(server_key) in self._intake_refused_sessions
+            and self.persistence_enabled
+            and str(server_key) not in self._server_persistence_blocks
+        ):
+            return True
         return bool(
             server is not None
             and server.monitoring_session_id
@@ -989,6 +1021,9 @@ class Phase2RestartRuntime:
             return RuntimeUpdate(
                 accepted=False, rejected_reason="server_persistence_blocked"
             )
+        if str(server_key) in self._authority_intake_paused:
+            # R8a: an unobserved poll is neither positive nor negative evidence.
+            return RuntimeUpdate(accepted=False, rejected_reason="learning_intake_paused")
         server = self._servers.get(str(server_key))
         if (
             server is None
@@ -1018,6 +1053,8 @@ class Phase2RestartRuntime:
             return RuntimeUpdate(
                 accepted=False, rejected_reason="server_persistence_blocked"
             )
+        if sample.server_key in self._authority_intake_paused:
+            return RuntimeUpdate(accepted=False, rejected_reason="learning_intake_paused")
         server = self._servers.get(sample.server_key)
         if (
             server is None
@@ -1199,6 +1236,11 @@ class Phase2RestartRuntime:
         if self._shutdown:
             return
         self._shutdown = True
+        backend = self._authoritative_schema4_backend
+        note_shutdown = getattr(backend, "note_shutdown_started", None)
+        if callable(note_shutdown):
+            # R8a: shutdown waits give up after the shorter no-progress limit.
+            note_shutdown()
         # R8: finish every queued and in-flight per-server rebuild, in order,
         # so mandatory finalized events are staged.  Queued window work is
         # skipped from now on; queued alert dispatches are never started.
@@ -1363,6 +1405,17 @@ class Phase2RestartRuntime:
                 False, False, "schema3", None, None, ("production_cutover_disabled",)
             ))
         server_key = str(server_key)
+        stalled_backend = self._authoritative_schema4_backend
+        if getattr(stalled_backend, "worker_stalled", None) is not None:
+            # R8a: no reservation can be committed, so nothing is dispatched.
+            return finish(AuthorityConsumerActionResult(
+                False,
+                False,
+                "schema4",
+                None,
+                None,
+                ("persistence_worker_stalled_action_not_dispatched", "at_most_once_delivery"),
+            ))
         if not self._authority_current(server_key):
             if kind not in {"scheduled_warning", "generic_recovery"}:
                 raise ValueError("unsupported authority consumer action kind")
@@ -1411,6 +1464,16 @@ class Phase2RestartRuntime:
                     still_wanted=still_wanted,
                 )
 
+            if self._authority_depth(server_key) >= MAX_AUTHORITY_QUEUE_OPS:
+                # R8a: bounded; never reserved, so never dispatched.
+                return finish(AuthorityConsumerActionResult(
+                    False,
+                    False,
+                    "schema4",
+                    None,
+                    None,
+                    ("learning_backlog_full_action_not_dispatched", "at_most_once_delivery"),
+                ))
             self._schedule_owner_op(server_key, dispatch_when_current)
             return AuthorityConsumerActionResult(
                 False,
@@ -2039,7 +2102,8 @@ class Phase2RestartRuntime:
             # once when no rebuild is pending, else in order after them.
             self._schedule_owner_op(
                 server.key,
-                lambda: self._evaluate_authority_consumer_shadow(
+                coalesce="authority_consumer_evaluation",
+                callback=lambda: self._evaluate_authority_consumer_shadow(
                     server,
                     schema3_decision=decision,
                     score=score,
@@ -2375,7 +2439,25 @@ class Phase2RestartRuntime:
             return False
         backend.enable_background_writes(post_to_owner)
         self._post_to_owner = post_to_owner
+        backend.set_worker_stall_listener(self._on_persistence_worker_stalled)
         return True
+
+    def _on_persistence_worker_stalled(self, error: BaseException) -> None:
+        """Owner thread (R8a): the worker stopped progressing; stop saving visibly."""
+
+        before = (self.persistence_status, self.persistence_error)
+        self._record_schema4_persistence_failure(error)
+        if (self.persistence_status, self.persistence_error) != before:
+            self._notify_persistence_listener()
+
+    def persistence_worker_liveness(self) -> dict | None:
+        """Diagnostics: the persistence worker's liveness assessment (R8a)."""
+
+        backend = self._authoritative_schema4_backend
+        probe = getattr(backend, "worker_liveness", None)
+        if not callable(probe):
+            return None
+        return probe()
 
     def _drain_authority_work_for_shutdown(self) -> None:
         if not self.authority_work_pending_any:
@@ -2622,7 +2704,8 @@ class Phase2RestartRuntime:
         Runs it immediately (returning True) when no rebuild or ordered
         work is pending for ``server_key``; otherwise queues it behind that
         work and returns False.  Queued window callbacks never run once the
-        runtime is shutting down.
+        runtime is shutting down.  Raises ``AuthorityBacklogFull`` (R8a)
+        instead of queueing past the hard bound; the callback never runs.
         """
 
         return self._schedule_owner_op(str(server_key), callback, external=True)
@@ -2633,10 +2716,35 @@ class Phase2RestartRuntime:
         callback: Callable[[], object],
         *,
         external: bool = False,
+        coalesce: str | None = None,
     ) -> bool:
         if self._authority_current(server_key):
             callback()
             return True
+        queue = self._authority_queues.get(server_key)
+        if (
+            coalesce is not None
+            and server_key in self._authority_intake_paused
+            and queue
+            and queue[-1].kind == "owner"
+            and queue[-1].coalesce == coalesce
+        ):
+            # R8a: while intake is paused, consecutive evaluations collapse
+            # into the newest one (it reads authority when it runs).
+            queue[-1].run = callback
+            self._authority_stats["coalesced_evaluations"] += 1
+            return False
+        if external and (
+            server_key in self._authority_intake_paused
+            or self._authority_depth(server_key) >= MAX_AUTHORITY_QUEUE_OPS
+        ):
+            # R8a: while intake is paused, window work is refused (the caller
+            # drops it like a lost poll) rather than run against stale
+            # authority; the remaining headroom is kept for mandatory work.
+            self._authority_stats["external_refused"] += 1
+            raise AuthorityBacklogFull(
+                f"ordered learning work for {server_key} is at its bound"
+            )
         self._enqueue_authority_op(
             server_key,
             _AuthorityOp(
@@ -2644,24 +2752,57 @@ class Phase2RestartRuntime:
                 run=callback,
                 external=external,
                 enqueued_at=time.perf_counter(),
+                coalesce=coalesce,
             ),
         )
         self._authority_stats["deferred_owner_ops"] += 1
         return False
 
+    def _authority_depth(self, server_key: str) -> int:
+        return len(self._authority_queues.get(server_key) or ()) + int(
+            self._authority_detached_depth.get(server_key, 0)
+        )
+
+    def authority_intake_paused(self, server_key: str) -> bool:
+        """R8a: True while this server's learning intake is paused for capacity."""
+
+        return str(server_key) in self._authority_intake_paused
+
     def _enqueue_authority_op(self, server_key: str, op: _AuthorityOp) -> None:
         queue = self._authority_queues.setdefault(server_key, collections.deque())
         queue.append(op)
-        depth = len(queue)
+        depth = self._authority_depth(server_key)
         if depth > self._authority_stats["max_queue_depth"]:
             self._authority_stats["max_queue_depth"] = depth
-        if depth > MAX_AUTHORITY_QUEUE_OPS and server_key not in self._authority_draining:
-            # Bounded: never drop mandatory work; wait for the worker instead.
-            self._authority_stats["backpressure_waits"] += 1
-            self._wait_for_authority_work(
-                lambda: len(self._authority_queues.get(server_key) or ())
-                <= MAX_AUTHORITY_QUEUE_OPS // 2
+        if (
+            depth >= AUTHORITY_INTAKE_PAUSE_OPS
+            and server_key not in self._authority_intake_paused
+        ):
+            # R8a: never wait on the owner thread; stop taking new polls and
+            # sessions for this server until the backlog has drained.
+            self._authority_intake_paused.add(server_key)
+            self._authority_stats["intake_pauses"] += 1
+            logger.warning(
+                "Server Companion learning intake paused for %s: %d queued "
+                "learning updates are waiting for the persistence worker",
+                server_key,
+                depth,
             )
+        if depth > MAX_AUTHORITY_QUEUE_OPS:
+            self._authority_stats["hard_bound_exceeded"] += 1
+            logger.error(
+                "Server Companion ordered learning work exceeded its bound for %s (%d)",
+                server_key,
+                depth,
+            )
+
+    def _maybe_resume_authority_intake(self, server_key: str) -> None:
+        if (
+            server_key in self._authority_intake_paused
+            and self._authority_depth(server_key) <= AUTHORITY_INTAKE_RESUME_OPS
+        ):
+            self._authority_intake_paused.discard(server_key)
+            logger.info("Server Companion learning intake resumed for %s", server_key)
 
     def _persist_server_background(
         self, server: _ServerRuntime, *, force: bool, now: float
@@ -2840,26 +2981,50 @@ class Phase2RestartRuntime:
                 # Work scheduled while this entry runs belongs to it, so it
                 # must precede the remaining (logically later) entries.
                 self._authority_queues[server_key] = collections.deque()
+                detached_before = self._authority_detached_depth.get(server_key, 0)
+                self._authority_detached_depth[server_key] = detached_before + len(queue)
                 try:
                     if not (op.external and self._shutdown):
                         op.run()
                 except Exception:
                     logger.exception("Server Companion ordered learning work failed")
                 finally:
+                    if detached_before:
+                        self._authority_detached_depth[server_key] = detached_before
+                    else:
+                        self._authority_detached_depth.pop(server_key, None)
                     nested = self._authority_queues.get(server_key)
                     if nested is None:
                         nested = collections.deque()
                     nested.extend(queue)
                     self._authority_queues[server_key] = nested
+                self._maybe_resume_authority_intake(server_key)
             if not self._authority_queues.get(server_key):
                 self._authority_queues.pop(server_key, None)
+            self._maybe_resume_authority_intake(server_key)
         finally:
             self._authority_draining.discard(server_key)
+        if (
+            self._authority_settled_listener is not None
+            and server_key not in self._authority_draining
+            and self._authority_current(server_key)
+        ):
+            try:
+                self._authority_settled_listener(server_key)
+            except Exception:
+                logger.exception("Server Companion authority-settled listener failed")
+
+    def set_authority_settled_listener(
+        self, listener: Callable[[str], None] | None
+    ) -> None:
+        """Called on the owner thread when a server's ordered work has all run."""
+
+        self._authority_settled_listener = listener
 
     def _wait_for_authority_work(
         self, done: Callable[[], bool], timeout: float | None = None
     ) -> bool:
-        """Owner thread: pump completions until ``done()`` (shutdown/tests/backpressure)."""
+        """Owner thread: pump completions until ``done()`` (shutdown/tests only)."""
 
         backend = self._authoritative_schema4_backend
         deadline = None if timeout is None else time.monotonic() + timeout

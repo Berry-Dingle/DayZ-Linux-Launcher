@@ -353,6 +353,10 @@ def test_withheld_rebuilds_learn_identically_and_never_alert_an_ended_session(
     rebuild was installed are never dispatched.
     """
 
+    # Ordering under a deep queue (not capacity): keep R8a's intake pause
+    # out of the way here; it is covered in the R8a module.
+    monkeypatch.setattr(runtime, "AUTHORITY_INTAKE_PAUSE_OPS", 10_000)
+    monkeypatch.setattr(runtime, "MAX_AUTHORITY_QUEUE_OPS", 20_000)
     reference = _run(tmp_path, monkeypatch, "sync", settle_each_step=False, name="sync")
     background = _run(tmp_path, monkeypatch, "r8", settle_each_step=False, name="r8")
     assert background.stats["max_queue_depth"] > 10
@@ -763,25 +767,6 @@ def test_record_changed_outside_the_queue_is_rebuilt_on_the_new_base(tmp_path, m
     assert "r8-maintenance" in installed["reason_codes"]
     sessions = installed["legacy_schema3_record"]["monitoring_sessions"]
     assert sessions[-1]["ended_at"] is None  # the queued save point is installed
-    value.shutdown(wall_at=now + 99_999, monotonic_at=99_999)
-
-
-def test_ordered_work_stays_bounded_and_drains_with_backpressure(tmp_path, monkeypatch):
-    active, legacy, now = r7._store(tmp_path)
-    value, pump = _open(active, legacy, now, "r8")
-    pump.drain(value)
-    monkeypatch.setattr(runtime, "MAX_AUTHORITY_QUEUE_OPS", 8)
-    driver = Driver(value, pump, now)
-    driver.select(KEYS[0], 100)
-    ran = []
-    for index in range(40):
-        value.when_authority_current(KEYS[0], lambda index=index: ran.append(index))
-        driver.poll(200 + index * 10, players=12 if index % 2 else 0)
-    stats = value.authority_queue_stats()
-    assert stats["backpressure_waits"] >= 1
-    assert stats["max_queue_depth"] <= 8 + 2
-    pump.drain(value)
-    assert ran == list(range(40))
     value.shutdown(wall_at=now + 99_999, monotonic_at=99_999)
 
 

@@ -69,6 +69,20 @@ logger = logging.getLogger(__name__)
 
 AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED_DEFAULT = False
 SCHEMA4_RUNTIME_WRITE_SEMANTICS_VERSION = 1
+
+# R8a worker liveness.  A task is "slow" once it has run this long (a
+# diagnostic only), and "stalled" once it has shown no progress evidence
+# (stage markers, worker-thread CPU time, worker-thread bytes written) for
+# the stall interval, or has run longer than the absolute task limit.  The
+# limits are far above any healthy rebuild (< 0.3 s) or write (< 1 s on an
+# SSD), so a slow disk is reported as slow, never as failed.
+WORKER_SLOW_SECONDS = 15.0
+WORKER_STALL_SECONDS = 120.0
+WORKER_SHUTDOWN_STALL_SECONDS = 30.0
+WORKER_MAX_TASK_SECONDS = 600.0
+WORKER_LIVENESS_CHECK_SECONDS = 1.0
+WORKER_CPU_PROGRESS_SECONDS = 0.02
+WORKER_STOP_AFTER_STALL_SECONDS = 1.0
 SCHEMA4_RUNTIME_WRITABLE_AUTHORITY_STATUSES = frozenset(
     {"valid_shadow_only", "valid_authoritative_runtime"}
 )
@@ -84,6 +98,15 @@ class Schema4WriterLockError(Schema4RuntimeError):
 
 class Schema4GenerationConflict(Schema4RuntimeError):
     """The active file changed since this runtime loaded it."""
+
+
+class Schema4WorkerStalled(Schema4RuntimeError):
+    """The persistence worker stopped making progress (R8a).
+
+    Raised for, or delivered to, every write and rebuild still waiting on
+    the worker.  Nothing is written by this runtime afterwards: a stalled
+    operation may still be running, so no second writer is ever started.
+    """
 
 
 class Schema4ServerWriteRejected(Schema4ValidationError):
@@ -424,17 +447,29 @@ class _Schema4DiskWriter:
             "runtime_write_semantics_version": SCHEMA4_RUNTIME_WRITE_SEMANTICS_VERSION,
             "previous_runtime_payload_sha256": self.sha256,
         }
+        worker = self._backend._worker
+        injector = self._backend._crash_injector
+        if worker is not None:
+            # R8a: every install stage boundary is progress evidence.
+            def staged(point, _inner=injector, _worker=worker):
+                _worker.note_progress(point)
+                if _inner is not None:
+                    _inner(point)
+
+            injector = staged
         try:
             write_root = dict(job.root)
             write_root.update(fields)
             payload, report = self.payload_for(write_root)
+            if worker is not None:
+                worker.note_progress("payload_validated")
             dirty = tuple(sorted(job.dirty_keys))
             _install_atomic_schema4(
                 self._backend.active_path,
                 payload,
                 expected_sha256=self.sha256,
                 last_known_good_path=self._backend.last_known_good_path,
-                crash_injector=self._backend._crash_injector,
+                crash_injector=injector,
             )
         except Exception as exc:
             return _Completion(
@@ -497,6 +532,13 @@ class _Schema4PersistenceWorker:
         self.max_rebuild_seconds = 0.0
         self.total_rebuild_seconds = 0.0
         self.max_rebuild_queue_depth = 0
+        # R8a progress evidence, written by the worker thread only.
+        self.task_kind: str | None = None
+        self.task_started: float | None = None
+        self.progress_at: float | None = None
+        self.progress_marks = 0
+        self._native_id: int | None = None
+        self._cpu_clock: int | None = None
         self._thread = threading.Thread(
             target=self._run,
             name="dzll-companion-persistence",
@@ -560,14 +602,71 @@ class _Schema4PersistenceWorker:
                 self._cond.wait(remaining)
             return True
 
-    def stop(self, *, discard_pending: bool) -> None:
+    def stop(self, *, discard_pending: bool, timeout: float | None = None) -> bool:
+        """Stop the worker; True once its thread has exited."""
+
         with self._cond:
             self._stopping = True
             self._discard = bool(discard_pending)
             self._cond.notify_all()
-        self._thread.join()
+        self._thread.join(timeout)
+        return not self._thread.is_alive()
+
+    # -- R8a progress evidence ------------------------------------------
+
+    def note_progress(self, _label: object = None) -> None:
+        """Worker thread: a stage boundary of the current task was reached."""
+
+        self.progress_at = time.monotonic()
+        self.progress_marks += 1
+
+    def _begin_task(self, kind: str) -> None:
+        now = time.monotonic()
+        self.task_started = now
+        self.progress_at = now
+        self.task_kind = kind
+
+    def _end_task(self) -> None:
+        self.task_kind = None
+        self.task_started = None
+
+    def liveness_evidence(self) -> dict:
+        """Any thread: a snapshot of the current task and its progress evidence."""
+
+        cpu = None
+        clock = self._cpu_clock
+        if clock is not None and self._thread.is_alive():
+            try:
+                cpu = time.clock_gettime(clock)
+            except (OSError, ValueError):
+                cpu = None
+        wchar = None
+        native = self._native_id
+        if native is not None:
+            try:
+                with open(f"/proc/self/task/{native}/io", "rb") as handle:
+                    for line in handle:
+                        if line.startswith(b"wchar:"):
+                            wchar = int(line.split()[1])
+                            break
+            except (OSError, ValueError):
+                wchar = None
+        return {
+            "kind": self.task_kind,
+            "started": self.task_started,
+            "progress_at": self.progress_at,
+            "marks": self.progress_marks,
+            "cpu": cpu,
+            "wchar": wchar,
+            "alive": self._thread.is_alive(),
+        }
 
     def _run(self) -> None:
+        self._native_id = threading.get_native_id()
+        try:
+            self._cpu_clock = time.pthread_getcpuclockid(threading.get_ident())
+        except (AttributeError, OSError):
+            self._cpu_clock = None
         while True:
             with self._cond:
                 while (
@@ -591,6 +690,9 @@ class _Schema4PersistenceWorker:
                 else:
                     return
                 self._busy = True
+            self._begin_task(
+                "rebuild" if rebuild is not None else "write" if job is not None else "aux"
+            )
             try:
                 if rebuild is not None:
                     if self._discard:
@@ -644,6 +746,7 @@ class _Schema4PersistenceWorker:
                         error=exc,
                     )
             finally:
+                self._end_task()
                 with self._cond:
                     self._busy = False
                     self._cond.notify_all()
@@ -709,6 +812,27 @@ class AuthoritativeSchema4Runtime:
         # the owner thread.
         self._rebuilds_in_flight = 0
         self._rebuild_rebase_count = 0
+        # R8a: liveness.  Open tickets are tracked so a stall can fail them
+        # (never dispatching an alert whose reservation was not committed).
+        self._submitted_tickets: dict[int, Schema4WriteTicket] = {}
+        self._open_rebuild_jobs: dict[int, _RebuildJob] = {}
+        self._open_aux: dict[int, Callable[[BaseException], None]] = {}
+        self._aux_sequence = 0
+        self._closing = False
+        self._stall_flag: dict | None = None
+        self._stalled: Schema4WorkerStalled | None = None
+        self._stall_listener: Callable[[Schema4WorkerStalled], None] | None = None
+        self._liveness_lock = threading.Lock()
+        self._liveness: dict = {"state": "idle"}
+        self._lv_task: float | None = None
+        self._lv_cpu: float | None = None
+        self._lv_wchar: int | None = None
+        self._lv_marks = 0
+        self._lv_evidence_at = 0.0
+        self._lv_slow_logged: float | None = None
+        self._late_completions_after_stall = 0
+        self._watchdog: threading.Thread | None = None
+        self._watchdog_stop = threading.Event()
 
     @classmethod
     def open(
@@ -762,9 +886,194 @@ class AuthoritativeSchema4Runtime:
 
     @property
     def write_in_progress(self) -> bool:
+        if self._stalled is not None:
+            # Abandoned: nothing this runtime waits on can complete any more.
+            return False
         return bool(self._submitted or self._rebuilds_in_flight) or (
             self._worker is not None and self._worker.busy
         )
+
+    @property
+    def worker_stalled(self) -> Schema4WorkerStalled | None:
+        return self._stalled
+
+    def set_worker_stall_listener(
+        self, listener: Callable[[Schema4WorkerStalled], None] | None
+    ) -> None:
+        """Called once, on the owner thread, when a stall is declared."""
+
+        self._stall_listener = listener
+
+    def note_shutdown_started(self) -> None:
+        """Shutdown waits use the shorter no-progress limit from now on."""
+
+        self._closing = True
+
+    def worker_liveness(self) -> dict:
+        """Diagnostics: idle, running, slow or stalled, with the evidence ages."""
+
+        with self._liveness_lock:
+            info = dict(self._liveness)
+        info["declared_stalled"] = self._stalled is not None
+        info["late_completions_after_stall"] = self._late_completions_after_stall
+        return info
+
+    def _sample_worker_liveness(self) -> dict:
+        """Any thread: update and return the worker's liveness assessment."""
+
+        worker = self._worker
+        now = time.monotonic()
+        if worker is None:
+            info = {"state": "idle"}
+            with self._liveness_lock:
+                self._liveness = info
+            return info
+        evidence = worker.liveness_evidence()
+        with self._liveness_lock:
+            started = evidence["started"]
+            if evidence["kind"] is None or started is None:
+                self._lv_task = None
+                info = {"state": "idle", "alive": evidence["alive"]}
+                if self._stalled is not None or self._stall_flag is not None:
+                    info["state"] = "stalled"
+                self._liveness = info
+                return info
+            if self._lv_task != started:
+                self._lv_task = started
+                self._lv_cpu = evidence["cpu"]
+                self._lv_wchar = evidence["wchar"]
+                self._lv_marks = evidence["marks"]
+                self._lv_evidence_at = started
+            else:
+                cpu = evidence["cpu"]
+                progressed = (
+                    evidence["marks"] != self._lv_marks
+                    or (
+                        evidence["wchar"] is not None
+                        and evidence["wchar"] != self._lv_wchar
+                    )
+                    or (
+                        cpu is not None
+                        and self._lv_cpu is not None
+                        and cpu - self._lv_cpu >= WORKER_CPU_PROGRESS_SECONDS
+                    )
+                )
+                if progressed:
+                    self._lv_cpu = cpu
+                    self._lv_wchar = evidence["wchar"]
+                    self._lv_marks = evidence["marks"]
+                    self._lv_evidence_at = now
+            last_evidence = max(
+                self._lv_evidence_at, float(evidence["progress_at"] or started)
+            )
+            running = now - started
+            quiet = now - last_evidence
+            stall_after = (
+                WORKER_SHUTDOWN_STALL_SECONDS if self._closing else WORKER_STALL_SECONDS
+            )
+            if quiet >= stall_after or running >= WORKER_MAX_TASK_SECONDS:
+                state = "stalled"
+            elif running >= WORKER_SLOW_SECONDS:
+                state = "slow"
+            else:
+                state = "running"
+            info = {
+                "state": state,
+                "task": evidence["kind"],
+                "running_seconds": round(running, 3),
+                "seconds_since_progress": round(quiet, 3),
+                "alive": evidence["alive"],
+            }
+            self._liveness = info
+            return info
+
+    def _watchdog_run(self) -> None:
+        while not self._watchdog_stop.wait(WORKER_LIVENESS_CHECK_SECONDS):
+            try:
+                info = self._sample_worker_liveness()
+            except Exception:
+                logger.exception("Server Companion persistence watchdog failed")
+                continue
+            if info["state"] == "slow" and self._lv_slow_logged != self._lv_task:
+                self._lv_slow_logged = self._lv_task
+                logger.warning(
+                    "Server Companion persistence %s is slow (%.0f s, last progress "
+                    "%.0f s ago); still waiting",
+                    info.get("task"),
+                    info.get("running_seconds", 0.0),
+                    info.get("seconds_since_progress", 0.0),
+                )
+            if (
+                info["state"] == "stalled"
+                and self._stall_flag is None
+                and self._stalled is None
+                and "task" in info
+            ):
+                self._stall_flag = info
+                self._completion_ready.set()
+                post = self._post_to_owner
+                if post is not None:
+                    try:
+                        post(self._declare_worker_stalled_idle)
+                    except Exception:
+                        pass  # declared by the next owner-thread wait
+
+    def _declare_worker_stalled_idle(self) -> bool:
+        self._declare_worker_stalled()
+        return False
+
+    def _check_stall_flag(self) -> None:
+        if self._stall_flag is not None and self._stalled is None:
+            self._declare_worker_stalled()
+
+    def _declare_worker_stalled(self) -> None:
+        """Owner thread: stop trusting the worker; fail everything waiting on it.
+
+        No automatic recovery and no second writer: the stalled operation may
+        still be running against the database.  Every open write ticket
+        resolves with the error, so an alert whose reservation was not
+        committed is never dispatched; open rebuilds are abandoned (a late
+        result is ignored); later writes are refused.
+        """
+
+        if self._stalled is not None:
+            return
+        info = dict(self._stall_flag or self._liveness or {})
+        error = Schema4WorkerStalled(
+            "persistence worker made no progress for "
+            f"{float(info.get('seconds_since_progress', 0.0)):.0f} s during a "
+            f"{info.get('task') or 'task'} (running "
+            f"{float(info.get('running_seconds', 0.0)):.0f} s); "
+            "learning is no longer being saved"
+        )
+        self._stalled = error
+        logger.error("Server Companion %s", error)
+        listener = self._stall_listener
+        if listener is not None:
+            try:
+                listener(error)
+            except Exception:
+                logger.exception("Server Companion stall listener failed")
+        with self._mutex:
+            write_tickets = [
+                ticket for ticket in self._submitted_tickets.values() if not ticket.done
+            ]
+            rebuild_jobs = list(self._open_rebuild_jobs.values())
+            self._open_rebuild_jobs.clear()
+            self._rebuilds_in_flight = max(
+                0, self._rebuilds_in_flight - len(rebuild_jobs)
+            )
+            aux = list(self._open_aux.values())
+            self._open_aux.clear()
+        for ticket in write_tickets:
+            ticket._resolve(None, error)
+        for job in rebuild_jobs:
+            job.ticket._resolve(None, error)
+        for abandon in aux:
+            try:
+                abandon(error)
+            except Exception:
+                logger.exception("Server Companion abandoned task callback failed")
 
     @property
     def rebuild_in_progress(self) -> bool:
@@ -855,6 +1164,7 @@ class AuthoritativeSchema4Runtime:
         while not done.is_set():
             self._completion_ready.wait(0.05)
             self.process_completions()
+            self._check_stall_flag()
         if box.get("error") is not None:
             raise box["error"]  # type: ignore[misc]
         return box["snapshot"]  # type: ignore[return-value]
@@ -866,6 +1176,10 @@ class AuthoritativeSchema4Runtime:
         """Serialize and validate the current snapshot off the owner thread."""
 
         self._ensure_open()
+        self._check_stall_flag()
+        if self._stalled is not None:
+            callback(None, self._stalled)
+            return
         with self._mutex:
             assert self._state is not None
             root = self._state
@@ -877,6 +1191,17 @@ class AuthoritativeSchema4Runtime:
             else:
                 callback(snapshot, None)
             return
+        with self._mutex:
+            self._aux_sequence += 1
+            token = self._aux_sequence
+            self._open_aux[token] = lambda error: callback(None, error)
+
+        def deliver(result, error) -> None:
+            with self._mutex:
+                open_entry = self._open_aux.pop(token, None)
+            if open_entry is None:
+                return  # abandoned at a stall; already reported
+            callback(result, error)
 
         def task() -> _Completion:
             try:
@@ -884,7 +1209,7 @@ class AuthoritativeSchema4Runtime:
             except BaseException as exc:
                 result, error = None, exc
             return _Completion(
-                kind="aux", result=result, error=error, owner_callback=callback
+                kind="aux", result=result, error=error, owner_callback=deliver
             )
 
         self._worker.submit_aux(task)
@@ -1442,6 +1767,9 @@ class AuthoritativeSchema4Runtime:
         """
 
         self._ensure_open()
+        self._check_stall_flag()
+        if self._stalled is not None:
+            raise self._stalled
         ticket = Schema4WriteTicket()
         if callback is not None:
             ticket.add_callback(callback)
@@ -1458,6 +1786,7 @@ class AuthoritativeSchema4Runtime:
             )
             worker = self._worker
             self._rebuilds_in_flight += 1
+            self._open_rebuild_jobs[id(ticket)] = job
         if worker is None:
             self._apply_completion(self._compute_server_rebuild(job))
             return ticket
@@ -1507,6 +1836,11 @@ class AuthoritativeSchema4Runtime:
         job = completion.rebuild_job
         assert job is not None
         ticket = job.ticket
+        if ticket.done:
+            # R8a: abandoned when the worker was declared stalled; a late
+            # result is never installed.
+            self._late_completions_after_stall += 1
+            return True
         error = completion.error
         result: Schema4RebuildResult | None = None
         resubmit = None
@@ -1563,6 +1897,7 @@ class AuthoritativeSchema4Runtime:
                     )
             if resubmit is None:
                 self._rebuilds_in_flight = max(0, self._rebuilds_in_flight - 1)
+                self._open_rebuild_jobs.pop(id(ticket), None)
             worker = self._worker
         if resubmit is not None:
             if worker is None:
@@ -1678,6 +2013,13 @@ class AuthoritativeSchema4Runtime:
             self._post_to_owner = post_to_owner
             self._worker = _Schema4PersistenceWorker(self)
             root = self._state
+            self._watchdog_stop.clear()
+            self._watchdog = threading.Thread(
+                target=self._watchdog_run,
+                name="dzll-companion-persistence-watchdog",
+                daemon=True,
+            )
+            self._watchdog.start()
 
         def warm() -> _Completion:
             # Encode and validate every fragment once in the background, so
@@ -1704,6 +2046,11 @@ class AuthoritativeSchema4Runtime:
         ticket = Schema4WriteTicket()
         if callback is not None:
             ticket.add_callback(callback)
+        self._check_stall_flag()
+        if self._stalled is not None:
+            # R8a: never start a second writer behind a stalled one.
+            ticket._resolve(None, self._stalled)
+            return ticket
         with self._mutex:
             staged = bool(self._dirty_servers or self._root_dirty)
             if not staged:
@@ -1726,6 +2073,7 @@ class AuthoritativeSchema4Runtime:
                 sequence = self._sequence
                 keys = frozenset(self._dirty_servers)
                 self._submitted[sequence] = (keys, self._root_dirty)
+                self._submitted_tickets[sequence] = ticket
                 self._dirty_servers = set()
                 self._root_dirty = False
                 self._last_ticket = ticket
@@ -1765,6 +2113,7 @@ class AuthoritativeSchema4Runtime:
         deadline = None if timeout is None else time.monotonic() + timeout
         while not ticket.done:
             self.process_completions()
+            self._check_stall_flag()
             if ticket.done:
                 break
             if self._worker is None or not self._worker.alive:
@@ -1790,6 +2139,11 @@ class AuthoritativeSchema4Runtime:
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             self.process_completions()
+            self._check_stall_flag()
+            if self._stalled is not None:
+                # Abandoned work never completes under our control.
+                self.process_completions()
+                return False
             if (
                 self._rebuilds_in_flight
                 and self._worker is not None
@@ -1856,6 +2210,10 @@ class AuthoritativeSchema4Runtime:
                     logger.exception("Server Companion persistence task callback failed")
             return
         with self._mutex:
+            for sequence in completion.sequences:
+                self._submitted_tickets.pop(sequence, None)
+            if self._stalled is not None:
+                self._late_completions_after_stall += 1
             if completion.error is None:
                 for sequence in completion.sequences:
                     self._submitted.pop(sequence, None)
@@ -1885,26 +2243,52 @@ class AuthoritativeSchema4Runtime:
     def close(self, *, flush: bool = True) -> Schema4WriteResult | None:
         if self._closed:
             return None
+        self._closing = True
         try:
+            self._check_stall_flag()
             if (
                 flush
                 and self.enabled
                 and self._rebuilds_in_flight
                 and self._worker is not None
+                and self._stalled is None
             ):
                 # R8: install in-flight rebuilds so the final write has them.
                 self.wait_idle()
-            return self.flush() if flush and self.enabled and self.dirty else None
+            if not (flush and self.enabled and self.dirty) or self._stalled is not None:
+                return None
+            try:
+                return self.flush()
+            except Schema4WorkerStalled:
+                return None  # already reported through the stall listener
         finally:
             worker = self._worker
+            stopped = True
             if worker is not None:
-                # Never release the writer lock while a write is running.
-                worker.stop(discard_pending=True)
+                # Never release the writer lock while a write may be running.
+                stopped = worker.stop(
+                    discard_pending=True,
+                    timeout=(
+                        WORKER_STOP_AFTER_STALL_SECONDS
+                        if self._stalled is not None
+                        else None
+                    ),
+                )
                 self.process_completions()
                 self._worker = None
+            self._watchdog_stop.set()
             self._closed = True
             if self._writer_lock is not None:
-                self._writer_lock.release()
+                if stopped:
+                    self._writer_lock.release()
+                else:
+                    # A stalled operation may still touch the database: keep
+                    # the exclusive lock until the process exits, so no other
+                    # writer (this process or another) can start meanwhile.
+                    logger.error(
+                        "Server Companion persistence worker is still running at "
+                        "close; the learning database stays locked until exit"
+                    )
 
     def _ensure_open(self) -> None:
         if not self.enabled:
