@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import collections
 import copy
 import fcntl
 import hashlib
+import logging
 import os
 import tempfile
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -41,15 +45,26 @@ from .companion_restart_phase2_schema4 import (
     Schema4Error,
     Schema4LoadResult,
     Schema4ValidationError,
+    Schema4ValidationIssue,
+    Schema4ValidationReport,
     Schema4VersionError,
-    _validate_server_record,
+    assemble_schema4_payload,
     canonical_json_bytes,
     compact_schema4_state,
+    deduplicate_schema4_snapshot,
     deserialize_schema4_bytes,
+    encode_schema4_server_fragment,
     rebuild_schema4_server_record,
     schema_version_from_bytes,
     serialize_schema4_state,
+    validate_schema4_envelope,
+    validate_schema4_server_fragment,
+    validate_schema4_server_record,
+    verify_schema4_payload_layout,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 AUTHORITATIVE_SCHEMA4_RUNTIME_ENABLED_DEFAULT = False
@@ -222,11 +237,332 @@ class Schema4WriterLock:
         self.release()
 
 
+class Schema4WriteTicket:
+    """Durability handle for one flush request.
+
+    Callbacks run on the owner (GTK) thread: immediately in inline mode, or
+    from ``process_completions`` once the persistence worker reports.  A
+    ticket resolves only after the snapshot that contains the requested state
+    was atomically installed (``error is None``) or definitively failed.
+    """
+
+    __slots__ = ("_callbacks", "_done", "_worker_done", "result", "error")
+
+    def __init__(self) -> None:
+        self._callbacks: list[Callable[["Schema4WriteTicket"], None]] = []
+        self._done = False
+        self._worker_done = threading.Event()
+        self.result: Schema4WriteResult | None = None
+        self.error: BaseException | None = None
+
+    @property
+    def done(self) -> bool:
+        return self._done
+
+    def add_callback(self, callback: Callable[["Schema4WriteTicket"], None]) -> None:
+        if self._done:
+            _run_ticket_callback(callback, self)
+        else:
+            self._callbacks.append(callback)
+
+    def _resolve(
+        self, result: Schema4WriteResult | None, error: BaseException | None
+    ) -> None:
+        if self._done:
+            return
+        self.result = result
+        self.error = error
+        self._done = True
+        callbacks, self._callbacks = self._callbacks, []
+        for callback in callbacks:
+            _run_ticket_callback(callback, self)
+
+
+def _run_ticket_callback(callback, ticket: Schema4WriteTicket) -> None:
+    try:
+        callback(ticket)
+    except Exception:
+        logger.exception("Server Companion persistence completion callback failed")
+
+
+@dataclass
+class _WriteJob:
+    sequences: list[int]
+    root: dict
+    tickets: list[Schema4WriteTicket]
+    dirty_keys: set[str]
+
+
+@dataclass(frozen=True)
+class _Completion:
+    kind: str
+    sequences: tuple[int, ...] = ()
+    tickets: tuple[Schema4WriteTicket, ...] = ()
+    result: object = None
+    error: BaseException | None = None
+    written_fields: Mapping[str, object] | None = None
+    report: Schema4ValidationReport | None = None
+    owner_callback: Callable[[object, BaseException | None], None] | None = None
+    duration: float = 0.0
+
+
+class _Schema4DiskWriter:
+    """Disk-side identity and the encoded-fragment cache.
+
+    Used by exactly one thread at a time: the owner thread in inline mode,
+    or the persistence worker in background mode.  It reads only immutable
+    copy-on-write snapshots and never touches the owner's live state.
+    """
+
+    def __init__(
+        self,
+        backend: "AuthoritativeSchema4Runtime",
+        *,
+        sha256: str | None,
+        generation: int,
+    ) -> None:
+        self._backend = backend
+        self.sha256 = sha256
+        self.generation = int(generation)
+        # key -> (record object, exact fragment bytes, quarantined)
+        self._fragments: dict[str, tuple[object, bytes, bool]] = {}
+        self.encoded_fragment_count = 0
+        self.bytes_written = 0
+
+    def _fragments_for(
+        self, servers: Mapping[str, object]
+    ) -> tuple[dict[str, bytes], tuple[str, ...]]:
+        fragments: dict[str, bytes] = {}
+        quarantined: list[str] = []
+        for raw_key, record in servers.items():
+            key = str(raw_key)
+            cached = self._fragments.get(key)
+            if cached is None or cached[0] is not record:
+                # Copy-on-write: a record object is never mutated after it is
+                # installed, so identity proves the cached bytes are current.
+                fragment = encode_schema4_server_fragment(record)
+                is_quarantined = validate_schema4_server_fragment(key, fragment)
+                cached = (record, fragment, is_quarantined)
+                self._fragments[key] = cached
+                self.encoded_fragment_count += 1
+            fragments[key] = cached[1]
+            if cached[2]:
+                quarantined.append(key)
+        for stale in set(self._fragments) - set(fragments):
+            del self._fragments[stale]
+        return fragments, tuple(sorted(quarantined))
+
+    def payload_for(self, root: Mapping[str, object]) -> tuple[bytes, Schema4ValidationReport]:
+        """Validated canonical bytes for ``root`` (== serialize_schema4_state)."""
+
+        if not isinstance(root.get("servers"), Mapping):
+            raise Schema4ValidationError("schema-4 servers must be a mapping")
+        disk_root = deduplicate_schema4_snapshot(root)
+        validate_schema4_envelope(disk_root)
+        fragments, quarantined = self._fragments_for(disk_root["servers"])
+        payload = assemble_schema4_payload(disk_root, fragments)
+        verify_schema4_payload_layout(payload, disk_root, fragments)
+        valid = tuple(sorted(key for key in fragments if key not in quarantined))
+        report = Schema4ValidationReport(
+            root_valid=True,
+            valid_server_keys=valid,
+            quarantined_server_keys=quarantined,
+            issues=tuple(
+                Schema4ValidationIssue(
+                    key, "server_quarantined", "server authority record is quarantined"
+                )
+                for key in quarantined
+            ),
+        )
+        return payload, report
+
+    def write(self, job: _WriteJob) -> _Completion:
+        started = time.perf_counter()
+        fields = {
+            "runtime_write_generation": self.generation + 1,
+            "runtime_write_semantics_version": SCHEMA4_RUNTIME_WRITE_SEMANTICS_VERSION,
+            "previous_runtime_payload_sha256": self.sha256,
+        }
+        try:
+            write_root = dict(job.root)
+            write_root.update(fields)
+            payload, report = self.payload_for(write_root)
+            dirty = tuple(sorted(job.dirty_keys))
+            _install_atomic_schema4(
+                self._backend.active_path,
+                payload,
+                expected_sha256=self.sha256,
+                last_known_good_path=self._backend.last_known_good_path,
+                crash_injector=self._backend._crash_injector,
+            )
+        except Exception as exc:
+            return _Completion(
+                kind="write",
+                sequences=tuple(job.sequences),
+                tickets=tuple(job.tickets),
+                error=exc,
+                duration=time.perf_counter() - started,
+            )
+        self.generation += 1
+        self.sha256 = _sha256(payload)
+        self.bytes_written += len(payload)
+        result = Schema4WriteResult(
+            wrote=True,
+            generation=self.generation,
+            sha256=self.sha256,
+            dirty_server_keys=dirty,
+            reason_codes=("validated_atomic_replace", "last_known_good_rotated"),
+        )
+        return _Completion(
+            kind="write",
+            sequences=tuple(job.sequences),
+            tickets=tuple(job.tickets),
+            result=result,
+            written_fields=fields,
+            report=report,
+            duration=time.perf_counter() - started,
+        )
+
+
+class _Schema4PersistenceWorker:
+    """One ordered background writer with a bounded, coalescing queue.
+
+    At most one write runs and one waits.  A newer snapshot replaces the
+    waiting one (it contains every earlier staged change), so queued work is
+    bounded, writes are never reordered and stale state can never overwrite
+    newer state.  Every coalesced request keeps its ticket.
+    """
+
+    def __init__(self, backend: "AuthoritativeSchema4Runtime") -> None:
+        self._backend = backend
+        self._cond = threading.Condition()
+        self._pending: _WriteJob | None = None
+        self._aux: collections.deque = collections.deque()
+        self._busy = False
+        self._stopping = False
+        self._discard = False
+        self.coalesced_requests = 0
+        self.completed_writes = 0
+        self.max_write_seconds = 0.0
+        self.total_write_seconds = 0.0
+        self._thread = threading.Thread(
+            target=self._run,
+            name="dzll-companion-persistence",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    @property
+    def busy(self) -> bool:
+        with self._cond:
+            return bool(self._busy or self._pending is not None or self._aux)
+
+    def submit(self, job: _WriteJob) -> None:
+        with self._cond:
+            if self._stopping:
+                raise Schema4RuntimeError("persistence worker is stopping")
+            if not self._thread.is_alive():
+                raise Schema4RuntimeError("persistence worker stopped unexpectedly")
+            if self._pending is None:
+                self._pending = job
+            else:
+                self._pending.sequences.extend(job.sequences)
+                self._pending.root = job.root
+                self._pending.tickets.extend(job.tickets)
+                self._pending.dirty_keys.update(job.dirty_keys)
+                self.coalesced_requests += 1
+            self._cond.notify_all()
+
+    def submit_aux(self, task: Callable[[], _Completion]) -> None:
+        with self._cond:
+            if self._stopping or not self._thread.is_alive():
+                raise Schema4RuntimeError("persistence worker is not running")
+            self._aux.append(task)
+            self._cond.notify_all()
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        with self._cond:
+            while self._busy or self._pending is not None or self._aux:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+    def stop(self, *, discard_pending: bool) -> None:
+        with self._cond:
+            self._stopping = True
+            self._discard = bool(discard_pending)
+            self._cond.notify_all()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                while (
+                    self._pending is None and not self._aux and not self._stopping
+                ):
+                    self._cond.wait()
+                job = None
+                task = None
+                if self._pending is not None:
+                    job, self._pending = self._pending, None
+                elif self._aux:
+                    task = self._aux.popleft()
+                else:
+                    return
+                self._busy = True
+            try:
+                if job is not None:
+                    if self._discard:
+                        completion = _Completion(
+                            kind="write",
+                            sequences=tuple(job.sequences),
+                            tickets=tuple(job.tickets),
+                            error=Schema4RuntimeError(
+                                "persistence stopped before this write was attempted"
+                            ),
+                        )
+                    else:
+                        completion = self._backend._writer.write(job)
+                        self.completed_writes += 1
+                        self.max_write_seconds = max(
+                            self.max_write_seconds, completion.duration
+                        )
+                        self.total_write_seconds += completion.duration
+                else:
+                    completion = task()
+            except BaseException as exc:  # defensive: tasks capture errors
+                completion = _Completion(
+                    kind="write" if job is not None else "aux",
+                    sequences=tuple(job.sequences) if job is not None else (),
+                    tickets=tuple(job.tickets) if job is not None else (),
+                    error=exc,
+                )
+            finally:
+                with self._cond:
+                    self._busy = False
+                    self._cond.notify_all()
+            self._backend._deliver_completion(completion)
+
+
 class AuthoritativeSchema4Runtime:
     """Validated single-writer persistence backend for schema 4.
 
     It owns persistence only.  During Stage 3A the caller's schema-3 scorer and
     consumers remain the displayed production authority.
+
+    R7: authoritative memory is copy-on-write.  Every mutation installs new
+    root/server mappings and never mutates an installed record, so a write
+    can serialize a snapshot without copying it.  Mutations validate only the
+    changed record (the rest of the state is unchanged and already valid).
+    Writes run inline (default) or on one ordered background worker
+    (``enable_background_writes``); both use the same validated code path.
     """
 
     def __init__(
@@ -240,10 +576,15 @@ class AuthoritativeSchema4Runtime:
         writer_lock: Schema4WriterLock | None = None,
         recovery: Schema4RecoveryResult | None = None,
         crash_injector: Callable[[Schema4CrashPoint], None] | None = None,
+        _owned_state: bool = False,
     ) -> None:
         self.active_path = Path(active_path)
         self.enabled = bool(enabled)
-        self._state = copy.deepcopy(state) if state is not None else None
+        if state is not None and not _owned_state:
+            state = copy.deepcopy(state)
+        if state is not None:
+            _share_identical_schema3_entries(state)
+        self._state = state
         self._load_result = load_result
         self._expected_sha256 = _sha256(active_bytes) if active_bytes is not None else None
         self._generation = int((state or {}).get("runtime_write_generation", 0) or 0)
@@ -255,6 +596,16 @@ class AuthoritativeSchema4Runtime:
         self._write_count = 0
         self._recovery = recovery
         self._crash_injector = crash_injector
+        self._sequence = 0
+        self._submitted: dict[int, tuple[frozenset[str], bool]] = {}
+        self._last_ticket: Schema4WriteTicket | None = None
+        self._writer = _Schema4DiskWriter(
+            self, sha256=self._expected_sha256, generation=self._generation
+        )
+        self._worker: _Schema4PersistenceWorker | None = None
+        self._post_to_owner: Callable[[Callable[[], object]], object] | None = None
+        self._completions: collections.deque = collections.deque()
+        self._completion_ready = threading.Event()
 
     @classmethod
     def open(
@@ -270,15 +621,7 @@ class AuthoritativeSchema4Runtime:
         lock = Schema4WriterLock(path)
         lock.acquire()
         try:
-            recovery = _recover_schema4_path(path)
-            raw = path.read_bytes()
-            if schema_version_from_bytes(raw) != SCHEMA4_ROOT_VERSION:
-                raise Schema4VersionError(
-                    "authoritative schema-4 runtime requires an explicitly migrated schema-4 file"
-                )
-            loaded = deserialize_schema4_bytes(raw, quarantine_invalid_servers=True)
-            if not loaded.report.root_valid:
-                raise Schema4ValidationError("schema-4 root validation failed")
+            recovery, raw, loaded = _recover_schema4_path_loaded(path)
             return cls(
                 active_path=path,
                 enabled=True,
@@ -288,6 +631,7 @@ class AuthoritativeSchema4Runtime:
                 writer_lock=lock,
                 recovery=recovery,
                 crash_injector=crash_injector,
+                _owned_state=True,
             )
         except Exception:
             lock.release()
@@ -305,46 +649,129 @@ class AuthoritativeSchema4Runtime:
 
     @property
     def dirty(self) -> bool:
-        return bool(self._dirty_servers or self._root_dirty)
+        """True while any staged change is not yet durably installed."""
+
+        return bool(self._dirty_servers or self._root_dirty or self._submitted)
+
+    @property
+    def background_writes_enabled(self) -> bool:
+        return self._worker is not None
+
+    @property
+    def write_in_progress(self) -> bool:
+        return bool(self._submitted) or (
+            self._worker is not None and self._worker.busy
+        )
+
+    def persistence_stats(self) -> dict:
+        worker = self._worker
+        return {
+            "background": worker is not None,
+            "writes": self._write_count,
+            "bytes_written": self._writer.bytes_written,
+            "encoded_fragments": self._writer.encoded_fragment_count,
+            "coalesced_requests": 0 if worker is None else worker.coalesced_requests,
+            "max_write_seconds": 0.0 if worker is None else worker.max_write_seconds,
+            "total_write_seconds": 0.0 if worker is None else worker.total_write_seconds,
+        }
 
     def schema3_projection(self) -> dict:
         """Return the in-memory schema-3 detector/scorer projection only."""
 
-        state = self.state
+        if not self.enabled or self._state is None:
+            raise Schema4RuntimeError("authoritative schema-4 runtime is disabled")
+        state = self._state
         snapshot = state.get("schema3_snapshot")
         if not isinstance(snapshot, dict) or snapshot.get("schema_version") != 3:
             raise Schema4ValidationError("schema-4 state has no valid schema-3 runtime projection")
-        projected = copy.deepcopy(snapshot)
-        projected_servers = projected.setdefault("servers", {})
-        for key, record in state.get("servers", {}).items():
+        projected = {
+            key: copy.deepcopy(value)
+            for key, value in snapshot.items()
+            if key != "servers"
+        }
+        projected_servers = {}
+        records = state.get("servers", {})
+        for key, value in (snapshot.get("servers") or {}).items():
+            record = records.get(key)
+            if record is None:
+                projected_servers[key] = copy.deepcopy(value)
+        for key, record in records.items():
             if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
                 projected_servers.pop(key, None)
                 continue
             legacy = record.get("legacy_schema3_record")
             if isinstance(legacy, Mapping):
                 projected_servers[key] = copy.deepcopy(dict(legacy))
+            elif key in (snapshot.get("servers") or {}):
+                projected_servers[key] = copy.deepcopy(snapshot["servers"][key])
+        projected["servers"] = projected_servers
         return projected
+
+    def _export_from(self, root: Mapping[str, object]) -> Schema4ExportSnapshot:
+        payload, report = self._writer.payload_for(root)
+        if not report.valid:
+            raise Schema4ValidationError(
+                "authoritative export snapshot failed strict validation"
+            )
+        return Schema4ExportSnapshot(
+            canonical_bytes=payload,
+            schema_version=SCHEMA4_ROOT_VERSION,
+            server_count=len(root.get("servers", {})),
+            sha256=_sha256(payload),
+        )
 
     def export_snapshot(self) -> Schema4ExportSnapshot:
         """Return one validated canonical view of current authoritative memory."""
 
         self._ensure_open()
+        if self._worker is None:
+            with self._mutex:
+                assert self._state is not None
+                return self._export_from(self._state)
+        box: dict[str, object] = {}
+        done = threading.Event()
+
+        def finished(snapshot, error):
+            box["snapshot"], box["error"] = snapshot, error
+            done.set()
+
+        self.export_snapshot_async(finished)
+        while not done.is_set():
+            self._completion_ready.wait(0.05)
+            self.process_completions()
+        if box.get("error") is not None:
+            raise box["error"]  # type: ignore[misc]
+        return box["snapshot"]  # type: ignore[return-value]
+
+    def export_snapshot_async(
+        self,
+        callback: Callable[[Schema4ExportSnapshot | None, BaseException | None], None],
+    ) -> None:
+        """Serialize and validate the current snapshot off the owner thread."""
+
+        self._ensure_open()
         with self._mutex:
             assert self._state is not None
-            payload = serialize_schema4_state(self._state)
-            loaded = deserialize_schema4_bytes(
-                payload, quarantine_invalid_servers=False
+            root = self._state
+        if self._worker is None:
+            try:
+                snapshot = self._export_from(root)
+            except Exception as exc:
+                callback(None, exc)
+            else:
+                callback(snapshot, None)
+            return
+
+        def task() -> _Completion:
+            try:
+                result, error = self._export_from(root), None
+            except BaseException as exc:
+                result, error = None, exc
+            return _Completion(
+                kind="aux", result=result, error=error, owner_callback=callback
             )
-            if not loaded.report.valid:
-                raise Schema4ValidationError(
-                    "authoritative export snapshot failed strict validation"
-                )
-            return Schema4ExportSnapshot(
-                canonical_bytes=payload,
-                schema_version=SCHEMA4_ROOT_VERSION,
-                server_count=len(loaded.state.get("servers", {})),
-                sha256=_sha256(payload),
-            )
+
+        self._worker.submit_aux(task)
 
     def authority_decision(self, server_key: str):
         """Return a copied immutable decision for a validated server only."""
@@ -383,6 +810,33 @@ class AuthoritativeSchema4Runtime:
             ledger, event_finalized_at=_event_finalized_at(record)
         )
 
+    def _consumer_record(self, server_key: str) -> Mapping[str, object]:
+        assert self._state is not None
+        record = self._state.get("servers", {}).get(server_key)
+        if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
+            raise Schema4ServerWriteRejected(
+                server_key,
+                "server_quarantined" if isinstance(record, Mapping) else "server_unavailable",
+                "consumer server is unavailable or quarantined",
+            )
+        return record
+
+    def _install_consumer_state(self, server_key: str, ledger) -> None:
+        """Copy-on-write install of one server's consumer ledger (validated)."""
+
+        assert self._state is not None
+        mapping = consumer_ledger_to_mapping(ledger)
+        canonical_json_bytes(mapping)  # JSON-safe before it is trusted
+        record = dict(self._state["servers"][server_key])
+        record["consumer_state"] = mapping
+        self._validate_record_for_server(server_key, record)
+        servers = dict(self._state["servers"])
+        servers[server_key] = record
+        candidate = dict(self._state)
+        candidate["servers"] = servers
+        self._state = candidate
+        self._dirty_servers.add(server_key)
+
     def record_consumer_decision(
         self, decision: AuthorityConsumerDecision, *, created_at: float
     ) -> bool:
@@ -390,16 +844,7 @@ class AuthoritativeSchema4Runtime:
 
         self._ensure_open()
         with self._mutex:
-            assert self._state is not None
-            record = self._state.get("servers", {}).get(decision.server_key)
-            if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
-                raise Schema4ServerWriteRejected(
-                    decision.server_key,
-                    "server_quarantined"
-                    if isinstance(record, Mapping)
-                    else "server_unavailable",
-                    "consumer server is unavailable or quarantined",
-                )
+            record = self._consumer_record(decision.server_key)
             ledger = consumer_ledger_from_mapping(
                 record.get("consumer_state"), server_key=decision.server_key
             )
@@ -418,42 +863,28 @@ class AuthoritativeSchema4Runtime:
             )
             if consumer_ledger_to_mapping(updated) == consumer_ledger_to_mapping(ledger):
                 return False
-            candidate = copy.deepcopy(self._state)
-            candidate["servers"][decision.server_key]["consumer_state"] = (
-                consumer_ledger_to_mapping(updated)
-            )
-            self._validate_candidate_for_server(
-                candidate,
-                decision.server_key,
-                candidate["servers"][decision.server_key],
-            )
-            self._state = candidate
-            self._dirty_servers.add(decision.server_key)
+            self._install_consumer_state(decision.server_key, updated)
             return True
 
-    def reserve_consumer_alert(
+    def stage_consumer_alert_reservation(
         self,
         *,
         decision: AuthorityConsumerDecision,
         key: AuthoritySuppressionKey,
         created_at: float,
     ) -> ConsumerAlertReservation:
-        """Atomically consume one alert slot before external action dispatch."""
+        """Stage (not yet durable) one alert reservation in authoritative memory.
+
+        The staged reservation immediately suppresses the key in memory, so a
+        concurrent request can never dispatch it twice.  The caller must not
+        dispatch until a flush covering it has completed successfully.
+        """
 
         self._ensure_open()
         if key.server_key != decision.server_key:
             raise Schema4ValidationError("consumer alert key server mismatch")
         with self._mutex:
-            assert self._state is not None
-            record = self._state.get("servers", {}).get(decision.server_key)
-            if not isinstance(record, Mapping) or record.get("authority_status") == "quarantined":
-                raise Schema4ServerWriteRejected(
-                    decision.server_key,
-                    "server_quarantined"
-                    if isinstance(record, Mapping)
-                    else "server_unavailable",
-                    "consumer server is unavailable or quarantined",
-                )
+            record = self._consumer_record(decision.server_key)
             if key.kind is AuthoritySuppressionKind.GENERIC_RECOVERY and key.event_id not in {
                 item.get("event_id")
                 for item in record.get("physical_events", ())
@@ -511,35 +942,47 @@ class AuthoritativeSchema4Runtime:
                 protect_key_ids=(reserved.key_id,),
                 protect_decision_ids=(preceding_decision_id,),
             )
-            candidate = copy.deepcopy(self._state)
-            candidate["servers"][decision.server_key]["consumer_state"] = (
-                consumer_ledger_to_mapping(ledger)
-            )
-            self._validate_candidate_for_server(
-                candidate,
-                decision.server_key,
-                candidate["servers"][decision.server_key],
-            )
-            self._state = candidate
-            self._dirty_servers.add(decision.server_key)
-            written = self.flush()
+            self._install_consumer_state(decision.server_key, ledger)
             return ConsumerAlertReservation(
                 True,
                 key,
                 reserved,
-                written,
-                ("reserved_and_durable_before_dispatch", "at_most_once_delivery"),
+                None,
+                ("reserved_pending_durable_commit", "at_most_once_delivery"),
             )
 
-    def complete_consumer_alert(
+    def reserve_consumer_alert(
+        self,
+        *,
+        decision: AuthorityConsumerDecision,
+        key: AuthoritySuppressionKey,
+        created_at: float,
+    ) -> ConsumerAlertReservation:
+        """Atomically consume one alert slot before external action dispatch."""
+
+        reservation = self.stage_consumer_alert_reservation(
+            decision=decision, key=key, created_at=created_at
+        )
+        if not reservation.reserved:
+            return reservation
+        written = self.flush()
+        return ConsumerAlertReservation(
+            True,
+            key,
+            reservation.record,
+            written,
+            ("reserved_and_durable_before_dispatch", "at_most_once_delivery"),
+        )
+
+    def stage_consumer_alert_completion(
         self,
         *,
         decision: AuthorityConsumerDecision,
         reservation: ConsumerAlertReservation,
         completed_at: float,
         action_succeeded: bool,
-    ) -> Schema4WriteResult:
-        """Append dispatch outcome; reservation remains replay-suppressing on failure."""
+    ) -> bool:
+        """Stage the dispatch outcome; return False if nothing needed staging."""
 
         self._ensure_open()
         if not reservation.reserved or reservation.record is None:
@@ -562,7 +1005,7 @@ class AuthoritativeSchema4Runtime:
                     raise Schema4RuntimeError(
                         "consumer alert reservation is missing and not suppressed"
                     )
-                return self.flush()
+                return False
             completed = alert_record(
                 key=reservation.key,
                 authority_consumer_decision_id=decision.decision_id,
@@ -592,18 +1035,26 @@ class AuthoritativeSchema4Runtime:
                 event_finalized_at=_event_finalized_at(record),
                 protect_key_ids=(completed.key_id,),
             )
-            candidate = copy.deepcopy(self._state)
-            candidate["servers"][decision.server_key]["consumer_state"] = (
-                consumer_ledger_to_mapping(ledger)
-            )
-            self._validate_candidate_for_server(
-                candidate,
-                decision.server_key,
-                candidate["servers"][decision.server_key],
-            )
-            self._state = candidate
-            self._dirty_servers.add(decision.server_key)
-            return self.flush()
+            self._install_consumer_state(decision.server_key, ledger)
+            return True
+
+    def complete_consumer_alert(
+        self,
+        *,
+        decision: AuthorityConsumerDecision,
+        reservation: ConsumerAlertReservation,
+        completed_at: float,
+        action_succeeded: bool,
+    ) -> Schema4WriteResult:
+        """Append dispatch outcome; reservation remains replay-suppressing on failure."""
+
+        self.stage_consumer_alert_completion(
+            decision=decision,
+            reservation=reservation,
+            completed_at=completed_at,
+            action_succeeded=action_succeeded,
+        )
+        return self.flush()
 
     def snapshot(self) -> Schema4RuntimeSnapshot:
         if not self.enabled or self._state is None:
@@ -627,6 +1078,9 @@ class AuthoritativeSchema4Runtime:
             if isinstance(decision, Mapping) and isinstance(decision.get("decision_id"), str):
                 decisions.append((str(key), str(decision["decision_id"])))
         report = self._load_result.report if self._load_result is not None else None
+        dirty = set(self._dirty_servers)
+        for keys, _root in self._submitted.values():
+            dirty.update(keys)
         return Schema4RuntimeSnapshot(
             enabled=True,
             active_path=str(self.active_path),
@@ -634,7 +1088,7 @@ class AuthoritativeSchema4Runtime:
             active_sha256=self._expected_sha256,
             valid_server_keys=() if report is None else report.valid_server_keys,
             quarantined_server_keys=() if report is None else report.quarantined_server_keys,
-            dirty_server_keys=tuple(sorted(self._dirty_servers)),
+            dirty_server_keys=tuple(sorted(dirty)),
             write_count=self._write_count,
             decision_ids=tuple(sorted(decisions)),
             recovery=self._recovery,
@@ -688,23 +1142,24 @@ class AuthoritativeSchema4Runtime:
         )
 
     @staticmethod
-    def _validate_candidate_for_server(
-        candidate: dict, server_key: str, record: Mapping[str, object]
+    def _validate_record_for_server(
+        server_key: str, record: Mapping[str, object]
     ) -> None:
-        """Strictly validate ``candidate``; attribute record-only failures."""
+        """Per-server strict validation of a record about to be trusted.
 
-        try:
-            serialize_schema4_state(candidate)
-        except Schema4ValidationError as exc:
-            issues = _validate_server_record(server_key, record)
-            if not issues:
-                raise
+        Every other record and the root are unchanged and were validated when
+        installed, so validating the changed record is equivalent to
+        validating the whole candidate state.
+        """
+
+        issues = validate_schema4_server_record(server_key, record)
+        if issues:
             raise Schema4ServerWriteRejected(
                 server_key,
                 "server_record_validation_failed",
                 "; ".join(item.detail for item in issues)[:512],
                 validation_codes=tuple(sorted({item.code for item in issues})),
-            ) from exc
+            )
 
     def note_healthy_poll(self, _server_key: str) -> None:
         """Healthy poll-only activity is intentionally non-durable."""
@@ -724,8 +1179,7 @@ class AuthoritativeSchema4Runtime:
         self._ensure_open()
         with self._mutex:
             assert self._state is not None
-            servers = self._state.setdefault("servers", {})
-            existing = servers.get(server_key)
+            existing = self._state.get("servers", {}).get(server_key)
             snapshot = self._state.get("schema3_snapshot")
             snapshot_servers = (
                 snapshot.get("servers") if isinstance(snapshot, Mapping) else None
@@ -768,20 +1222,29 @@ class AuthoritativeSchema4Runtime:
             reasons = set(rebuilt.get("reason_codes", ()))
             reasons.add(str(durable_reason))
             rebuilt["reason_codes"] = sorted(reasons)
-            candidate = copy.deepcopy(self._state)
-            candidate["servers"][server_key] = rebuilt
-            candidate_snapshot = candidate["schema3_snapshot"]
-            candidate_snapshot["servers"][server_key] = copy.deepcopy(
-                dict(schema3_record)
-            )
+            self._validate_record_for_server(server_key, rebuilt)
+            entry = copy.deepcopy(dict(schema3_record))
+            legacy = rebuilt.get("legacy_schema3_record")
+            if isinstance(legacy, dict) and legacy == entry:
+                # Share the identical mapping (R6 stores it once on disk);
+                # neither copy is ever mutated after installation.
+                entry = legacy
+            candidate_snapshot = dict(snapshot)
+            candidate_snapshot_servers = dict(snapshot_servers)
+            candidate_snapshot_servers[server_key] = entry
+            candidate_snapshot["servers"] = candidate_snapshot_servers
             candidate_snapshot["updated_at"] = max(
                 int(updated_at),
                 int(candidate_snapshot.get("created_at", 0) or 0),
             )
+            servers = dict(self._state.get("servers", {}))
+            servers[server_key] = rebuilt
+            candidate = dict(self._state)
+            candidate["servers"] = servers
+            candidate["schema3_snapshot"] = candidate_snapshot
             candidate["updated_at"] = max(
                 int(updated_at), int(candidate.get("created_at", 0) or 0)
             )
-            self._validate_candidate_for_server(candidate, server_key, rebuilt)
             self._state = candidate
             self._dirty_servers.add(server_key)
             return True
@@ -794,15 +1257,17 @@ class AuthoritativeSchema4Runtime:
         self._ensure_open()
         with self._mutex:
             assert self._state is not None
-            candidate = copy.deepcopy(self._state)
-            candidate.setdefault("servers", {})[server_key] = copy.deepcopy(dict(record))
+            replacement = copy.deepcopy(dict(record))
+            servers = dict(self._state.get("servers", {}))
+            servers[server_key] = replacement
+            candidate = dict(self._state)
+            candidate["servers"] = servers
             serialize_schema4_state(candidate)
-            current = self._state["servers"].get(server_key)
+            current = self._state.get("servers", {}).get(server_key)
             if canonical_json_bytes(current) == canonical_json_bytes(record):
                 return False
-            candidate["servers"][server_key]["reason_codes"] = sorted(
-                set(candidate["servers"][server_key].get("reason_codes", ()))
-                | {str(reason)}
+            replacement["reason_codes"] = sorted(
+                set(replacement.get("reason_codes", ())) | {str(reason)}
             )
             self._state = candidate
             self._dirty_servers.add(server_key)
@@ -855,54 +1320,216 @@ class AuthoritativeSchema4Runtime:
             self.compact()
         return reasons
 
-    def flush(self) -> Schema4WriteResult:
+    # ------------------------------------------------------------------
+    # Writes: one validated path, inline or on the ordered worker
+    # ------------------------------------------------------------------
+
+    def enable_background_writes(
+        self, post_to_owner: Callable[[Callable[[], object]], object]
+    ) -> None:
+        """Move writes to one ordered worker thread.
+
+        ``post_to_owner`` schedules a zero-argument callable on the owner
+        thread (production: the main-loop idle scheduler).  Completions and every ticket
+        callback then run on the owner thread via ``process_completions``.
+        """
+
         self._ensure_open()
         with self._mutex:
-            if not self.dirty:
-                return Schema4WriteResult(
+            if self._worker is not None:
+                self._post_to_owner = post_to_owner
+                return
+            if self._submitted:
+                raise Schema4RuntimeError("cannot switch write mode during a write")
+            self._post_to_owner = post_to_owner
+            self._worker = _Schema4PersistenceWorker(self)
+            root = self._state
+
+        def warm() -> _Completion:
+            # Encode and validate every fragment once in the background, so
+            # the first event-time write only encodes what changed.
+            try:
+                if root is not None:
+                    self._writer.payload_for(root)
+            except BaseException:
+                pass
+            return _Completion(kind="noop")
+
+        self._worker.submit_aux(warm)
+
+    def flush_async(
+        self, callback: Callable[[Schema4WriteTicket], None] | None = None
+    ) -> Schema4WriteTicket:
+        """Request durability of the current state without waiting.
+
+        The ticket resolves after the newest snapshot containing every change
+        staged so far has been atomically installed, or with the failure.
+        """
+
+        self._ensure_open()
+        ticket = Schema4WriteTicket()
+        if callback is not None:
+            ticket.add_callback(callback)
+        with self._mutex:
+            staged = bool(self._dirty_servers or self._root_dirty)
+            if not staged:
+                last = self._last_ticket
+                if self._submitted and last is not None and not last.done:
+                    # The newest submitted snapshot already contains the
+                    # current state: its durability is this request's.
+                    last.add_callback(lambda done: ticket._resolve(done.result, done.error))
+                    return ticket
+                unchanged = Schema4WriteResult(
                     wrote=False,
                     generation=self._generation,
                     sha256=self._expected_sha256,
                     dirty_server_keys=(),
                     reason_codes=("unchanged_no_write",),
                 )
-            assert self._state is not None
-            current = self.active_path.read_bytes()
-            current_hash = _sha256(current)
-            if current_hash != self._expected_sha256:
-                raise Schema4GenerationConflict(
-                    "schema-4 active file changed after load; reload before retry"
+            else:
+                assert self._state is not None
+                self._sequence += 1
+                sequence = self._sequence
+                keys = frozenset(self._dirty_servers)
+                self._submitted[sequence] = (keys, self._root_dirty)
+                self._dirty_servers = set()
+                self._root_dirty = False
+                self._last_ticket = ticket
+                job = _WriteJob([sequence], self._state, [ticket], set(keys))
+                worker = self._worker
+        if not staged:
+            ticket._resolve(unchanged, None)
+            return ticket
+        if worker is None:
+            completion = self._writer.write(job)
+            self._apply_completion(completion)
+            return ticket
+        try:
+            worker.submit(job)
+        except BaseException as exc:
+            self._apply_completion(
+                _Completion(
+                    kind="write",
+                    sequences=(sequence,),
+                    tickets=(ticket,),
+                    error=exc,
                 )
-            next_state = copy.deepcopy(self._state)
-            next_generation = self._generation + 1
-            next_state["runtime_write_generation"] = next_generation
-            next_state["runtime_write_semantics_version"] = (
-                SCHEMA4_RUNTIME_WRITE_SEMANTICS_VERSION
             )
-            next_state["previous_runtime_payload_sha256"] = current_hash
-            payload = serialize_schema4_state(next_state)
-            dirty = tuple(sorted(self._dirty_servers))
-            _install_atomic_schema4(
-                self.active_path,
-                payload,
-                previous_valid_bytes=current,
-                last_known_good_path=self.last_known_good_path,
-                crash_injector=self._crash_injector,
-            )
-            self._state = next_state
-            self._generation = next_generation
-            self._expected_sha256 = _sha256(payload)
-            self._dirty_servers.clear()
-            self._root_dirty = False
-            self._write_count += 1
-            loaded = deserialize_schema4_bytes(payload, quarantine_invalid_servers=True)
-            self._load_result = loaded
-            return Schema4WriteResult(
-                wrote=True,
-                generation=self._generation,
-                sha256=self._expected_sha256,
-                dirty_server_keys=dirty,
-                reason_codes=("validated_atomic_replace", "last_known_good_rotated"),
+        return ticket
+
+    def flush(self) -> Schema4WriteResult:
+        ticket = self.flush_async()
+        self.wait_for(ticket)
+        if ticket.error is not None:
+            raise ticket.error
+        assert ticket.result is not None
+        return ticket.result
+
+    def wait_for(self, ticket: Schema4WriteTicket, timeout: float | None = None) -> bool:
+        """Block the owner thread until ``ticket`` resolves (shutdown/tests)."""
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while not ticket.done:
+            self.process_completions()
+            if ticket.done:
+                break
+            if self._worker is None or not self._worker.alive:
+                self.process_completions()
+                if not ticket.done:
+                    ticket._resolve(
+                        None,
+                        Schema4RuntimeError("persistence worker is not running"),
+                    )
+                break
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._completion_ready.wait(0.05 if remaining is None else min(0.05, remaining))
+        return True
+
+    def wait_idle(self, timeout: float | None = None) -> bool:
+        """Block until every submitted write completed (shutdown/tests)."""
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            self.process_completions()
+            if not self._submitted and (
+                self._worker is None or not self._worker.busy
+            ):
+                self.process_completions()
+                return True
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._completion_ready.wait(0.05 if remaining is None else min(0.05, remaining))
+
+    def _deliver_completion(self, completion: _Completion) -> None:
+        """Worker thread: queue a completion for the owner thread."""
+
+        self._completions.append(completion)
+        for ticket in completion.tickets:
+            ticket._worker_done.set()
+        self._completion_ready.set()
+        post = self._post_to_owner
+        if post is not None:
+            try:
+                post(self._process_completions_idle)
+            except Exception:
+                # Drained by the next owner-thread wait, flush or close.
+                pass
+
+    def _process_completions_idle(self) -> bool:
+        self.process_completions()
+        return False
+
+    def process_completions(self) -> int:
+        """Owner thread: apply every queued completion in order."""
+
+        count = 0
+        self._completion_ready.clear()
+        while True:
+            try:
+                completion = self._completions.popleft()
+            except IndexError:
+                return count
+            self._apply_completion(completion)
+            count += 1
+
+    def _apply_completion(self, completion: _Completion) -> None:
+        if completion.kind == "noop":
+            return
+        if completion.kind == "aux":
+            if completion.owner_callback is not None:
+                try:
+                    completion.owner_callback(completion.result, completion.error)
+                except Exception:
+                    logger.exception("Server Companion persistence task callback failed")
+            return
+        with self._mutex:
+            if completion.error is None:
+                for sequence in completion.sequences:
+                    self._submitted.pop(sequence, None)
+                result = completion.result
+                assert isinstance(result, Schema4WriteResult)
+                self._generation = result.generation
+                self._expected_sha256 = result.sha256
+                self._write_count += 1
+                if completion.report is not None:
+                    self._load_result = Schema4LoadResult(state={}, report=completion.report)
+                if completion.written_fields and self._state is not None:
+                    updated = dict(self._state)
+                    updated.update(completion.written_fields)
+                    self._state = updated
+            else:
+                for sequence in completion.sequences:
+                    keys, root = self._submitted.pop(sequence, (frozenset(), False))
+                    # Still not durable: the next flush writes them again.
+                    self._dirty_servers.update(keys)
+                    self._root_dirty = self._root_dirty or root
+        for ticket in completion.tickets:
+            ticket._resolve(
+                completion.result if completion.error is None else None,
+                completion.error,
             )
 
     def close(self, *, flush: bool = True) -> Schema4WriteResult | None:
@@ -911,6 +1538,12 @@ class AuthoritativeSchema4Runtime:
         try:
             return self.flush() if flush and self.enabled and self.dirty else None
         finally:
+            worker = self._worker
+            if worker is not None:
+                # Never release the writer lock while a write is running.
+                worker.stop(discard_pending=True)
+                self.process_completions()
+                self._worker = None
             self._closed = True
             if self._writer_lock is not None:
                 self._writer_lock.release()
@@ -1013,29 +1646,50 @@ class Schema4RuntimeSoakHarness:
 
 
 def _recover_schema4_path(path: Path) -> Schema4RecoveryResult:
+    return _recover_schema4_path_loaded(path)[0]
+
+
+def _recover_schema4_path_loaded(
+    path: Path,
+) -> tuple[Schema4RecoveryResult, bytes, Schema4LoadResult]:
+    """Recover the active file and return it parsed and validated once.
+
+    Before R7 the active bytes were parsed and validated twice at open (here
+    and again by the caller).  The loaded result of the bytes that end up
+    active is now returned instead.
+    """
+
     if not path.exists():
         raise Schema4RuntimeError(
             "authoritative schema-4 runtime will not create or migrate state implicitly"
         )
     removed: list[str] = []
-    for stale in sorted(path.parent.glob(f".{path.name}.schema4-runtime-*.tmp")):
-        try:
-            stale.unlink()
-            removed.append(str(stale))
-        except OSError:
-            pass
+    stale_patterns = (
+        f".{path.name}.schema4-runtime-*.tmp",
+        f".{path.name}.last-known-good.link-*.tmp",
+    )
+    for pattern in stale_patterns:
+        for stale in sorted(path.parent.glob(pattern)):
+            try:
+                stale.unlink()
+                removed.append(str(stale))
+            except OSError:
+                pass
     reasons = set()
     if removed:
         reasons.add("stale_temporary_files_removed")
     try:
         active = path.read_bytes()
-        if schema_version_from_bytes(active) != SCHEMA4_ROOT_VERSION:
-            raise Schema4VersionError("active state is not schema 4")
+        # One parse: deserialization itself rejects a non-schema-4 root.
         loaded = deserialize_schema4_bytes(active, quarantine_invalid_servers=True)
         if not loaded.report.root_valid:
             raise Schema4ValidationError("active schema-4 root invalid")
         reasons.add("valid_active_schema4_retained")
-        return Schema4RecoveryResult(tuple(removed), False, None, tuple(sorted(reasons)))
+        return (
+            Schema4RecoveryResult(tuple(removed), False, None, tuple(sorted(reasons))),
+            active,
+            loaded,
+        )
     except (OSError, Schema4Error, ValueError) as active_error:
         backup = path.with_name(path.name + ".last-known-good")
         if not backup.exists():
@@ -1046,10 +1700,10 @@ def _recover_schema4_path(path: Path) -> Schema4RecoveryResult:
         try:
             if schema_version_from_bytes(backup_bytes) != SCHEMA4_ROOT_VERSION:
                 raise Schema4VersionError("last-known-good is not schema 4")
-            loaded = deserialize_schema4_bytes(
+            strict = deserialize_schema4_bytes(
                 backup_bytes, quarantine_invalid_servers=False
             )
-            if not loaded.report.valid:
+            if not strict.report.valid:
                 raise Schema4ValidationError("last-known-good validation failed")
         except (Schema4Error, ValueError) as backup_error:
             raise Schema4RuntimeError(
@@ -1061,92 +1715,201 @@ def _recover_schema4_path(path: Path) -> Schema4RecoveryResult:
             _write_new_file_fsynced(invalid_path, invalid_bytes)
         _replace_bytes_fsynced(path, backup_bytes)
         reasons.update({"invalid_active_preserved", "last_known_good_restored"})
-        return Schema4RecoveryResult(
-            tuple(removed), True, str(invalid_path), tuple(sorted(reasons))
+        # A strictly valid file loads identically with quarantining enabled.
+        return (
+            Schema4RecoveryResult(
+                tuple(removed), True, str(invalid_path), tuple(sorted(reasons))
+            ),
+            backup_bytes,
+            strict,
         )
+
+
+_LKG_LINK_UNSUPPORTED_ERRNOS = frozenset(
+    code
+    for code in (
+        getattr(__import__("errno"), name, None)
+        for name in ("EXDEV", "EPERM", "ENOTSUP", "EOPNOTSUPP", "EMLINK", "ENOSYS", "EACCES")
+    )
+    if code is not None
+)
+
+
+def _prepare_last_known_good(
+    active_path: Path, last_known_good_path: Path, expected_sha256: str | None
+) -> tuple[Path | None, bytes | None]:
+    """Capture the current active file as the next last-known-good, verified.
+
+    R7: the active file is only ever replaced by rename, never modified in
+    place, so a hard link to it preserves its exact bytes without copying
+    them.  The linked bytes are hashed against the runtime's expected
+    identity (generation-conflict detection).  When hard links are not
+    supported the bytes are read and later copied, as before R7.
+    """
+
+    link_path = last_known_good_path.with_name(
+        f".{last_known_good_path.name}.link-{os.getpid()}-{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        os.link(active_path, link_path)
+    except OSError as exc:
+        if exc.errno not in _LKG_LINK_UNSUPPORTED_ERRNOS:
+            raise
+        current = active_path.read_bytes()
+        if _sha256(current) != expected_sha256:
+            raise Schema4GenerationConflict(
+                "schema-4 active file changed after load; reload before retry"
+            )
+        return None, current
+    try:
+        if _sha256_file(link_path) != expected_sha256:
+            raise Schema4GenerationConflict(
+                "schema-4 active file changed after load; reload before retry"
+            )
+    except BaseException:
+        _unlink_quiet(link_path)
+        raise
+    return link_path, None
 
 
 def _install_atomic_schema4(
     active_path: Path,
     payload: bytes,
     *,
-    previous_valid_bytes: bytes,
+    expected_sha256: str | None,
     last_known_good_path: Path,
     crash_injector: Callable[[Schema4CrashPoint], None] | None,
 ) -> None:
+    """Atomically install ``payload`` (already validated, byte for byte).
+
+    Order: verify the active identity and capture it as last-known-good,
+    write and fsync the temporary file and verify its bytes, rotate the
+    last-known-good, rename over the active file, fsync the directory, and
+    verify the installed bytes.  Failure phases are classified as before.
+    """
+
+    link_path, previous_valid_bytes = _prepare_last_known_good(
+        active_path, last_known_good_path, expected_sha256
+    )
     try:
-        active_path.parent.mkdir(parents=True, exist_ok=True)
-        fd, raw_name = tempfile.mkstemp(
-            prefix=f".{active_path.name}.schema4-runtime-",
-            suffix=".tmp",
-            dir=active_path.parent,
-        )
-    except OSError as exc:
         try:
-            unchanged = active_path.read_bytes() == previous_valid_bytes
-        except OSError:
-            unchanged = False
-        phase = (
-            Schema4WriteFailurePhase.CONFIRMED_PRE_COMMIT
-            if unchanged
-            else Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS
-        )
-        raise Schema4WriteFailure(phase, exc) from exc
-    temp_path = Path(raw_name)
-    active_replaced = False
-    try:
-        if crash_injector is not None:
-            crash_injector(Schema4CrashPoint.BEFORE_TEMP_COMPLETE)
-        with os.fdopen(fd, "wb") as handle:
-            fd = -1
-            handle.write(payload)
-            handle.flush()
-            os.fsync(handle.fileno())
-        # Validate the exact bytes that will be installed, not only the mapping.
-        loaded = deserialize_schema4_bytes(
-            temp_path.read_bytes(), quarantine_invalid_servers=False
-        )
-        if not (
-            loaded.report.root_valid
-            and all(item.code == "server_quarantined" for item in loaded.report.issues)
-        ):
-            raise Schema4ValidationError("prepared runtime payload failed validation")
-        if crash_injector is not None:
-            crash_injector(Schema4CrashPoint.AFTER_TEMP_FSYNC_BEFORE_REPLACE)
-        _replace_bytes_fsynced(last_known_good_path, previous_valid_bytes)
-        os.replace(temp_path, active_path)
-        active_replaced = True
-        _fsync_directory(active_path.parent)
-        if crash_injector is not None:
-            crash_injector(Schema4CrashPoint.AFTER_REPLACE)
-        if active_path.read_bytes() != payload:
-            raise Schema4RuntimeError("atomic schema-4 replacement verification failed")
-    except Schema4Error as exc:
-        if active_replaced:
-            raise Schema4WriteFailure(
-                Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS,
-                exc,
-            ) from exc
-        raise
-    except Exception as exc:
-        if not active_replaced and not isinstance(exc, OSError):
+            active_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, raw_name = tempfile.mkstemp(
+                prefix=f".{active_path.name}.schema4-runtime-",
+                suffix=".tmp",
+                dir=active_path.parent,
+            )
+        except OSError as exc:
+            phase = (
+                Schema4WriteFailurePhase.CONFIRMED_PRE_COMMIT
+                if _active_unchanged(active_path, expected_sha256)
+                else Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS
+            )
+            raise Schema4WriteFailure(phase, exc) from exc
+        temp_path = Path(raw_name)
+        active_replaced = False
+        try:
+            if crash_injector is not None:
+                crash_injector(Schema4CrashPoint.BEFORE_TEMP_COMPLETE)
+            with os.fdopen(fd, "wb") as handle:
+                fd = -1
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            # The payload's every byte was validated before this call
+            # (per-fragment strict parse plus exact layout); prove that the
+            # durable temporary file holds exactly those bytes.
+            payload_sha256 = _sha256(payload)
+            if _sha256_file(temp_path) != payload_sha256:
+                raise Schema4ValidationError("prepared runtime payload failed validation")
+            if crash_injector is not None:
+                crash_injector(Schema4CrashPoint.AFTER_TEMP_FSYNC_BEFORE_REPLACE)
+            if link_path is not None:
+                os.replace(link_path, last_known_good_path)
+                link_path = None
+                _fsync_directory(last_known_good_path.parent)
+            else:
+                _replace_bytes_fsynced(last_known_good_path, previous_valid_bytes or b"")
+            os.replace(temp_path, active_path)
+            active_replaced = True
+            _fsync_directory(active_path.parent)
+            if crash_injector is not None:
+                crash_injector(Schema4CrashPoint.AFTER_REPLACE)
+            if _sha256_file(active_path) != payload_sha256:
+                raise Schema4RuntimeError("atomic schema-4 replacement verification failed")
+        except Schema4Error as exc:
+            if active_replaced:
+                raise Schema4WriteFailure(
+                    Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS,
+                    exc,
+                ) from exc
             raise
-        phase = Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS
-        if not active_replaced:
-            try:
-                unchanged = active_path.read_bytes() == previous_valid_bytes
-            except OSError:
-                unchanged = False
-            if unchanged:
+        except Exception as exc:
+            if not active_replaced and not isinstance(exc, OSError):
+                raise
+            phase = Schema4WriteFailurePhase.POST_COMMIT_OR_AMBIGUOUS
+            if not active_replaced and _active_unchanged(active_path, expected_sha256):
                 phase = Schema4WriteFailurePhase.CONFIRMED_PRE_COMMIT
-        raise Schema4WriteFailure(phase, exc) from exc
+            raise Schema4WriteFailure(phase, exc) from exc
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                temp_path.unlink()
+            except FileNotFoundError:
+                pass
     finally:
-        if fd >= 0:
-            os.close(fd)
-        try:
-            temp_path.unlink()
-        except FileNotFoundError:
-            pass
+        if link_path is not None:
+            _unlink_quiet(link_path)
+
+
+def _share_identical_schema3_entries(state: dict) -> None:
+    """Point each equal schema-3 snapshot entry at its record's copy.
+
+    In memory both mappings are identical (R6 stores one on disk).  Sharing
+    the object lets every later write prove the equality by identity instead
+    of a deep comparison.  Neither is ever mutated after installation.
+    """
+
+    snapshot = state.get("schema3_snapshot")
+    records = state.get("servers")
+    if not isinstance(snapshot, dict) or not isinstance(records, dict):
+        return
+    projected = snapshot.get("servers")
+    if not isinstance(projected, dict):
+        return
+    for key, value in list(projected.items()):
+        record = records.get(key)
+        if not isinstance(record, dict) or record.get("authority_status") == "quarantined":
+            continue
+        legacy = record.get("legacy_schema3_record")
+        if isinstance(legacy, dict) and legacy is not value and legacy == value:
+            projected[key] = legacy
+
+
+def _active_unchanged(active_path: Path, expected_sha256: str | None) -> bool:
+    try:
+        return _sha256_file(active_path) == expected_sha256
+    except OSError:
+        return False
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            chunk = handle.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _unlink_quiet(path: Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _replace_bytes_fsynced(path: Path, payload: bytes) -> None:

@@ -102,6 +102,9 @@ COMPACT_EVENT_LIMIT = 12
 COLD_EVENT_LIMIT = 2
 
 
+from .companion_restart_phase2_schema4 import canonical_json_bytes
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -141,6 +144,8 @@ class RuntimePersistenceStatus(str, Enum):
     DEGRADED_RETRYABLE_WRITE_FAILED = "degraded_retryable_write_failed"
     DISABLED_INITIALIZATION_FAILED = "disabled_initialization_failed"
     DISABLED_WRITE_FAILED = "disabled_write_failed"
+    # R7: the real runtime is still being loaded off the GTK thread.
+    LOADING = "loading"
 
 
 class LiveResultDisposition(str, Enum):
@@ -345,8 +350,11 @@ class Phase2RestartRuntime:
             else RuntimePersistenceStatus.DISABLED_INITIALIZATION_FAILED
         )
         self.persistence_error: str | None = migration.error
-        self._schema4_staged_runtime_server_keys: set[str] = set()
+        # Runtime servers staged into schema 4 and not yet known durable,
+        # with the canonical bytes of the staged schema-3 record.
+        self._schema4_staged_runtime_server_keys: dict[str, bytes] = {}
         self._server_persistence_blocks: dict[str, ServerPersistenceBlock] = {}
+        self._persistence_listener: Callable[[], None] | None = None
         self._servers: dict[str, _ServerRuntime] = {}
         self._shutdown = False
         self._load_servers(float(time.time() if now is None else now))
@@ -489,6 +497,27 @@ class Phase2RestartRuntime:
         )
         return cls(migration, now=0)
 
+    @classmethod
+    def loading_placeholder(cls, *, active_path: str | Path) -> "Phase2RestartRuntime":
+        """A non-learning stand-in while the real runtime loads in the background.
+
+        It reads and writes nothing, learns nothing (``persistence_enabled``
+        is False) and raises no notice.
+        """
+
+        value = cls.disabled_for_startup_failure(
+            active_path=active_path,
+            error="Server Companion learning is still loading",
+            error_kind="startup_loading",
+        )
+        value.persistence_status = RuntimePersistenceStatus.LOADING
+        value.persistence_error = None
+        return value
+
+    @property
+    def loading(self) -> bool:
+        return self.persistence_status is RuntimePersistenceStatus.LOADING
+
     @property
     def persistence_enabled(self) -> bool:
         return self.persistence_status in {
@@ -547,7 +576,7 @@ class Phase2RestartRuntime:
             blocked_at=float(now),
         )
         self._server_persistence_blocks[server_key] = block
-        self._schema4_staged_runtime_server_keys.discard(server_key)
+        self._schema4_staged_runtime_server_keys.pop(server_key, None)
         logger.warning(
             "Server Companion learning for server %s is not being saved "
             "(%s%s): %s. Other servers continue to learn and save.",
@@ -584,6 +613,8 @@ class Phase2RestartRuntime:
 
     @property
     def pending_notice(self) -> RuntimeNotice | None:
+        if self.persistence_status is RuntimePersistenceStatus.LOADING:
+            return None
         result = self.migration
         if self.persistence_status in {
             RuntimePersistenceStatus.DEGRADED_RETRYABLE_WRITE_FAILED,
@@ -795,6 +826,18 @@ class Phase2RestartRuntime:
                 poll_generation=generation,
             ),
             True,
+        )
+
+    def monitoring_session_pending_durability(self, server_key: str) -> bool:
+        """A session was created but its start is not yet known durable."""
+
+        server = self._servers.get(str(server_key))
+        return bool(
+            server is not None
+            and server.monitoring_session_id
+            and not server.monitoring_session_durable
+            and self.persistence_enabled
+            and server.key not in self._server_persistence_blocks
         )
 
     def active_monitoring_session_id(self, server_key: str) -> str:
@@ -1110,6 +1153,10 @@ class Phase2RestartRuntime:
         if self._shutdown:
             return
         self._shutdown = True
+        # Background writes: apply every outstanding completion first so the
+        # shutdown save point sees the true persistence status (a retryable
+        # failure is retried below, an ambiguous one is not).
+        self._drain_background_writes()
         for key in tuple(self._servers):
             server = self._servers[key]
             if server.monitoring_session_id:
@@ -1122,6 +1169,7 @@ class Phase2RestartRuntime:
             self._persist_server(server, force=True, now=wall_at)
         backend = self._authoritative_schema4_backend
         if backend is not None:
+            self._drain_background_writes()
             flush_on_close = (
                 self.persistence_status
                 is not RuntimePersistenceStatus.DISABLED_WRITE_FAILED
@@ -1149,6 +1197,20 @@ class Phase2RestartRuntime:
         if not self.authoritative_schema4_runtime_enabled or backend is None:
             raise RuntimeError("authoritative schema-4 learning export is unavailable")
         return backend.export_snapshot()
+
+    def export_authoritative_schema4_snapshot_async(
+        self, callback: Callable[[object | None, BaseException | None], None]
+    ) -> None:
+        """Serialize and validate an export off the owner thread.
+
+        ``callback(snapshot, error)`` runs on the owner thread (immediately
+        with inline persistence).
+        """
+
+        backend = self._authoritative_schema4_backend
+        if not self.authoritative_schema4_runtime_enabled or backend is None:
+            raise RuntimeError("authoritative schema-4 learning export is unavailable")
+        backend.export_snapshot_async(callback)
 
     def authority_consumer_shadow_snapshot(self, server_key: str) -> object | None:
         """Return an in-memory Stage 3B1 comparison; never a production input."""
@@ -1198,33 +1260,52 @@ class Phase2RestartRuntime:
         action: Callable[[], bool],
         after_reservation: Callable[[], None] | None = None,
         after_dispatch: Callable[[], None] | None = None,
+        on_result: Callable[[AuthorityConsumerActionResult], None] | None = None,
+        still_wanted: Callable[[], bool] | None = None,
     ) -> AuthorityConsumerActionResult:
-        """Reserve durably, then invoke one existing external action at most once."""
+        """Reserve durably, then invoke one existing external action at most once.
+
+        With inline persistence the reservation is durable before this
+        returns and the action runs synchronously.  With background
+        persistence this returns at once (``reservation_pending_durable_commit``)
+        and the action runs on the owner thread only after the reservation's
+        write has been committed; ``on_result`` receives the final result.
+        A reservation whose write fails is never dispatched; it still
+        suppresses the key (at-most-once).
+        """
 
         from .companion_restart_phase2_authority_consumers import (
             AuthorityConsumerDecision,
             CutoverSource,
         )
 
+        def finish(result: AuthorityConsumerActionResult) -> AuthorityConsumerActionResult:
+            if on_result is not None:
+                try:
+                    on_result(result)
+                except Exception:
+                    logger.exception("Server Companion alert result callback failed")
+            return result
+
         if not self.schema4_authority_production_cutover_enabled:
-            return AuthorityConsumerActionResult(
+            return finish(AuthorityConsumerActionResult(
                 False, False, "schema3", None, None, ("production_cutover_disabled",)
-            )
+            ))
         resolution = self._authority_consumer_resolutions.get(str(server_key))
         if resolution is None or resolution.source is not CutoverSource.SCHEMA4:
-            return AuthorityConsumerActionResult(
+            return finish(AuthorityConsumerActionResult(
                 False,
                 False,
                 "schema3_safe_fallback",
                 None,
                 None,
                 ("schema4_consumer_not_selected",),
-            )
+            ))
         decision = resolution.selected_output
         if not isinstance(decision, AuthorityConsumerDecision):
-            return AuthorityConsumerActionResult(
+            return finish(AuthorityConsumerActionResult(
                 False, False, "schema3_safe_fallback", None, None, ("invalid_consumer_output",)
-            )
+            ))
         if kind == "scheduled_warning":
             eligible = decision.scheduled_pre_restart_alert_eligible
             key = decision.scheduled_warning_suppression_key
@@ -1234,82 +1315,168 @@ class Phase2RestartRuntime:
         else:
             raise ValueError("unsupported authority consumer action kind")
         if not eligible or key is None:
-            return AuthorityConsumerActionResult(
+            return finish(AuthorityConsumerActionResult(
                 False,
                 False,
                 "schema4",
                 None if key is None else key.serialize(),
                 None,
                 ("schema4_action_not_eligible",),
-            )
+            ))
         backend = self._authoritative_schema4_backend
         if backend is None or not self.authoritative_schema4_runtime_enabled:
-            return AuthorityConsumerActionResult(
+            return finish(AuthorityConsumerActionResult(
                 False, False, "schema3_safe_fallback", None, None, ("schema4_backend_unavailable",)
-            )
+            ))
         try:
-            reservation = backend.reserve_consumer_alert(
+            reservation = backend.stage_consumer_alert_reservation(
                 decision=decision,
                 key=key,
                 created_at=now,
             )
         except Exception as exc:
             if self._isolate_server_write_rejection(exc, now=now):
-                return AuthorityConsumerActionResult(
+                return finish(AuthorityConsumerActionResult(
                     False,
                     False,
                     "schema4",
                     key.serialize(),
                     None,
                     ("server_persistence_blocked", "at_most_once_delivery"),
-                )
+                ))
             self._record_schema4_persistence_failure(exc)
+            self._notify_persistence_listener()
             raise
-        self._record_schema4_persistence_success(
-            reservation.write_result,
-            now=now,
-        )
         if not reservation.reserved:
-            return AuthorityConsumerActionResult(
+            return finish(AuthorityConsumerActionResult(
                 False,
                 False,
                 "schema4",
                 key.serialize(),
                 None,
                 reservation.reason_codes,
-            )
-        if after_reservation is not None:
-            after_reservation()
-        succeeded = False
-        try:
-            succeeded = bool(action())
-            if after_dispatch is not None:
-                after_dispatch()
-        except Exception:
+            ))
+
+        def dispatch_after_durable_reservation() -> AuthorityConsumerActionResult:
+            wanted = True
+            if still_wanted is not None:
+                try:
+                    wanted = bool(still_wanted())
+                except Exception:
+                    wanted = False
+            if after_reservation is not None:
+                after_reservation()
             succeeded = False
-        try:
-            completed = backend.complete_consumer_alert(
+            if wanted:
+                try:
+                    succeeded = bool(action())
+                    if after_dispatch is not None:
+                        after_dispatch()
+                except Exception:
+                    succeeded = False
+            backend.stage_consumer_alert_completion(
                 decision=decision,
                 reservation=reservation,
                 completed_at=now,
                 action_succeeded=succeeded,
             )
-        except Exception as exc:
-            self._record_schema4_persistence_failure(exc)
-            raise
-        self._record_schema4_persistence_success(completed, now=now)
+            return AuthorityConsumerActionResult(
+                True,
+                succeeded,
+                "schema4",
+                key.serialize(),
+                None,
+                (
+                    "external_action_emitted_once"
+                    if succeeded
+                    else (
+                        "external_action_failed_after_reservation"
+                        if wanted
+                        else "external_action_no_longer_wanted_after_reservation"
+                    ),
+                    "at_most_once_delivery",
+                ),
+            )
+
+        ticket = backend.flush_async()
+        if ticket.done:
+            # Inline persistence: identical to the pre-R7 synchronous path.
+            if ticket.error is not None:
+                self._record_schema4_persistence_failure(ticket.error)
+                self._notify_persistence_listener()
+                raise ticket.error
+            self._record_schema4_persistence_success(ticket.result, now=now)
+            staged = dispatch_after_durable_reservation()
+            try:
+                completed = backend.flush()
+            except Exception as exc:
+                self._record_schema4_persistence_failure(exc)
+                self._notify_persistence_listener()
+                raise
+            self._record_schema4_persistence_success(completed, now=now)
+            return finish(replace(staged, persistence_generation=completed.generation))
+
+        def reservation_durable(done) -> None:
+            self._on_schema4_write_complete(done, now=now)
+            if done.error is not None:
+                finish(AuthorityConsumerActionResult(
+                    True,
+                    False,
+                    "schema4",
+                    key.serialize(),
+                    None,
+                    ("reservation_not_durable_action_not_dispatched", "at_most_once_delivery"),
+                ))
+                return
+            if self._shutdown:
+                # Shutting down: never start an external action now.  The
+                # durable reservation keeps the key suppressed.
+                finish(AuthorityConsumerActionResult(
+                    True,
+                    False,
+                    "schema4",
+                    key.serialize(),
+                    done.result.generation if done.result is not None else None,
+                    ("shutdown_before_dispatch", "at_most_once_delivery"),
+                ))
+                return
+            try:
+                result = dispatch_after_durable_reservation()
+            except Exception as exc:
+                if not self._isolate_server_write_rejection(exc, now=now):
+                    self._record_schema4_persistence_failure(exc)
+                    self._notify_persistence_listener()
+                finish(AuthorityConsumerActionResult(
+                    True,
+                    False,
+                    "schema4",
+                    key.serialize(),
+                    None,
+                    ("completion_staging_failed", "at_most_once_delivery"),
+                ))
+                return
+            try:
+                backend.flush_async(
+                    lambda completed: self._on_schema4_write_complete(completed, now=now)
+                )
+            except Exception as exc:
+                self._record_schema4_persistence_failure(exc)
+                self._notify_persistence_listener()
+            finish(replace(
+                result,
+                persistence_generation=(
+                    done.result.generation if done.result is not None else None
+                ),
+            ))
+
+        ticket.add_callback(reservation_durable)
         return AuthorityConsumerActionResult(
             True,
-            succeeded,
+            False,
             "schema4",
             key.serialize(),
-            completed.generation,
-            (
-                "external_action_emitted_once"
-                if succeeded
-                else "external_action_failed_after_reservation",
-                "at_most_once_delivery",
-            ),
+            None,
+            ("reservation_pending_durable_commit", "at_most_once_delivery"),
         )
 
     def _ingest_sample(
@@ -2043,6 +2210,74 @@ class Phase2RestartRuntime:
             ),
         )
 
+    def enable_background_persistence(
+        self, *, post_to_owner: Callable[[Callable[[], object]], object]
+    ) -> bool:
+        """Move schema-4 writes off the caller (GTK) thread.
+
+        ``post_to_owner`` schedules a callable on the owner thread
+        (production: the main-loop idle scheduler); every completion, status
+        change and alert dispatch then runs there.  Returns False when there
+        is nothing to persist (schema 4 disabled or persistence unavailable).
+        """
+
+        backend = self._authoritative_schema4_backend
+        if (
+            backend is None
+            or not self.authoritative_schema4_runtime_enabled
+            or not self.persistence_enabled
+            or self._shutdown
+        ):
+            return False
+        backend.enable_background_writes(post_to_owner)
+        return True
+
+    def _drain_background_writes(self) -> None:
+        backend = self._authoritative_schema4_backend
+        if backend is None or not getattr(backend, "background_writes_enabled", False):
+            return
+        try:
+            backend.wait_idle()
+        except Exception:
+            logger.exception("Server Companion persistence drain failed")
+
+    @property
+    def persistence_busy(self) -> bool:
+        """True while a schema-4 write is queued or running."""
+
+        backend = self._authoritative_schema4_backend
+        return bool(backend is not None and backend.write_in_progress)
+
+    def set_persistence_status_listener(
+        self, listener: Callable[[], None] | None
+    ) -> None:
+        """Called on the owner thread after an asynchronous status change."""
+
+        self._persistence_listener = listener
+
+    def _notify_persistence_listener(self) -> None:
+        listener = self._persistence_listener
+        if listener is None:
+            return
+        try:
+            listener()
+        except Exception:
+            logger.exception("Server Companion persistence status listener failed")
+
+    def _on_schema4_write_complete(self, ticket, *, now: float) -> None:
+        before = (self.persistence_status, self.persistence_error)
+        if ticket.error is not None:
+            self._record_schema4_persistence_failure(ticket.error)
+            # Not durable: make sure the next save point stages them again.
+            for key in tuple(self._schema4_staged_runtime_server_keys):
+                item = self._servers.get(key)
+                if item is not None:
+                    item.dirty = True
+        elif ticket.result is not None:
+            self._record_schema4_persistence_success(ticket.result, now=now)
+        if (self.persistence_status, self.persistence_error) != before:
+            self._notify_persistence_listener()
+
     def _record_schema4_persistence_failure(self, exc: BaseException) -> None:
         from .companion_restart_phase2_schema4_runtime import (
             Schema4WriteFailure,
@@ -2072,11 +2307,15 @@ class Phase2RestartRuntime:
             return
         if backend.dirty:
             return
-        durable_runtime_keys = set(self._schema4_staged_runtime_server_keys)
+        durable_runtime_keys = dict(self._schema4_staged_runtime_server_keys)
         self._schema4_staged_runtime_server_keys.clear()
-        for key in durable_runtime_keys:
+        for key, staged in durable_runtime_keys.items():
             item = self._servers.get(key)
-            if item is not None:
+            if item is None or not item.dirty:
+                continue
+            # Only a server whose runtime state is still exactly what was
+            # staged is now durable; a later change must still be staged.
+            if canonical_json_bytes(_serialize_server(item)) == staged:
                 item.dirty = False
                 item.last_saved_at = now
         if (
@@ -2112,10 +2351,11 @@ class Phase2RestartRuntime:
         if not force and now - server.last_saved_at < PERSIST_HEARTBEAT_SECONDS:
             return False
         if backend is not None:
+            schema3_record = _serialize_server(server)
             try:
                 changed = backend.update_server_from_schema3(
                     server.key,
-                    _serialize_server(server),
+                    schema3_record,
                     updated_at=now,
                     durable_reason=(
                         "schema4_chain_or_event_durable_update"
@@ -2127,17 +2367,29 @@ class Phase2RestartRuntime:
                 if not self._isolate_server_write_rejection(exc, now=now):
                     self._record_schema4_persistence_failure(exc)
                 return False
-            self._schema4_staged_runtime_server_keys.add(server.key)
+            self._schema4_staged_runtime_server_keys[server.key] = (
+                canonical_json_bytes(schema3_record)
+            )
             try:
-                result = backend.flush() if force else None
+                ticket = backend.flush_async(
+                    lambda done: self._on_schema4_write_complete(done, now=now)
+                )
             except Exception as exc:
                 self._record_schema4_persistence_failure(exc)
+                self._notify_persistence_listener()
                 return False
-            if result is not None:
-                self._record_schema4_persistence_success(result, now=now)
+            if ticket.done:
+                if ticket.error is not None:
+                    return False
+                server.dirty = False
+                server.last_saved_at = now
+                result = ticket.result
+                return bool(changed and result is not None and result.wrote)
+            # Background write: the backend holds the staged state and tracks
+            # its durability; a failure re-marks this server dirty.
             server.dirty = False
             server.last_saved_at = now
-            return bool(changed and result is not None and result.wrote)
+            return bool(changed)
         servers = self.state.setdefault("servers", {})
         servers[server.key] = _serialize_server(server)
         self._compact_global_history(active_key=server.key, now=now)

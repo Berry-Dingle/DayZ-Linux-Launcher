@@ -490,10 +490,23 @@ def test_crash_after_replace_leaves_complete_new_file(tmp_path):
     value.close(flush=False)
 
 
-def test_invalid_prepared_state_never_replaces_active(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "seam,replacement",
+    [
+        # R7: the runtime payload is assembled from per-server fragments; an
+        # assembly that is not exactly envelope + verified fragments is refused.
+        ("assemble_schema4_payload", lambda _root, _fragments: b"{}\n"),
+        # A fragment whose exact bytes do not parse as a valid record.
+        ("encode_schema4_server_fragment", lambda _record: b"{}"),
+        ("encode_schema4_server_fragment", lambda _record: b"{not json"),
+    ],
+)
+def test_invalid_prepared_state_never_replaces_active(
+    tmp_path, monkeypatch, seam, replacement
+):
     value, path, raw = _open(tmp_path)
     value.replace_server_record(SERVER, _changed_record(value), reason="invalid")
-    monkeypatch.setattr(live4, "serialize_schema4_state", lambda _state: b"{}\n")
+    monkeypatch.setattr(live4, seam, replacement)
     with pytest.raises(schema4.Schema4Error):
         value.flush()
     assert path.read_bytes() == raw

@@ -596,13 +596,21 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.last_played = load_last_played()
         self._last_played_presentation_token = None
         self._last_server_companion_saved = load_last_companion_server()
-        self._companion_import_startup_result = apply_pending_import_at_startup(
-            config_dir=Path(COMPANION_RESTART_LEARNING_PHASE2_PATH).parent,
-            live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+        # R7: the learning database (pending-import apply, read, strict
+        # validation, schema-3 projection, scoring) loads off the GTK thread.
+        # Until it is installed a non-learning placeholder stands in.
+        self._companion_import_startup_result = None
+        self._companion_restart_phase2 = Phase2RestartRuntime.loading_placeholder(
+            active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH
         )
-        if self._companion_import_startup_result.safe_to_initialize:
-            self._companion_restart_phase2 = (
-                _initialize_companion_restart_runtime_for_window(
+
+        def load_phase2_learning_runtime():
+            import_result = apply_pending_import_at_startup(
+                config_dir=Path(COMPANION_RESTART_LEARNING_PHASE2_PATH).parent,
+                live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+            )
+            if import_result.safe_to_initialize:
+                loaded = _initialize_companion_restart_runtime_for_window(
                     active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
                     legacy_path=COMPANION_RESTART_LEARNING_PATH,
                     authoritative_schema4_runtime_enabled=(
@@ -615,17 +623,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         SCHEMA4_AUTHORITY_PRODUCTION_CUTOVER_ENABLED
                     ),
                 )
-            )
-        else:
-            self._companion_restart_phase2 = (
-                Phase2RestartRuntime.disabled_for_startup_failure(
+            else:
+                loaded = Phase2RestartRuntime.disabled_for_startup_failure(
                     active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
-                    error=self._companion_import_startup_result.error or "unsafe learning state",
-                    error_kind=_pending_import_startup_error_kind(
-                        self._companion_import_startup_result
-                    ),
+                    error=import_result.error or "unsafe learning state",
+                    error_kind=_pending_import_startup_error_kind(import_result),
                 )
-            )
+            return import_result, loaded
+
+        DZLLWindow._start_companion_restart_learning_load(
+            self, load_phase2_learning_runtime
+        )
         self._pending_last_played_obj = None
         self._pending_join_mod_ids = []
         self._pending_join_mod_names_by_id = {}
@@ -2518,6 +2526,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
 
         try:
+            DZLLWindow._finish_companion_restart_learning_load_for_shutdown(self)
+        except Exception:
+            pass
+
+        try:
             runtime = getattr(self, "_companion_restart_phase2", None)
             if runtime is not None:
                 runtime.shutdown(wall_at=time.time(), monotonic_at=time.monotonic())
@@ -2728,6 +2741,162 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if obj is None:
             return
         self.set_server_companion_server(obj, persist=False)
+
+    def _companion_session_pending_durability(self, key) -> bool:
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        probe = getattr(runtime, "monitoring_session_pending_durability", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(key))
+        except Exception:
+            return False
+
+    def _start_companion_restart_learning_load(self, loader) -> None:
+        """Run ``loader`` on a dedicated thread; install the result on GTK."""
+
+        self._companion_learning_load_lock = threading.Lock()
+        self._companion_learning_load_result = None
+        self._companion_learning_load_installed = False
+
+        def run() -> None:
+            try:
+                result = loader()
+            except Exception as exc:
+                logger.exception("Server Companion restart-learning load failed")
+                result = (
+                    None,
+                    Phase2RestartRuntime.disabled_for_startup_failure(
+                        active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+                        error=f"{type(exc).__name__}: {exc}",
+                    ),
+                )
+            with self._companion_learning_load_lock:
+                self._companion_learning_load_result = result
+            try:
+                GLib.idle_add(DZLLWindow._install_companion_restart_learning, self)
+            except Exception:
+                logger.exception("Server Companion restart-learning install scheduling failed")
+
+        thread = threading.Thread(
+            target=run, name="dzll-companion-learning-load", daemon=True
+        )
+        self._companion_learning_load_thread = thread
+        thread.start()
+
+    def _take_companion_restart_learning_load(self):
+        lock = getattr(self, "_companion_learning_load_lock", None)
+        if lock is None:
+            return None
+        with lock:
+            if self._companion_learning_load_installed:
+                return None
+            result = self._companion_learning_load_result
+            if result is None:
+                return None
+            self._companion_learning_load_installed = True
+            self._companion_learning_load_result = None
+            return result
+
+    def _install_companion_restart_learning(self) -> bool:
+        """GTK thread: replace the loading placeholder with the loaded runtime."""
+
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            DZLLWindow._discard_companion_restart_learning_load(self)
+            return False
+        result = DZLLWindow._take_companion_restart_learning_load(self)
+        if result is None:
+            return False
+        import_result, runtime = result
+        self._companion_import_startup_result = import_result
+        self._companion_restart_phase2 = runtime
+        DZLLWindow._enable_companion_background_persistence(self)
+        notice = None
+        try:
+            notice = self._server_companion_import_startup_notice() or runtime.pending_notice
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                f"restart-learning startup notice failed safely: {exc!r}"
+            )
+        coordinator = getattr(self, "_startup_presentation", None)
+        if (
+            notice is not None
+            and coordinator is not None
+            and coordinator.pending_notice is None
+            and not coordinator.notice_showing
+        ):
+            coordinator.pending_notice = notice
+            try:
+                coordinator.try_show_notice()
+            except Exception:
+                pass
+        try:
+            if (
+                getattr(self, "_server_companion_poll_timer_id", 0)
+                and self._server_companion_should_poll()
+            ):
+                key = self._server_companion_restart_learning_key()
+                if key:
+                    self._record_server_companion_monitor_started(key)
+            self._refresh_server_companion_restart_learning_summary()
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                f"restart-learning install refresh failed safely: {exc!r}"
+            )
+        return False
+
+    def _discard_companion_restart_learning_load(self) -> None:
+        """Shutdown: close a runtime that was loaded but never installed."""
+
+        result = DZLLWindow._take_companion_restart_learning_load(self)
+        if result is None:
+            return
+        _import_result, runtime = result
+        try:
+            runtime.shutdown(wall_at=time.time(), monotonic_at=time.monotonic())
+        except Exception:
+            pass
+
+    def _finish_companion_restart_learning_load_for_shutdown(self) -> None:
+        """Shutdown: let an in-progress load (and import apply) finish safely."""
+
+        thread = getattr(self, "_companion_learning_load_thread", None)
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=60.0)
+        DZLLWindow._discard_companion_restart_learning_load(self)
+
+    def _enable_companion_background_persistence(self) -> None:
+        """R7: schema-4 writes run on the runtime's ordered worker thread.
+
+        Completions, status changes and alert dispatch return to the GTK
+        thread through ``GLib.idle_add``; the GTK thread never serializes,
+        validates or writes the learning database during normal operation.
+        """
+
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        if runtime is None:
+            return
+        try:
+            runtime.set_persistence_status_listener(
+                lambda: DZLLWindow._on_companion_persistence_status_changed(self)
+            )
+            runtime.enable_background_persistence(post_to_owner=GLib.idle_add)
+        except Exception as exc:
+            logger.warning(
+                "Server Companion background persistence unavailable; "
+                "writes stay synchronous: %r",
+                exc,
+            )
+
+    def _on_companion_persistence_status_changed(self) -> None:
+        if bool(getattr(self, "_shutdown_cleanup_done", False)):
+            return
+        try:
+            DZLLWindow._surface_restart_learning_persistence_notice(self)
+        except Exception as exc:
+            self._debug_server_companion_alert(
+                f"restart-learning persistence status refresh failed: {exc!r}"
+            )
 
     def _server_companion_restart_learning_key(self):
         obj = getattr(self, "_server_companion_obj", None)
@@ -3951,6 +4120,16 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 )
             except Exception as exc:
                 self._debug_server_companion_alert(f"Phase 2 poll mapping failed safely: {exc!r}")
+            if (
+                phase2_update is not None
+                and not getattr(phase2_update, "accepted", True)
+                and getattr(phase2_update, "rejected_reason", None)
+                == "no_active_monitoring_session"
+                and DZLLWindow._companion_session_pending_durability(self, key)
+            ):
+                # R7: a session whose start is still being committed in the
+                # background becomes usable once its write completes.
+                self._record_server_companion_monitor_started(key)
         if disposition in {
             LiveResultDisposition.NEUTRAL,
             LiveResultDisposition.PROTOCOL_FAILURE,
@@ -4302,6 +4481,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
                         )
                         is None
                     ),
+                    still_wanted=lambda: (
+                        not bool(getattr(self, "_shutdown_cleanup_done", False))
+                        and self._server_companion_restart_learning_key() == key
+                    ),
                 )
                 if result.source == "schema4":
                     continue
@@ -4367,17 +4550,32 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 action_result["message"] = message
                 return bool(ok)
 
+            def schema4_warning_result(result) -> None:
+                # Runs on the GTK thread once the outcome is final: at once
+                # with inline persistence, or after the reservation's durable
+                # commit with background persistence.
+                if result.source != "schema4":
+                    return
+                message = action_result.get("message")
+                self._set_server_companion_alert_audio_status(
+                    None if result.emitted else (str(message) if message else None)
+                )
+
             result = self._companion_restart_phase2.dispatch_authority_consumer_action(
                 key,
                 kind="scheduled_warning",
                 now=time.time(),
                 action=play_schema4_warning,
+                on_result=schema4_warning_result,
+                still_wanted=lambda: (
+                    not bool(getattr(self, "_shutdown_cleanup_done", False))
+                    and self._server_companion_restart_learning_key() == key
+                    and bool(
+                        getattr(self, "_server_companion_restart_alert_enabled", False)
+                    )
+                ),
             )
             if result.source == "schema4":
-                message = action_result.get("message")
-                self._set_server_companion_alert_audio_status(
-                    None if result.emitted else (str(message) if message else None)
-                )
                 return
         if not decision.warning_eligible or decision.warning_key is None:
             self._debug_server_companion_alert(

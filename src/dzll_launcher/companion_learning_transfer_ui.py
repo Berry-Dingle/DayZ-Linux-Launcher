@@ -66,11 +66,39 @@ class CompanionLearningTransferController:
     def choose_export(self, *_args) -> None:
         if self._busy:
             return
-        try:
-            snapshot = self._win._companion_restart_phase2.export_authoritative_schema4_snapshot()
-        except Exception as exc:
-            self._show_message("Export failed", str(exc), error=True)
+        runtime = self._win._companion_restart_phase2
+        request = getattr(runtime, "export_authoritative_schema4_snapshot_async", None)
+        if not callable(request):
+            try:
+                snapshot = runtime.export_authoritative_schema4_snapshot()
+            except Exception as exc:
+                self._show_message("Export failed", str(exc), error=True)
+                return
+            self._present_export_dialog(snapshot)
             return
+        # R7: serialization and validation run on the persistence worker; the
+        # GTK thread only receives the finished snapshot.
+        self._busy = True
+        self._set_busy(True, "Preparing learning data export…")
+
+        def ready(snapshot, error) -> None:
+            self._set_busy(False)
+            if bool(getattr(self._win, "_shutdown_cleanup_done", False)):
+                return
+            if error is not None or snapshot is None:
+                self._show_message(
+                    "Export failed", str(error or "Unknown export error."), error=True
+                )
+                return
+            self._present_export_dialog(snapshot)
+
+        try:
+            request(ready)
+        except Exception as exc:
+            self._set_busy(False)
+            self._show_message("Export failed", str(exc), error=True)
+
+    def _present_export_dialog(self, snapshot) -> None:
         dialog = Gtk.FileChooserNative.new(
             title="Export Server Companion Learning Data",
             parent=self._win,
@@ -91,19 +119,60 @@ class CompanionLearningTransferController:
             if not path:
                 self._show_message("Export failed", "The selected destination is not a local file.", error=True)
                 return
-            try:
-                write_export_file(path, snapshot.canonical_bytes)
-            except Exception as exc:
-                self._show_message("Export failed", str(exc), error=True)
+            if self._busy:
                 return
-            self._show_message(
-                "Learning data exported",
-                "Exported a database containing "
-                f"{format_learned_server_records(snapshot.server_count)} to:\n{path}",
+            self._busy = True
+            self._set_busy(True, "Writing learning data export…")
+
+            def written(_result, error) -> None:
+                self._set_busy(False)
+                if bool(getattr(self._win, "_shutdown_cleanup_done", False)):
+                    return
+                if error is not None:
+                    self._show_message("Export failed", str(error), error=True)
+                    return
+                self._show_message(
+                    "Learning data exported",
+                    "Exported a database containing "
+                    f"{format_learned_server_records(snapshot.server_count)} to:\n{path}",
+                )
+
+            self._run_off_gtk_thread(
+                lambda: write_export_file(path, snapshot.canonical_bytes), written
             )
 
         dialog.connect("response", done)
         dialog.show()
+
+    def _run_off_gtk_thread(self, work, done) -> None:
+        """Run blocking file work on the executor; ``done(result, error)`` on GTK."""
+
+        def guarded():
+            try:
+                return work(), None
+            except Exception as exc:
+                logger.exception("SC learning transfer background work failed")
+                return None, exc
+
+        try:
+            future = self._win._hi_executor.submit(guarded)
+        except Exception as exc:
+            logger.exception("SC learning transfer background submission failed")
+            done(None, exc)
+            return
+        if future.done():
+            result, error = future.result()
+            done(result, error)
+            return
+
+        def finished(completed) -> None:
+            try:
+                result, error = completed.result()
+            except Exception as exc:
+                result, error = None, exc
+            GLib.idle_add(lambda: (done(result, error), False)[1])
+
+        future.add_done_callback(finished)
 
     def choose_import(self, *_args) -> None:
         if self._busy:
@@ -312,14 +381,21 @@ class CompanionLearningTransferController:
             "SC learning import: staging approved action=%s",
             "restart-now" if restart_now else "restart-later",
         )
-        try:
-            stage_pending_import(validated, config_dir=CFG_DIR, replace_existing=True)
-        except Exception as exc:
-            logger.exception("SC learning import staging failed")
-            self._show_message("Database replacement staging failed", str(exc), error=True)
+        # R7: the staged copy (database-sized write, fsync and verification)
+        # is written off the GTK thread.
+        self._run_off_gtk_thread(
+            lambda: stage_pending_import(validated, config_dir=CFG_DIR, replace_existing=True),
+            lambda _result, error: self._staging_finished(error, restart_now=restart_now),
+        )
+
+    def _staging_finished(self, error, *, restart_now: bool) -> None:
+        self._set_busy(False)
+        if bool(getattr(self._win, "_shutdown_cleanup_done", False)):
             return
-        finally:
-            self._set_busy(False)
+        if error is not None:
+            logger.error("SC learning import staging failed: %s", error)
+            self._show_message("Database replacement staging failed", str(error), error=True)
+            return
         self.refresh_pending_state()
         if restart_now:
             app = self._win.get_application()

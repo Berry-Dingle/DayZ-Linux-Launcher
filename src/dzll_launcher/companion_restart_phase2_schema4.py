@@ -307,7 +307,185 @@ def serialize_schema4_state(state: object) -> bytes:
     if not _report_acceptable_for_persistence(loaded.report):
         detail = "; ".join(item.detail for item in loaded.report.issues)
         raise Schema4ValidationError(detail or "schema-4 validation failed")
-    return canonical_json_bytes(_deduplicate_schema3_snapshot(loaded.state))
+    deduplicated = _deduplicate_schema3_snapshot(loaded.state)
+    # Byte-identical to ``canonical_json_bytes(deduplicated)``, encoded one
+    # server at a time so no single encoder call spans the whole document.
+    return assemble_schema4_payload(
+        deduplicated,
+        {
+            str(key): encode_schema4_server_fragment(record)
+            for key, record in deduplicated["servers"].items()
+        },
+    )
+
+
+# R7: incremental canonical serialization.  A server record nested at depth 2
+# of the canonical document (``indent=2``) is its standalone canonical text
+# with every line after the first indented by four spaces.  JSON strings never
+# contain a raw newline, so the substitution only touches structural newlines.
+_SERVER_FRAGMENT_INDENT = "    "
+_SERVERS_PLACEHOLDER = "\u0000dzll-schema4-servers-placeholder\u0000"
+
+
+def encode_schema4_server_fragment(record: object) -> bytes:
+    """Canonical bytes of one server record as nested in the root document."""
+
+    text = json.dumps(
+        record,
+        ensure_ascii=False,
+        allow_nan=False,
+        indent=2,
+        sort_keys=True,
+    )
+    return text.replace("\n", "\n" + _SERVER_FRAGMENT_INDENT).encode("utf-8")
+
+
+def _schema4_envelope(root: Mapping[str, object]) -> tuple[bytes, bytes]:
+    """Canonical bytes of the root before and after the ``servers`` value."""
+
+    head = {key: value for key, value in root.items() if key != "servers"}
+    head["servers"] = _SERVERS_PLACEHOLDER
+    text = canonical_json_bytes(head).decode("utf-8")
+    token = '"servers": ' + json.dumps(_SERVERS_PLACEHOLDER, ensure_ascii=False)
+    before, found, after = text.partition(token)
+    if not found or token in after:
+        raise Schema4ValidationError("schema-4 root envelope is ambiguous")
+    return (before + '"servers": ').encode("utf-8"), after.encode("utf-8")
+
+
+def _schema4_server_entry_prefix(key: str) -> bytes:
+    return (
+        _SERVER_FRAGMENT_INDENT + json.dumps(str(key), ensure_ascii=False) + ": "
+    ).encode("utf-8")
+
+
+def assemble_schema4_payload(
+    root: Mapping[str, object], fragments: Mapping[str, bytes]
+) -> bytes:
+    """Return ``canonical_json_bytes(root)`` from pre-encoded server fragments.
+
+    ``fragments`` maps every key of ``root["servers"]`` to
+    ``encode_schema4_server_fragment(root["servers"][key])``.
+    """
+
+    before, after = _schema4_envelope(root)
+    parts = [before]
+    if not fragments:
+        parts.append(b"{}")
+    else:
+        parts.append(b"{\n")
+        for index, key in enumerate(sorted(fragments)):
+            if index:
+                parts.append(b",\n")
+            parts.append(_schema4_server_entry_prefix(key))
+            parts.append(fragments[key])
+        parts.append(b"\n  }")
+    parts.append(after)
+    return b"".join(parts)
+
+
+def verify_schema4_payload_layout(
+    payload: bytes, root: Mapping[str, object], fragments: Mapping[str, bytes]
+) -> None:
+    """Prove ``payload`` is exactly the envelope plus the given fragments.
+
+    Every byte is accounted for: the envelope (parsed and root-validated by
+    the caller), the canonical separators, and each server fragment (parsed
+    and validated by the caller).  Raises on any deviation.
+    """
+
+    before, after = _schema4_envelope(root)
+    offset = 0
+
+    def expect(chunk: bytes) -> None:
+        nonlocal offset
+        if not payload.startswith(chunk, offset):
+            raise Schema4ValidationError(
+                "prepared runtime payload failed validation (layout)"
+            )
+        offset += len(chunk)
+
+    expect(before)
+    if not fragments:
+        expect(b"{}")
+    else:
+        expect(b"{\n")
+        for index, key in enumerate(sorted(fragments)):
+            if index:
+                expect(b",\n")
+            expect(_schema4_server_entry_prefix(key))
+            expect(fragments[key])
+        expect(b"\n  }")
+    expect(after)
+    if offset != len(payload):
+        raise Schema4ValidationError(
+            "prepared runtime payload failed validation (trailing bytes)"
+        )
+
+
+def validate_schema4_envelope(root: Mapping[str, object]) -> None:
+    """Strictly parse the canonical envelope bytes and validate the root."""
+
+    before, after = _schema4_envelope(root)
+    try:
+        parsed = json.loads(
+            (before + b'{}' + after).decode("utf-8"),
+            parse_constant=_reject_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise Schema4ValidationError(f"invalid schema-4 envelope: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise Schema4ValidationError("schema-4 root must be a mapping")
+    version = parsed.get("schema_version")
+    if type(version) is not int or version != SCHEMA4_ROOT_VERSION:
+        raise Schema4VersionError(
+            f"unsupported restart-learning schema {version!r}; expected 4"
+        )
+    issues: list[Schema4ValidationIssue] = []
+    if not _validate_root(parsed, issues):
+        raise Schema4ValidationError(
+            "; ".join(item.detail for item in issues) or "schema-4 root invalid"
+        )
+
+
+def validate_schema4_server_fragment(server_key: str, fragment: bytes) -> bool:
+    """Strictly parse one fragment's exact bytes; return True if quarantined.
+
+    A valid record is accepted; an existing quarantine wrapper is accepted
+    as quarantined (as whole-document persistence validation does); any
+    other issue raises.
+    """
+
+    try:
+        parsed = json.loads(fragment.decode("utf-8"), parse_constant=_reject_constant)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise Schema4ValidationError(
+            f"invalid schema-4 server fragment {server_key!r}: {exc}"
+        ) from exc
+    if isinstance(parsed, dict) and parsed.get("authority_status") == "quarantined":
+        issues = _validate_server_record(server_key, bound_quarantine_wrapper(parsed))
+        if all(item.code == "server_quarantined" for item in issues):
+            return True
+    else:
+        issues = _validate_server_record(server_key, parsed)
+        if not issues:
+            return False
+    raise Schema4ValidationError(
+        "; ".join(item.detail for item in issues)
+        or f"schema-4 server fragment {server_key!r} failed validation"
+    )
+
+
+def validate_schema4_server_record(server_key: str, record: object) -> tuple[Schema4ValidationIssue, ...]:
+    """Per-server validation used by the runtime's incremental staging."""
+
+    return tuple(_validate_server_record(str(server_key), record))
+
+
+def deduplicate_schema4_snapshot(state: Mapping[str, object]) -> dict:
+    """Public wrapper: the on-disk root (R6 single schema-3 copy)."""
+
+    return _deduplicate_schema3_snapshot(state)
 
 
 def _deduplicate_schema3_snapshot(state: Mapping[str, object]) -> dict:
@@ -364,11 +542,26 @@ def _rehydrate_schema3_snapshot(state: dict) -> None:
             projected[key] = copy.deepcopy(record["legacy_schema3_record"])
 
 
+def _yielding_object(pairs: list[tuple[str, object]]) -> dict:
+    """``dict(pairs)`` from a Python frame.
+
+    R7: ``json.loads`` of a whole learning database is one long C call.  A
+    Python-level object hook gives other threads (the GTK main loop) a chance
+    to run between objects, at the same result as the default decoding.
+    """
+
+    return dict(pairs)
+
+
 def deserialize_schema4_bytes(
     raw: bytes, *, quarantine_invalid_servers: bool = True
 ) -> Schema4LoadResult:
     try:
-        value = json.loads(raw.decode("utf-8"), parse_constant=_reject_constant)
+        value = json.loads(
+            raw.decode("utf-8"),
+            parse_constant=_reject_constant,
+            object_pairs_hook=_yielding_object,
+        )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise Schema4ValidationError(f"invalid schema-4 JSON: {exc}") from exc
     return deserialize_schema4_state(
