@@ -153,6 +153,40 @@ EXPECTED_WINDOW_FOLD_SETTLE_SECONDS = 24 * 3600
 # alert bookkeeping is bounded by the consumer ledger itself.
 DECISION_HISTORY_BOUNDED_REASON = "alert_and_decision_history_bounded"
 AUTHORITY_DECISION_RETENTION_LIMIT = 64
+# Retention R6: per-server storage bounds.  A record carrying this reason code
+# was rebuilt on the compact path and satisfies all of the following, which
+# strict validation enforces:
+# * every regime record is referenced by the current decision or by consumer
+#   state, and at most ``REGIME_SUPERSEDED_TRIM_THRESHOLD + 1`` superseded
+#   regimes that the learned state already covers are kept outside consumer
+#   references;
+# * at most ``EXPECTED_WINDOW_HARD_LIMIT`` expected-window records;
+# * every decision-history payload is compacted (ID lists replaced by counts
+#   and one digest; the full current decision stays in ``authority_decision``).
+PER_SERVER_STORAGE_BOUNDED_REASON = "per_server_storage_bounded"
+# Covered superseded regimes are trimmed back to the newest
+# ``REGIME_SUPERSEDED_RETENTION`` only once more than
+# ``REGIME_SUPERSEDED_TRIM_THRESHOLD`` are carried.  Each trim changes the
+# carried regime set once (one extra settle rebuild); the hysteresis makes
+# that happen once per nine supersessions instead of after every one.
+REGIME_SUPERSEDED_RETENTION = 8
+REGIME_SUPERSEDED_TRIM_THRESHOLD = 2 * REGIME_SUPERSEDED_RETENTION
+EXPECTED_WINDOW_HARD_LIMIT = 2 * EXPECTED_WINDOW_RETENTION_LIMIT
+EXPECTED_WINDOW_BURST_FOLDED_REASON = "expected_window_burst_folded"
+HISTORY_COMPACTED_FIELD = "history_compacted"
+HISTORY_REFERENCE_DIGEST_FIELD = "history_reference_digest"
+HISTORY_REFERENCE_FIELDS = (
+    ("regime_ids", "regime_count"),
+    ("candidate_ids", "candidate_count"),
+    ("challenger_context_ids", "challenger_context_count"),
+    ("active_suspicion_evidence_ids", "active_suspicion_evidence_count"),
+)
+# Quarantine wrappers keep an invalid record verbatim only up to this size
+# (a pruned production record is about 1 MB); larger payloads are replaced by
+# a digest and a structural summary.  Validation errors are capped likewise.
+QUARANTINE_PAYLOAD_RETENTION_BYTES = 2 * 1024 * 1024
+QUARANTINE_VALIDATION_ERROR_LIMIT = 64
+QUARANTINE_DETAIL_CHARACTERS = 512
 
 
 class Schema4Error(ValueError):
@@ -273,7 +307,61 @@ def serialize_schema4_state(state: object) -> bytes:
     if not _report_acceptable_for_persistence(loaded.report):
         detail = "; ".join(item.detail for item in loaded.report.issues)
         raise Schema4ValidationError(detail or "schema-4 validation failed")
-    return canonical_json_bytes(loaded.state)
+    return canonical_json_bytes(_deduplicate_schema3_snapshot(loaded.state))
+
+
+def _deduplicate_schema3_snapshot(state: Mapping[str, object]) -> dict:
+    """Retention R6: store each server's schema-3 record once on disk.
+
+    In memory ``schema3_snapshot["servers"][key]`` and the record's
+    ``legacy_schema3_record`` hold the same mapping (the runtime writes both,
+    and ``schema3_projection`` prefers the record's copy).  On disk the
+    snapshot entry is omitted when it is identical to the copy of a valid,
+    non-quarantined record; ``deserialize_schema4_state`` restores it.  A
+    differing or record-less snapshot entry is written unchanged.
+    """
+
+    snapshot = state.get("schema3_snapshot")
+    records = state.get("servers")
+    if not isinstance(snapshot, Mapping) or not isinstance(records, Mapping):
+        return dict(state)
+    projected = snapshot.get("servers")
+    if not isinstance(projected, Mapping):
+        return dict(state)
+    kept = {
+        key: value
+        for key, value in projected.items()
+        if not (
+            isinstance(records.get(key), Mapping)
+            and records[key].get("authority_status") != "quarantined"
+            and records[key].get("legacy_schema3_record") == value
+        )
+    }
+    if len(kept) == len(projected):
+        return dict(state)
+    result = dict(state)
+    result["schema3_snapshot"] = {**snapshot, "servers": kept}
+    return result
+
+
+def _rehydrate_schema3_snapshot(state: dict) -> None:
+    """Restore snapshot entries omitted on disk from their records' copies."""
+
+    snapshot = state.get("schema3_snapshot")
+    records = state.get("servers")
+    if not isinstance(snapshot, dict) or not isinstance(records, dict):
+        return
+    projected = snapshot.get("servers")
+    if not isinstance(projected, dict):
+        return
+    for key, record in records.items():
+        if (
+            key not in projected
+            and isinstance(record, dict)
+            and record.get("authority_status") != "quarantined"
+            and isinstance(record.get("legacy_schema3_record"), dict)
+        ):
+            projected[key] = copy.deepcopy(record["legacy_schema3_record"])
 
 
 def deserialize_schema4_bytes(
@@ -299,6 +387,7 @@ def deserialize_schema4_state(
             f"unsupported restart-learning schema {version!r}; expected 4"
         )
     normalized = copy.deepcopy(state)
+    _rehydrate_schema3_snapshot(normalized)
     issues: list[Schema4ValidationIssue] = []
     root_valid = _validate_root(normalized, issues)
     servers = normalized.get("servers")
@@ -311,23 +400,27 @@ def deserialize_schema4_state(
     for raw_key in sorted(tuple(servers)):
         key = str(raw_key)
         record = servers[raw_key]
+        if isinstance(record, dict) and record.get("authority_status") == "quarantined":
+            # Retention R6: an existing wrapper is brought within the
+            # quarantine bounds (a no-op for wrappers that already are) and
+            # stays as it is.  Before R6 it was wrapped again on every load,
+            # so wrappers nested and grew with each reopen and write.
+            record = bound_quarantine_wrapper(record)
+            servers[raw_key] = record
+            issues.extend(_validate_server_record(key, record))
+            quarantined.append(key)
+            continue
         server_issues = _validate_server_record(key, record)
         if server_issues:
             issues.extend(server_issues)
             quarantined.append(key)
             if quarantine_invalid_servers:
-                servers[key] = {
-                    "server_key": key,
-                    "authority_status": "quarantined",
-                    "schema_version": SCHEMA4_ROOT_VERSION,
-                    "semantic_version": SCHEMA4_AUTHORITY_SEMANTICS_VERSION,
-                    "validation_errors": [
-                        {"code": item.code, "detail": item.detail}
-                        for item in server_issues
-                    ],
-                    "quarantined_payload": copy.deepcopy(record),
-                    "reason_codes": ["schema4_server_authority_quarantined"],
-                }
+                servers[key] = quarantine_wrapper(
+                    key,
+                    record,
+                    [{"code": item.code, "detail": item.detail} for item in server_issues],
+                    reason_codes=["schema4_server_authority_quarantined"],
+                )
         else:
             valid_keys.append(key)
     normalized["servers"] = {
@@ -1234,6 +1327,118 @@ def compact_schema4_state(state: object) -> dict:
     return compacted
 
 
+def quarantine_wrapper(
+    server_key: str,
+    payload: object,
+    errors: Sequence[Mapping[str, object]],
+    *,
+    reason_codes: Sequence[str],
+) -> dict:
+    """Return a bounded quarantine wrapper for an invalid server payload.
+
+    The invalid payload is never trusted.  It is kept verbatim when its
+    canonical JSON is at most ``QUARANTINE_PAYLOAD_RETENTION_BYTES``; a larger
+    payload is replaced by its SHA-256, size and a structural summary.  At
+    most ``QUARANTINE_VALIDATION_ERROR_LIMIT`` errors are kept (each detail
+    truncated); the total count is recorded.
+    """
+
+    try:
+        payload_bytes = canonical_json_bytes(payload)
+    except (TypeError, ValueError):
+        payload_bytes = repr(payload).encode("utf-8", errors="replace")
+    errors = list(errors)
+    reasons = set(reason_codes)
+    wrapper: dict[str, object] = {
+        "schema_version": SCHEMA4_ROOT_VERSION,
+        "semantic_version": SCHEMA4_AUTHORITY_SEMANTICS_VERSION,
+        "server_key": server_key,
+        "authority_status": "quarantined",
+        "validation_errors": [
+            {
+                "code": str(item.get("code", ""))[:QUARANTINE_DETAIL_CHARACTERS],
+                "detail": str(item.get("detail", ""))[:QUARANTINE_DETAIL_CHARACTERS],
+            }
+            for item in errors[:QUARANTINE_VALIDATION_ERROR_LIMIT]
+            if isinstance(item, Mapping)
+        ],
+        "validation_error_count": len(errors),
+        "quarantined_payload_sha256": _sha256(payload_bytes),
+        "quarantined_payload_bytes": len(payload_bytes),
+    }
+    if len(payload_bytes) <= QUARANTINE_PAYLOAD_RETENTION_BYTES:
+        wrapper["quarantined_payload"] = copy.deepcopy(payload)
+    else:
+        wrapper["quarantined_payload_summary"] = _payload_structure(payload)
+        reasons.add("quarantined_payload_summarized")
+    wrapper["reason_codes"] = sorted(reasons)
+    return wrapper
+
+
+def bound_quarantine_wrapper(wrapper: Mapping[str, object]) -> dict:
+    """Bring an existing (possibly pre-R6) quarantine wrapper within bounds."""
+
+    errors = wrapper.get("validation_errors")
+    if not isinstance(errors, list):
+        errors = []
+    errors = [item for item in errors if isinstance(item, Mapping)]
+    count = wrapper.get("validation_error_count")
+    payload_bytes = wrapper.get("quarantined_payload_bytes")
+    oversized_errors = len(errors) > QUARANTINE_VALIDATION_ERROR_LIMIT or any(
+        len(str(item.get(name, ""))) > QUARANTINE_DETAIL_CHARACTERS
+        for item in errors
+        for name in ("code", "detail")
+    )
+    if "quarantined_payload" in wrapper:
+        size = len(canonical_json_bytes(wrapper["quarantined_payload"]))
+        if (
+            not oversized_errors
+            and size <= QUARANTINE_PAYLOAD_RETENTION_BYTES
+            and isinstance(count, int)
+            and isinstance(payload_bytes, int)
+        ):
+            return dict(wrapper)
+        rebuilt = quarantine_wrapper(
+            str(wrapper.get("server_key", "")),
+            wrapper["quarantined_payload"],
+            errors,
+            reason_codes=list(wrapper.get("reason_codes") or ()),
+        )
+        if isinstance(count, int) and count > len(errors):
+            rebuilt["validation_error_count"] = count
+        return rebuilt
+    if not oversized_errors:
+        return dict(wrapper)
+    result = dict(wrapper)
+    result["validation_errors"] = [
+        {
+            "code": str(item.get("code", ""))[:QUARANTINE_DETAIL_CHARACTERS],
+            "detail": str(item.get("detail", ""))[:QUARANTINE_DETAIL_CHARACTERS],
+        }
+        for item in errors[:QUARANTINE_VALIDATION_ERROR_LIMIT]
+    ]
+    result["validation_error_count"] = max(len(errors), count if isinstance(count, int) else 0)
+    return result
+
+
+def _payload_structure(payload: object) -> dict:
+    """Field names, kinds and sizes of an invalid payload (no values)."""
+
+    if not isinstance(payload, Mapping):
+        return {"kind": type(payload).__name__}
+    fields = {}
+    for key in sorted(payload, key=str)[:QUARANTINE_VALIDATION_ERROR_LIMIT]:
+        value = payload[key]
+        name = str(key)[:QUARANTINE_DETAIL_CHARACTERS]
+        if isinstance(value, (list, tuple)):
+            fields[name] = {"kind": "list", "length": len(value)}
+        elif isinstance(value, Mapping):
+            fields[name] = {"kind": "object", "length": len(value)}
+        else:
+            fields[name] = {"kind": type(value).__name__}
+    return {"kind": "object", "field_count": len(payload), "fields": fields}
+
+
 def rebuild_schema4_server_record(
     existing_record: Mapping[str, object],
     schema3_record: Mapping[str, object],
@@ -1403,6 +1608,12 @@ def rebuild_schema4_server_record(
             events=events,
             recent_events=_recent_events(_unique_events(runtime.events)),
         )
+    storage_bounded = COMPACT_AUTHORITY_ENABLED and learned_state is not None
+    if storage_bounded and prior is not None:
+        # Retention R6: the learned state has just observed the full prior
+        # decision, so superseded regimes it covers may leave the regime
+        # history the authority carries forward.
+        prior = bound_prior_regimes(prior, learned_state)
     if COMPACT_AUTHORITY_ENABLED:
         decision = evaluate_compact_authority(
             learned_state,
@@ -1432,6 +1643,12 @@ def rebuild_schema4_server_record(
             learned_state = fold_expected_window_overflow(
                 learned_state, windows_ledger, now=updated_at
             )
+            burst_folded_state = fold_expected_window_burst(learned_state, windows_ledger)
+            if burst_folded_state is not learned_state:
+                learned_state = burst_folded_state
+                fresh["reason_codes"] = sorted(
+                    set(fresh.get("reason_codes", ())) | {EXPECTED_WINDOW_BURST_FOLDED_REASON}
+                )
         from .companion_restart_phase2_learned_state import learned_state_to_mapping
 
         fresh["learned_state"] = learned_state_to_mapping(learned_state)
@@ -1460,13 +1677,14 @@ def rebuild_schema4_server_record(
         if isinstance(item, Mapping) and isinstance(item.get("regime_id"), str)
     }
     regimes.update({item.regime_id: _primitive(item) for item in decision.regimes})
-    fresh["regimes"] = [regimes[key] for key in sorted(regimes)]
     history = {
-        str(item.get("decision_id")): copy.deepcopy(dict(item))
+        str(item.get("decision_id")): compact_decision_history_payload(item)
         for item in existing_record.get("authority_decisions", ())
         if isinstance(item, Mapping) and isinstance(item.get("decision_id"), str)
     }
-    history[decision.decision_id] = _decision_payload(decision)
+    history[decision.decision_id] = compact_decision_history_payload(
+        _decision_payload(decision)
+    )
     consumer_state, fresh["authority_decisions"] = bound_alert_and_decision_history(
         existing_record.get("consumer_state", empty_consumer_state(server_key)),
         history.values(),
@@ -1476,6 +1694,13 @@ def rebuild_schema4_server_record(
         now=updated_at,
         event_finalized_at={item.event_id: item.finalized_at for item in events},
     )
+    # Retention R6: only regimes the current decision or consumer state
+    # references are persisted.  Nothing else reads a regime record: the
+    # authority reloads only the current decision's regimes.
+    wanted = {item.regime_id for item in decision.regimes} | consumer_referenced_regime_ids(
+        consumer_state
+    )
+    fresh["regimes"] = [regimes[key] for key in sorted(regimes) if key in wanted]
     fresh["prior_authority_decision_id"] = (
         None if prior is None else prior.decision_id
     )
@@ -1487,7 +1712,12 @@ def rebuild_schema4_server_record(
         set(existing_record.get("reason_codes", ()))
         | set(fresh.get("reason_codes", ()))
         | {"authoritative_schema4_runtime_rebuilt", DECISION_HISTORY_BOUNDED_REASON}
+        | ({PER_SERVER_STORAGE_BOUNDED_REASON} if storage_bounded else set())
     )
+    if not storage_bounded:
+        fresh["reason_codes"] = [
+            item for item in fresh["reason_codes"] if item != PER_SERVER_STORAGE_BOUNDED_REASON
+        ]
     audit = copy.deepcopy(fresh.get("migration_audit", {}))
     audit.update({
         "reference_validation_result": "valid",
@@ -1717,6 +1947,166 @@ def fold_expected_window_overflow(
     if cutoff is None:
         return state
     return fold_windows(state, [item for item in unfolded if item.window_end_at <= cutoff])
+
+
+def fold_expected_window_burst(
+    state,
+    windows: Iterable[ExpectedWindowLedgerRecord],
+    *,
+    hard_limit: int = EXPECTED_WINDOW_HARD_LIMIT,
+):
+    """Retention R6: enforce the hard expected-window bound under a burst.
+
+    ``fold_expected_window_overflow`` folds only windows that ended at least
+    24 hours ago.  If more than ``hard_limit`` unfolded records remain (an
+    exceptional burst inside 24 hours), the oldest whole window end times are
+    folded regardless of age.  Folding is the same conservative evaluation:
+    a possibly in-phase genuine miss keeps counting and a later revision of a
+    folded window is ignored, which can only keep a miss counting.  So a
+    burst never bypasses the bound and never hides a miss.  Returns the same
+    state object when nothing needed folding.
+    """
+
+    from .companion_restart_phase2_learned_state import fold_windows
+
+    mark = state.watermark.window_end_at
+    unfolded = [
+        item
+        for item in windows
+        if item.server_key == state.server_key
+        and (mark is None or item.window_end_at > mark)
+    ]
+    if len(unfolded) <= hard_limit:
+        return state
+    remaining = len(unfolded)
+    cutoff = None
+    for end in sorted({item.window_end_at for item in unfolded}):
+        if remaining <= hard_limit:
+            break
+        remaining -= sum(1 for item in unfolded if item.window_end_at == end)
+        cutoff = end
+    return fold_windows(state, [item for item in unfolded if item.window_end_at <= cutoff])
+
+
+def superseded_regime_covered(regime: RegimeRecord, state) -> bool:
+    """True when the learned state's superseded summary holds this regime.
+
+    ``observe_decision`` merges a superseded regime into the entry of its
+    (period, phase bin), widening the tolerance to cover it and keeping the
+    later boundary.  Covered means that entry exists, ends no earlier and its
+    tolerance contains the regime's phase window.
+    """
+
+    if regime.status is not RegimeRecordStatus.SUPERSEDED or regime.superseded_at is None:
+        return False
+    from .companion_restart_phase2_learned_state import SupersededRegime, _circular_distance
+
+    period = regime.candidate_period_seconds
+    key = SupersededRegime(
+        period, regime.phase_offset % period, regime.phase_tolerance, regime.superseded_at
+    ).key
+    for entry in state.superseded:
+        if entry.key != key:
+            continue
+        return bool(
+            entry.superseded_at >= regime.superseded_at
+            and _circular_distance(entry.phase_offset, regime.phase_offset % period, period)
+            + regime.phase_tolerance
+            <= entry.phase_tolerance + 1e-6
+        )
+    return False
+
+
+def bound_prior_regimes(prior: AuthorityDecision, state) -> AuthorityDecision:
+    """Retention R6: bound the regime history carried into the next decision.
+
+    The authority merges the prior decision's regimes into every established
+    decision, so without a bound every superseded or abandoned regime is
+    carried forever.  Kept: the prior selected and incumbent regimes, every
+    non-superseded regime a prior challenger context names, the newest
+    ``REGIME_SUPERSEDED_RETENTION`` superseded regimes (trimmed only when more
+    than ``REGIME_SUPERSEDED_TRIM_THRESHOLD`` covered ones are carried), and
+    every superseded regime the learned state does not cover.  Dropped: superseded regimes the
+    learned state already covers (it is the only reader of superseded
+    regimes on the compact path) and unreferenced non-superseded records
+    (abandoned provisional regimes, which nothing reads).  Regime identity is
+    derived from period and phase, so a returning schedule keeps its ID.
+    """
+
+    keep = {
+        item.regime_id
+        for item in (prior.selected_shadow_regime, prior.incumbent_shadow_regime)
+        if item is not None
+    }
+    named = set()
+    for context in (*prior.challenger_contexts, prior.strongest_challenger):
+        if context is not None:
+            named.update((context.incumbent_regime_id, context.proposed_regime_id))
+    # A context names regimes only by ID (challengers are matched against
+    # candidates, never against regime records), so a superseded regime it
+    # names follows the superseded rule; a provisional one it names is kept.
+    keep.update(
+        item.regime_id
+        for item in prior.regimes
+        if item.regime_id in named and item.status is not RegimeRecordStatus.SUPERSEDED
+    )
+    superseded = sorted(
+        (item for item in prior.regimes if item.status is RegimeRecordStatus.SUPERSEDED),
+        key=lambda item: (item.superseded_at or 0.0, item.regime_id),
+    )
+    covered = [item for item in superseded if superseded_regime_covered(item, state)]
+    if len(covered) <= REGIME_SUPERSEDED_TRIM_THRESHOLD:
+        keep.update(item.regime_id for item in superseded)
+    else:
+        keep.update(item.regime_id for item in superseded[-REGIME_SUPERSEDED_RETENTION:])
+        keep.update(
+            item.regime_id for item in superseded if not superseded_regime_covered(item, state)
+        )
+    kept = tuple(item for item in prior.regimes if item.regime_id in keep)
+    if len(kept) == len(prior.regimes):
+        return prior
+    return dataclasses.replace(prior, regimes=kept)
+
+
+def consumer_referenced_regime_ids(consumer_state: object) -> frozenset[str]:
+    """Regime IDs that persisted consumer decisions and alert records name."""
+
+    if not isinstance(consumer_state, Mapping):
+        return frozenset()
+    values = set()
+    for item in consumer_state.get("decisions", ()) or ():
+        if isinstance(item, Mapping) and isinstance(item.get("selected_regime_id"), str):
+            values.add(item["selected_regime_id"])
+    for item in consumer_state.get("alert_records", ()) or ():
+        if isinstance(item, Mapping) and isinstance(item.get("regime_id"), str):
+            values.add(item["regime_id"])
+    return frozenset(values)
+
+
+def compact_decision_history_payload(payload: Mapping[str, object]) -> dict:
+    """Retention R6: the history copy of a decision without its ID lists.
+
+    History payloads are read only for ``decision_id`` and ``state``
+    (retention); the current decision is loaded from ``authority_decision``,
+    which keeps its full payload.  Each ID list is replaced by its length and
+    all of them by one SHA-256 digest, so a history entry no longer repeats up
+    to hundreds of evidence IDs.  Idempotent.
+    """
+
+    value = copy.deepcopy(dict(payload))
+    if value.get(HISTORY_COMPACTED_FIELD) is True:
+        return value
+    digest_source = {}
+    for field, count_field in HISTORY_REFERENCE_FIELDS:
+        items = value.pop(field, None)
+        items = list(items) if isinstance(items, (list, tuple)) else []
+        value[count_field] = len(items)
+        digest_source[field] = items
+    value[HISTORY_REFERENCE_DIGEST_FIELD] = _stable_id(
+        "schema4-decision-history-references", digest_source
+    )
+    value[HISTORY_COMPACTED_FIELD] = True
+    return value
 
 
 def prune_folded_raw_evidence(
@@ -2861,7 +3251,14 @@ def _validate_server_record(server_key: str, record: object) -> list[Schema4Vali
                 "raw_event_retention_exceeded",
                 f"pruned record retains {len(record['physical_events'])} physical events",
             )
+    for item in record.get("authority_decisions", ()):
+        if isinstance(item, Mapping) and item.get(HISTORY_COMPACTED_FIELD) is not None:
+            for detail in _compacted_history_errors(item):
+                add("invalid_compacted_decision_history", f"{item.get('decision_id')}: {detail}")
     reasons = record.get("reason_codes")
+    if isinstance(reasons, (list, tuple)) and PER_SERVER_STORAGE_BOUNDED_REASON in reasons:
+        for code, detail in _per_server_storage_errors(record, regimes):
+            add(code, detail)
     if (
         isinstance(reasons, (list, tuple))
         and DECISION_HISTORY_BOUNDED_REASON in reasons
@@ -2882,6 +3279,78 @@ def _validate_server_record(server_key: str, record: object) -> list[Schema4Vali
     for error in consumer_errors:
         add("invalid_consumer_state", error)
     return issues
+
+
+def _compacted_history_errors(item: Mapping[str, object]) -> list[str]:
+    errors = []
+    if item.get(HISTORY_COMPACTED_FIELD) is not True:
+        errors.append("history_compacted must be true")
+    for field, count_field in HISTORY_REFERENCE_FIELDS:
+        if field in item:
+            errors.append(f"compacted entry still holds {field}")
+        count = item.get(count_field)
+        if type(count) is not int or count < 0:
+            errors.append(f"{count_field} must be a non-negative integer")
+    digest = item.get(HISTORY_REFERENCE_DIGEST_FIELD)
+    if not isinstance(digest, str) or len(digest) != 64 or any(
+        char not in "0123456789abcdef" for char in digest
+    ):
+        errors.append(f"{HISTORY_REFERENCE_DIGEST_FIELD} must be a SHA-256 hex digest")
+    return errors
+
+
+def _per_server_storage_errors(
+    record: Mapping[str, object], regime_ids: set[str]
+) -> list[tuple[str, str]]:
+    """Retention R6 bounds of a record marked ``PER_SERVER_STORAGE_BOUNDED_REASON``."""
+
+    errors = []
+    current = record.get("authority_decision")
+    decision_regimes = set(current.get("regime_ids", ())) if isinstance(current, Mapping) else set()
+    consumer_regimes = consumer_referenced_regime_ids(record.get("consumer_state"))
+    orphans = sorted(regime_ids - decision_regimes - consumer_regimes)
+    if orphans:
+        errors.append(
+            ("unreferenced_regime_retained", f"{len(orphans)} regime(s), e.g. {orphans[0]}")
+        )
+    raw_state = record.get("learned_state")
+    if raw_state is not None:
+        from .companion_restart_phase2_learned_state import (
+            LearnedStateError,
+            learned_state_from_mapping,
+        )
+
+        try:
+            state = learned_state_from_mapping(raw_state)
+        except LearnedStateError:
+            state = None
+        if state is not None:
+            covered = 0
+            for item in record.get("regimes", ()):
+                if not isinstance(item, Mapping) or item.get("regime_id") in consumer_regimes:
+                    continue
+                try:
+                    regime = _regime_from(item)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if superseded_regime_covered(regime, state):
+                    covered += 1
+            if covered > REGIME_SUPERSEDED_TRIM_THRESHOLD + 1:
+                errors.append(
+                    (
+                        "superseded_regime_retention_exceeded",
+                        f"{covered} covered superseded regimes",
+                    )
+                )
+    windows = record.get("expected_window_results")
+    if isinstance(windows, list) and len(windows) > EXPECTED_WINDOW_HARD_LIMIT:
+        errors.append(
+            ("expected_window_retention_exceeded", f"{len(windows)} expected-window records")
+        )
+    for item in record.get("authority_decisions", ()):
+        if isinstance(item, Mapping) and item.get(HISTORY_COMPACTED_FIELD) is not True:
+            errors.append(("decision_history_not_compacted", str(item.get("decision_id"))))
+    return errors
 
 
 def _decision_payload(decision: AuthorityDecision) -> dict:
@@ -3190,15 +3659,12 @@ def _decision_gate(decision: AuthorityDecision) -> AuthorityGate:
 
 
 def _quarantined_migration_record(server_key: str, raw: object, exc: Exception) -> dict:
-    return {
-        "schema_version": SCHEMA4_ROOT_VERSION,
-        "semantic_version": SCHEMA4_AUTHORITY_SEMANTICS_VERSION,
-        "server_key": server_key,
-        "authority_status": "quarantined",
-        "validation_errors": [{"code": "migration_failed", "detail": f"{type(exc).__name__}: {exc}"}],
-        "quarantined_payload": copy.deepcopy(raw),
-        "reason_codes": ["server_migration_failed_closed"],
-    }
+    return quarantine_wrapper(
+        server_key,
+        raw,
+        [{"code": "migration_failed", "detail": f"{type(exc).__name__}: {exc}"}],
+        reason_codes=["server_migration_failed_closed"],
+    )
 
 
 def _quarantined_migration_audit(server_key: str, raw: object, exc: Exception) -> dict:

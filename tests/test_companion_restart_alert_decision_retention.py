@@ -758,7 +758,7 @@ def _knowledge(state):
     }
 
 
-@pytest.mark.parametrize("extra_servers", [3, 100])
+@pytest.mark.parametrize("extra_servers", [3, 125])
 def test_learning_export_and_import_round_trip_below_and_above_8_mib(extra_servers, tmp_path):
     source = tmp_path / "source.json"
     source.write_bytes(schema4.serialize_schema4_state(_many_server_state(extra_servers)))
@@ -822,7 +822,7 @@ def test_learning_export_and_import_round_trip_below_and_above_8_mib(extra_serve
 
 
 def test_large_inputs_are_still_fully_validated(tmp_path):
-    raw = schema4.serialize_schema4_state(_many_server_state(100))
+    raw = schema4.serialize_schema4_state(_many_server_state(125))
     assert len(raw) > 8 * 1024 * 1024
     with pytest.raises(transfer.ExternalLearningValidationError, match="Invalid JSON"):
         transfer.validate_external_learning_bytes(raw[:-10])
