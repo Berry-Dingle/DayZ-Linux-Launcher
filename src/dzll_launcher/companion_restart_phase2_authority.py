@@ -122,6 +122,40 @@ ISOLATED_OFF_PHASE_RESTART_REASON = "isolated_off_phase_restart_does_not_affect_
 TWO_INTERVAL_SPARSE_CONFLICT_REASON = (
     "two_interval_establishment_awaits_confirmation_against_sparse_conflict"
 )
+# Time Shift Detection.  An established continuity regime whose restarts move
+# to another phase of the *same* period (a DST change, or an administrator
+# moving the restart times) keeps its period and earned authority.  The
+# evidence is independent authentic restarts after the regime's latest
+# aligned evidence that agree on one new phase within the regime tolerance:
+# one is noticed, two withhold the prediction, three adopt the phase.  The
+# state is derived from the retained events on every rebuild; only the
+# adopted phase is persisted (on the regime).  Period changes stay with the
+# challenger rules above.
+TIME_SHIFT_SUSPECT_OBSERVATIONS = 2
+TIME_SHIFT_CONFIRM_OBSERVATIONS = 3
+TIME_SHIFT_NOTICED_REASON = "possible_time_shift_noticed"
+TIME_SHIFT_SUSPECTED_REASON = "possible_time_shift_prediction_withheld"
+# Persistent marker on a regime whose phase was adopted from a time shift.
+TIME_SHIFT_ADOPTED_REASON = "time_shift_adopted_period_and_authority_retained"
+# Persistent marker ``<prefix><phase>`` on a shifted regime (and on the
+# candidate that carries its authority): the phase at which the regime's
+# earned high evidence was observed.  It is dropped once the evidence at the
+# regime's own phase is at least as strong.
+TIME_SHIFT_AUTHORITY_PHASE_PREFIX = "time_shift_authority_phase:"
+# Persistent marker ``<prefix><time>`` beside the authority phase on a shifted
+# sparse-established regime (and its carrying candidate): the first shifted
+# observation.  A sparse regime's confidence is a per-phase statistic over
+# its retained restarts, so its earned value is that statistic at the
+# authority phase over the restarts strictly before this time (the shifted
+# observations are excluded).  Continuity regimes never carry it.
+TIME_SHIFT_AUTHORITY_UNTIL_PREFIX = "time_shift_authority_until:"
+# Historical acquisition recovery (acquisition only).  A never-established
+# server whose retained restarts before a confirmed time shift would on their
+# own have passed the unchanged sparse establishment gate is established as
+# the live runtime would have established it then, and the later restarts are
+# judged by the established-regime rules (Time Shift Detection included).
+# Persistent provenance marker on the regime (and so on its decisions).
+HISTORICAL_ACQUISITION_REASON = "established_from_retained_history_before_time_shift"
 # A full interval that is not high-eligible (query-visible endpoints) may still
 # confirm a sparse-established regime when its only high-ineligibility is the
 # endpoint evidence class; continuity, coverage, query health, identity,
@@ -554,6 +588,7 @@ def _sparse_support(
     sparse: _SparseEvidence,
     excluded_event_ids: frozenset[str],
     candidate: "AuthorityCandidate | None" = None,
+    before_at: float | None = None,
 ) -> _SparseSupport:
     """Per-event sparse support for one candidate (period, phase).
 
@@ -573,6 +608,9 @@ def _sparse_support(
     gate accepts (``SPARSE_CONSISTENCY_TOLERANCE``) the magnitude also falls
     proportionally.  With no off-phase restart this is exactly the Stage 8.3
     statistic, which is still returned as ``phase_confidence`` for SE3.
+
+    ``before_at`` limits the evaluation to restarts strictly earlier than it
+    (Time Shift Detection's pre-shift value); ``None`` uses every restart.
     """
 
     if sparse.compact is not None:
@@ -582,6 +620,7 @@ def _sparse_support(
             compact=sparse.compact,
             excluded_event_ids=excluded_event_ids,
             candidate=candidate,
+            before_at=before_at,
         )
     historical: set[str] = set()
     for regime, explained in sparse.historical:
@@ -592,7 +631,10 @@ def _sparse_support(
         ):
             historical.update(explained)
     pool = tuple(
-        item for item in sparse.events if item.event_id not in excluded_event_ids
+        item
+        for item in sparse.events
+        if item.event_id not in excluded_event_ids
+        and (before_at is None or _event_at(item) < before_at)
     )
     aligned = tuple(
         item
@@ -1384,14 +1426,38 @@ def _transition_decision(
             previous=previous_incumbent,
             sparse=sparse,
             compact=compact,
+            relationships=relationships,
+            prior=prior,
         )
 
-    incumbent_candidate = _matching_candidate(previous_incumbent, candidates)
+    candidates, incumbent_candidate = _time_shift_incumbent_candidate(
+        previous_incumbent,
+        candidates,
+        _time_shift_authority_phase(previous_incumbent.reason_codes),
+        authority_until=_time_shift_authority_until(previous_incumbent.reason_codes),
+        sparse=sparse,
+        relationship_map=relationship_map,
+    )
+    carried = bool(
+        incumbent_candidate is not None
+        and _time_shift_authority_phase(incumbent_candidate.reason_codes) is not None
+    )
+    if carried:
+        ranked = tuple(sorted(candidates, key=_candidate_rank, reverse=True))
     incumbent = previous_incumbent
     confirmation_reasons: tuple[str, ...] = ()
+    # The candidates before any sparse confirmation of the incumbent's
+    # candidate: an adopted time shift re-anchors the regime, after which that
+    # confirmation (of the previous phase) no longer applies.
+    unconfirmed_candidates = candidates
     if incumbent_candidate is not None:
+        # A carrier's evidence is at the authority phase, not the regime's:
+        # it neither upgrades the origin nor confirms a sparse regime (both
+        # are judged at the regime's own phase once the native candidate
+        # takes over).
         upgrade = bool(
             previous_incumbent.origin is AuthorityOrigin.NORMAL
+            and not carried
             and (
                 _continuity_upgrade_qualifies(
                     incumbent_candidate,
@@ -1405,6 +1471,7 @@ def _transition_decision(
         )
         if (
             not upgrade
+            and not carried
             and previous_incumbent.origin is AuthorityOrigin.NORMAL
             and SPARSE_ESTABLISHMENT_REASON in previous_incumbent.reason_codes
         ):
@@ -1442,9 +1509,17 @@ def _transition_decision(
         (ORIGIN_UPGRADE_REASON,)
         if ORIGIN_UPGRADE_REASON in incumbent.reason_codes
         else ()
+    ) + (
+        (TIME_SHIFT_ADOPTED_REASON,)
+        if TIME_SHIFT_ADOPTED_REASON in incumbent.reason_codes
+        else ()
+    ) + (
+        (HISTORICAL_ACQUISITION_REASON,)
+        if HISTORICAL_ACQUISITION_REASON in incumbent.reason_codes
+        else ()
     ) + confirmation_reasons
 
-    return _incumbent_decision(
+    arguments = dict(
         server_key=server_key,
         normal_score=normal_score,
         candidates=candidates,
@@ -1464,6 +1539,11 @@ def _transition_decision(
         sparse=sparse,
         compact=compact,
     )
+    return _resolve_time_shift(
+        _incumbent_decision(**arguments),
+        arguments,
+        unconfirmed_candidates=unconfirmed_candidates,
+    )
 
 
 def _acquisition_decision(
@@ -1482,13 +1562,41 @@ def _acquisition_decision(
     previous: RegimeRecord | None,
     sparse: _SparseEvidence | None = None,
     compact: "_Compact | None" = None,
+    relationships: tuple[IntervalRelationship, ...] = (),
+    prior: AuthorityDecision | None = None,
 ) -> AuthorityDecision:
     """Initial acquisition for an unknown server or a never-established LIKELY one.
 
     The result depends on the evidence only, so an evidence-identical
     rebuild reproduces it.  A prior LIKELY regime keeps its regime ID (and
     defining evidence) when the same period and phase is selected again.
+    When H3, sparse and two-interval establishment all fail, historical
+    acquisition recovery is tried before any LIKELY or learning outcome.
     """
+
+    recovery: list[AuthorityDecision | None] = []
+
+    def historical_recovery() -> AuthorityDecision | None:
+        if not recovery:
+            recovery.append(
+                _historical_shift_acquisition(
+                    server_key=server_key,
+                    normal_score=normal_score,
+                    candidates=candidates,
+                    ranked=ranked,
+                    normal_ledger=normal_ledger,
+                    high_ledger=high_ledger,
+                    windows=windows,
+                    events=events,
+                    relationships=relationships or tuple(relationship_map.values()),
+                    relationship_map=relationship_map,
+                    streaks=streaks,
+                    prior=prior,
+                    sparse=sparse,
+                    compact=compact,
+                )
+            )
+        return recovery[0]
 
     high_h3 = tuple(item for item in ranked if item.h3_gate)
     high_h2 = tuple(item for item in ranked if item.h2_gate)
@@ -1680,6 +1788,9 @@ def _acquisition_decision(
             )
         if sparse_choice is not None:
             return sparse_decision()
+        recovered = historical_recovery()
+        if recovered is not None:
+            return recovered
         return selected_decision(
             state=RegimeState.LIKELY,
             selected=regime_for(selected_candidate, status=RegimeRecordStatus.LIKELY),
@@ -1693,6 +1804,10 @@ def _acquisition_decision(
 
     if sparse_choice is not None:
         return sparse_decision()
+
+    recovered = historical_recovery()
+    if recovered is not None:
+        return recovered
 
     if normal_score.selected_period_seconds is not None:
         selected_candidate = _normal_selected_candidate(normal_score, ranked)
@@ -2015,6 +2130,7 @@ def _sparse_establishing_candidate(
     windows: tuple[ExpectedWindowLedgerRecord, ...],
     relationship_map: dict[str, IntervalRelationship],
     sparse: _SparseEvidence,
+    before_at: float | None = None,
 ) -> tuple[AuthorityCandidate, float] | None:
     """Stage 8.5 sparse establishment gate (acquisition only).
 
@@ -2026,7 +2142,10 @@ def _sparse_establishing_candidate(
     regime; they confirm it.  It is withheld when any conflicting schedule
     is H2, or another conflicting candidate meets the sparse structure with
     comparable support.  ``established_at`` is its latest aligned sparse
-    restart.
+    restart.  ``before_at`` (historical acquisition recovery) evaluates the
+    aligned restarts strictly before it; the candidates must then carry the
+    matching pre-boundary values (``_historical_prefix_candidate``).  SE6
+    still counts every genuine miss from the first aligned restart on.
     """
 
     qualifying = []
@@ -2055,6 +2174,7 @@ def _sparse_establishing_candidate(
                 if item in relationship_map
             ),
             candidate=candidate,
+            before_at=before_at,
         )
         bounds = _support_bounds(support)
         if bounds is None:
@@ -2254,21 +2374,9 @@ def _incumbent_decision(
 ) -> AuthorityDecision:
     """The established-incumbent path: suspicion, challengers and transitions."""
 
-    suspicion_events = events
-    incumbent_state = None
-    if compact is None:
-        last_aligned_at = _last_aligned_evidence_at(incumbent, events, windows)
-    else:
-        from .companion_restart_phase2_learned_state import (
-            compact_last_aligned_evidence_at,
-            knowledge_for_regime,
-        )
-
-        incumbent_state = knowledge_for_regime(compact.state, incumbent)
-        last_aligned_at = compact_last_aligned_evidence_at(
-            incumbent_state, ring_events=compact.ring_events, ring_windows=compact.ring_windows
-        )
-        suspicion_events = _compact_unfolded_events(compact)
+    last_aligned_at, suspicion_events, incumbent_state = _incumbent_alignment(
+        incumbent, events, windows, compact
+    )
     active_misses = tuple(
         item.result_id
         for item in windows
@@ -2654,6 +2762,905 @@ def _incumbent_decision(
         selected_candidate=incumbent_candidate,
         reasons=reasons,
     )
+
+
+def _incumbent_alignment(
+    incumbent: RegimeRecord,
+    events: tuple[PhysicalRestartEvent, ...],
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    compact: "_Compact | None",
+) -> tuple[float, tuple[PhysicalRestartEvent, ...], object]:
+    """Latest evidence aligned with ``incumbent`` and the events judged after it.
+
+    Returns ``(last_aligned_at, suspicion_events, compact_incumbent_state)``.
+    On the compact path the events are the unfolded ring and the state is the
+    learned state describing ``incumbent`` (``None`` on the raw path).
+    """
+
+    if compact is None:
+        return _last_aligned_evidence_at(incumbent, events, windows), events, None
+    from .companion_restart_phase2_learned_state import (
+        compact_last_aligned_evidence_at,
+        knowledge_for_regime,
+    )
+
+    incumbent_state = knowledge_for_regime(compact.state, incumbent)
+    last_aligned_at = compact_last_aligned_evidence_at(
+        incumbent_state, ring_events=compact.ring_events, ring_windows=compact.ring_windows
+    )
+    return last_aligned_at, _compact_unfolded_events(compact), incumbent_state
+
+
+# --------------------------------------------------------------------------
+# Time Shift Detection
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _TimeShift:
+    """Independent restarts agreeing on one new phase of the incumbent period.
+
+    ``event_ids`` are in time order and ``first_observed_at`` is the time of
+    the first.  ``confirmed_at`` is the time of the confirming observation,
+    or ``None`` while the shift is unconfirmed.
+    """
+
+    phase_offset: float
+    event_ids: tuple[str, ...]
+    confirmed_at: float | None
+    first_observed_at: float
+
+
+def _time_shift_assessment(
+    incumbent: RegimeRecord,
+    events: tuple[PhysicalRestartEvent, ...],
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    *,
+    last_aligned_at: float,
+) -> _TimeShift | None:
+    """The time-shift hypothesis supported by the retained events, if any.
+
+    Observations are authentic, learning-eligible restarts later than the
+    incumbent's latest aligned evidence and outside its phase tolerance, so
+    a restart back on the original phase restarts the count.  They are
+    grouped in time order by proposed phase: a restart joins the first group
+    whose first restart it matches within the incumbent tolerance, and counts
+    only as a distinct scheduled occurrence.  A restart matching no group
+    (an off-grid administrative restart) starts its own and is neutral to the
+    others.  A genuine expected-window miss at a group's phase discards that
+    group's earlier restarts.  Unmonitored time contributes nothing.
+
+    Any repeated phase withholds the prediction.  Confirmation additionally
+    needs the confirming restarts to be later than the latest restart of
+    every other *repeated* phase: restarts that keep returning to several
+    phases do not describe one shifted schedule (they are what a different
+    interval looks like when seen sparsely) and stay with the cycle-change
+    rules.  The first group confirmed wins and is described by exactly its
+    confirming restarts, so identical history always yields the same phase
+    and adoption time.
+    """
+
+    period = incumbent.candidate_period_seconds
+    tolerance = incumbent.phase_tolerance
+    observations = sorted(
+        (_event_at(item), item.event_id)
+        for item in events
+        if _authentic_event(item)
+        and _event_at(item) is not None
+        and _event_at(item) > last_aligned_at
+        and _circular_distance(_event_at(item), incumbent.phase_offset, period) > tolerance
+    )
+    groups: list[list[tuple[float, str]]] = []
+    for at, event_id in observations:
+        group = next(
+            (
+                item
+                for item in groups
+                if _circular_distance(at, item[0][0], period) <= tolerance
+            ),
+            None,
+        )
+        if group is None:
+            groups.append([(at, event_id)])
+        elif all(abs(at - other) > period / 2 for other, _event in group):
+            group.append((at, event_id))
+
+    def uncontradicted(group: list[tuple[float, str]]) -> list[tuple[float, str]]:
+        anchor = group[0][0]
+        missed_at = max(
+            (
+                item.expected_at
+                for item in windows
+                if item.outcome is ExpectedWindowOutcome.GENUINE_MISS
+                and item.negative_penalty_active
+                and item.candidate_period_seconds == period
+                and item.expected_at > anchor
+                and _circular_distance(item.expected_phase_offset, anchor, period)
+                <= tolerance
+            ),
+            default=None,
+        )
+        if missed_at is None:
+            return group
+        return [item for item in group if item[0] > missed_at]
+
+    groups = [item for item in map(uncontradicted, groups) if item]
+    if not groups:
+        return None
+
+    def unchallenged(group: list[tuple[float, str]]) -> list[tuple[float, str]]:
+        rival_at = max(
+            (
+                item[-1][0]
+                for item in groups
+                if item is not group and len(item) >= TIME_SHIFT_SUSPECT_OBSERVATIONS
+            ),
+            default=None,
+        )
+        if rival_at is None:
+            return group
+        return [item for item in group if item[0] > rival_at]
+
+    confirmed = [
+        item
+        for item in map(unchallenged, groups)
+        if len(item) >= TIME_SHIFT_CONFIRM_OBSERVATIONS
+    ]
+    if confirmed:
+        members = min(
+            confirmed,
+            key=lambda item: (item[TIME_SHIFT_CONFIRM_OBSERVATIONS - 1][0], item[0][0]),
+        )[:TIME_SHIFT_CONFIRM_OBSERVATIONS]
+    else:
+        members = max(groups, key=lambda item: (len(item), -item[0][0]))
+    phase, _spread = _phase_estimate((at for at, _event in members), period)
+    return _TimeShift(
+        phase_offset=round(phase, 6) % period,
+        event_ids=tuple(event_id for _at, event_id in members),
+        confirmed_at=members[-1][0] if confirmed else None,
+        first_observed_at=members[0][0],
+    )
+
+
+def _time_shift_authority_phase(reason_codes: Iterable[str]) -> float | None:
+    """The authority phase recorded by a time-shift marker, if present."""
+
+    for item in reason_codes:
+        if item.startswith(TIME_SHIFT_AUTHORITY_PHASE_PREFIX):
+            try:
+                value = float(item[len(TIME_SHIFT_AUTHORITY_PHASE_PREFIX) :])
+            except ValueError:
+                return None
+            return value if math.isfinite(value) and value >= 0 else None
+    return None
+
+
+def _time_shift_authority_until(reason_codes: Iterable[str]) -> float | None:
+    """The pre-shift evidence boundary recorded on a sparse regime, if present."""
+
+    for item in reason_codes:
+        if item.startswith(TIME_SHIFT_AUTHORITY_UNTIL_PREFIX):
+            try:
+                value = float(item[len(TIME_SHIFT_AUTHORITY_UNTIL_PREFIX) :])
+            except ValueError:
+                return None
+            return value if math.isfinite(value) and value >= 0 else None
+    return None
+
+
+def _time_shift_boundary(first_observed_at: float) -> float:
+    """The persisted pre-shift boundary: never later than the first observation.
+
+    Stored to the millisecond, rounded down, so the first shifted observation
+    stays excluded and the value read back from the reason code is the value
+    used when it was written.
+    """
+
+    return float(f"{math.floor(first_observed_at * 1000) / 1000:.3f}")
+
+
+def _time_shift_markers(reason_codes: Iterable[str]) -> tuple[str, ...]:
+    return tuple(
+        item
+        for item in reason_codes
+        if item.startswith(TIME_SHIFT_AUTHORITY_PHASE_PREFIX)
+        or item.startswith(TIME_SHIFT_AUTHORITY_UNTIL_PREFIX)
+    )
+
+
+def _time_shift_sparse_regime(regime: RegimeRecord) -> bool:
+    return bool(
+        regime.origin is AuthorityOrigin.NORMAL
+        and SPARSE_ESTABLISHMENT_REASON in regime.reason_codes
+    )
+
+
+def _time_shift_eligible(regime: RegimeRecord) -> bool:
+    """Established regimes Time Shift Detection applies to.
+
+    Continuity-origin and sparse-established regimes predict from their own
+    phase.  Legacy schema-3-origin regimes predict from the schema-3 phase,
+    so they stay excluded.
+    """
+
+    return bool(
+        regime.status is RegimeRecordStatus.ESTABLISHED
+        and (regime.origin is AuthorityOrigin.CONTINUITY or _time_shift_sparse_regime(regime))
+    )
+
+
+def _time_shift_preserved_candidate(
+    source: AuthorityCandidate,
+    *,
+    before_at: float,
+    sparse: _SparseEvidence,
+    relationship_map: dict[str, IntervalRelationship],
+) -> AuthorityCandidate:
+    """``source`` with its sparse slot evaluated on restarts before ``before_at``.
+
+    The existing sparse statistic and combination, at the source's own phase
+    and with the source's own endpoint exclusions; only the restarts it is
+    computed over change.  Gates, high authority and identity are unchanged.
+    """
+
+    support = _sparse_support(
+        period=source.candidate_period_seconds,
+        phase_offset=source.phase_offset,
+        sparse=sparse,
+        excluded_event_ids=_relationship_endpoint_ids(
+            relationship_map[item]
+            for item in source.high_relationship_ids
+            if item in relationship_map
+        ),
+        candidate=source,
+        before_at=before_at,
+    )
+    combined = source.high_authority + (1.0 - source.high_authority) * min(
+        SPARSE_EVIDENCE_CEILING, SPARSE_EVIDENCE_CEILING * support.value
+    )
+    return replace(
+        source,
+        aligned_normal_confidence=round(support.value, 6),
+        combined_confidence=round(combined, 6),
+    )
+
+
+def _time_shift_incumbent_candidate(
+    regime: RegimeRecord,
+    candidates: tuple[AuthorityCandidate, ...],
+    authority_phase: float | None,
+    *,
+    authority_until: float | None = None,
+    sparse: _SparseEvidence | None = None,
+    relationship_map: dict[str, IntervalRelationship] | None = None,
+) -> tuple[tuple[AuthorityCandidate, ...], AuthorityCandidate | None]:
+    """The candidate describing ``regime``, carrying shifted authority if needed.
+
+    Without an authority phase this is the ordinary matching candidate.  A
+    time-shifted regime earned its high evidence at ``authority_phase``; the
+    interval evidence there still proves the period, so the best candidate
+    at that phase is carried to the regime's phase (same evidence, gates and
+    confidence, under the shifted regime's own identity) until the evidence
+    at the regime's own phase is at least as strong.  Returns the candidates
+    (with the carrier appended when it is used) and the selected candidate.
+
+    A sparse-established regime earned a sparse statistic, not interval
+    authority: the carrier's sparse slot is that statistic at the authority
+    phase over the restarts before ``authority_until`` (the first shifted
+    observation), and it is carried while the native candidate's confidence
+    is lower and its gate no higher.  That includes a regime that shifted
+    back to its authority phase: the native statistic there still counts the
+    shifted restarts as off-phase.
+    """
+
+    native = _matching_candidate(regime, candidates)
+    period = regime.candidate_period_seconds
+    sparse_regime = _time_shift_sparse_regime(regime)
+    if (
+        authority_phase is None
+        or not (regime.origin is AuthorityOrigin.CONTINUITY or sparse_regime)
+        or (sparse_regime and (authority_until is None or sparse is None))
+        or (
+            not sparse_regime
+            and _circular_distance(authority_phase, regime.phase_offset, period)
+            <= regime.phase_tolerance
+        )
+    ):
+        return candidates, native
+    source = max(
+        (
+            item
+            for item in candidates
+            if item.candidate_period_seconds == period
+            and _circular_distance(item.phase_offset, authority_phase, period)
+            <= regime.phase_tolerance
+        ),
+        key=_candidate_rank,
+        default=None,
+    )
+    markers = {f"{TIME_SHIFT_AUTHORITY_PHASE_PREFIX}{authority_phase % period:.6f}"}
+    if sparse_regime and source is not None:
+        source = _time_shift_preserved_candidate(
+            source,
+            before_at=authority_until,
+            sparse=sparse,
+            relationship_map=relationship_map or {},
+        )
+        markers.add(f"{TIME_SHIFT_AUTHORITY_UNTIL_PREFIX}{authority_until:.3f}")
+    if source is None or (
+        native is not None
+        and (
+            _candidate_rank(native)[:1] > _candidate_rank(source)[:1]
+            or native.combined_confidence >= source.combined_confidence
+            if sparse_regime
+            else _candidate_rank(native)[:2] >= _candidate_rank(source)[:2]
+        )
+    ):
+        return candidates, native
+    phase = round(regime.phase_offset, 6) % period
+    carrier = replace(
+        source,
+        candidate_id=_stable_id(
+            "authority-time-shift-candidate",
+            AUTHORITY_SEMANTIC_VERSION,
+            source.candidate_id,
+            phase,
+        ),
+        regime_id=regime.regime_id,
+        phase_offset=phase,
+        reason_codes=tuple(
+            sorted({*source.reason_codes, TIME_SHIFT_ADOPTED_REASON, *markers})
+        ),
+    )
+    return (*candidates, carrier), carrier
+
+
+def _cycle_change_takes_precedence(
+    base: AuthorityDecision, incumbent: RegimeRecord, shift: _TimeShift
+) -> bool:
+    """Whether the ordinary cycle-change rules own this decision.
+
+    They do whenever a challenger has suspended or replaced the incumbent
+    (level-two suspicion, a provisional transition or a new regime), unless
+    every such challenger is the time shift itself: the incumbent period at
+    the proposed phase.
+    """
+
+    if base.state in {
+        RegimeState.TRANSITION_CONFIRMED,
+        RegimeState.NEW_REGIME_PROVISIONAL,
+        RegimeState.NEW_REGIME_ESTABLISHED,
+    }:
+        drivers = (base.strongest_challenger,)
+    elif base.state is RegimeState.CHALLENGER_ACCUMULATING and base.suspicion_level >= 2:
+        drivers = tuple(
+            item
+            for item in base.challenger_contexts
+            if COUNTDOWN_SUSPENSION_LATCH_REASON in item.reason_codes
+        ) or (base.strongest_challenger,)
+    else:
+        return False
+    period = incumbent.candidate_period_seconds
+    return any(
+        item is None
+        or item.candidate_period_seconds != period
+        or _circular_distance(item.phase_offset, shift.phase_offset, period)
+        > incumbent.phase_tolerance
+        for item in drivers
+    )
+
+
+def _resolve_time_shift(
+    base: AuthorityDecision,
+    arguments: dict,
+    *,
+    unconfirmed_candidates: tuple[AuthorityCandidate, ...] | None = None,
+) -> AuthorityDecision:
+    """Apply Time Shift Detection to an established-incumbent decision.
+
+    ``arguments`` are the ``_incumbent_decision`` arguments that produced
+    ``base``.  A confirmed shift re-evaluates the decision with the incumbent
+    re-anchored at the new phase (and is then assessed again, so later shifts
+    in the retained history are followed; each adoption moves the regime's
+    establishment boundary forward, which bounds the recursion).  An
+    unconfirmed shift only annotates ``base``.
+    """
+
+    incumbent = arguments["incumbent"]
+    if not _time_shift_eligible(incumbent):
+        return base
+    last_aligned_at, suspicion_events, _state = _incumbent_alignment(
+        incumbent, arguments["events"], arguments["windows"], arguments["compact"]
+    )
+    shift = _time_shift_assessment(
+        incumbent, suspicion_events, arguments["windows"], last_aligned_at=last_aligned_at
+    )
+    if shift is None or _cycle_change_takes_precedence(base, incumbent, shift):
+        return base
+    if shift.confirmed_at is not None:
+        adopted = _time_shift_adoption(
+            arguments, shift, unconfirmed_candidates=unconfirmed_candidates
+        )
+        return _resolve_time_shift(_incumbent_decision(**adopted), adopted)
+    selected = base.selected_shadow_regime
+    if (
+        base.state not in {RegimeState.CHANGE_SUSPECTED, RegimeState.CHALLENGER_ACCUMULATING}
+        or selected is None
+        or selected.regime_id != incumbent.regime_id
+    ):
+        return base
+    suspected = len(shift.event_ids) >= TIME_SHIFT_SUSPECT_OBSERVATIONS
+    reasons = set(base.reason_codes)
+    if suspected:
+        reasons.discard(ISOLATED_OFF_PHASE_RESTART_REASON)
+        reasons.add(TIME_SHIFT_SUSPECTED_REASON)
+    else:
+        reasons.add(TIME_SHIFT_NOTICED_REASON)
+    selected_candidate = arguments["incumbent_candidate"]
+    candidates = base.candidates
+    regimes = base.regimes
+    incumbent_record = base.incumbent_shadow_regime
+    if (
+        suspected
+        and _time_shift_sparse_regime(incumbent)
+        and selected_candidate is not None
+        and _time_shift_authority_phase(selected_candidate.reason_codes) is None
+    ):
+        # A sparse regime's statistic at its own phase counts the shifted
+        # restarts as off-phase.  While the shift is suspected the earned
+        # pre-shift value is shown instead: the same statistic over the
+        # restarts before the first shifted observation.  Nothing persists.
+        preserved = _time_shift_preserved_candidate(
+            selected_candidate,
+            before_at=_time_shift_boundary(shift.first_observed_at),
+            sparse=arguments["sparse"],
+            relationship_map=arguments["relationship_map"],
+        )
+        if preserved.combined_confidence > selected_candidate.combined_confidence:
+            candidates = tuple(
+                preserved if item.candidate_id == selected_candidate.candidate_id else item
+                for item in candidates
+            )
+            selected_candidate = preserved
+
+            def preserve(regime: RegimeRecord | None) -> RegimeRecord | None:
+                if regime is None or regime.regime_id != incumbent.regime_id:
+                    return regime
+                return replace(regime, combined_confidence=preserved.combined_confidence)
+
+            selected = preserve(selected)
+            incumbent_record = preserve(incumbent_record)
+            regimes = tuple(preserve(item) for item in regimes)
+    return _decision(
+        server_key=base.server_key,
+        state=base.state,
+        selected=selected,
+        incumbent=incumbent_record,
+        regimes=regimes,
+        candidates=candidates,
+        contexts=base.challenger_contexts,
+        strongest=base.strongest_challenger,
+        normal_ledger=base.normal_ledger,
+        high_ledger=base.high_ledger,
+        cycle_visible=base.cycle_visible,
+        prediction_usable=base.prediction_usable and not suspected,
+        countdown_safe=base.countdown_safe and not suspected,
+        suspicion_level=base.suspicion_level,
+        suspicion_ids=base.active_suspicion_evidence_ids,
+        selected_candidate=selected_candidate,
+        reasons=tuple(reasons),
+    )
+
+
+def _time_shift_adoption(
+    arguments: dict,
+    shift: _TimeShift,
+    *,
+    unconfirmed_candidates: tuple[AuthorityCandidate, ...] | None = None,
+) -> dict:
+    """``_incumbent_decision`` arguments with the incumbent at the new phase.
+
+    The regime keeps its period, origin and earned authority.  Its phase
+    becomes the confirmed phase and its establishment boundary the confirming
+    restart, so evidence at the previous phase is historical: it cannot
+    authorize a transition back, which then needs new evidence.
+
+    Regime identity is period and phase, and the candidate at the previous
+    phase may still carry the previous identity, so the re-anchored regime
+    gets its own (derived from the previous one and the confirmed shift) and
+    replaces the previous record instead of superseding it: nothing about
+    the period was disproved, so no supersession boundary is recorded.
+    """
+
+    incumbent = arguments["incumbent"]
+    prior = arguments["prior"]
+    period = incumbent.candidate_period_seconds
+    phase = round(shift.phase_offset, 6) % period
+    authority_phase = _time_shift_authority_phase(incumbent.reason_codes)
+    authority_until = _time_shift_authority_until(incumbent.reason_codes)
+    if authority_phase is None:
+        authority_phase = incumbent.phase_offset
+        authority_until = None
+    if authority_until is None and _time_shift_sparse_regime(incumbent):
+        authority_until = _time_shift_boundary(shift.first_observed_at)
+    shifted = replace(
+        incumbent,
+        regime_id=_stable_id(
+            "authority-time-shift-regime",
+            AUTHORITY_SEMANTIC_VERSION,
+            incumbent.regime_id,
+            period,
+            phase,
+            round(shift.confirmed_at, 3),
+        ),
+        phase_offset=phase,
+        established_at=shift.confirmed_at,
+        reason_codes=tuple(
+            sorted(
+                {
+                    *(
+                        item
+                        for item in incumbent.reason_codes
+                        if item not in _time_shift_markers(incumbent.reason_codes)
+                    ),
+                    TIME_SHIFT_ADOPTED_REASON,
+                }
+            )
+        ),
+    )
+    candidates, candidate = _time_shift_incumbent_candidate(
+        shifted,
+        tuple(
+            item
+            for item in (
+                arguments["candidates"]
+                if unconfirmed_candidates is None
+                else unconfirmed_candidates
+            )
+            if _time_shift_authority_phase(item.reason_codes) is None
+        ),
+        authority_phase,
+        authority_until=authority_until,
+        sparse=arguments["sparse"],
+        relationship_map=arguments["relationship_map"],
+    )
+    if candidate is not None:
+        shifted = _regime_from_candidate(
+            candidate, status=RegimeRecordStatus.ESTABLISHED, existing=shifted
+        )
+    if prior is not None:
+        prior = replace(
+            prior,
+            regimes=tuple(
+                item for item in prior.regimes if item.regime_id != incumbent.regime_id
+            ),
+        )
+    # A sparse confirmation of the previous phase's candidate does not carry
+    # over to the re-anchored regime (the next rebuild judges confirmation at
+    # the regime's own phase, and never for a carrier).
+    upgrade_reasons = tuple(
+        item for item in arguments["upgrade_reasons"] if item != SPARSE_CONFIRMATION_REASON
+    )
+    return {
+        **arguments,
+        "prior": prior,
+        "candidates": candidates,
+        "ranked": tuple(sorted(candidates, key=_candidate_rank, reverse=True)),
+        "incumbent": shifted,
+        "incumbent_candidate": candidate,
+        "upgrade_reasons": tuple(dict.fromkeys((*upgrade_reasons, TIME_SHIFT_ADOPTED_REASON))),
+    }
+
+
+# --------------------------------------------------------------------------
+# Historical acquisition recovery
+# --------------------------------------------------------------------------
+
+
+def _historical_regime(candidate: AuthorityCandidate) -> RegimeRecord:
+    """A sparse-established regime at ``candidate`` (period, phase, tolerance)."""
+
+    regime = _regime_from_candidate(
+        candidate, status=RegimeRecordStatus.ESTABLISHED, origin=AuthorityOrigin.NORMAL
+    )
+    return replace(
+        regime,
+        reason_codes=tuple(
+            dict.fromkeys(
+                (*regime.reason_codes, SPARSE_ESTABLISHMENT_REASON, HISTORICAL_ACQUISITION_REASON)
+            )
+        ),
+    )
+
+
+def _historical_shift_group_refutes_longer_periods(
+    regime: RegimeRecord,
+    shift: _TimeShift,
+    events: tuple[PhysicalRestartEvent, ...],
+    *,
+    last_aligned_at: float,
+) -> bool:
+    """A2: the shifted restarts cannot be a longer multiple of the period.
+
+    SE4's rule applied to the shifted schedule's restarts: the authentic
+    restarts after the last aligned one that fall on the confirmed phase (one
+    per scheduled occurrence; the three confirming restarts and any later
+    ones) must refute every longer candidate period that is a multiple of
+    the regime's, and must still do so with any single restart removed, so
+    one coincidental restart can never decide it.
+    """
+
+    period = regime.candidate_period_seconds
+    multiples = tuple(
+        item for item in CANDIDATE_PERIODS if item > period and item % period == 0
+    )
+    if not multiples:
+        return True
+    members: list[float] = []
+    for at in sorted(
+        _event_at(item)
+        for item in events
+        if _authentic_event(item)
+        and _event_at(item) is not None
+        and _event_at(item) > last_aligned_at
+        and _circular_distance(_event_at(item), shift.phase_offset, period)
+        <= regime.phase_tolerance
+    ):
+        if all(abs(at - other) > period / 2 for other in members):
+            members.append(at)
+
+    def refutes(times: list[float]) -> bool:
+        return bool(times) and all(
+            any(
+                _circular_distance(value, times[0], multiple)
+                > candidate_phase_tolerance(multiple)
+                for value in times
+            )
+            for multiple in multiples
+        )
+
+    return refutes(members) and all(
+        refutes(members[:index] + members[index + 1 :]) for index in range(len(members))
+    )
+
+
+def _historical_prefix_candidate(
+    candidate: AuthorityCandidate,
+    *,
+    before_at: float,
+    normal_score: ScheduleScore,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    sparse: _SparseEvidence,
+) -> AuthorityCandidate:
+    """``candidate`` with its sparse slot and structure as of ``before_at``.
+
+    The existing sparse statistic, structure rules (SE1-SE5) and combined
+    formula, over the restarts strictly before the boundary, with the
+    candidate's own endpoint exclusions.  Gates, high authority and identity
+    are unchanged.
+    """
+
+    period = candidate.candidate_period_seconds
+    support = _sparse_support(
+        period=period,
+        phase_offset=candidate.phase_offset,
+        sparse=sparse,
+        excluded_event_ids=_relationship_endpoint_ids(
+            relationship_map[item]
+            for item in candidate.high_relationship_ids
+            if item in relationship_map
+        ),
+        candidate=candidate,
+        before_at=before_at,
+    )
+    try:
+        normal_candidate = normal_score.candidate(period)
+    except KeyError:
+        structure: tuple[str, ...] = ()
+    else:
+        structure = _sparse_structure_reasons(
+            period=period,
+            support=support,
+            normal_candidate=normal_candidate,
+            windows=windows,
+        )
+    proportional = bool(
+        support.off_phase_weight > 0 and support.consistency >= SPARSE_CONSISTENCY_TOLERANCE
+    )
+    sparse_reasons = {
+        SPARSE_STRUCTURE_REASON,
+        SPARSE_PERIOD_AMBIGUOUS_REASON,
+        SPARSE_PROPORTIONAL_ANOMALY_REASON,
+    }
+    combined = candidate.high_authority + (1.0 - candidate.high_authority) * min(
+        SPARSE_EVIDENCE_CEILING, SPARSE_EVIDENCE_CEILING * support.value
+    )
+    return replace(
+        candidate,
+        aligned_normal_confidence=round(support.value, 6),
+        combined_confidence=round(combined, 6),
+        reason_codes=tuple(
+            sorted(
+                {
+                    *(item for item in candidate.reason_codes if item not in sparse_reasons),
+                    *structure,
+                    *((SPARSE_PROPORTIONAL_ANOMALY_REASON,) if proportional else ()),
+                }
+            )
+        ),
+    )
+
+
+def _historical_shift_proposal(
+    candidate: AuthorityCandidate,
+    *,
+    normal_score: ScheduleScore,
+    candidates: tuple[AuthorityCandidate, ...],
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    sparse: _SparseEvidence,
+    compact: "_Compact | None",
+) -> tuple[AuthorityCandidate, float] | None:
+    """The pre-shift sparse establishment of ``candidate``, if the evidence has one.
+
+    The boundary is not searched for: it is the first observation of the
+    time shift that the existing assessment confirms against a regime at the
+    candidate's phase (after its latest aligned restart).  The unchanged
+    sparse gate (SE1-SE7 and the competitor rule) must select exactly this
+    candidate from the evidence before that boundary.
+    """
+
+    if candidate.harmonic_blockers:
+        return None
+    hypothetical = _historical_regime(candidate)
+    last_aligned_at, suspicion_events, _state = _incumbent_alignment(
+        hypothetical, events, windows, compact
+    )
+    shift = _time_shift_assessment(
+        hypothetical, suspicion_events, windows, last_aligned_at=last_aligned_at
+    )
+    if shift is None or shift.confirmed_at is None:
+        return None
+    if not _historical_shift_group_refutes_longer_periods(
+        hypothetical, shift, suspicion_events, last_aligned_at=last_aligned_at
+    ):
+        return None
+    boundary = _time_shift_boundary(shift.first_observed_at)
+    view = tuple(
+        _historical_prefix_candidate(
+            item,
+            before_at=boundary,
+            normal_score=normal_score,
+            windows=windows,
+            relationship_map=relationship_map,
+            sparse=sparse,
+        )
+        for item in candidates
+    )
+    choice = _sparse_establishing_candidate(
+        candidates=view,
+        windows=windows,
+        relationship_map=relationship_map,
+        sparse=sparse,
+        before_at=boundary,
+    )
+    if choice is None or choice[0].candidate_id != candidate.candidate_id:
+        return None
+    return choice
+
+
+def _historical_shift_acquisition(
+    *,
+    server_key: str,
+    normal_score: ScheduleScore,
+    candidates: tuple[AuthorityCandidate, ...],
+    ranked: tuple[AuthorityCandidate, ...],
+    normal_ledger: NormalEvidenceLedger,
+    high_ledger: HighEvidenceLedger,
+    windows: tuple[ExpectedWindowLedgerRecord, ...],
+    events: tuple[PhysicalRestartEvent, ...],
+    relationships: tuple[IntervalRelationship, ...],
+    relationship_map: dict[str, IntervalRelationship],
+    streaks: tuple[CadenceStreak, ...],
+    prior: AuthorityDecision | None,
+    sparse: _SparseEvidence | None,
+    compact: "_Compact | None",
+) -> AuthorityDecision | None:
+    """Historical acquisition recovery (operator decisions A1-A3).
+
+    Establishes what the live runtime would have established on the retained
+    evidence before a confirmed time shift, then evaluates every later
+    restart with the unchanged established-regime rules (suspicion,
+    challengers, cycle-change precedence and Time Shift Detection with its
+    sparse confidence carrier).  The result is used only when exactly one
+    candidate qualifies and the outcome is an established, adopted and
+    prediction-safe regime; otherwise acquisition continues unchanged.
+    Confidence is the existing combined formula throughout.
+    """
+
+    if sparse is None:
+        return None
+    proposals: dict[str, tuple[AuthorityCandidate, float]] = {}
+    for candidate in ranked:
+        proposal = _historical_shift_proposal(
+            candidate,
+            normal_score=normal_score,
+            candidates=candidates,
+            windows=windows,
+            events=events,
+            relationship_map=relationship_map,
+            sparse=sparse,
+            compact=compact,
+        )
+        if proposal is not None:
+            proposals[proposal[0].candidate_id] = proposal
+    if len(proposals) != 1:
+        return None
+    (prefix_candidate, established_at), = proposals.values()
+    regime = _historical_regime(prefix_candidate)
+    if regime.established_at is None:
+        regime = replace(regime, established_at=established_at)
+    superseded = tuple(
+        item
+        for item in (prior.regimes if prior is not None else ())
+        if item.status is RegimeRecordStatus.SUPERSEDED
+    )
+    historical_prior = _decision(
+        server_key=server_key,
+        state=RegimeState.ESTABLISHED,
+        selected=regime,
+        incumbent=regime,
+        regimes=(regime, *superseded),
+        candidates=candidates,
+        contexts=(),
+        strongest=None,
+        normal_ledger=normal_ledger,
+        high_ledger=high_ledger,
+        cycle_visible=True,
+        prediction_usable=True,
+        countdown_safe=True,
+        suspicion_level=0,
+        suspicion_ids=(),
+        selected_candidate=prefix_candidate,
+        reasons=(SPARSE_ESTABLISHMENT_REASON, HISTORICAL_ACQUISITION_REASON),
+    )
+    decision = _transition_decision(
+        server_key=server_key,
+        normal_score=normal_score,
+        candidates=candidates,
+        normal_ledger=normal_ledger,
+        high_ledger=high_ledger,
+        windows=windows,
+        events=events,
+        prior=historical_prior,
+        relationships=relationships,
+        streaks=streaks,
+        sparse=sparse,
+        compact=compact,
+    )
+    incumbent = decision.incumbent_shadow_regime
+    if not (
+        decision.state is RegimeState.ESTABLISHED
+        and incumbent is not None
+        and decision.selected_shadow_regime is not None
+        and decision.selected_shadow_regime.regime_id == incumbent.regime_id
+        and TIME_SHIFT_ADOPTED_REASON in incumbent.reason_codes
+        and HISTORICAL_ACQUISITION_REASON in incumbent.reason_codes
+        and decision.cycle_visible
+        and decision.prediction_usable
+        and decision.countdown_safe
+        and (
+            decision.suspicion_level == 0
+            or (
+                decision.suspicion_level == 1
+                and ISOLATED_OFF_PHASE_RESTART_REASON in decision.reason_codes
+            )
+        )
+    ):
+        return None
+    return decision
 
 
 def _isolated_off_phase_restart(
@@ -3214,6 +4221,13 @@ def _regime_from_candidate(
             reasons.append(ORIGIN_UPGRADE_REASON)
         if SPARSE_ESTABLISHMENT_REASON in existing.reason_codes:
             reasons.append(SPARSE_ESTABLISHMENT_REASON)
+        if HISTORICAL_ACQUISITION_REASON in existing.reason_codes:
+            reasons.append(HISTORICAL_ACQUISITION_REASON)
+        if TIME_SHIFT_ADOPTED_REASON in existing.reason_codes:
+            reasons.append(TIME_SHIFT_ADOPTED_REASON)
+            # The authority-phase marker lives on the carrying candidate, so
+            # it lapses with the carrier once the regime supports itself.
+            reasons.extend(_time_shift_markers(candidate.reason_codes))
     gate = candidate.highest_gate if origin is AuthorityOrigin.CONTINUITY else AuthorityGate.NORMAL
     return RegimeRecord(
         schema_version=AUTHORITY_SCHEMA_VERSION,
@@ -3717,6 +4731,7 @@ def _compact_sparse_support(
     compact: _Compact,
     excluded_event_ids: frozenset[str],
     candidate: "AuthorityCandidate | None",
+    before_at: float | None = None,
 ) -> _SparseSupport:
     from .companion_restart_phase2_learned_state import compact_sparse_support
 
@@ -3732,6 +4747,7 @@ def _compact_sparse_support(
         excluded_ring_event_ids=excluded,
         exclude_folded_high_endpoints=bool(info is not None and info.has_folded_evidence),
         exclude_anchor=anchor is not None and anchor in excluded,
+        before_at=before_at,
     )
     return _SparseSupport(
         value=value.value,

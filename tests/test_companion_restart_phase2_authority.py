@@ -783,12 +783,18 @@ def test_established_four_hour_is_symmetrically_superseded_by_h3_three_hour():
     ("event_count", "expected_state"),
     [
         (2, authority.RegimeState.CHANGE_SUSPECTED),
-        (3, authority.RegimeState.TRANSITION_CONFIRMED),
-        (4, authority.RegimeState.NEW_REGIME_ESTABLISHED),
+        (3, authority.RegimeState.ESTABLISHED),
+        (4, authority.RegimeState.ESTABLISHED),
     ],
 )
-def test_same_period_shifted_phase_is_distinct_reversible_regime(event_count, expected_state):
+def test_same_period_shifted_phase_is_a_time_shift_of_the_same_regime(event_count, expected_state):
+    """Time Shift Detection: the interval is unchanged, so the regime, its
+    period and its earned authority are kept and only the phase moves.  (A
+    same-period phase change used to supersede the incumbent with a new,
+    relearned regime through the H2/H3 challenger transition.)"""
+
     (events3, relationships3, streaks3), incumbent = established_three_hour()
+    original = incumbent.incumbent_shadow_regime
     shifted_start = events3[-1].canonical_phase_at + 3 * HOUR + 40 * 60
     shifted_events, shifted_relationships, shifted_streaks = cadence(
         3 * HOUR,
@@ -803,15 +809,30 @@ def test_same_period_shifted_phase_is_distinct_reversible_regime(event_count, ex
         combine(streaks3, shifted_streaks),
         prior=incumbent,
     )
+    regime = value.incumbent_shadow_regime
     assert value.state is expected_state
-    assert value.strongest_challenger.proposed_regime_id != incumbent.incumbent_shadow_regime.regime_id
+    assert value.selected_shadow_regime.regime_id == regime.regime_id
+    assert regime.candidate_period_seconds == 3 * HOUR
+    assert regime.authority_gate is original.authority_gate
+    assert regime.high_authority >= original.high_authority
+    assert value.combined_confidence >= incumbent.combined_confidence
+    assert value.strongest_challenger.proposed_regime_id != regime.regime_id
     assert "same_period_distinct_phase_regime" in value.strongest_challenger.reason_codes
+    assert [item.status for item in value.regimes] == [authority.RegimeRecordStatus.ESTABLISHED]
     if event_count == 2:
-        assert value.selected_shadow_regime.regime_id == incumbent.selected_shadow_regime.regime_id
-    elif event_count == 3:
+        assert authority.TIME_SHIFT_SUSPECTED_REASON in value.reason_codes
+        assert regime.regime_id == original.regime_id
+        assert regime.phase_offset == original.phase_offset
         assert not value.countdown_safe
+        assert not value.prediction_usable
     else:
-        assert value.incumbent_shadow_regime.phase_offset != incumbent.incumbent_shadow_regime.phase_offset
+        assert authority.TIME_SHIFT_ADOPTED_REASON in regime.reason_codes
+        assert regime.regime_id != original.regime_id
+        assert regime.phase_offset == pytest.approx(shifted_start % (3 * HOUR))
+        assert regime.established_at == shifted_events[2].canonical_phase_at
+        assert value.suspicion_level == 0
+        assert value.countdown_safe
+        assert value.prediction_usable
 
 
 @pytest.mark.parametrize(

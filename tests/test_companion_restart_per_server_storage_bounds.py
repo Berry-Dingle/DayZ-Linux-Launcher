@@ -27,6 +27,7 @@ from dzll_launcher import companion_restart_phase2_scoring as scoring
 
 HOUR = scoring.HOUR
 P3 = 3 * HOUR
+P4 = 4 * HOUR
 SUPERSEDED = authority.RegimeRecordStatus.SUPERSEDED.value
 
 
@@ -36,16 +37,22 @@ SUPERSEDED = authority.RegimeRecordStatus.SUPERSEDED.value
 
 
 def schedule_changes(changes, *, per=8, gap_hours=6, phases=23, step_minutes=7):
-    """``changes`` genuine schedule changes: continuous 3 h segments whose phase
-    moves by ``step_minutes`` each time, cycling through ``phases`` phases (so
-    earlier schedules return and are re-acquired)."""
+    """``changes`` genuine schedule changes: continuous segments alternating
+    between a 3 h and a 4 h interval whose phase moves by ``step_minutes``
+    each time, cycling through ``phases`` phases (so earlier schedules return
+    and are re-acquired).
+
+    The interval itself changes at every segment.  A change of phase alone
+    keeps the regime (Time Shift Detection) and would supersede nothing.
+    """
 
     pipeline = s8.Pipeline()
     start = s8.at(0, 0)
     for index in range(changes + 1):
+        period = P4 if index % 2 else P3
         first = start + (index % phases) * step_minutes * 60
-        pipeline.observe(f"segment-{index}", [first + step * P3 for step in range(per)])
-        start = first + per * P3 + gap_hours * HOUR
+        pipeline.observe(f"segment-{index}", [first + step * period for step in range(per)])
+        start = first + per * period + gap_hours * HOUR
     return pipeline
 
 

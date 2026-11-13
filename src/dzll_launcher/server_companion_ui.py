@@ -40,6 +40,11 @@ RESTART_PRESENTATION_TOOLTIPS = {
         "Cycle Confidence shows support for the possible new schedule. The learned "
         "cycle returns after it is confirmed twice more."
     ),
+    "possible_time_change": (
+        "The server appears to be restarting at different times while keeping its "
+        "established restart interval. Predictions will resume when the new schedule "
+        "is confirmed."
+    ),
     "likely_new_cycle": "A possible replacement cycle is being verified; prediction is paused.",
     "confirmed_new_cycle": "A newer repeated cadence has replaced the previous cycle.",
     "prediction_temporarily_suspended": "The learned schedule is temporarily unsafe to predict.",

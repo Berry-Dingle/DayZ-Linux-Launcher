@@ -1858,6 +1858,7 @@ def compact_sparse_support(
     exclude_folded_high_endpoints: bool = False,
     exclude_folded_confirmation_endpoints: bool = False,
     exclude_anchor: bool = False,
+    before_at: float | None = None,
 ) -> CompactSparseSupport:
     """``authority._sparse_support`` over folded bins plus ring events.
 
@@ -1869,6 +1870,13 @@ def compact_sparse_support(
     superseded-explained restarts count as historical only then (otherwise
     off-phase).  Superseded explanation uses the bin's closest residual.
     Every approximation lowers, never raises, the result.
+
+    ``before_at`` limits the pool to restarts strictly earlier than it (Time
+    Shift Detection's pre-shift evaluation).  A bin first folded at or after
+    it is left out.  A bin straddling it cannot be split, so an aligned one
+    counts as off-phase; the domain total runs to the earliest restart of
+    the first bin folded at or after ``before_at`` (exact when no bin
+    straddles, otherwise larger).  Both only lower the result.
     """
 
     excluded = set(excluded_ring_event_ids)
@@ -1901,8 +1909,12 @@ def compact_sparse_support(
     befores: dict[int, tuple[float, float]] = {}
     other_tags: list[EndpointTag] = []
     for item in state.pool:
+        if before_at is not None and item.first_at >= before_at:
+            continue
         entry = _bin_entry(item)
         state_class, mad_value = _classify(entry, phase_offset, period)
+        if before_at is not None and state_class == _ALIGNED and item.last_at >= before_at:
+            state_class = _AMBIGUOUS
         weight, count = item.weight, item.count
         first_at = item.first_at
         before = (item.weight_before, item.tagged_before_at(period))
@@ -1927,7 +1939,7 @@ def compact_sparse_support(
                 removed.append((removed_weight, removed_at))
         elif exclude_folded_high_endpoints and tag is not None:
             other_tags.append(tag)
-        if count <= 0 or weight <= _EPSILON:
+        if count <= 0 or weight <= _EPSILON or (before_at is not None and first_at >= before_at):
             continue
         entry = _Entry(
             item.seconds_min,
@@ -1946,6 +1958,8 @@ def compact_sparse_support(
         if event.event_id in excluded:
             continue
         entry = _ring_entry(event)
+        if before_at is not None and entry.first_at >= before_at:
+            continue
         state_class, mad_value = _classify(entry, phase_offset, period)
         entries.append((entry, state_class, mad_value, explained(entry)))
 
@@ -1969,22 +1983,36 @@ def compact_sparse_support(
     )
     if anchor_entry.source is not None:
         pool_before, tagged_before = befores[anchor_entry.source.index]
+        pool_until = state.pool_weight_total
+        tagged_until = next(
+            (value for key, value in state.tagged_weight_totals if key == period), 0.0
+        )
+        if before_at is not None:
+            later = [item for item in state.pool if item.first_at >= before_at]
+            if later:
+                boundary = min(later, key=lambda item: (item.first_at, item.weight_before))
+                pool_until = boundary.weight_before
+                tagged_until = boundary.tagged_before_at(period)
         # Exact: every restart folded at or after the first aligned one.
-        folded_total = state.pool_weight_total - pool_before
+        folded_total = pool_until - pool_before
         if exclude_folded_high_endpoints:
             # Excluded endpoints folded at or after the domain start: all
             # period-P tagged weight since then, minus tags of bins that stay
             # in the pool (over-estimated, so the domain is never too small).
-            tagged_since = next(
-                (value for key, value in state.tagged_weight_totals if key == period), 0.0
-            ) - tagged_before
+            tagged_since = tagged_until - tagged_before
             tagged_since -= sum(
                 item.weight
                 for item in other_tags
                 if item.last_tagged_at is None or item.last_tagged_at >= first
             )
             folded_total -= max(0.0, tagged_since)
-        folded_total -= sum(weight for weight, at in removed if at >= first)
+        folded_total -= sum(
+            weight
+            for weight, at in removed
+            if at >= first and (before_at is None or at < before_at)
+        )
+        if before_at is not None:
+            folded_total = max(0.0, folded_total)
     else:
         folded_total = 0.0
     total = folded_total + ring_total

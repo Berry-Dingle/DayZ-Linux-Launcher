@@ -1030,8 +1030,17 @@ def test_s15_sparse_off_phase_evidence_never_escalates_against_established_cycle
         step.decision.incumbent_shadow_regime.regime_id
         == original.decision.incumbent_shadow_regime.regime_id
     )
-    assert value.presentation_state is Presentation.CONFIRMED_CYCLE
-    assert value.countdown_visible and value.countdown_safe
+    assert (
+        step.decision.incumbent_shadow_regime.phase_offset
+        == original.decision.incumbent_shadow_regime.phase_offset
+    )
+    # Time Shift Detection: these restarts repeat several different phases,
+    # so no shift is adopted and nothing escalates, but a repeated new phase
+    # withholds the prediction until the schedule is clear again.
+    assert authority.TIME_SHIFT_SUSPECTED_REASON in step.decision.reason_codes
+    assert value.presentation_state is Presentation.POSSIBLE_TIME_CHANGE
+    assert value.cycle_period_seconds == P3
+    assert not value.countdown_visible
 
 
 # --------------------------------------------------------------------------

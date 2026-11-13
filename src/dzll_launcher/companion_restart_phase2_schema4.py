@@ -47,6 +47,8 @@ from .companion_restart_phase2_continuity import (
     build_continuity_chains,
     extract_interval_relationships,
     observed_transition_spans_from_events,
+    reassess_cadence_streaks,
+    reassess_high_eligibility,
     reconstruct_historical_event_provenance,
 )
 from .companion_restart_phase2_detection import (
@@ -1779,10 +1781,18 @@ def rebuild_schema4_server_record(
         regime_boundaries=(item.ended_at for item in runtime.prior_regimes),
         phase_recency_policy=PhaseRecencyPolicy.INACTIVITY_NEUTRAL,
     )
-    relationships = persisted_interval_relationships(fresh)
-    streaks = persisted_cadence_streaks(fresh)
-    windows_ledger = persisted_expected_window_ledger(fresh)
     events = persisted_physical_events(fresh)
+    # Persisted relationships are immutable; derived evaluation (folding and
+    # authority, raw or compact) judges their high eligibility by the current
+    # rules, so a relationship stored before a rule cannot keep authority the
+    # rule rejects.  The persisted record is unchanged.
+    relationships = reassess_high_eligibility(persisted_interval_relationships(fresh), events)
+    streaks = reassess_cadence_streaks(
+        persisted_cadence_streaks(fresh),
+        relationships,
+        chains=persisted_continuity_chains(fresh),
+    )
+    windows_ledger = persisted_expected_window_ledger(fresh)
     try:
         prior = persisted_authority_decision(existing_record)
     except (KeyError, TypeError, ValueError, Schema4Error):

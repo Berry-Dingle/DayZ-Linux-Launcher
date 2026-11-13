@@ -599,24 +599,8 @@ def extract_interval_relationships(
             right_at = _event_at(right)
             if right_at is None or right_at <= left_at:
                 continue
-            intervening = tuple(unique[left_index + 1:right_index])
-            authentic_intervening = tuple(
-                item for item in intervening if _authentic_physical_event(item)
-            )
-            unobservable_intervening = tuple(
-                item
-                for item in intervening
-                if not _authentic_physical_event(item)
-                and not _schedule_neutral_attribution_anomaly(item)
-                and (
-                    event_interrupts_interval_observation(item)
-                    or item.outcome
-                    in {
-                        EventOutcome.AMBIGUOUS_DRAIN,
-                        EventOutcome.INCOMPLETE,
-                        EventOutcome.EXPIRED,
-                    }
-                )
+            authentic_intervening, unobservable_intervening = _intervening_episodes(
+                unique[left_index + 1:right_index]
             )
             gap = right_at - left_at
             same_identity = _same_event_continuity(left, right)
@@ -1151,6 +1135,151 @@ def _identity_break_reason(left: ContinuitySpan, right: ContinuitySpan) -> str |
     if left.continuity_chain_id != right.continuity_chain_id:
         return "continuity_chain_changed"
     return None
+
+
+def _intervening_episodes(
+    intervening: Iterable[PhysicalRestartEvent],
+) -> tuple[tuple[PhysicalRestartEvent, ...], tuple[PhysicalRestartEvent, ...]]:
+    """(authentic restarts, unobservable episodes) between two endpoints."""
+
+    values = tuple(intervening)
+    authentic = tuple(item for item in values if _authentic_physical_event(item))
+    unobservable = tuple(
+        item
+        for item in values
+        if not _authentic_physical_event(item)
+        and not _schedule_neutral_attribution_anomaly(item)
+        and (
+            event_interrupts_interval_observation(item)
+            or item.outcome
+            in {
+                EventOutcome.AMBIGUOUS_DRAIN,
+                EventOutcome.INCOMPLETE,
+                EventOutcome.EXPIRED,
+            }
+        )
+    )
+    return authentic, unobservable
+
+
+# A persisted relationship whose stored high eligibility the current
+# event-based rules reject (for example an unobservable episode between its
+# endpoints, a rule newer than the relationship).  Derived evaluation only;
+# the persisted relationship is immutable and unchanged.
+HIGH_ELIGIBILITY_WITHDRAWN_REASON = "high_eligibility_withdrawn_under_current_rules"
+
+
+@dataclass(frozen=True)
+class _StoredContinuityVerdict:
+    """The coverage verdict of a stored high-eligible relationship.
+
+    Coverage and query health were judged from spans when the relationship
+    was created; retention may since have pruned those spans, so they are not
+    re-judged (and never granted)."""
+
+    continuity_qualified: bool = True
+    query_health_adequate: bool = True
+
+
+def reassess_high_eligibility(
+    relationships: Iterable[IntervalRelationship],
+    events: Iterable[PhysicalRestartEvent],
+) -> tuple[IntervalRelationship, ...]:
+    """Stored relationships with high eligibility as the current rules judge it.
+
+    Schema-4 relationships are immutable by identity, so a relationship
+    persisted before a rule existed keeps its original flag.  For derived
+    evaluation, every stored high-eligible relationship whose endpoints are
+    retained is judged again by the current event-based rules
+    (``_high_eligibility_reasons``: endpoint class, authenticity, outage
+    contract, continuity identity, intervening restarts and unobservable
+    episodes, residual), with the retained events between its endpoints.  A
+    relationship the rules reject is returned high-ineligible; nothing is
+    ever made eligible, and a relationship that cannot be judged (an endpoint
+    not retained) keeps its stored verdict.  Order and identities are kept.
+    """
+
+    unique = _unique_events(events)
+    position = {item.event_id: index for index, item in enumerate(unique)}
+    verdict = _StoredContinuityVerdict()
+    result = []
+    for relationship in relationships:
+        left_index = position.get(relationship.left_event_id)
+        right_index = position.get(relationship.right_event_id)
+        if (
+            not relationship.high_authority_eligible
+            or left_index is None
+            or right_index is None
+            or right_index <= left_index
+        ):
+            result.append(relationship)
+            continue
+        authentic, unobservable = _intervening_episodes(unique[left_index + 1 : right_index])
+        reasons = _high_eligibility_reasons(
+            unique[left_index],
+            unique[right_index],
+            relationship.relationship_kind,
+            relationship.signed_residual_seconds,
+            relationship.tolerance_seconds,
+            authentic,
+            verdict,
+            unobservable_intervening=unobservable,
+        )
+        if not reasons:
+            result.append(relationship)
+            continue
+        result.append(
+            replace(
+                relationship,
+                high_authority_eligible=False,
+                high_quality_diagnostic=0.0,
+                reason_codes=tuple(
+                    sorted(
+                        (set(relationship.reason_codes) - {"high_authority_eligible"})
+                        | set(reasons)
+                        | {HIGH_ELIGIBILITY_WITHDRAWN_REASON}
+                    )
+                ),
+            )
+        )
+    return tuple(result)
+
+
+def reassess_cadence_streaks(
+    streaks: Iterable[CadenceStreak],
+    relationships: Iterable[IntervalRelationship],
+    *,
+    chains: Iterable[ContinuityChain] = (),
+) -> tuple[CadenceStreak, ...]:
+    """Stored streaks consistent with ``reassess_high_eligibility``.
+
+    A streak containing a relationship whose eligibility was withdrawn is
+    replaced by the maximal runs of its remaining eligible relationships
+    (``build_cadence_streaks``); every other streak is kept as stored.
+    """
+
+    values = tuple(streaks)
+    by_id = {item.relationship_id: item for item in relationships}
+    withdrawn = {
+        key
+        for key, item in by_id.items()
+        if HIGH_ELIGIBILITY_WITHDRAWN_REASON in item.reason_codes
+    }
+    if not withdrawn:
+        return values
+    affected = [item for item in values if withdrawn.intersection(item.relationship_ids)]
+    if not affected:
+        return values
+    remaining = {
+        key: by_id[key]
+        for item in affected
+        for key in item.relationship_ids
+        if key in by_id and key not in withdrawn
+    }
+    rebuilt = build_cadence_streaks(remaining.values(), chains=chains)
+    kept = tuple(item for item in values if item not in affected)
+    merged = {item.streak_id: item for item in (*kept, *rebuilt)}
+    return tuple(sorted(merged.values(), key=lambda item: item.streak_id))
 
 
 def _high_eligibility_reasons(

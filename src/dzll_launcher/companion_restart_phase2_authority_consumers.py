@@ -11,6 +11,7 @@ from .companion_restart_phase2_authority import (
     ISOLATED_OFF_PHASE_RESTART_REASON,
     SPARSE_ESTABLISHMENT_REASON,
     SPARSE_PERIOD_AMBIGUOUS_REASON,
+    TIME_SHIFT_SUSPECTED_REASON,
     AuthorityCandidate,
     AuthorityDecision,
     AuthorityGate,
@@ -68,6 +69,9 @@ class AuthorityPresentationKey(str, Enum):
     LIKELY_CYCLE = "likely_cycle"
     CONFIRMED_CYCLE = "confirmed_cycle"
     SCHEDULE_CHANGE_SUSPECTED = "schedule_change_suspected"
+    # Time Shift Detection: the established period is kept, but restarts
+    # appear to have moved to a new time that is not confirmed yet.
+    POSSIBLE_TIME_CHANGE = "possible_time_change"
     LIKELY_NEW_CYCLE = "likely_new_cycle"
     CONFIRMED_NEW_CYCLE = "confirmed_new_cycle"
     PREDICTION_TEMPORARILY_SUSPENDED = "prediction_temporarily_suspended"
@@ -724,10 +728,10 @@ def authority_consumer_summary(
     normal_schedule_confidence = (
         "normal_schedule_confidence_display" in decision.reason_codes
     )
-    suspected_change = (
-        decision.presentation_state
-        is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
-    )
+    suspected_change = decision.presentation_state in {
+        AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED,
+        AuthorityPresentationKey.POSSIBLE_TIME_CHANGE,
+    }
     learning = decision.presentation_state in {
         AuthorityPresentationKey.NONE,
         AuthorityPresentationKey.PATTERN_ONLY,
@@ -810,6 +814,14 @@ def _presentation(
         # candidate supplies the (capped) learning confidence.  Provisional
         # changes use TRANSITION_CONFIRMED / NEW_REGIME_PROVISIONAL, below.
         return AuthorityPresentationKey.PATTERN_ONLY, False, False, None
+    if TIME_SHIFT_SUSPECTED_REASON in decision.reason_codes and state in {
+        RegimeState.CHANGE_SUSPECTED,
+        RegimeState.CHALLENGER_ACCUMULATING,
+    }:
+        # Time Shift Detection: the established cycle and its confidence stay
+        # visible; authority has withheld the prediction, so no countdown or
+        # scheduled warning exists and neither row is shown.
+        return AuthorityPresentationKey.POSSIBLE_TIME_CHANGE, True, False, None
     if safe_established_continuity_h2:
         return AuthorityPresentationKey.CONFIRMED_CYCLE, True, False, None
     if safe_established_sparse:
@@ -1102,6 +1114,7 @@ def _presentation_text(decision: AuthorityConsumerDecision) -> str:
         AuthorityPresentationKey.LIKELY_CYCLE: f"Likely: {label}",
         AuthorityPresentationKey.CONFIRMED_CYCLE: f"Confirmed: {label}",
         AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED: "Suspected Cycle Change",
+        AuthorityPresentationKey.POSSIBLE_TIME_CHANGE: "Possible Time Change",
         AuthorityPresentationKey.LIKELY_NEW_CYCLE: f"Likely new: {label}",
         AuthorityPresentationKey.CONFIRMED_NEW_CYCLE: f"Confirmed new: {label}",
         AuthorityPresentationKey.PREDICTION_TEMPORARILY_SUSPENDED: "Prediction temporarily suspended",
