@@ -395,12 +395,41 @@ def refresh_column_view_sort_indicators(view: Gtk.ColumnView, sort_key: str, sor
             pass
 
 
+def _normalize_column_title_button(button, column_index: int, *, is_last: bool) -> None:
+    _add_css_classes(button, "dzll-column-title-flat")
+    if is_last:
+        _add_css_classes(button, "dzll-column-title-join")
+    try:
+        button.set_halign(Gtk.Align.FILL)
+        button.set_hexpand(True)
+    except Exception:
+        pass
+
+    box = _find_first_descendant(button, lambda widget: _css_name_is(widget, "box"))
+    if box is not None:
+        try:
+            box.set_halign(Gtk.Align.FILL)
+            box.set_hexpand(True)
+        except Exception:
+            pass
+
+    label = _find_first_descendant(button, lambda widget: isinstance(widget, Gtk.Label))
+    if label is not None:
+        _set_header_label_alignment(label, column_index)
+
+
 def _normalize_column_view_header(view: Gtk.ColumnView) -> None:
     header = _find_first_descendant(view, lambda widget: _css_name_is(widget, "header"))
     if header is None:
         return
 
     if getattr(view, "_dzll_columnview_header_normalized", False):
+        # A column inserted after the one-time pass (the optional background
+        # download column) gets a fresh title button; style it the same way.
+        # Only the name column (never re-inserted) uses start alignment.
+        for button in _iter_widget_children(header):
+            if _css_name_is(button, "button") and not button.has_css_class("dzll-column-title-flat"):
+                _normalize_column_title_button(button, -1, is_last=False)
         refresh_column_view_sort_header_handlers(view)
         refresh_column_view_sort_indicators(
             view,
@@ -421,26 +450,11 @@ def _normalize_column_view_header(view: Gtk.ColumnView) -> None:
     view._dzll_columnview_header_normalized = True
 
     for column_index, button in enumerate(title_buttons):
-        _add_css_classes(button, "dzll-column-title-flat")
-        if column_index == len(title_buttons) - 1:
-            _add_css_classes(button, "dzll-column-title-join")
-        try:
-            button.set_halign(Gtk.Align.FILL)
-            button.set_hexpand(True)
-        except Exception:
-            pass
-
-        box = _find_first_descendant(button, lambda widget: _css_name_is(widget, "box"))
-        if box is not None:
-            try:
-                box.set_halign(Gtk.Align.FILL)
-                box.set_hexpand(True)
-            except Exception:
-                pass
-
-        label = _find_first_descendant(button, lambda widget: isinstance(widget, Gtk.Label))
-        if label is not None:
-            _set_header_label_alignment(label, column_index)
+        _normalize_column_title_button(
+            button,
+            column_index,
+            is_last=column_index == len(title_buttons) - 1,
+        )
 
     refresh_column_view_sort_header_handlers(view)
     refresh_column_view_sort_indicators(
@@ -2284,9 +2298,21 @@ def _make_action_factory(
             if perf_metrics is not None:
                 perf_metrics.finish(token)
 
+    def teardown(_factory, list_item):
+        # Cells are destroyed when GTK discards row widgets or when the
+        # optional column is removed; drop the stale button reference.
+        button = list_item.get_child()
+        if button is None:
+            return
+        try:
+            buttons.remove(button)
+        except ValueError:
+            pass
+
     factory.connect("setup", setup)
     factory.connect("bind", bind)
     factory.connect("unbind", unbind)
+    factory.connect("teardown", teardown)
 
     def refresh_active_states() -> None:
         for button in list(buttons):
@@ -2504,7 +2530,7 @@ def build_server_column_view(
         perf_metrics=perf_metrics,
         drag_light=drag_light,
     )
-    _append_column(
+    join_column = _append_column(
         view,
         "",
         join_factory,
@@ -2512,7 +2538,47 @@ def build_server_column_view(
         header_title="",
         header_css_classes="dzll-column-header-action",
     )
+    view._dzll_background_download_anchor_column = join_column
     view.refresh_join_states = getattr(
         join_factory, "_dzll_refresh_active_states", lambda: None,
     )
     return view, features
+
+
+def _background_download_column_position(view) -> int:
+    columns = view.get_columns()
+    count = int(columns.get_n_items())
+    anchor = getattr(view, "_dzll_background_download_anchor_column", None)
+    if anchor is not None:
+        for index in range(count):
+            if columns.get_item(index) is anchor:
+                return index
+    return count
+
+
+def set_background_download_column_attached(view, attached: bool) -> bool:
+    """Show or hide the optional background-download column.
+
+    The column is removed from and re-inserted into the view (immediately
+    before the Join column) instead of being hidden with
+    ``Gtk.ColumnViewColumn.set_visible(False)``. GTK 4.24 measures the cell
+    that follows an invisible column at width 0 and logs a
+    "Trying to measure GtkColumnViewCellWidget" warning for every row widget
+    on every relayout.
+
+    Returns False when the view has no background-download column.
+    """
+    column = getattr(view, "background_download_column", None)
+    if view is None or column is None:
+        return False
+    is_attached = column.get_column_view() is view
+    if not attached:
+        if is_attached:
+            view.remove_column(column)
+        return True
+    if not column.get_visible():
+        column.set_visible(True)
+    if not is_attached:
+        view.insert_column(_background_download_column_position(view), column)
+        _schedule_column_view_header_refresh(view)
+    return True

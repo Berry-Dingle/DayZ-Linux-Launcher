@@ -110,6 +110,7 @@ from .column_view import (
     required_mods_popup_suppression_count,
     refresh_column_view_sort_header_handlers,
     refresh_column_view_sort_indicators,
+    set_background_download_column_attached,
     set_required_mods_popup_suppressed,
     set_sort_debug_bind_hook,
 )
@@ -9008,9 +9009,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             GLib.idle_add(restore_favourite_scroll)
 
     def _set_background_download_column_visible(self, visible: bool) -> None:
-        column = getattr(getattr(self, "list_view", None), "background_download_column", None)
-        if column is not None:
-            column.set_visible(bool(visible))
+        view = getattr(self, "list_view", None)
+        if view is not None:
+            set_background_download_column_attached(view, bool(visible))
 
     # ----------------------------
     # Manual Refresh

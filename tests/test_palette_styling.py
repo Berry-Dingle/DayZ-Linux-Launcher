@@ -130,7 +130,7 @@ def test_server_companion_adjacent_join_header_has_no_right_border():
         1,
     )[1].split("}", 1)[0]
 
-    assert 'if column_index == len(title_buttons) - 1:' in source
+    assert 'is_last=column_index == len(title_buttons) - 1' in source
     assert '_add_css_classes(button, "dzll-column-title-join")' in source
     assert "border-right: 0;" in rule
     assert "border-top" not in rule
