@@ -139,6 +139,37 @@ def _set_text_if_changed(widget, text: str, perf_metrics=None) -> bool:
     return True
 
 
+def _on_lazy_tooltip_query(widget, _x, _y, _keyboard_mode, tooltip) -> bool:
+    text = getattr(widget, "_dzll_lazy_tooltip", None)
+    if not text:
+        return False
+    tooltip.set_text(text)
+    return True
+
+
+def _set_lazy_tooltip(widget, text) -> None:
+    """Record a row-cell tooltip without calling Gtk.Widget.set_tooltip_text().
+
+    In GTK 4, set_tooltip_text() triggers a synchronous tooltip query (a pointer
+    round trip to the display server, ~6 ms each). Row binds used to call it
+    several times per row, which froze the main loop for 15-30 s whenever the
+    visible store was rebuilt. The text is now resolved only on hover.
+    """
+    text = None if text is None else (str(text) or None)
+    if not isinstance(widget, Gtk.Widget):
+        widget.set_tooltip_text(text)
+        return
+    widget._dzll_lazy_tooltip = text
+    if getattr(widget, "_dzll_lazy_tooltip_installed", False):
+        return
+    widget._dzll_lazy_tooltip_installed = True
+    if widget.get_tooltip_text() is not None:
+        # Drop any static GTK tooltip so the class handler cannot show stale text.
+        widget.set_tooltip_text(None)
+    widget.connect("query-tooltip", _on_lazy_tooltip_query)
+    widget.set_has_tooltip(True)
+
+
 def _set_visible_if_changed(widget, visible: bool, perf_metrics=None) -> bool:
     try:
         if bool(widget.get_visible()) == bool(visible):
@@ -1683,7 +1714,7 @@ def _bind_required_mods_popover_target(
     has_mods = bool(names)
     _set_required_mods_pointer_cursor(widget, has_mods)
     try:
-        widget.set_tooltip_text("View required mods" if has_mods else None)
+        _set_lazy_tooltip(widget, "View required mods" if has_mods else None)
         if perf_metrics is not None:
             perf_metrics.count("name_tooltip_writes")
     except Exception:
@@ -1709,11 +1740,11 @@ def _bind_name_status(cell, obj: ServerObject | None, perf_metrics=None, *, ligh
         _set_text_if_changed(lock_label, lock_text, perf_metrics)
     else:
         lock_label.set_text(lock_text)
-    lock_label.set_tooltip_text("Password Protected" if locked else None)
+    _set_lazy_tooltip(lock_label, "Password Protected" if locked else None)
     badge = getattr(cell, "_dzll_official_badge", None)
     if badge is not None:
         badge.set_visible(official)
-        badge.set_tooltip_text("Official Server" if official else None)
+        _set_lazy_tooltip(badge, "Official Server" if official else None)
 
 
 def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) -> None:
@@ -1731,12 +1762,12 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) 
     if not isinstance(obj, ServerObject):
         _bind_name_status(cell, None)
         name_label.set_text("")
-        name_label.set_tooltip_text(None)
+        _set_lazy_tooltip(name_label, None)
         perspective_label.set_text("")
         flag_label.set_text("")
-        flag_label.set_tooltip_text(None)
+        _set_lazy_tooltip(flag_label, None)
         ipport_label.set_text("")
-        ipport_label.set_tooltip_text(None)
+        _set_lazy_tooltip(ipport_label, None)
         ipport_label._dzll_ipport_plain = ""
         mods_label.set_text("")
         mods_label.set_visible(False)
@@ -1752,7 +1783,7 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) 
     _bind_name_status(cell, obj)
     server_name = (getattr(obj, "name", "") or "").strip()
     name_label.set_text(server_name)
-    name_label.set_tooltip_text(server_name or None)
+    _set_lazy_tooltip(name_label, server_name or None)
 
     is_3p = bool(getattr(obj, "third_person", False))
     perspective_label.set_text("3P" if is_3p else "1P")
@@ -1764,14 +1795,14 @@ def _bind_name_cell(cell: Gtk.Box, obj: ServerObject | None, perf_metrics=None) 
 
     country = (getattr(obj, "country", "") or "").strip().upper()
     flag_label.set_text(flag_for(country) if len(country) == 2 else "")
-    flag_label.set_tooltip_text(country_tooltip_for(country))
+    _set_lazy_tooltip(flag_label, country_tooltip_for(country))
 
     _flag, _country_name, ipport, _meta = row_stable_display(obj)
     mod_count = int(getattr(obj, "mod_count", 0) or 0)
     mods_text = f"Mods: {mod_count}"
     ipport_label.set_text(ipport)
     ipport_label._dzll_ipport_plain = ipport
-    ipport_label.set_tooltip_text(f"Right-click to copy address: {ipport}" if ipport else None)
+    _set_lazy_tooltip(ipport_label, f"Right-click to copy address: {ipport}" if ipport else None)
     mods_label.set_text(mods_text)
     mods_button_label.set_text(mods_text)
     has_mods = mod_count > 0
@@ -1813,7 +1844,7 @@ def _bind_name_cell_light(
     if not getattr(cell, "_dzll_drag_tooltips_cleared", False):
         for widget in (name_label, ipport_label, mods_button):
             try:
-                widget.set_tooltip_text(None)
+                _set_lazy_tooltip(widget, None)
             except Exception:
                 pass
         cell._dzll_drag_tooltips_cleared = True
@@ -1871,7 +1902,7 @@ def _bind_name_cell_light(
         if changed and index == 2 and perf_metrics is not None:
             perf_metrics.count("light_flag_updates")
     ipport_label._dzll_ipport_plain = ipport
-    flag_label.set_tooltip_text(country_tooltip)
+    _set_lazy_tooltip(flag_label, country_tooltip)
     _set_visible_if_changed(mods_label, not has_mods, perf_metrics)
     _set_visible_if_changed(mods_button, has_mods, perf_metrics)
     if perf_metrics is not None:
@@ -2081,7 +2112,7 @@ def _bind_action_button_light(
     if not active_css_class:
         return
     if not getattr(button, "_dzll_drag_action_light", False) and tooltip_text:
-        button.set_tooltip_text(tooltip_text)
+        _set_lazy_tooltip(button, tooltip_text)
     button._dzll_drag_action_light = True
     if perf_metrics is not None:
         perf_metrics.count("drag_skipped_tooltip_writes")
@@ -2138,9 +2169,9 @@ def _make_action_factory(
             image.set_from_icon_name(dynamic_icon)
         dynamic_tooltip = dynamic.get("tooltip")
         if dynamic_tooltip is not None:
-            button.set_tooltip_text(str(dynamic_tooltip))
+            _set_lazy_tooltip(button, str(dynamic_tooltip))
         elif tooltip_text:
-            button.set_tooltip_text(tooltip_text)
+            _set_lazy_tooltip(button, tooltip_text)
         dynamic_accessible = dynamic.get("accessible_label")
         if dynamic_accessible is not None:
             try:
@@ -2176,7 +2207,7 @@ def _make_action_factory(
                 if perf_metrics is not None:
                     perf_metrics.count(f"{factory_name}_image_state_changes", 2)
         if dynamic_tooltip is None and (tooltip_text or active_tooltip_text):
-            button.set_tooltip_text(active_tooltip_text if active and active_tooltip_text else tooltip_text)
+            _set_lazy_tooltip(button, active_tooltip_text if active and active_tooltip_text else tooltip_text)
             if perf_metrics is not None:
                 perf_metrics.count(f"{factory_name}_tooltip_writes")
 
@@ -2203,7 +2234,7 @@ def _make_action_factory(
         if perf_metrics is not None:
             perf_metrics.count(f"{factory_name}_image_state_changes")
         if tooltip_text:
-            button.set_tooltip_text(tooltip_text)
+            _set_lazy_tooltip(button, tooltip_text)
             if perf_metrics is not None:
                 perf_metrics.count(f"{factory_name}_tooltip_writes")
         if accessible_label:
