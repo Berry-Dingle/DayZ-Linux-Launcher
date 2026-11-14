@@ -1424,6 +1424,12 @@ class PhysicalEpisodeEngine:
     def _population_substantially_unchanged(self, sample: ObservationSample) -> bool:
         if sample.player_status is not FieldStatus.PRESENT or sample.players is None:
             return False
+        # A restart is expected to return with zero players, so a zero-player
+        # return can never show that players stayed connected.  Without this,
+        # the one-player tolerance floor treats a zero return as unchanged
+        # whenever the positive pre-roll median is one.
+        if sample.players == 0:
+            return False
         episode = self._episode
         if episode is not None and episode.baseline_players is not None:
             baseline = float(episode.baseline_players)
