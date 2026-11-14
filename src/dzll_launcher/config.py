@@ -101,6 +101,9 @@ REPO_RAW_BASE = "https://raw.githubusercontent.com/Berry-Dingle/DayZ-Linux-Launc
 DB_URL = f"{REPO_RAW_BASE}/{DATA_BRANCH}/data/dzll-servers.db"
 DB_LOCAL_DIR = os.path.expanduser("~/.local/share/dzll")
 DB_LOCAL_PATH = os.path.join(DB_LOCAL_DIR, "dzll-servers.db")
+# If the startup download has not finished after this delay, show the local
+# copy from the previous launch until the fresh database arrives.
+STARTUP_LOCAL_DB_FALLBACK_MS = 5000
 
 # Live refresh rules
 STARTUP_WARMUP_READY_PERCENT = 65

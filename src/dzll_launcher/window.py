@@ -48,6 +48,7 @@ from .config import (
     PING_MAX,
     STARTUP_WARMUP_READY_PERCENT,
     STARTUP_WARMUP_MAX_WAIT_SECS,
+    STARTUP_LOCAL_DB_FALLBACK_MS,
     STARTUP_LIVE_REST_WORKERS,
     STARTUP_LIVE_REST_TIMEOUT_SECS,
     STARTUP_LIVE_FLUSH_MAX,
@@ -5657,8 +5658,48 @@ class DZLLWindow(Gtk.ApplicationWindow):
                     self._server_db_update_inflight = False
             return False
 
+        def startup_db_settled() -> bool:
+            return bool(
+                getattr(self, "_startup_db_applied", False)
+                or getattr(self, "_startup_db_provisional", False)
+                or getattr(self, "_shutdown_cleanup_done", False)
+            )
+
+        def show_local_db_while_fetching(rows):
+            if startup_db_settled():
+                return False
+            print("[DB] Server database download is slow; showing the local copy until it finishes")
+            apply_db_rows_once(rows, False, True)
+            return False
+
+        def read_local_db_for_slow_fetch():
+            read_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
+            try:
+                rows = read_servers_from_db()
+            except Exception:
+                rows = []
+            if PERF_LOG_ENABLED:
+                log_startup_phase(self._startup_perf_origin_ns, "db_slow_fetch_local_read", read_start_ns,
+                                  rows=len(rows))
+            if rows:
+                GLib.idle_add(show_local_db_while_fetching, rows)
+
+        def slow_fetch_fallback():
+            # Fast downloads never pay for a second, provisional list load.
+            if startup_db_settled():
+                return False
+            try:
+                threading.Thread(
+                    target=read_local_db_for_slow_fetch, name="dzll-local-db-read", daemon=True,
+                ).start()
+            except Exception:
+                pass
+            return False
+
+        GLib.timeout_add(STARTUP_LOCAL_DB_FALLBACK_MS, slow_fetch_fallback)
+
         def db_watchdog():
-            if getattr(self, "_startup_db_applied", False):
+            if startup_db_settled():
                 return False
             read_start_ns = time.monotonic_ns() if PERF_LOG_ENABLED else 0
             rows = read_servers_from_db()
