@@ -29,6 +29,11 @@ Folded relationship bins keep exact phase extremes, so single-linkage
 component formation is exact.  Every remaining approximation can only lower
 confidence or withhold a gate; none can promote.
 
+Burst independence (schema 4).  The pool holds only independently counted
+sparse onsets (``authority.sparse_occurrence_onsets``), decided at fold time
+from the latest folded onset; followers are folded into presence-only
+``followers`` bins that the incumbent helpers still read.
+
 Storage.  Every collection has a fixed key space that does not depend on the
 number of observed restarts (see ``LEARNED_STATE_MAX_ENTRIES`` and
 ``LEARNED_STATE_MAX_JSON_BYTES``, both enforced on serialisation and load).
@@ -70,6 +75,8 @@ from .companion_restart_phase2_authority import (
     _relationship_phase,
     _relationship_phase_value,
     relationship_authority_quality,
+    sparse_occurrence_onsets,
+    sparse_usable_event,
 )
 from .companion_restart_phase2_continuity import IntervalRelationship, RelationshipKind
 from .companion_restart_phase2_detection import PhysicalRestartEvent
@@ -92,7 +99,12 @@ from .companion_restart_phase2_scoring import (
 )
 
 
-LEARNED_STATE_SCHEMA_VERSION = 3
+# Schema 4 (burst independence, A1): the pool holds only independently
+# counted sparse onsets; followers are kept as presence-only ``followers``
+# bins.  Schema-3 states load unchanged (their pool is legacy: every folded
+# restart counted) with no follower bins.
+LEARNED_STATE_SCHEMA_VERSION = 4
+SUPPORTED_LEARNED_STATE_SCHEMA_VERSIONS = frozenset({3, LEARNED_STATE_SCHEMA_VERSION})
 PHASE_BIN_SECONDS = 60
 DAY_BINS = DAY // PHASE_BIN_SECONDS
 # Relationship, miss and superseded-regime bins.  Never wider than the
@@ -126,6 +138,7 @@ DIVISOR_KEYS = tuple(
 )
 LEARNED_STATE_MAX_ENTRIES = (
     DAY_BINS  # pool (endpoint and confirmation tags live inside pool bins)
+    + DAY_BINS  # follower presence (burst independence)
     + INTERVAL_BIN_TOTAL  # lifetime continuous evidence
     + INTERVAL_BIN_TOTAL  # epoch challenger evidence
     + INTERVAL_BIN_TOTAL  # expected-window outcomes
@@ -144,9 +157,11 @@ _NUMBER = 25
 _STRING = MAX_STRING_LENGTH * 6 + 3  # worst-case JSON escaping of non-ASCII
 _POOL_BIN_NUMBERS = 10 + 8 * len(CANDIDATE_PERIODS) + 3 + 2 * len(CANDIDATE_PERIODS)
 _INTERVAL_BIN_NUMBERS = 17 + 7
+_FOLLOWER_BIN_NUMBERS = 8
 LEARNED_STATE_MAX_JSON_BYTES = (
     4096  # keys, brackets and scalar fields
     + DAY_BINS * (_POOL_BIN_NUMBERS * _NUMBER + 16 + 4 * len(CANDIDATE_PERIODS))
+    + DAY_BINS * (_FOLLOWER_BIN_NUMBERS * _NUMBER + 4)
     + 2 * INTERVAL_BIN_TOTAL * (_INTERVAL_BIN_NUMBERS * _NUMBER + 8)
     + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)
     + INTERVAL_BIN_TOTAL * (4 * _NUMBER + 4)
@@ -236,6 +251,37 @@ class PhaseBin:
 
     def tag(self, period: int) -> EndpointTag | None:
         return next((item for item in self.endpoints if item.period == period), None)
+
+
+@dataclass(frozen=True)
+class FollowerBin:
+    """Folded follower restarts sharing one UTC minute of the day (presence).
+
+    A follower is a sparse-usable restart inside an independent occurrence's
+    anchored window (``authority.sparse_occurrence_onsets``).  It carries no
+    sparse weight, so it is kept out of the pool's weight, count, domain and
+    endpoint accounting, but its exact offset range, times and uncertainty
+    stay visible to the incumbent helpers that read restart presence
+    (off-phase suspicion, later restarts, isolation, last aligned evidence),
+    exactly as the raw path still sees the follower event.
+    """
+
+    index: int
+    count: int
+    offset_min: float
+    offset_max: float
+    first_at: float
+    last_at: float
+    uncertainty_min: float
+    uncertainty_max: float
+
+    @property
+    def seconds_min(self) -> float:
+        return self.index * PHASE_BIN_SECONDS + self.offset_min
+
+    @property
+    def seconds_max(self) -> float:
+        return self.index * PHASE_BIN_SECONDS + self.offset_max
 
 
 @dataclass(frozen=True)
@@ -450,6 +496,8 @@ class LearnedState:
     # Divisor resolution is re-learned only from schema-3 windows that start
     # after this instant (latest contradiction or supersession).
     divisor_floor_at: float | None = None
+    # Burst independence: folded follower restarts (presence only).
+    followers: tuple[FollowerBin, ...] = ()
 
 
 def empty_learned_state(server_key: str) -> LearnedState:
@@ -462,6 +510,7 @@ def learned_state_entry_count(state: LearnedState) -> int:
     run = state.open_chain.run if state.open_chain is not None else None
     return (
         len(state.pool)
+        + len(state.followers)
         + len(state.intervals)
         + len(state.epoch.challenger)
         + len(state.misses)
@@ -528,9 +577,25 @@ def _newer(event: PhysicalRestartEvent, mark: tuple[float, str] | None) -> bool:
 def _sparse_usable(event: PhysicalRestartEvent) -> bool:
     """The schema-4 sparse pool predicate (``authority._sparse_evidence``)."""
 
-    return bool(
-        _authentic_event(event) and _event_weight(event) > 0 and _event_at(event) is not None,
-    )
+    return sparse_usable_event(event)
+
+
+def last_counted_onset_at(state: LearnedState) -> float | None:
+    """The latest folded independent onset, carried across the fold boundary.
+
+    The pool holds only counted onsets (schema 4), so its latest restart is
+    the latest folded onset.  A legacy schema-3 pool counted every restart;
+    its latest restart is then the conservative anchor (legacy bins are
+    never re-judged).
+    """
+
+    return max((item.last_at for item in state.pool), default=None)
+
+
+def _presence_bins(state: LearnedState) -> tuple[PhaseBin | FollowerBin, ...]:
+    """Every folded sparse-usable restart bin: counted onsets and followers."""
+
+    return (*state.pool, *state.followers)
 
 
 def _median_of_counts(values: list[tuple[float, int]]) -> float:
@@ -950,6 +1015,23 @@ def plan_ring_folding(
     return FoldPlan(tuple(units), tuple(ring))
 
 
+def _follower_bin_add(
+    existing: FollowerBin | None, index: int, offset: float, at: float, uncertainty: float
+) -> FollowerBin:
+    if existing is None:
+        return FollowerBin(index, 1, offset, offset, at, at, uncertainty, uncertainty)
+    return replace(
+        existing,
+        count=existing.count + 1,
+        offset_min=min(existing.offset_min, offset),
+        offset_max=max(existing.offset_max, offset),
+        first_at=min(existing.first_at, at),
+        last_at=max(existing.last_at, at),
+        uncertainty_min=min(existing.uncertainty_min, uncertainty),
+        uncertainty_max=max(existing.uncertainty_max, uncertainty),
+    )
+
+
 def _tag_bin(
     pool: dict[int, PhaseBin],
     index: int,
@@ -1114,6 +1196,13 @@ def fold_unit(
         return state
     ordered = sorted(accepted.values(), key=lambda item: (_event_at(item), item.event_id))
     chain_id = ordered[-1].continuity_chain_id
+    # Burst independence: every accepted event is newer than everything
+    # already folded, so continuing from the latest folded onset decides each
+    # restart exactly as the raw path does over the whole history.
+    counted = {
+        item.event_id
+        for item in sparse_occurrence_onsets(ordered, last_onset_at=last_counted_onset_at(state))[0]
+    }
 
     open_chain = state.open_chain
     seed = None
@@ -1135,6 +1224,7 @@ def fold_unit(
         stale = _run_from_open(open_chain)
 
     pool = {item.index: item for item in state.pool}
+    followers = {item.index: item for item in state.followers}
     intervals = {(item.period, item.index): item for item in state.intervals}
     epoch = state.epoch
     challenger = {(item.period, item.index): item for item in epoch.challenger}
@@ -1168,16 +1258,21 @@ def fold_unit(
         """Record tags; they are applied in time order after this pass."""
 
         nonlocal anchor_confirmation_tagged, anchor_confirmation_period
-        event = context[event_id]
-        if not _sparse_usable(event):
-            return
+        # Only counted onsets are in the pool, so only they can be tagged as
+        # excludable endpoints (a follower is never sparse evidence).  The
+        # anchor was decided when it was folded: ``anchor_index`` is set
+        # exactly when it entered the pool.
         if event_id == anchor_id:
+            if open_chain.anchor_index is None:
+                return
             if period is not None and period not in anchor_high_periods:
                 anchor_high_periods.add(period)
                 anchor_new_periods.append(period)
             if confirmation is not None and not anchor_confirmation_tagged:
                 anchor_confirmation_tagged = True
                 anchor_confirmation_period = confirmation
+            return
+        if event_id not in counted:
             return
         if period is not None and (period, event_id) not in tagged:
             tagged.add((period, event_id))
@@ -1258,7 +1353,13 @@ def fold_unit(
     learning_count = 0
     for event in ordered:
         at = _event_at(event)
-        if _sparse_usable(event):
+        if _sparse_usable(event) and event.event_id not in counted:
+            # A follower: presence only (no weight, count, domain or tags).
+            learning_count += 1
+            uncertainty = _capped_uncertainty(event.phase_uncertainty)
+            index, offset = _day_bin(at)
+            followers[index] = _follower_bin_add(followers.get(index), index, offset, at, uncertainty)
+        elif _sparse_usable(event):
             learning_count += 1
             weight = _event_weight(event)
             uncertainty = _capped_uncertainty(event.phase_uncertainty)
@@ -1388,7 +1489,7 @@ def fold_unit(
 
     if new_anchor is not None:
         high_periods = {period for period, event_id in tagged if event_id == new_anchor.event_id}
-        index = _day_bin(_event_at(new_anchor))[0] if _sparse_usable(new_anchor) else None
+        index = _day_bin(_event_at(new_anchor))[0] if new_anchor.event_id in counted else None
         next_open = OpenChain(
             chain_id=chain_id,
             anchor_event_id=new_anchor.event_id,
@@ -1417,6 +1518,7 @@ def fold_unit(
         watermark=watermark,
         pool_weight_total=pool_total,
         pool=tuple(pool[key] for key in sorted(pool)),
+        followers=tuple(followers[key] for key in sorted(followers)),
         intervals=tuple(intervals[key] for key in sorted(intervals)),
         incumbent=incumbent,
         epoch=replace(
@@ -1703,11 +1805,15 @@ def observe_decision(state: LearnedState, decision: AuthorityDecision) -> Learne
 
 
 def _folded_last_aligned(state: LearnedState, regime: RegimeRecord) -> float | None:
-    """Latest folded restart wholly aligned with a newly observed incumbent."""
+    """Latest folded restart wholly aligned with a newly observed incumbent.
+
+    Restart presence: followers count, as the raw path sees every authentic
+    restart.
+    """
 
     values = [
         item.last_at
-        for item in state.pool
+        for item in _presence_bins(state)
         if _range_abs(
             item.seconds_min,
             item.seconds_max,
@@ -1758,6 +1864,22 @@ def _bin_entry(item: PhaseBin, *, weight: float | None = None, count: int | None
     )
 
 
+def _presence_entry(item: PhaseBin | FollowerBin) -> _Entry:
+    if isinstance(item, PhaseBin):
+        return _bin_entry(item)
+    return _Entry(
+        item.seconds_min,
+        item.seconds_max,
+        0.0,
+        item.count,
+        item.first_at,
+        item.last_at,
+        item.uncertainty_min,
+        item.uncertainty_max,
+        None,
+    )
+
+
 def _ring_entry(event: PhysicalRestartEvent) -> _Entry:
     at = _event_at(event)
     uncertainty = _capped_uncertainty(event.phase_uncertainty)
@@ -1781,13 +1903,21 @@ def _classify(entry: _Entry, phase: float, period: int) -> tuple[str, float]:
 def ring_sparse_events(
     state: LearnedState, events: Iterable[PhysicalRestartEvent]
 ) -> tuple[PhysicalRestartEvent, ...]:
+    """Unfolded independent sparse onsets (burst independence, A1).
+
+    The ring continues the occurrence sequence from the latest folded onset,
+    so a ring restart is a follower exactly when the raw path, seeing the
+    whole history, would make it one.  Ring followers stay in the raw ring
+    for every presence consumer; they are only absent from the sparse pool.
+    """
+
     mark = _watermark_key(state)
-    values = {
-        item.event_id: item
+    values = [
+        item
         for item in events
         if item.server_key == state.server_key and _sparse_usable(item) and _newer(item, mark)
-    }
-    return tuple(sorted(values.values(), key=lambda item: (_event_at(item), item.event_id)))
+    ]
+    return sparse_occurrence_onsets(values, last_onset_at=last_counted_onset_at(state))[0]
 
 
 def _ring_map(
@@ -2254,13 +2384,20 @@ def compact_folded_off_phase_ids(
     One reference per folded minute bin whose latest restart is after
     ``since`` and whose range is not wholly within tolerance (conservative:
     a possibly off-phase restart keeps suspicion and prevents isolation).
+    Restart presence: follower bins count too (one reference per minute).
     """
 
     return tuple(
-        f"learned-off-phase:{item.index}"
-        for item in state.pool
-        if item.last_at > since
-        and _range_abs(item.seconds_min, item.seconds_max, phase_offset, period)[1] > tolerance
+        f"learned-off-phase:{index}"
+        for index in sorted(
+            {
+                item.index
+                for item in _presence_bins(state)
+                if item.last_at > since
+                and _range_abs(item.seconds_min, item.seconds_max, phase_offset, period)[1]
+                > tolerance
+            }
+        )
     )
 
 
@@ -2294,9 +2431,12 @@ def compact_folded_restart_after(
     after: float,
     aligned: bool,
 ) -> bool:
-    """Whether a folded restart after ``after`` may be aligned (or off-phase)."""
+    """Whether a folded restart after ``after`` may be aligned (or off-phase).
 
-    for item in state.pool:
+    Restart presence: follower bins count too.
+    """
+
+    for item in _presence_bins(state):
         if item.last_at <= after:
             continue
         smallest, largest = _range_abs(item.seconds_min, item.seconds_max, phase_offset, period)
@@ -2873,8 +3013,8 @@ def compact_isolated_off_phase_restart(
         return False
     anomaly_entry = _ring_entry(anomaly)
     others = [
-        _bin_entry(item)
-        for item in state.pool
+        _presence_entry(item)
+        for item in _presence_bins(state)
         if _range_abs(
             item.seconds_min,
             item.seconds_max,
@@ -3126,6 +3266,41 @@ def _pool_bin_to(item: PhaseBin) -> list:
         else [PERIOD_INDEX[confirmation.period], confirmation.weight, confirmation.count],
         [[PERIOD_INDEX[key], value] for key, value in item.tagged_before],
     ]
+
+
+def _follower_bin_to(item: FollowerBin) -> list:
+    return [
+        item.index,
+        item.count,
+        item.offset_min,
+        item.offset_max,
+        item.first_at,
+        item.last_at,
+        item.uncertainty_min,
+        item.uncertainty_max,
+    ]
+
+
+def _follower_bin_from(value: object, name: str) -> FollowerBin:
+    data = _array(value, name, length=_FOLLOWER_BIN_NUMBERS)
+    offset_min = _finite(data[2], f"{name}.offset_min", maximum=PHASE_BIN_SECONDS)
+    offset_max = _finite(data[3], f"{name}.offset_max", maximum=PHASE_BIN_SECONDS)
+    first_at = _finite(data[4], f"{name}.first_at")
+    last_at = _finite(data[5], f"{name}.last_at")
+    uncertainty_min = _finite(data[6], f"{name}.uncertainty_min", maximum=PHASE_UNCERTAINTY_CAP)
+    uncertainty_max = _finite(data[7], f"{name}.uncertainty_max", maximum=PHASE_UNCERTAINTY_CAP)
+    if offset_max < offset_min or last_at < first_at or uncertainty_max < uncertainty_min:
+        raise LearnedStateError(f"{name} extremes are inverted")
+    return FollowerBin(
+        index=_integer(data[0], f"{name}.index", maximum=DAY_BINS - 1),
+        count=_integer(data[1], f"{name}.count", minimum=1),
+        offset_min=offset_min,
+        offset_max=offset_max,
+        first_at=first_at,
+        last_at=last_at,
+        uncertainty_min=uncertainty_min,
+        uncertainty_max=uncertainty_max,
+    )
 
 
 def _tag_from(value: object, name: str, count_limit: int, weight_limit: float) -> EndpointTag:
@@ -3420,6 +3595,7 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
             [PERIOD_INDEX[key], value] for key, value in state.tagged_weight_totals
         ],
         "pool": [_pool_bin_to(item) for item in state.pool],
+        "followers": [_follower_bin_to(item) for item in state.followers],
         "intervals": [_interval_bin_to(item) for item in state.intervals],
         "misses": [
             [
@@ -3491,8 +3667,27 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
 
 def learned_state_from_mapping(value: object) -> LearnedState:
     data = _mapping(value, "learned_state")
-    if data.get("schema_version") != LEARNED_STATE_SCHEMA_VERSION:
+    version = data.get("schema_version")
+    if (
+        isinstance(version, bool)
+        or not isinstance(version, int)
+        or version not in SUPPORTED_LEARNED_STATE_SCHEMA_VERSIONS
+    ):
         raise LearnedStateError("unsupported learned-state schema version")
+    if version == LEARNED_STATE_SCHEMA_VERSION:
+        followers = tuple(
+            _follower_bin_from(item, f"followers[{index}]")
+            for index, item in enumerate(
+                _array(data.get("followers"), "followers", maximum=DAY_BINS)
+            )
+        )
+        _ordered_unique([item.index for item in followers], "followers")
+    else:
+        # Schema 3: the legacy pool is kept exactly as folded (every restart
+        # counted); there is no follower evidence to recover.
+        if "followers" in data:
+            raise LearnedStateError("schema-3 learned state cannot carry followers")
+        followers = ()
     mark = _array(data.get("watermark"), "watermark", length=5)
     watermark = FoldWatermark(
         at=_optional_finite(mark[0], "watermark.at"),
@@ -3675,6 +3870,7 @@ def learned_state_from_mapping(value: object) -> LearnedState:
         tagged_weight_totals=_period_values_from(
             data.get("tagged_weight_totals"), "tagged_weight_totals"
         ),
+        followers=followers,
     )
     if learned_state_entry_count(state) > LEARNED_STATE_MAX_ENTRIES:
         raise LearnedStateError("learned state exceeds its entry bound")

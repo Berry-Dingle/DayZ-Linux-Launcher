@@ -1060,8 +1060,10 @@ def test_storage_is_bounded_regardless_of_observation_count():
 
 
 def test_entry_bound_is_compact():
-    assert learned.LEARNED_STATE_MAX_ENTRIES == 1440 + 5 * 420 + 9 + 2 + 721 + 2
-    assert learned.LEARNED_STATE_MAX_ENTRIES < 4500
+    # Pool, follower presence (burst independence), five interval-bin key
+    # spaces, divisors, recovery, open-run residuals, incumbent and chain.
+    assert learned.LEARNED_STATE_MAX_ENTRIES == 1440 + 1440 + 5 * 420 + 9 + 2 + 721 + 2
+    assert learned.LEARNED_STATE_MAX_ENTRIES < 6000
 
 
 def _maximal_state():
@@ -1074,6 +1076,13 @@ def _maximal_state():
         learned.PhaseBin(
             index, 1.0 + long, 10**9, long, 59.123456789012345, time_value, time_value + 1,
             long, 299.12345678901234, 0.0, tags, learned.EndpointTag(P3, 0.5, 1),
+        )
+        for index in range(learned.DAY_BINS)
+    )
+    followers = tuple(
+        learned.FollowerBin(
+            index, 10**9, long, 59.123456789012345, time_value, time_value + 1,
+            long, 299.12345678901234,
         )
         for index in range(learned.DAY_BINS)
     )
@@ -1111,6 +1120,7 @@ def _maximal_state():
         watermark=learned.FoldWatermark(time_value, text, 10**15, 10**15, time_value),
         pool_weight_total=10**12 + long,
         pool=pool,
+        followers=followers,
         intervals=interval_bins(),
         misses=misses,
         divisors=tuple(

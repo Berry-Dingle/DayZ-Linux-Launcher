@@ -111,6 +111,12 @@ SPARSE_CONFIRMATION_REASON = "sparse_regime_confirmed_by_full_interval"
 # magnitude falls in proportion, as before.
 SPARSE_CONSISTENCY_TOLERANCE = SPARSE_PHASE_CONFIDENCE_MINIMUM / _event_count_cap(8)
 SPARSE_PROPORTIONAL_ANOMALY_REASON = "sparse_off_phase_restarts_within_proportional_tolerance"
+# Burst independence (A1).  Sparse evidence counts independent restart
+# occurrences, not restarts: two restarts closer than half of the shortest
+# candidate period can never be two scheduled occurrences of any learnable
+# schedule (Time Shift Detection's "more than P/2 apart" rule at the shortest
+# P, so the definition is candidate-independent and foldable).
+SPARSE_OCCURRENCE_WINDOW_SECONDS = min(CANDIDATE_PERIODS) / 2
 # Stage 8.7a: an established incumbent's only level-one contradiction is one
 # authentic off-phase restart that is phase-coherent with no other off-phase
 # restart.  It is learning evidence, not a challenger: safe H2/sparse
@@ -498,21 +504,63 @@ class _SparseEvidence:
     compact: "_Compact | None" = None
 
 
+def sparse_usable_event(event: PhysicalRestartEvent) -> bool:
+    """Authentic, learning-eligible restart with a positive schedule weight.
+
+    The single predicate for the sparse pool (raw and compact).  Ineligible,
+    non-authentic and service-interruption events never qualify, so they
+    can neither count nor open or extend an occurrence window.
+    """
+
+    return bool(
+        _authentic_event(event) and _event_weight(event) > 0 and _event_at(event) is not None
+    )
+
+
+def sparse_occurrence_onsets(
+    events: Iterable[PhysicalRestartEvent],
+    *,
+    last_onset_at: float | None = None,
+) -> tuple[tuple[PhysicalRestartEvent, ...], float | None]:
+    """Independent sparse restart occurrences (burst independence, A1).
+
+    In restart-time order (ties by event ID), a sparse-usable restart is an
+    independently counted *onset* when it starts strictly more than
+    ``SPARSE_OCCURRENCE_WINDOW_SECONDS`` after the last counted onset; the
+    restarts inside that anchored window are *followers*.  Followers do not
+    extend the window, so a long crash loop keeps contributing one onset per
+    window.  The rule is candidate-independent and lookback-only, so folding
+    can apply it exactly (``last_onset_at`` carries the latest onset that is
+    no longer among ``events``).  Followers keep their identity,
+    classification and every non-sparse use; they only carry no sparse
+    weight.  Returns the onsets in time order and the latest onset time.
+    """
+
+    values = {item.event_id: item for item in events if sparse_usable_event(item)}
+    onsets: list[PhysicalRestartEvent] = []
+    last = last_onset_at
+    for item in sorted(values.values(), key=lambda value: (_event_at(value), value.event_id)):
+        at = _event_at(item)
+        if last is None or at - last > SPARSE_OCCURRENCE_WINDOW_SECONDS:
+            onsets.append(item)
+            last = at
+    return tuple(onsets), last
+
+
 def _sparse_evidence(
     events: tuple[PhysicalRestartEvent, ...],
     prior: AuthorityDecision | None,
     compact: "_Compact | None" = None,
 ) -> _SparseEvidence:
-    usable = tuple(
-        item
-        for item in events
-        if _authentic_event(item)
-        and _event_weight(item) > 0
-        and _event_at(item) is not None
-    )
     if compact is not None:
-        # Superseded-regime separation lives in the learned state.
-        return _SparseEvidence(events=usable, historical=(), compact=compact)
+        from .companion_restart_phase2_learned_state import ring_sparse_events
+
+        # Superseded-regime separation lives in the learned state; the ring's
+        # onsets continue from the latest folded onset.
+        return _SparseEvidence(
+            events=ring_sparse_events(compact.state, events), historical=(), compact=compact
+        )
+    usable, _last = sparse_occurrence_onsets(events)
     historical = []
     for regime in prior.regimes if prior is not None else ():
         if (
@@ -594,7 +642,10 @@ def _sparse_support(
 
     Reuses the schema-3 per-event phase statistic: event-count cap x MAD
     quality band x consistency, with effective counts weighted by the
-    existing schedule weights.  Every physical restart counts at most once;
+    existing schedule weights.  Only independent occurrence onsets are in
+    the pool (burst independence, ``sparse_occurrence_onsets``): a follower
+    inside an onset's anchored window carries no sparse weight, aligned or
+    off-phase.  Every physical restart counts at most once;
     the candidate's own high-relationship endpoints are excluded so no
     restart is counted in both the continuous and the sparse slot.  Gaps
     are never interpreted (no relationships, no inferred restarts), so
