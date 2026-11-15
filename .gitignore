@@ -128,3 +128,8 @@ htmlcov/
 /AGENTS.md
 /DZLL_MEMORY.md
 /DZLL_RELEASE_PLAYBOOK.md
+
+# Local-only development files
+/CLAUDE.md
+/DZLL_TECHNICAL_HANDOVER.md
+/.qwen/
