@@ -89,6 +89,12 @@ def test_selected_settings_navigation_uses_semantic_accent():
     assert "border-radius: 7px;" in hover_child
 
 
+def test_tooltip_label_text_colour_is_owned_by_dzll():
+    css = app_css()
+    rule = css.split("tooltip.background label {", 1)[1].split("}", 1)[0]
+    assert "color: @dzll_text_primary;" in rule
+
+
 def test_root_and_feature_styling_hooks_are_applied():
     sources = {
         "window": (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8"),

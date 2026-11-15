@@ -762,6 +762,12 @@ def get_app_css(
           border-color: @dzll_border;
         }}
 
+        /* Themes colour tooltip descendants directly (e.g. Breeze `tooltip *`),
+           which beats the colour inherited from the box above. */
+        tooltip.background label {{
+          color: @dzll_text_primary;
+        }}
+
         /* ---------- List rows (keep transparent) ---------- */
         .dzll-app-root listview row {{ background: transparent; }}
         .dzll-app-root listview row:hover {{ background: transparent; }}
