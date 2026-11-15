@@ -17,6 +17,9 @@ from dzll_launcher.preparation_contracts import (
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW_SOURCE = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
+STATUS_UI_SOURCE = (
+    ROOT / "src/dzll_launcher/background_prepare_status_ui.py"
+).read_text(encoding="utf-8")
 COLUMN_SOURCE = (ROOT / "src/dzll_launcher/column_view.py").read_text(encoding="utf-8")
 BROWSER_SOURCE = (
     ROOT / "src/dzll_launcher/background_prepare_browser.py"
@@ -194,7 +197,8 @@ def test_sensitivity_cancel_terminal_close_and_fifo_ownership_are_explicit():
     assert "refresh_download_mods_states" in WINDOW_SOURCE
     assert "refresh_join_states" in WINDOW_SOURCE
     assert "_background_prepare_cancel_requested" in WINDOW_SOURCE
-    assert 'set_text("Cancelling…")' in WINDOW_SOURCE
+    assert 'set_text("Cancelling…")' in STATUS_UI_SOURCE
+    assert "self._background_prepare_status_ui.present_cancelling()" in WINDOW_SOURCE
     assert "_background_prepare_terminal_handled" in WINDOW_SOURCE
     assert 'set_label("Close")' in WINDOW_SOURCE
     assert "background_prepare_status.set_visible(False)" in WINDOW_SOURCE

@@ -267,6 +267,39 @@ def test_real_window_wires_preparation_overlay_renderer_to_its_widgets_and_downl
         _close_window(app, window)
 
 
+def test_real_window_wires_background_prepare_status_strip_to_its_widgets_and_actions(
+    isolated_window_state,
+):
+    app = _new_app()
+    window = window_module.DZLLWindow(app)
+    try:
+        ui = window._background_prepare_status_ui
+        assert ui.win is window
+        assert ui.background_prepare_status is window.background_prepare_status
+        for name in ("grid", "info", "server_label", "detail_label", "queue_divider",
+                     "queue_label", "failed_label", "retry_btn", "count_label",
+                     "percent_label", "right_status_label", "action_btn"):
+            assert getattr(ui, f"background_prepare_{name}") is getattr(
+                window, f"background_prepare_{name}"
+            )
+        assert not window.background_prepare_status.get_visible()
+        assert not hasattr(window_module, "BACKGROUND_PREPARE_ACTIVE_HORIZONTAL_INSET")
+        assert not hasattr(window_module.DZLLWindow, "_build_background_prepare_status_block")
+
+        # The idle strip's action button is wired to the window's real handler:
+        # with nothing queued it closes the strip, advancing the UI generation.
+        generation = window._background_prepare_ui_generation
+        window.background_prepare_action_btn.emit("clicked")
+        assert window._background_prepare_ui_generation == generation + 1
+        assert not window.background_prepare_status.get_visible()
+
+        # Retry with no completed batch is a no-op through the real handler.
+        window.background_prepare_retry_btn.emit("clicked")
+        assert window._background_prepare_ui_generation == generation + 1
+    finally:
+        _close_window(app, window)
+
+
 def test_real_window_shutdown_cancels_search_suggestion_and_pulse_timers(
     isolated_window_state,
 ):

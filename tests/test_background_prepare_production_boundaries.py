@@ -17,6 +17,7 @@ from dzll_launcher.background_prepare import (
     SingleServerBackgroundPreparation,
 )
 from dzll_launcher.background_prepare_queue import BackgroundPreparationQueue
+from dzll_launcher.background_prepare_status_ui import BackgroundPrepareStatusUI
 from dzll_launcher.preparation_contracts import (
     PreparationEventKind,
     PreparationOutcome,
@@ -184,6 +185,13 @@ class ProductionStartHarness:
         self.background_prepare_retry_btn = Widget()
         self.background_prepare_failed_label = Widget()
         self.background_prepare_status = Widget()
+        self._background_prepare_status_ui = BackgroundPrepareStatusUI(self)
+        for name in vars(BackgroundPrepareStatusUI(None)):
+            if name.startswith("background_prepare_"):
+                setattr(
+                    self._background_prepare_status_ui, name,
+                    getattr(self, name, None),
+                )
 
     def _resolve_join_mods(self, _obj):
         return [(101, "One")]

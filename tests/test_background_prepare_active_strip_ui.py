@@ -6,6 +6,7 @@ from dzll_launcher.background_prepare import (
     BackgroundServerPreparationSnapshot,
 )
 from dzll_launcher.background_prepare_queue import BackgroundPreparationQueue
+from dzll_launcher.background_prepare_status_ui import BackgroundPrepareStatusUI
 from dzll_launcher.preparation_contracts import PreparationOutcome, PreparationStatus
 from dzll_launcher.preparation_presentation import PreparationProgressMode
 from dzll_launcher.ui_row import ServerObject
@@ -14,6 +15,9 @@ from dzll_launcher.window import DZLLWindow
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOW_SOURCE = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
+STATUS_UI_SOURCE = (
+    ROOT / "src/dzll_launcher/background_prepare_status_ui.py"
+).read_text(encoding="utf-8")
 STYLE_SOURCE = (ROOT / "src/dzll_launcher/styles.py").read_text(encoding="utf-8")
 SIDEBAR_SOURCE = (ROOT / "src/dzll_launcher/sidebar_ui.py").read_text(encoding="utf-8")
 
@@ -96,6 +100,15 @@ def _snapshot(server):
     )
 
 
+def _status_ui(host):
+    """Return a real status renderer drawing into the host's fake widgets."""
+    ui = BackgroundPrepareStatusUI(host)
+    for name in vars(BackgroundPrepareStatusUI(None)):
+        if name.startswith("background_prepare_"):
+            setattr(ui, name, getattr(host, name, None))
+    return ui
+
+
 def _host(queue=None):
     host = SimpleNamespace(
         _background_prepare_queue=queue or BackgroundPreparationQueue(),
@@ -115,11 +128,7 @@ def _host(queue=None):
         _refresh_background_prepare_action_states=lambda: None,
         _background_prepare_is_current=lambda generation: generation == 7,
     )
-    host._background_prepare_set_active_presentation = (
-        lambda active, **kwargs: DZLLWindow._background_prepare_set_active_presentation(
-            host, active, **kwargs,
-        )
-    )
+    host._background_prepare_status_ui = _status_ui(host)
     host._steam_ugc_format_size = (
         lambda value: DZLLWindow._steam_ugc_format_size(host, value)
     )
@@ -131,9 +140,9 @@ def _host(queue=None):
 
 
 def test_active_strip_builder_has_fixed_flexible_optional_and_right_blocks():
-    builder = WINDOW_SOURCE.split(
-        "def _build_background_prepare_status_block", 1,
-    )[1].split("def _background_prepare_set_active_presentation", 1)[0]
+    builder = STATUS_UI_SOURCE.split(
+        "    def build(self):", 1,
+    )[1].split("    def set_status_container(", 1)[0]
     assert "grid = Gtk.Grid()" in builder
     assert "root.append(grid)" in builder
     assert "grid.attach(info, 0, 0, 2, 1)" in builder
@@ -170,23 +179,24 @@ def test_active_strip_builder_has_fixed_flexible_optional_and_right_blocks():
     assert builder.index("background_prepare_action_btn") < builder.index(
         "return root"
     )
-    assert 'connect(\n            "clicked", self._background_prepare_action_clicked' in builder
+    assert 'connect(\n            "clicked", self.win._background_prepare_action_clicked' in builder
     assert "background_prepare_percent_label.set_size_request(44, -1)" in builder
     assert "background_prepare_percent_label.set_halign(Gtk.Align.FILL)" in builder
     assert "background_prepare_percent_label.set_valign(Gtk.Align.CENTER)" in builder
     assert "background_prepare_percent_label.set_opacity" not in builder
     assert "failed_slot" not in builder
-    assert "BACKGROUND_PREPARE_STATUS_HEIGHT" not in WINDOW_SOURCE
-    assert "FixedHeightStatusBox" not in WINDOW_SOURCE
+    for source in (WINDOW_SOURCE, STATUS_UI_SOURCE):
+        assert "BACKGROUND_PREPARE_STATUS_HEIGHT" not in source
+        assert "FixedHeightStatusBox" not in source
     assert "Gtk.ProgressBar()" not in builder
     assert "right.append(self.background_prepare_percent_label)" in builder
     assert "dzll-background-prepare-progress trough" not in STYLE_SOURCE
 
 
 def test_progress_fill_uses_container_class_and_clears_it_when_inactive():
-    helper = WINDOW_SOURCE.split(
-        "def _background_prepare_set_progress_presentation", 1,
-    )[1].split("def _background_prepare_download_available", 1)[0]
+    helper = STATUS_UI_SOURCE.split(
+        "    def set_progress_presentation(", 1,
+    )[1]
     assert "root = self.background_prepare_status" in helper
     assert "root.remove_css_class(old_class)" in helper
     assert 'f"dzll-background-prepare-progress-{percent}"' in helper
@@ -199,11 +209,11 @@ def test_cancelling_keeps_action_button_allocation():
         ("def _background_prepare_render_cancelling", "def _background_prepare_render_batch_summary"),
     ):
         source = WINDOW_SOURCE.split(method_name, 1)[1].split(next_name, 1)[0]
-        assert "_background_prepare_present_cancelling(self)" in source
+        assert "self._background_prepare_status_ui.present_cancelling()" in source
 
-    helper = WINDOW_SOURCE.split(
-        "def _background_prepare_set_action_presentation", 1,
-    )[1].split("def _background_prepare_present_cancelling", 1)[0]
+    helper = STATUS_UI_SOURCE.split(
+        "    def set_action_presentation(", 1,
+    )[1].split("    def present_cancelling(", 1)[0]
     assert "button.set_visible(True)" in helper
     assert "set_opacity(1.0 if actionable else 0.0)" in helper
     assert "button.set_sensitive(bool(actionable))" in helper
@@ -259,8 +269,8 @@ def test_reap_blocked_strip_is_terminal_truthful_and_actionable():
 def test_status_container_uses_search_row_inset_and_present_only_bottom_spacing():
     host = _host()
 
-    DZLLWindow._background_prepare_set_active_presentation(
-        host, True, server_name="Server", queued_count=0,
+    host._background_prepare_status_ui.set_active_presentation(
+        True, server_name="Server", queued_count=0,
     )
 
     assert "search_row.set_margin_start(10)" in SIDEBAR_SOURCE
@@ -269,7 +279,7 @@ def test_status_container_uses_search_row_inset_and_present_only_bottom_spacing(
     assert host.background_prepare_status.margin_end == 10
     assert host.background_prepare_status.margin_bottom == 8
 
-    DZLLWindow._background_prepare_set_active_presentation(host, False)
+    host._background_prepare_status_ui.set_active_presentation(False)
 
     assert host.background_prepare_status.margin_start == 0
     assert host.background_prepare_status.margin_end == 0
@@ -307,8 +317,8 @@ def test_active_mod_count_size_progress_and_percentage_are_presented_separately(
 
 def test_indeterminate_state_keeps_reserved_progress_row_visually_suppressed():
     host = _host()
-    DZLLWindow._background_prepare_set_active_presentation(
-        host, True, server_name="Server", queued_count=0,
+    host._background_prepare_status_ui.set_active_presentation(
+        True, server_name="Server", queued_count=0,
     )
     snapshot = SimpleNamespace(
         current_mod_name="",
@@ -384,9 +394,9 @@ def test_finished_and_cancelling_states_clear_percentage_without_collapsing_row(
 
 
 def test_percentage_values_use_one_stable_right_aligned_slot():
-    builder = WINDOW_SOURCE.split(
-        "def _build_background_prepare_status_block", 1,
-    )[1].split("def _background_prepare_set_active_presentation", 1)[0]
+    builder = STATUS_UI_SOURCE.split(
+        "    def build(self):", 1,
+    )[1].split("    def set_status_container(", 1)[0]
     assert "background_prepare_percent_label.set_size_request(44, -1)" in builder
     assert "background_prepare_percent_label.set_width_chars(4)" in builder
     assert "background_prepare_percent_label.set_max_width_chars(4)" in builder
@@ -419,8 +429,8 @@ def test_progress_fill_covers_zero_partial_and_complete_without_changing_cancel(
         (0.42, "dzll-background-prepare-progress-42"),
         (1.0, "dzll-background-prepare-progress-100"),
     ):
-        DZLLWindow._background_prepare_set_progress_presentation(
-            host, True, fraction,
+        host._background_prepare_status_ui.set_progress_presentation(
+            True, fraction,
         )
         progress_classes = {
             name for name in host.background_prepare_status.css_classes

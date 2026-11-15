@@ -7,6 +7,7 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, GLib, Gtk
 
+from dzll_launcher.background_prepare_status_ui import BackgroundPrepareStatusUI
 from dzll_launcher.window import DZLLWindow
 
 
@@ -59,8 +60,10 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
         pytest.skip("usable GTK display is unavailable")
 
     host = StatusHost()
-    status = DZLLWindow._build_background_prepare_status_block(host)
+    ui = BackgroundPrepareStatusUI(host)
+    status = ui.build()
     host.background_prepare_status = status
+    host._background_prepare_status_ui = ui
     host._background_prepare_active = False
     host._background_prepare_controller = None
 
@@ -80,11 +83,11 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
     window.present()
 
     try:
-        DZLLWindow._background_prepare_set_active_presentation(
-            host, True, server_name="Server", queued_count=0,
+        ui.set_active_presentation(
+            True, server_name="Server", queued_count=0,
         )
         host.background_prepare_detail_label.set_text("Preparing…")
-        DZLLWindow._background_prepare_set_progress_presentation(host, False)
+        ui.set_progress_presentation(False)
         status.set_visible(True)
         _settle_layout(window)
 
@@ -112,10 +115,10 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
         record("checking")
 
         host.background_prepare_percent_label.set_text("50%")
-        DZLLWindow._background_prepare_set_progress_presentation(host, True, 0.5)
+        ui.set_progress_presentation(True, 0.5)
         record("progress")
 
-        DZLLWindow._background_prepare_present_cancelling(host)
+        ui.present_cancelling()
         record("cancelling")
 
         DZLLWindow._background_prepare_render_batch_summary(
@@ -150,7 +153,7 @@ def test_permanent_status_grid_has_stable_real_gtk_allocation():
         assert visible_status_ok
         assert visible_header_ok
         status.set_visible(False)
-        DZLLWindow._background_prepare_set_status_container(host, False)
+        ui.set_status_container(False)
         _settle_layout(window)
         assert not status.get_mapped()
         hidden_header_ok, hidden_header_bounds = header.compute_bounds(browser)

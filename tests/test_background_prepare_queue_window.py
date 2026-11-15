@@ -11,6 +11,7 @@ from dzll_launcher.background_prepare_queue import (
     BackgroundPreparationQueue,
     BackgroundServerState,
 )
+from dzll_launcher.background_prepare_status_ui import BackgroundPrepareStatusUI
 from dzll_launcher.preparation_contracts import PreparationOutcome, PreparationStatus
 from dzll_launcher.steam_ugc_backend import UGCHelperReapError
 from dzll_launcher.ui_row import ServerObject
@@ -21,6 +22,9 @@ ROOT = Path(__file__).resolve().parents[1]
 COLUMN_SOURCE = (ROOT / "src/dzll_launcher/column_view.py").read_text(encoding="utf-8")
 STYLE_SOURCE = (ROOT / "src/dzll_launcher/styles.py").read_text(encoding="utf-8")
 WINDOW_SOURCE = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
+STATUS_UI_SOURCE = (
+    ROOT / "src/dzll_launcher/background_prepare_status_ui.py"
+).read_text(encoding="utf-8")
 
 
 class Widget:
@@ -82,6 +86,14 @@ def state_host(queue):
     )
 
 
+def status_ui(host):
+    ui = BackgroundPrepareStatusUI(host)
+    for name in vars(BackgroundPrepareStatusUI(None)):
+        if name.startswith("background_prepare_"):
+            setattr(ui, name, getattr(host, name, None))
+    return ui
+
+
 def summary_host(queue):
     host = state_host(queue)
     host._background_prepare_active = False
@@ -96,6 +108,7 @@ def summary_host(queue):
     host.background_prepare_retry_btn = Widget()
     host.background_prepare_action_btn = Widget()
     host.background_prepare_status = Widget()
+    host._background_prepare_status_ui = status_ui(host)
     return host
 
 
@@ -270,8 +283,8 @@ def test_column_factory_and_css_implement_narrow_blocked_join_state():
 
 
 def test_summary_label_uses_ellipsis_without_mutating_stored_names():
-    builder = WINDOW_SOURCE.split("def _build_background_prepare_status_block", 1)[1].split(
-        "def _background_prepare_download_available", 1
+    builder = STATUS_UI_SOURCE.split("    def build(self):", 1)[1].split(
+        "    def set_status_container(", 1
     )[0]
     assert "background_prepare_failed_label.set_ellipsize(Pango.EllipsizeMode.END)" in builder
     assert "set_tooltip_text" in WINDOW_SOURCE
