@@ -781,3 +781,107 @@ def test_shared_endpoint_change_on_the_production_path_with_reopen():
     assert not countdown(steps[9]) and not countdown(steps[10])  # 2nd, 3rd: withheld
     assert period(steps[11]) == P3  # adopted at the 4th
     assert all(countdown(step) and period(step) == P3 for step in steps[12:])
+
+
+# --------------------------------------------------------------------------
+# I1: two unrelated admin restarts ending on scheduled restarts recover on
+# discriminating incumbent confirmations
+# --------------------------------------------------------------------------
+
+
+I1_ADMIN_INTERVALS = ((at(9, 22), at(10, 0)), (at(11, 10), at(11, 12)))
+
+
+def _i1_pipeline(confirmations):
+    pipeline, original = st3.e2()
+    for index, times in enumerate(I1_ADMIN_INTERVALS):
+        pipeline.observe(f"admin-{index}", list(times))
+    st3.add_sparse(pipeline, list(confirmations), "after")
+    return pipeline, original
+
+
+def _i1_raw(confirmations):
+    pipeline, step = st3.e2()
+    steps = [step]
+    for index, times in enumerate(I1_ADMIN_INTERVALS):
+        pipeline.observe(f"admin-{index}", list(times))
+        step = st3.advance(pipeline, step)
+        steps.append(step)
+    for index, when in enumerate(confirmations):
+        st3.add_sparse(pipeline, [when], f"after-{index}")
+        step = st3.advance(pipeline, step)
+        steps.append(step)
+    return pipeline, steps
+
+
+def test_i1_two_discriminating_confirmations_restore_the_e2_countdown():
+    # 03:00 and 09:00 are on the 3 h grid only; 06:00 is on both grids.
+    pipeline, steps = _i1_raw((at(13, 3), at(14, 6), at(15, 9)))
+    original = steps[0]
+    assert countdown(steps[1])  # first admin interval: internal only
+    assert not countdown(steps[2])  # second: coherent suspicion
+    assert not countdown(steps[3])  # one discriminating confirmation
+    assert not countdown(steps[4])  # a both-grid restart never confirms
+    restored = steps[5]
+    assert countdown(restored) and restored.consumer().scheduled_warning_eligible
+    assert st3.regime(restored).regime_id == st3.regime(original).regime_id
+    assert st3.regime(restored).phase_offset == st3.regime(original).phase_offset
+    assert authority.REGIME_STRONG_REASON in st3.regime(restored).reason_codes
+    # No complete incumbent interval was observed after the suspicion.
+    assert not any(
+        item.candidate_period_seconds == P3 and item.left_at > at(11, 12)
+        for item in restored.relationships
+    )
+    st3.assert_fixed_point(pipeline, restored)
+
+
+def test_i1_shared_endpoints_alone_never_release_the_suspicion():
+    _pipeline, steps = _i1_raw((at(13, 6), at(14, 12), at(15, 18), at(16, 0)))
+    assert all(not countdown(step) for step in steps[2:])
+
+
+def test_i1_suspicion_is_marked_shared_endpoint_and_cleared_after_recovery():
+    _pipeline, steps = _i1_raw((at(13, 3), at(15, 9)))
+    suspected = [
+        item
+        for item in steps[2].decision.challenger_contexts
+        if authority.SHARED_ENDPOINT_SUSPICION_REASON in item.reason_codes
+    ]
+    assert suspected and all(item.candidate_period_seconds == 2 * H for item in suspected)
+    assert not any(
+        authority.COUNTDOWN_SUSPENSION_LATCH_REASON in item.reason_codes
+        for item in steps[-1].decision.challenger_contexts
+    )
+
+
+def test_i1_shortcut_never_applies_to_a_challenger_with_later_off_grid_evidence():
+    # The same admin pair, but the second admin restart ends its interval off
+    # the incumbent's grid (scheduled 12:00, admin 14:00): the ordinary level-2
+    # rule owns it and lone aligned restarts do not release it.
+    pipeline, step = st3.e2()
+    pipeline.observe("admin-0", [at(9, 22), at(10, 0)])
+    step = st3.advance(pipeline, step)
+    pipeline.observe("admin-1", [at(11, 12), at(11, 14)])
+    step = st3.advance(pipeline, step)
+    assert not countdown(step)
+    for index, when in enumerate((at(13, 3), at(15, 9))):
+        st3.add_sparse(pipeline, [when], f"after-{index}")
+        step = st3.advance(pipeline, step)
+    assert not countdown(step)
+
+
+@pytest.mark.parametrize("capacity", (3, 5, 20, 80))
+def test_i1_compact_recovery_never_ahead_of_raw(capacity):
+    pipeline, _original = _i1_pipeline((at(13, 3), at(14, 6), at(15, 9), at(16, 15)))
+    ordered = sorted(pipeline.events, key=lambda item: item.canonical_phase_at)
+    chains = list(dict.fromkeys(item.continuity_chain_id for item in ordered))
+    batches = [[item for item in ordered if item.continuity_chain_id == chain] for chain in chains]
+    raw = ca.raw_steps(pipeline, batches)
+    runner = ca.CompactOnly(pipeline, capacity=capacity)
+    compact = [runner.step(batch) for batch in batches]
+    assert_compact_never_shows_more(raw, compact)
+    for raw_step, compact_step in zip(raw, compact):
+        assert compact_step.decision.combined_confidence <= raw_step.decision.combined_confidence + 1e-9
+    assert countdown(raw[-1])
+    if capacity >= 20:
+        assert [countdown(step) for step in compact] == [countdown(step) for step in raw]

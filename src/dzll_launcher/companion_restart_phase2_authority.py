@@ -4347,6 +4347,30 @@ def _incumbent_decision(
         )
         for item in contexts
     }
+    # Correction I1: a level-2 suspicion that only the shared-endpoint rule
+    # raised against a mature (E2) cycle also recovers on two discriminating
+    # incumbent onsets (aligned with the incumbent, off the challenger's grid,
+    # after the suspicion); the Stage 6 interval rule still applies otherwise.
+    shared_attributed = {
+        item.context_id
+        for item in contexts
+        if strong
+        and _shared_endpoint_attributed(
+            item,
+            incumbent=incumbent,
+            last_aligned_at=last_aligned_at,
+            confirmations=len(recovery[item.context_id]),
+            prior=prior,
+            relationship_map=relationship_map,
+            event_map=event_map,
+            compact=compact,
+        )
+    }
+    for item in contexts:
+        if item.context_id in shared_attributed:
+            onsets = _discriminating_incumbent_onsets(item, incumbent=incumbent, sparse=sparse)
+            if len(onsets) > len(recovery[item.context_id]):
+                recovery[item.context_id] = onsets
     activity = {
         item.context_id: _context_activity(
             item,
@@ -4362,6 +4386,7 @@ def _incumbent_decision(
             confirmations=len(recovery[item.context_id]),
             relationship_map=relationship_map,
             event_map=event_map,
+            compact=compact,
         )
         for item in contexts
     }
@@ -4371,6 +4396,7 @@ def _incumbent_decision(
             incumbent=incumbent,
             active=activity[item.context_id],
             confirmations=len(recovery[item.context_id]),
+            shared_endpoint=item.context_id in shared_attributed,
         )
         for item in contexts
     )
@@ -4623,6 +4649,7 @@ def _incumbent_decision(
             confirmations=len(recovery[item.context_id]),
             relationship_map=relationship_map,
             event_map=event_map,
+            compact=compact,
         )
         for item in active_contexts
     )
@@ -6732,6 +6759,7 @@ def _shared_endpoint_challenger_active(
     confirmations: int,
     relationship_map: dict[str, IntervalRelationship],
     event_map: dict[str, PhysicalRestartEvent],
+    compact: "_Compact | None" = None,
 ) -> bool:
     """Shared-endpoint correction: an incumbent restart that ends the
     challenger's own witnessed interval corroborates the incumbent but does
@@ -6783,7 +6811,38 @@ def _shared_endpoint_challenger_active(
         )
         if unexplained(relationship.left_event_id) or unexplained(relationship.right_event_id)
     }
-    return len(independent) >= SHARED_ENDPOINT_INDEPENDENT_INTERVALS
+    folded = 0
+    if compact is not None and _interval_endpoint_unexplained_by_geometry(context, incumbent):
+        # Folded witnessed intervals (schema-5 verification bins, wholly after
+        # the boundary) are classified by geometry: at a period that is not a
+        # multiple of the incumbent's, or at a phase off the incumbent's grid,
+        # every interval has an endpoint the incumbent cannot explain.  Never
+        # fewer than raw, so a folded interval never relaxes compact.
+        from .companion_restart_phase2_learned_state import compact_witnessed_interval_count
+
+        folded = compact_witnessed_interval_count(
+            compact.state,
+            period=period,
+            phase_offsets=(context.phase_offset,),
+            tolerance=context.phase_tolerance,
+            after_at=boundary,
+        )
+    return len(independent) + folded >= SHARED_ENDPOINT_INDEPENDENT_INTERVALS
+
+
+def _interval_endpoint_unexplained_by_geometry(
+    context: ChallengerContext, incumbent: RegimeRecord
+) -> bool:
+    """Whether every witnessed interval of the context has an endpoint off the
+    incumbent's grid, from period and phase alone (tolerances combined)."""
+
+    period = incumbent.candidate_period_seconds
+    if context.candidate_period_seconds % period:
+        return True
+    return (
+        _circular_distance(context.phase_offset, incumbent.phase_offset, period)
+        > incumbent.phase_tolerance + context.phase_tolerance
+    )
 
 
 def _qualifying_intervals(
@@ -6807,6 +6866,85 @@ def _qualifying_intervals(
         and _circular_distance(_relationship_phase_value(relationship, period), phase_offset, period)
         <= tolerance
         and _full_interval_quality(relationship, event_map) > 0
+    )
+
+
+SHARED_ENDPOINT_SUSPICION_REASON = "suspicion_raised_by_shared_endpoint_intervals"
+
+
+def _shared_endpoint_attributed(
+    context: ChallengerContext,
+    *,
+    incumbent: RegimeRecord,
+    last_aligned_at: float,
+    confirmations: int,
+    prior: AuthorityDecision | None,
+    relationship_map: dict[str, IntervalRelationship],
+    event_map: dict[str, PhysicalRestartEvent],
+    compact: "_Compact | None" = None,
+) -> bool:
+    """Correction I1: whether a context's suspicion is the shared-endpoint
+    rule's alone.
+
+    True when the context has no H2/H3 confirmation of its own, no evidence
+    later than the incumbent's latest aligned restart (a later off-grid
+    challenger restart is the ordinary level-2 mechanism), and either the
+    shared-endpoint rule makes it active now or the prior decision recorded
+    it as shared-endpoint suspicion (persisted in its challenger context).
+    """
+
+    if context.high_confirmation_present or context.last_evidence_at > last_aligned_at:
+        return False
+    if _shared_endpoint_challenger_active(
+        context,
+        incumbent=incumbent,
+        last_aligned_at=last_aligned_at,
+        confirmations=confirmations,
+        relationship_map=relationship_map,
+        event_map=event_map,
+        compact=compact,
+    ):
+        return True
+    if (
+        prior is None
+        or prior.incumbent_shadow_regime is None
+        or prior.incumbent_shadow_regime.regime_id != incumbent.regime_id
+    ):
+        return False
+    period = context.candidate_period_seconds
+    return any(
+        SHARED_ENDPOINT_SUSPICION_REASON in item.reason_codes
+        and item.incumbent_regime_id == incumbent.regime_id
+        and item.candidate_period_seconds == period
+        and _circular_distance(item.phase_offset, context.phase_offset, period)
+        <= context.phase_tolerance
+        for item in prior.challenger_contexts
+    )
+
+
+def _discriminating_incumbent_onsets(
+    context: ChallengerContext, *, incumbent: RegimeRecord, sparse: _SparseEvidence
+) -> tuple[str, ...]:
+    """Correction I1: incumbent confirmations the challenger cannot explain.
+
+    Independent (A1) authentic, learning-eligible onsets (``sparse.events``:
+    observed restarts only, never predicted times, unknown windows, outages
+    or followers) strictly after the context's latest evidence, aligned with
+    the incumbent and off the challenger's grid (a restart both schedules
+    predict never counts).  Folded onsets are not counted (conservative).
+    """
+
+    return tuple(
+        item.event_id
+        for item in sparse.events
+        if _event_at(item) is not None
+        and _event_at(item) > context.last_evidence_at
+        and not _sparse_off_phase(
+            item, period=incumbent.candidate_period_seconds, phase_offset=incumbent.phase_offset
+        )
+        and _sparse_off_phase(
+            item, period=context.candidate_period_seconds, phase_offset=context.phase_offset
+        )
     )
 
 
@@ -6838,6 +6976,7 @@ def _annotate_context_recovery(
     incumbent: RegimeRecord,
     active: bool,
     confirmations: int,
+    shared_endpoint: bool = False,
 ) -> ChallengerContext:
     if not _credible_suspension_context(context):
         return context
@@ -6849,6 +6988,8 @@ def _annotate_context_recovery(
     elif active:
         reasons.add(COUNTDOWN_SUSPENSION_LATCH_REASON)
         reasons.add(_recovery_progress_reason(confirmations))
+        if shared_endpoint:
+            reasons.add(SHARED_ENDPOINT_SUSPICION_REASON)
     else:
         return context
     return replace(context, reason_codes=tuple(sorted(reasons)))
