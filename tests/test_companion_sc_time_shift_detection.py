@@ -47,10 +47,14 @@ Presentation = consumers4.AuthorityPresentationKey
 NOTICED = authority.TIME_SHIFT_NOTICED_REASON
 SUSPECTED = authority.TIME_SHIFT_SUSPECTED_REASON
 ADOPTED = authority.TIME_SHIFT_ADOPTED_REASON
+DISPLACED = authority.TIME_SHIFT_DISPLACED_REASON
 
 # A 3 h cycle observed at 09:00, 12:00, 15:00, 18:00 UTC: restart grid
 # 00, 03, ... 21.  Moved one hour later the grid is 01, 04, ... 22.
-SHIFTED_GRID = (at(3, 22), at(4, 1), at(5, 16), at(6, 10))
+# Stage 5: the first two observations are 12 h apart, so they cannot rule out
+# a change to a 4 h (or 2 h) interval and the third observation confirms, as
+# before; two restarts 3 h apart corroborate at once (Stage 5 tests).
+SHIFTED_GRID = (at(3, 22), at(4, 10), at(5, 16), at(6, 10))
 
 
 # --------------------------------------------------------------------------
@@ -167,6 +171,8 @@ def test_one_matching_off_phase_observation_is_noticed_but_cannot_confirm():
     (step,) = observe_shift(pipeline, original, SHIFTED_GRID[:1])
 
     assert time_shift_reasons(step) == {NOTICED}
+    # Stage 5: recorded internally as a possible one-hour displacement only.
+    assert DISPLACED in step.decision.reason_codes
     assert step.decision.state is State.CHANGE_SUSPECTED
     assert step.decision.suspicion_level == 1
     assert_unshifted(step, original)
@@ -329,7 +335,7 @@ def test_observations_must_agree_within_the_established_tolerance():
     tolerance = regime(original).phase_tolerance
     # The third restart is on another phase (outside tolerance of the first
     # two): it is a different hypothesis and cannot confirm theirs.
-    times = (at(3, 22), at(4, 1), at(5, 16) + tolerance + 60)
+    times = (at(3, 22), at(4, 10), at(5, 16) + tolerance + 60)
     step = observe_shift(pipeline, original, times)[-1]
 
     assert time_shift_reasons(step) == {SUSPECTED}
@@ -337,7 +343,7 @@ def test_observations_must_agree_within_the_established_tolerance():
 
     # Inside the tolerance it does.
     pipeline, original = established()
-    times = (at(3, 22), at(4, 1) + 120, at(5, 16) + tolerance - 60)
+    times = (at(3, 22), at(4, 10) + 120, at(5, 16) + tolerance - 60)
     step = observe_shift(pipeline, original, times)[-1]
     assert ADOPTED in regime(step).reason_codes
 
@@ -350,7 +356,7 @@ def test_observations_must_agree_within_the_established_tolerance():
 def test_off_grid_extra_restart_neither_confirms_nor_invalidates():
     pipeline, original = established()
     off_grid = at(4, 14, 45)
-    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 1), off_grid))
+    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 10), off_grid))
 
     # Two matching restarts plus an unrelated one: still only suspected.
     assert time_shift_reasons(steps[-1]) == {SUSPECTED}
@@ -364,7 +370,7 @@ def test_off_grid_extra_restart_neither_confirms_nor_invalidates():
 
 def test_restart_back_on_the_original_phase_restarts_the_count():
     pipeline, original = established()
-    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 1)))
+    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 10)))
     assert time_shift_reasons(steps[-1]) == {SUSPECTED}
 
     contradicted = advance(pipeline, steps[-1], "original-phase", at(4, 15))
@@ -381,9 +387,9 @@ def test_restart_back_on_the_original_phase_restarts_the_count():
 
 def test_genuine_miss_at_the_proposed_phase_discards_earlier_observations():
     pipeline, original = established()
-    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 1)))
-    # The proposed 04:00 restart window was observed and nothing restarted.
-    miss = s8.genuine_miss(P3, at(4, 4), key="proposed-phase-miss")
+    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 10)))
+    # The proposed 13:00 restart window was observed and nothing restarted.
+    miss = s8.genuine_miss(P3, at(4, 13), key="proposed-phase-miss")
     pipeline.sparse("third", [at(5, 16)])
     step = pipeline.evaluate(s8.persisted(steps[-1].decision), ledger=(miss,))
 
@@ -431,8 +437,14 @@ def test_sparsely_observed_different_interval_is_not_adopted_as_a_shift():
     times = tuple(at(1, 10, 30) + index * 7 * P4 for index in range(9))
     for step in observe_shift(pipeline, original, times, name="four-hour"):
         assert_unshifted(step, original)
-        assert step.decision.suspicion_level <= 1
-    assert time_shift_reasons(step) == {SUSPECTED}
+        # Stage 3: once the 4 h schedule is identified it suspends the
+        # strongly established countdown as a cycle change, never a shift.
+        assert step.decision.suspicion_level <= 1 or (
+            authority.CHALLENGER_SUSPENDS_STRONG_REASON in step.decision.reason_codes
+        )
+    assert ADOPTED not in time_shift_reasons(step)
+    assert authority.CHALLENGER_SUSPENDS_STRONG_REASON in step.decision.reason_codes
+    assert step.consumer().presentation_state is Presentation.SCHEDULE_CHANGE_SUSPECTED
 
 
 # --------------------------------------------------------------------------
@@ -488,7 +500,7 @@ def test_genuine_interval_change_is_left_to_cycle_change_rules(batch):
 
 def test_unmonitored_time_is_neither_confirmation_nor_contradiction():
     pipeline, original = established()
-    steps = observe_shift(pipeline, original, (at(3, 22), at(10, 1)))
+    steps = observe_shift(pipeline, original, (at(3, 22), at(10, 22)))
     suspected = steps[-1]
     assert time_shift_reasons(suspected) == {SUSPECTED}
 
@@ -539,7 +551,7 @@ INELIGIBLE_SHAPES = {
 @pytest.mark.parametrize("name", sorted(INELIGIBLE_SHAPES))
 def test_non_qualifying_episodes_never_count_as_observations(name):
     pipeline, original = established()
-    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 1)))
+    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 10)))
     assert time_shift_reasons(steps[-1]) == {SUSPECTED}
 
     # Exactly on the proposed phase, repeatedly, but never a qualifying restart.
@@ -569,7 +581,7 @@ def test_non_qualifying_episodes_alone_are_not_even_noticed():
 
 def test_duplicate_delivery_and_same_occurrence_count_once():
     pipeline, original = established()
-    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 1)))
+    steps = observe_shift(pipeline, original, (at(3, 22), at(4, 10)))
     suspected = steps[-1]
 
     # The same physical events delivered again (same identities).
@@ -580,7 +592,7 @@ def test_duplicate_delivery_and_same_occurrence_count_once():
 
     # A second episode inside the same scheduled occurrence (two minutes
     # later, a distinct identity) is not an independent observation.
-    step = advance(pipeline, replayed, "same-occurrence", at(4, 1, 2))
+    step = advance(pipeline, replayed, "same-occurrence", at(4, 10, 2))
     assert time_shift_reasons(step) == {SUSPECTED}
     assert_unshifted(step, original)
 
@@ -661,7 +673,7 @@ def test_schedule_can_shift_back_and_keeps_its_authority():
     pipeline, original = established()
     adopted = observe_shift(pipeline, original, SHIFTED_GRID[:3])[-1]
     back = observe_shift(
-        pipeline, adopted, (at(20, 21), at(21, 0), at(22, 15)), name="back"
+        pipeline, adopted, (at(20, 21), at(21, 9), at(22, 15)), name="back"
     )[-1]
 
     assert_adopted(back, original, shift=0)
@@ -854,34 +866,42 @@ SERVICE_INTERRUPTION = INELIGIBLE_SHAPES["service_interruption"]
 
 
 def test_dawn_of_the_bobs_history_is_corrected_at_the_third_qualifying_restart():
+    # Stage 5 (was: corrected at the third qualifying restart, 1 Nov 16:00):
+    # the first displaced restart is an internal suspicion only (the
+    # established countdown stays), and 1 Nov 01:00, three hours after 31 Oct
+    # 22:00 (which no 2 h, 4 h or 8 h grid contains), corroborates it.
     production, original = production_established_at(BOBS_ORIGINAL)
     assert phase(original) == pytest.approx(8.0, abs=5.0)  # the old UTC phase
     confidence = s8.percent(original)
 
     first = production.restart("oct31-2200", BOBS_SHIFTED["31 Oct 22:00"])
     assert time_shift_reasons(first) == {NOTICED}
+    assert DISPLACED in first.decision.reason_codes
     for index, when in enumerate(BOBS_SERVICE_INTERRUPTIONS[:3]):
         step = production.restart(f"blip-{index}", when, **SERVICE_INTERRUPTION)
         assert time_shift_reasons(step) == {NOTICED}
+        assert_unshifted(step, original)
+    shown = panel(step)
+    assert shown["cycle_text"] == "Every 3 Hours"
+    assert shown["confidence_percent"] == confidence
+    assert shown["countdown_visible"]
 
     second = production.restart("nov01-0100", BOBS_SHIFTED["1 Nov 01:00"])
-    assert time_shift_reasons(second) == {SUSPECTED}
-    shown = panel(second)
-    assert shown["cycle_text"] == "Possible Time Change"
-    assert shown["confidence_percent"] == confidence
-    assert not shown["countdown_visible"] and not shown["next_visible"]
-    assert not second.consumer().scheduled_warning_eligible
+    assert_adopted(second, original, shift=HOUR, tolerance=10.0)
+    assert phase(second) == pytest.approx(HOUR + 3, abs=5.0)  # XX:00:0x on 01/04/.../22
+    assert regime(second).established_at == BOBS_SHIFTED["1 Nov 01:00"]
+    assert s8.percent(second) == confidence
 
-    # The off-grid extra restart is neutral: no confirmation, no reset.
+    # The off-grid extra restart (not one hour off) only notices; the
+    # adopted grid keeps its countdown.
     extra = production.restart("nov01-1445", BOBS_OFF_GRID)
-    assert time_shift_reasons(extra) == {SUSPECTED}
-    assert_unshifted(extra, original)
+    assert time_shift_reasons(extra) == {NOTICED, ADOPTED}
+    assert regime(extra).regime_id == regime(second).regime_id
+    assert extra.consumer().countdown_visible
 
     third = production.restart("nov01-1600", BOBS_SHIFTED["1 Nov 16:00"])
-    assert_adopted(third, original, shift=HOUR, tolerance=10.0)
-    assert phase(third) == pytest.approx(HOUR + 5, abs=5.0)  # XX:00:05 on 01/04/.../22
-    assert regime(third).established_at == BOBS_SHIFTED["1 Nov 16:00"]
-    assert s8.percent(third) == confidence
+    assert third.decision.state is State.ESTABLISHED
+    assert regime(third).regime_id == regime(second).regime_id
     assert third.consumer().next_expected_restart_at == pytest.approx(at(8, 19), abs=10.0)
 
     # Coverage-ineligible restarts stay ineligible; they change nothing.
@@ -941,9 +961,10 @@ def test_dawn_of_the_bobs_retained_history_is_corrected_by_one_rebuild():
 
     step = production.rebuild()
     assert_adopted(step, original, shift=HOUR, tolerance=10.0)
-    # Third *qualifying* restart: 1 Nov 16:00.  The ineligible restarts and
-    # the off-grid one were not counted.
-    assert regime(step).established_at == BOBS_SHIFTED["1 Nov 16:00"]
+    # Stage 5: the corroborated pair adopts at 1 Nov 01:00 (was the third
+    # qualifying restart, 1 Nov 16:00), exactly as live learning does.  The
+    # ineligible restarts and the off-grid one are not counted.
+    assert regime(step).established_at == BOBS_SHIFTED["1 Nov 01:00"]
     assert step.decision.active_suspicion_evidence_ids == ()
     assert step.consumer(now=at(20, 1, 30)).next_expected_restart_at == pytest.approx(
         at(20, 4), abs=10.0
@@ -953,16 +974,20 @@ def test_dawn_of_the_bobs_retained_history_is_corrected_by_one_rebuild():
 
 
 def test_dawn_of_the_bobs_ineligible_restarts_cannot_be_the_third_observation():
+    # Stage 5: after the first displaced restart, ineligible restarts on the
+    # new grid can be neither the corroborating second nor a third: the
+    # suspicion stays internal and the established countdown stays.
     production, original = production_established_at(BOBS_ORIGINAL)
-    production.restart("oct31-2200", BOBS_SHIFTED["31 Oct 22:00"])
-    step = production.restart("nov01-0100", BOBS_SHIFTED["1 Nov 01:00"])
+    step = production.restart("oct31-2200", BOBS_SHIFTED["31 Oct 22:00"])
     for index, when in enumerate(BOBS_INELIGIBLE):
         step = production.restart(f"ineligible-{index}", when, coverage_complete=False)
     step = production.restart("nov13-0100", BOBS_SERVICE_INTERRUPTIONS[3], **SERVICE_INTERRUPTION)
 
-    assert time_shift_reasons(step) == {SUSPECTED}
+    assert time_shift_reasons(step) == {NOTICED}
+    assert DISPLACED in step.decision.reason_codes
     assert_unshifted(step, original)
-    assert step.consumer().presentation_state is Presentation.POSSIBLE_TIME_CHANGE
+    assert step.consumer().presentation_state is Presentation.CONFIRMED_CYCLE
+    assert step.consumer().countdown_visible
 
 
 # --------------------------------------------------------------------------

@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from enum import Enum
 
 from .companion_restart_phase2_authority import (
+    AWAITING_VERIFICATION_REASON,
     COUNTDOWN_SUSPENSION_LATCH_REASON,
     ISOLATED_OFF_PHASE_RESTART_REASON,
     SPARSE_ESTABLISHMENT_REASON,
     SPARSE_PERIOD_AMBIGUOUS_REASON,
+    STRONG_ANOMALY_TOLERANCE_REASON,
+    TIME_SHIFT_SEVERAL_PHASES_REASON,
     TIME_SHIFT_SUSPECTED_REASON,
     AuthorityCandidate,
     AuthorityDecision,
@@ -75,6 +78,21 @@ class AuthorityPresentationKey(str, Enum):
     LIKELY_NEW_CYCLE = "likely_new_cycle"
     CONFIRMED_NEW_CYCLE = "confirmed_new_cycle"
     PREDICTION_TEMPORARILY_SUSPENDED = "prediction_temporarily_suspended"
+    # Verified acquisition: a candidate is identified, but no fully witnessed
+    # restart-to-restart interval verifies it yet.  Learning-like: no named
+    # cycle, countdown or warning; the candidate period is offered for the
+    # explanatory tooltip only.
+    AWAITING_CYCLE_VERIFICATION = "awaiting_cycle_verification"
+
+
+# Presentations that show learning confidence (pre-establishment).
+LEARNING_PRESENTATIONS = frozenset(
+    {
+        AuthorityPresentationKey.NONE,
+        AuthorityPresentationKey.PATTERN_ONLY,
+        AuthorityPresentationKey.AWAITING_CYCLE_VERIFICATION,
+    }
+)
 
 
 class AuthoritySuppressionKind(str, Enum):
@@ -249,6 +267,9 @@ class AuthorityConsumerDecision:
     generic_recovery_suppression_key: AuthoritySuppressionKey | None
     transition_change_suspected: bool
     reason_codes: tuple[str, ...]
+    # Candidate period while awaiting verification (tooltip only; never a
+    # prediction, never persisted, never ``cycle_period_seconds``).
+    awaiting_period_seconds: int | None = None
 
 
 @dataclass(frozen=True)
@@ -498,10 +519,7 @@ def evaluate_authority_consumers(
         if presentation is AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED
         else None
     )
-    learning_presentation = presentation in {
-        AuthorityPresentationKey.NONE,
-        AuthorityPresentationKey.PATTERN_ONLY,
-    }
+    learning_presentation = presentation in LEARNING_PRESENTATIONS
     learning_confidence, learning_reasons = (
         _learning_confidence(decision, regime, candidate)
         if learning_presentation
@@ -600,6 +618,12 @@ def evaluate_authority_consumers(
         ),
         generic_recovery_alert_eligible=generic_eligible,
         generic_recovery_suppression_key=generic_key,
+        awaiting_period_seconds=(
+            regime.candidate_period_seconds
+            if presentation is AuthorityPresentationKey.AWAITING_CYCLE_VERIFICATION
+            and regime is not None
+            else None
+        ),
         transition_change_suspected=decision.state in {
             RegimeState.CHANGE_SUSPECTED,
             RegimeState.CHALLENGER_ACCUMULATING,
@@ -732,10 +756,10 @@ def authority_consumer_summary(
         AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED,
         AuthorityPresentationKey.POSSIBLE_TIME_CHANGE,
     }
-    learning = decision.presentation_state in {
-        AuthorityPresentationKey.NONE,
-        AuthorityPresentationKey.PATTERN_ONLY,
-    }
+    learning = decision.presentation_state in LEARNING_PRESENTATIONS
+    awaiting = (
+        decision.presentation_state is AuthorityPresentationKey.AWAITING_CYCLE_VERIFICATION
+    )
     learning_visible = learning and LEARNING_CONFIDENCE_REASON in decision.reason_codes
     learning_fields = (
         {"learning_confidence_source": LEARNING_CONFIDENCE_SOURCE} if learning else {}
@@ -768,9 +792,16 @@ def authority_consumer_summary(
         ),
         **learning_fields,
         "cycle_text": (
-            "Learning Restart Pattern"
+            _presentation_text(decision)
+            if awaiting
+            else "Learning Restart Pattern"
             if learning_visible
             else _presentation_text(decision)
+        ),
+        **(
+            {"awaiting_period_seconds": decision.awaiting_period_seconds}
+            if awaiting
+            else {}
         ),
         "next_text": "Prediction suspended" if decision.prediction_suspended else (
             str(int(prediction)) if prediction is not None else "--"
@@ -813,7 +844,30 @@ def _presentation(
         # is presented as Learning with no named period; its evaluated
         # candidate supplies the (capped) learning confidence.  Provisional
         # changes use TRANSITION_CONFIRMED / NEW_REGIME_PROVISIONAL, below.
+        # Verified acquisition: an identified candidate that still needs a
+        # witnessed interval is "Awaiting Cycle Verification" (still no named
+        # cycle, countdown or warning).
+        if (
+            AWAITING_VERIFICATION_REASON in decision.reason_codes
+            and decision.selected_shadow_regime is not None
+        ):
+            return AuthorityPresentationKey.AWAITING_CYCLE_VERIFICATION, False, False, None
         return AuthorityPresentationKey.PATTERN_ONLY, False, False, None
+    if (
+        TIME_SHIFT_SUSPECTED_REASON in decision.reason_codes
+        and TIME_SHIFT_SEVERAL_PHASES_REASON in decision.reason_codes
+        and state in {RegimeState.CHANGE_SUSPECTED, RegimeState.CHALLENGER_ACCUMULATING}
+    ):
+        # Stage 4: the withheld restarts interleave two or more new phases of
+        # the incumbent period, which one time shift cannot produce: the
+        # existing suspected-cycle-change presentation (no countdown or
+        # warning; no new cycle is claimed).
+        return (
+            AuthorityPresentationKey.SCHEDULE_CHANGE_SUSPECTED,
+            True,
+            True,
+            "off_phase_restarts_inconsistent_with_one_time_shift",
+        )
     if TIME_SHIFT_SUSPECTED_REASON in decision.reason_codes and state in {
         RegimeState.CHANGE_SUSPECTED,
         RegimeState.CHALLENGER_ACCUMULATING,
@@ -914,10 +968,17 @@ def _prediction_safe_incumbent_state(decision: AuthorityDecision) -> bool:
 
     if decision.state is RegimeState.ESTABLISHED and decision.suspicion_level == 0:
         return True
+    # Stage 5 correction: authority's E2 tolerance (unrelated anomalies or a
+    # single genuine missed window) also keeps the prediction.
     return bool(
         decision.state is RegimeState.CHANGE_SUSPECTED
         and decision.suspicion_level == 1
-        and ISOLATED_OFF_PHASE_RESTART_REASON in decision.reason_codes
+        and decision.prediction_usable
+        and decision.countdown_safe
+        and (
+            ISOLATED_OFF_PHASE_RESTART_REASON in decision.reason_codes
+            or STRONG_ANOMALY_TOLERANCE_REASON in decision.reason_codes
+        )
     )
 
 
@@ -1118,6 +1179,7 @@ def _presentation_text(decision: AuthorityConsumerDecision) -> str:
         AuthorityPresentationKey.LIKELY_NEW_CYCLE: f"Likely new: {label}",
         AuthorityPresentationKey.CONFIRMED_NEW_CYCLE: f"Confirmed new: {label}",
         AuthorityPresentationKey.PREDICTION_TEMPORARILY_SUSPENDED: "Prediction temporarily suspended",
+        AuthorityPresentationKey.AWAITING_CYCLE_VERIFICATION: "Awaiting Cycle Verification",
     }[decision.presentation_state]
 
 

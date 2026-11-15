@@ -64,8 +64,10 @@ from .companion_restart_phase2_authority import (
     SPARSE_PERIOD_AMBIGUOUS_REASON,
     SPARSE_PHASE_CONFIDENCE_MINIMUM,
     SPARSE_PHASE_QUALITY_BAND_MINIMUM,
+    SPARSE_REFUTATION_DAY_TOLERANCE,
     SPARSE_STRUCTURE_REASON,
     STREAK_BONUS_COEFFICIENT,
+    VERIFIED_INTERVAL_WEIGHT,
     AuthorityDecision,
     RegimeRecord,
     RegimeRecordStatus,
@@ -75,6 +77,8 @@ from .companion_restart_phase2_authority import (
     _relationship_phase,
     _relationship_phase_value,
     relationship_authority_quality,
+    sparse_identification_count_met,
+    sparse_identification_magnitudes,
     sparse_occurrence_onsets,
     sparse_usable_event,
 )
@@ -103,8 +107,16 @@ from .companion_restart_phase2_scoring import (
 # counted sparse onsets; followers are kept as presence-only ``followers``
 # bins.  Schema-3 states load unchanged (their pool is legacy: every folded
 # restart counted) with no follower bins.
-LEARNED_STATE_SCHEMA_VERSION = 4
-SUPPORTED_LEARNED_STATE_SCHEMA_VERSIONS = frozenset({3, LEARNED_STATE_SCHEMA_VERSION})
+# Schema 5 (verified acquisition): ``verifications`` holds folded fully
+# witnessed restart-to-restart intervals (offline-observed or query-visible)
+# per (period, 5-minute phase bin), so an interval witnessed before a
+# candidate is identified still verifies it after folding; the epoch also
+# keeps the base-weight (0.5) confirmation residual of verified regimes.
+# Schema-3 and schema-4 states load unchanged with no verification bins
+# (nothing is reconstructed) and an epoch base residual known only when no
+# confirmation was folded.
+LEARNED_STATE_SCHEMA_VERSION = 5
+SUPPORTED_LEARNED_STATE_SCHEMA_VERSIONS = frozenset({3, 4, LEARNED_STATE_SCHEMA_VERSION})
 PHASE_BIN_SECONDS = 60
 DAY_BINS = DAY // PHASE_BIN_SECONDS
 # Relationship, miss and superseded-regime bins.  Never wider than the
@@ -144,6 +156,7 @@ LEARNED_STATE_MAX_ENTRIES = (
     + INTERVAL_BIN_TOTAL  # expected-window outcomes
     + INTERVAL_BIN_TOTAL  # superseded regimes
     + INTERVAL_BIN_TOTAL  # non-high (normal) relationships
+    + INTERVAL_BIN_TOTAL  # witnessed-interval verification (schema 5)
     + len(DIVISOR_KEYS)
     + ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS
     + RUN_RESIDUAL_KEY_LIMIT  # the single open streak
@@ -166,6 +179,7 @@ LEARNED_STATE_MAX_JSON_BYTES = (
     + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)
     + INTERVAL_BIN_TOTAL * (4 * _NUMBER + 4)
     + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)
+    + INTERVAL_BIN_TOTAL * (7 * _NUMBER + 4)  # verification bins
     + len(DIVISOR_KEYS) * (6 * _NUMBER + 4)
     + ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS * (2 * _NUMBER + 4)
     + RUN_RESIDUAL_KEY_LIMIT * (4 * _NUMBER + 4)
@@ -332,6 +346,31 @@ class IntervalBin:
 
 
 @dataclass(frozen=True)
+class VerificationBin:
+    """Folded fully witnessed intervals at one (period, 5-minute phase bin).
+
+    A relationship enters when it is folded and ``_full_interval_quality`` is
+    positive (the raw verification predicate).  ``phase_min``/``phase_max``
+    are the exact extreme phase offsets from the bin start.  A bin is
+    narrower than twice any candidate tolerance, so a witnessed interval lies
+    within tolerance of a phase exactly when one of the two extremes does:
+    existence is exact, not conservative.
+    """
+
+    period: int
+    index: int
+    count: int
+    phase_min: float
+    phase_max: float
+    first_at: float
+    last_at: float
+
+    @property
+    def start(self) -> float:
+        return float(self.index * INTERVAL_BIN_SECONDS)
+
+
+@dataclass(frozen=True)
 class MissBin:
     """Folded expected-window outcomes at one (period, 5-minute phase bin)."""
 
@@ -465,6 +504,12 @@ class EpochEvidence:
     confirmation_count: int = 0
     confirmation_residual: float = 1.0
     recovery: tuple[RecoveryInterval, ...] = ()
+    # Schema 5: ``prod(1 - 0.5 q)`` over the same folded confirmations (the
+    # verified-acquisition weight).  ``None`` only for an epoch loaded from
+    # schema 3/4 with folded confirmations, whose individual qualities are
+    # unknown; such an epoch belongs to a regime established before verified
+    # acquisition, which keeps the 0.75 residual above.
+    confirmation_base_residual: float | None = 1.0
 
 
 @dataclass(frozen=True)
@@ -498,6 +543,8 @@ class LearnedState:
     divisor_floor_at: float | None = None
     # Burst independence: folded follower restarts (presence only).
     followers: tuple[FollowerBin, ...] = ()
+    # Verified acquisition: folded fully witnessed intervals (schema 5).
+    verifications: tuple["VerificationBin", ...] = ()
 
 
 def empty_learned_state(server_key: str) -> LearnedState:
@@ -517,6 +564,7 @@ def learned_state_entry_count(state: LearnedState) -> int:
         + len(state.superseded)
         + len(state.divisors)
         + len(state.normal_relationships)
+        + len(state.verifications)
         + len(state.epoch.recovery)
         + (len(run.residuals) if run is not None else 0)
         + (state.incumbent is not None)
@@ -1135,6 +1183,25 @@ def _interval_bin_add_relationship(
     )
 
 
+def _verification_bin_add(
+    existing: VerificationBin | None, relationship: IntervalRelationship
+) -> VerificationBin:
+    period = relationship.candidate_period_seconds
+    index, offset = _interval_bin(_relationship_phase_value(relationship, period), period)
+    if existing is None:
+        return VerificationBin(
+            period, index, 1, offset, offset, relationship.left_at, relationship.right_at
+        )
+    return replace(
+        existing,
+        count=existing.count + 1,
+        phase_min=min(existing.phase_min, offset),
+        phase_max=max(existing.phase_max, offset),
+        first_at=min(existing.first_at, relationship.left_at),
+        last_at=max(existing.last_at, relationship.right_at),
+    )
+
+
 def _interval_bin_add_streak(
     existing: IntervalBin | None,
     run: _Run,
@@ -1230,6 +1297,8 @@ def fold_unit(
     challenger = {(item.period, item.index): item for item in epoch.challenger}
     confirmation_count = epoch.confirmation_count
     confirmation_residual = epoch.confirmation_residual
+    confirmation_base_residual = epoch.confirmation_base_residual
+    verifications = {(item.period, item.index): item for item in state.verifications}
     recovery = list(epoch.recovery)
     incumbent = state.incumbent
     last_aligned = None if incumbent is None else incumbent.last_aligned_evidence_at
@@ -1286,6 +1355,12 @@ def fold_unit(
             relationship.right_event_id: context[relationship.right_event_id],
         }
         full_quality = _full_interval_quality(relationship, pair)
+        if full_quality > 0:
+            key = (
+                period,
+                _interval_bin(_relationship_phase_value(relationship, period), period)[0],
+            )
+            verifications[key] = _verification_bin_add(verifications.get(key), relationship)
         if _high_direct(relationship):
             quality = relationship_authority_quality(relationship, pair.values())
             high_items.append((relationship, quality))
@@ -1324,6 +1399,8 @@ def fold_unit(
         ):
             confirmation_count += 1
             confirmation_residual *= 1.0 - SPARSE_CONFIRMATION_INTERVAL_WEIGHT * full_quality
+            if confirmation_base_residual is not None:
+                confirmation_base_residual *= 1.0 - VERIFIED_INTERVAL_WEIGHT * full_quality
             tag(relationship.left_event_id, confirmation=period)
             tag(relationship.right_event_id, confirmation=period)
 
@@ -1526,8 +1603,10 @@ def fold_unit(
             challenger=tuple(challenger[key] for key in sorted(challenger)),
             confirmation_count=confirmation_count,
             confirmation_residual=confirmation_residual,
+            confirmation_base_residual=confirmation_base_residual,
             recovery=_greedy_recovery(recovery),
         ),
+        verifications=tuple(verifications[key] for key in sorted(verifications)),
         open_chain=next_open,
         normal_relationships=tuple(normal_bins[key] for key in sorted(normal_bins)),
         tagged_weight_totals=tuple(
@@ -1973,6 +2052,13 @@ class CompactSparseSupport:
     first_aligned_at: float | None
     last_aligned_at: float | None
     aligned_ranges: tuple[tuple[float, float], ...]
+    # Stage 2 identification calibration (``authority._SparseSupport``).
+    calibrated: bool = False
+    within_tolerance: bool = False
+    # Aligned occurrences as (low, high, count) seconds of the UTC day, and
+    # the same without any endpoint exclusion (SE4r input).
+    aligned_entries: tuple[tuple[float, float, int], ...] = ()
+    refutation: tuple[tuple[float, float, int], ...] = ()
 
 
 _EMPTY_SUPPORT = CompactSparseSupport(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0, None, None, ())
@@ -1989,8 +2075,50 @@ def compact_sparse_support(
     exclude_folded_confirmation_endpoints: bool = False,
     exclude_anchor: bool = False,
     before_at: float | None = None,
+    calibrated: bool = True,
+    after_at: float | None = None,
+    explained_by: tuple[int, float, float] | None = None,
+    resolve_anomalies: bool = False,
+    window_domain: bool = False,
+    split_lower_bound: bool = False,
+    refutation_endpoint_ids: Iterable[str] | None = None,
+    _endpoint_marks: tuple[frozenset[str], bool, int | None] | None = None,
 ) -> CompactSparseSupport:
     """``authority._sparse_support`` over folded bins plus ring events.
+
+    ``refutation_endpoint_ids`` (correction N1) are the candidate's own ring
+    interval endpoints, marked in the SE4 refutation input together with its
+    folded high-endpoint tags; ``None`` means ``excluded_ring_event_ids``.
+
+    ``resolve_anomalies`` (Stage 4, established display only) removes the
+    resolved off-phase restarts from the consistency domain
+    (``compact_resolved_anomaly_weight``).  ``window_domain`` starts the
+    consistency domain at the evaluation window: every retained entry counts
+    (a folded bin straddling ``after_at`` counts whole, which only lowers the
+    result).
+
+    ``split_lower_bound`` (Stage 4 established display) changes how an
+    aligned folded bin straddling ``before_at`` or ``after_at`` is read: it
+    certainly holds one restart on the evaluated side (its first restart
+    before ``before_at``, its last after ``after_at``), counted at the least
+    weight that restart can have (``_least_restart_weight``); its other
+    restarts are unknown and leave both the aligned weight and the domain.
+    A straddling bin with excluded endpoints is unknown entirely.  The
+    domain total is then the explicit sum of the retained entries (an
+    off-phase bin straddling a boundary counts whole).  Both only lower the
+    result, and the read is exact when the straddling bin holds one restart
+    on the evaluated side.
+
+    ``explained_by`` (Stage 3 challengers) is the incumbent's (period, phase,
+    tolerance): a restart it explains is no challenger evidence and counts
+    as historical, like a superseded-explained one.  A folded bin is
+    explained when any part of its range is (its closest residual), which
+    only lowers the result; ring restarts are exact.
+
+    ``after_at`` (Stage 3 post-boundary evidence) keeps only restarts strictly
+    later than it: a bin folded wholly before it is left out, and a bin
+    straddling it cannot be split, so an aligned one counts as off-phase
+    (only lowers the result).
 
     Exact for ring events.  A folded bin is aligned only when its whole
     offset range is within tolerance; an ambiguous bin counts as off-phase.
@@ -2026,6 +2154,12 @@ def compact_sparse_support(
             anchor_index = anchor.anchor_index
 
     def explained(entry: _Entry) -> bool:
+        if (
+            explained_by is not None
+            and _range_abs(entry.low, entry.high, explained_by[1], explained_by[0])[0]
+            <= explained_by[2]
+        ):
+            return True
         return any(
             entry.first_at <= regime.superseded_at
             and _range_abs(entry.low, entry.high, regime.phase_offset, regime.period)[0]
@@ -2034,6 +2168,7 @@ def compact_sparse_support(
         )
 
     entries: list[tuple[_Entry, str, float, bool]] = []
+    own_marks: dict[int, int] = {}
     removed: list[tuple[float, float]] = []
     # Domain anchors per folded bin: (pool total before, tagged total before).
     befores: dict[int, tuple[float, float]] = {}
@@ -2041,10 +2176,20 @@ def compact_sparse_support(
     for item in state.pool:
         if before_at is not None and item.first_at >= before_at:
             continue
+        if after_at is not None and item.last_at <= after_at:
+            continue
         entry = _bin_entry(item)
         state_class, mad_value = _classify(entry, phase_offset, period)
-        if before_at is not None and state_class == _ALIGNED and item.last_at >= before_at:
-            state_class = _AMBIGUOUS
+        straddles_before = before_at is not None and item.last_at >= before_at
+        straddles_after = after_at is not None and item.first_at <= after_at
+        partial = None
+        if state_class == _ALIGNED and (straddles_before or straddles_after):
+            if not split_lower_bound:
+                state_class = _AMBIGUOUS
+            elif straddles_before and straddles_after:
+                continue
+            else:
+                partial = (item.first_at,) * 2 if straddles_before else (item.last_at,) * 2
         weight, count = item.weight, item.count
         first_at = item.first_at
         before = (item.weight_before, item.tagged_before_at(period))
@@ -2069,6 +2214,13 @@ def compact_sparse_support(
                 removed.append((removed_weight, removed_at))
         elif exclude_folded_high_endpoints and tag is not None:
             other_tags.append(tag)
+        last_at = item.last_at
+        if partial is not None:
+            if weight < item.weight - _EPSILON or count != item.count:
+                # Endpoints left the bin: which side they were on is unknown.
+                continue
+            weight, count = _least_restart_weight(weight, count), 1
+            first_at, last_at = partial
         if count <= 0 or weight <= _EPSILON or (before_at is not None and first_at >= before_at):
             continue
         entry = _Entry(
@@ -2077,21 +2229,43 @@ def compact_sparse_support(
             weight,
             count,
             first_at,
-            item.last_at,
+            last_at,
             item.uncertainty_min,
             item.uncertainty_max,
             item,
         )
         befores[item.index] = before
         entries.append((entry, state_class, mad_value, explained(entry)))
+        if _endpoint_marks is not None:
+            own_count = 0
+            if _endpoint_marks[1] and tag is not None:
+                own_count += tag.count
+            if _endpoint_marks[2] is not None and _endpoint_marks[2] == item.index:
+                own_count += 1
+            own_marks[id(entry)] = min(entry.count, own_count)
     for event in ring_sparse_events(state, ring_events):
         if event.event_id in excluded:
             continue
         entry = _ring_entry(event)
         if before_at is not None and entry.first_at >= before_at:
             continue
+        if after_at is not None and entry.first_at <= after_at:
+            continue
         state_class, mad_value = _classify(entry, phase_offset, period)
-        entries.append((entry, state_class, mad_value, explained(entry)))
+        hist = explained(entry)
+        if _endpoint_marks is not None and event.event_id in _endpoint_marks[0]:
+            own_marks[id(entry)] = 1
+            if (
+                hist
+                and explained_by is not None
+                and _range_abs(entry.low, entry.high, explained_by[1], explained_by[0])[1]
+                <= explained_by[2]
+            ):
+                # Shared-endpoint correction (refutation input only): an
+                # incumbent-explained endpoint of the candidate's own ring
+                # interval still dates its grid; folded ones are left out.
+                hist = False
+        entries.append((entry, state_class, mad_value, hist))
 
     aligned = [
         (entry, mad_value)
@@ -2111,7 +2285,25 @@ def compact_sparse_support(
         for entry, _class, _mad, _hist in entries
         if entry.source is None and entry.first_at >= first
     )
-    if anchor_entry.source is not None:
+    explicit = window_domain or split_lower_bound
+    if window_domain:
+        first = min(entry.first_at for entry, _class, _mad, _hist in entries)
+
+    def in_domain(entry: _Entry) -> bool:
+        return entry.last_at >= first if explicit else entry.first_at >= first
+
+    if explicit:
+        folded_total = sum(
+            entry.weight
+            for entry, _class, _mad, _hist in entries
+            if entry.source is not None and in_domain(entry)
+        )
+        ring_total = sum(
+            entry.weight
+            for entry, _class, _mad, _hist in entries
+            if entry.source is None and in_domain(entry)
+        )
+    elif anchor_entry.source is not None:
         pool_before, tagged_before = befores[anchor_entry.source.index]
         pool_until = state.pool_weight_total
         tagged_until = next(
@@ -2149,12 +2341,100 @@ def compact_sparse_support(
     historical_in_domain = sum(
         entry.weight
         for entry, state_class, _mad, hist in entries
-        if hist and state_class == _ALIGNED and entry.first_at >= first
+        if hist and state_class == _ALIGNED and in_domain(entry)
     )
+    if explained_by is not None:
+        # Correction P1: an aligned restart the incumbent certainly explains
+        # (the whole range within its tolerance; ring restarts exact) is
+        # predicted by both schedules, so it leaves the challenger's
+        # consistency domain as well as its aligned support.  A restart the
+        # challenger does not predict still contradicts it and stays; a
+        # folded bin only possibly explained stays, which only lowers the
+        # result.
+        removed_aligned = sum(
+            entry.weight
+            for entry, state_class, _mad, _hist in entries
+            if state_class == _ALIGNED
+            and in_domain(entry)
+            and _range_abs(entry.low, entry.high, explained_by[1], explained_by[0])[1]
+            <= explained_by[2]
+        )
+        total -= removed_aligned
+        historical_in_domain -= removed_aligned
+    if resolve_anomalies:
+        total -= compact_resolved_anomaly_weight(
+            state,
+            period=period,
+            phase_offset=phase_offset,
+            ring_events=ring_events,
+            domain=[
+                entry
+                for entry, state_class, _mad, _hist in entries
+                if state_class == _OFF and in_domain(entry)
+            ],
+            explained=explained,
+        )
     off_phase_weight = max(0.0, total - effective - historical_in_domain)
     mad = _median_of_counts([(mad_value, entry.count) for entry, mad_value in aligned])
     band = phase_quality_band(mad)
     consistency = effective / total if total > 0 else 0.0
+    if calibrated:
+        value, phase_confidence, within = sparse_identification_magnitudes(
+            effective=effective,
+            band=band,
+            off_phase_weight=off_phase_weight,
+            consistency=consistency,
+            period=period,
+        )
+        aligned_entries = _occurrence_entries(
+            (entry for entry, _mad in aligned),
+            own_marks if _endpoint_marks is not None else None,
+        )
+        marked = excluded if refutation_endpoint_ids is None else set(refutation_endpoint_ids)
+        if (
+            excluded
+            or marked
+            or exclude_folded_high_endpoints
+            or exclude_folded_confirmation_endpoints
+            or exclude_anchor
+        ):
+            refutation = compact_sparse_support(
+                state,
+                period=period,
+                phase_offset=phase_offset,
+                ring_events=ring_events,
+                before_at=before_at,
+                after_at=after_at,
+                explained_by=explained_by,
+                _endpoint_marks=(
+                    frozenset(marked),
+                    exclude_folded_high_endpoints,
+                    state.open_chain.anchor_index
+                    if exclude_anchor
+                    and state.open_chain is not None
+                    and state.open_chain.anchor_index is not None
+                    and period not in state.open_chain.anchor_high_periods
+                    else None,
+                ),
+            ).aligned_entries
+        else:
+            refutation = aligned_entries
+        return CompactSparseSupport(
+            value,
+            effective,
+            band,
+            phase_confidence,
+            round(off_phase_weight, 6),
+            round(consistency, 6),
+            sum(entry.count for entry, _mad in aligned),
+            first,
+            max(entry.last_at for entry, _mad in aligned),
+            tuple(sorted((entry.low, entry.high) for entry, _mad in aligned)),
+            calibrated=True,
+            within_tolerance=within,
+            aligned_entries=aligned_entries,
+            refutation=refutation,
+        )
     phase_confidence = _event_count_cap(effective) * band * consistency
     value = (
         _event_count_cap(max(0.0, effective - off_phase_weight))
@@ -2173,6 +2453,186 @@ def compact_sparse_support(
         max(entry.last_at for entry, _mad in aligned),
         tuple(sorted((entry.low, entry.high) for entry, _mad in aligned)),
     )
+
+
+_SPARSE_EVENT_WEIGHTS = (1.0, 0.8, 0.5)
+
+
+def _least_restart_weight(weight: float, count: int) -> float:
+    """The least weight any one restart of a folded bin can have.
+
+    Sparse-usable restarts weigh 1.0, 0.8 or 0.5 (``scoring._event_weight``).
+    Over every split of ``count`` restarts into those weights that sums to
+    ``weight``, the smallest weight present; exact for a uniform bin.  Zero
+    when no split matches (never claims weight that may not exist).
+    """
+
+    if count == 1:
+        return weight
+    least = None
+    high, middle, low = _SPARSE_EVENT_WEIGHTS
+    for strong in range(count + 1):
+        for medium in range(count - strong + 1):
+            weak = count - strong - medium
+            if abs(strong * high + medium * middle + weak * low - weight) > 1e-6:
+                continue
+            smallest = low if weak else middle if medium else high
+            least = smallest if least is None else min(least, smallest)
+    return least or 0.0
+
+
+def _entries_coherent(left: _Entry, right: _Entry) -> bool:
+    """``authority._phase_coherent`` for compact entries (seconds of the UTC
+    day for folded bins, exact times for ring onsets; every candidate period
+    divides 24 h).  A folded range is coherent unless it certainly is not,
+    so the compact path never finds an anomaly isolated that raw would not.
+    """
+
+    width = (right.high - right.low) / 2
+    for period in CANDIDATE_PERIODS:
+        smallest = _range_abs(left.low, left.high, right.mid, period)[0] - width
+        if smallest <= candidate_phase_tolerance(period) + max(
+            left.uncertainty_max, right.uncertainty_max
+        ):
+            return True
+    return False
+
+
+def compact_resolved_anomaly_weight(
+    state: LearnedState,
+    *,
+    period: int,
+    phase_offset: float,
+    ring_events: Iterable[PhysicalRestartEvent],
+    domain: Sequence[_Entry],
+    explained=None,
+) -> float:
+    """``authority._resolved_anomaly_ids`` (Stage 4) over the learned state.
+
+    ``domain`` are the certainly off-phase entries in a support's consistency
+    domain.  An entry is resolved when it is one restart that is phase
+    coherent with no other off-phase sparse onset, or when every off-phase
+    onset coherent with it (itself included) is earlier than the second
+    latest aligned onset (the regime was reconfirmed twice since).  Folded
+    aligned bins count only when wholly aligned and their earlier restarts at
+    their first instant; coherence is conservative.  Both only lower the
+    resolved weight (the raw path is exact).  Returns the resolved weight.
+    """
+
+    if not domain:
+        return 0.0
+    every = [_bin_entry(item) for item in state.pool]
+    every.extend(_ring_entry(item) for item in ring_sparse_events(state, ring_events))
+    others: list[_Entry] = []
+    aligned_times: list[float] = []
+    for entry in every:
+        state_class, _mad = _classify(entry, phase_offset, period)
+        if state_class == _ALIGNED:
+            if explained is None or not explained(entry):
+                aligned_times.append(entry.last_at)
+                aligned_times.extend([entry.first_at] * (entry.count - 1))
+        else:
+            others.append(entry)
+    aligned_times.sort(reverse=True)
+    reconfirmed_before = aligned_times[1] if len(aligned_times) >= 2 else None
+
+    def same(left: _Entry, right: _Entry) -> bool:
+        if left.source is not None or right.source is not None:
+            return left.source is right.source
+        return left.first_at == right.first_at and left.low == right.low
+
+    resolved = 0.0
+    for entry in domain:
+        coherent = [
+            other.last_at
+            for other in others
+            if not same(other, entry) and _entries_coherent(entry, other)
+        ]
+        if (entry.count == 1 and not coherent) or (
+            reconfirmed_before is not None
+            and max([entry.last_at, *coherent]) < reconfirmed_before
+        ):
+            resolved += entry.weight
+    return resolved
+
+
+def _occurrence_entries(
+    entries: Iterable[_Entry], own_marks: dict[int, int] | None = None
+) -> tuple[tuple, ...]:
+    """(low, high, count) seconds of the UTC day; ring entries are exact.
+
+    With ``own_marks`` (correction N1) each entry also carries how many of its
+    occurrences are endpoints of the candidate's own witnessed intervals.
+    """
+
+    values = []
+    for entry in entries:
+        if entry.source is None:
+            second = entry.low % DAY
+            value = (second, second, entry.count)
+        else:
+            value = (entry.low, entry.high, entry.count)
+        if own_marks is not None:
+            value = (*value, own_marks.get(id(entry), 0))
+        values.append(value)
+    return tuple(sorted(values))
+
+
+SELF_INTERVAL_REFUTATION_OCCURRENCES = 3
+
+
+def sparse_robust_refutation(
+    entries: Iterable[tuple], period: int
+) -> bool:
+    """SE4r (C5) with the 24 h refutation-only multiple (C6).
+
+    For every longer candidate period that is a multiple of ``period``, and
+    for 24 h, no single cluster (an aligned occurrence and everything within
+    that multiple's tolerance of it) may hold all occurrences but at most
+    one, so removing any single occurrence still leaves the longer period
+    refuted: one coincidental restart can never decide it.  An entry may carry
+    a fourth element, how many of its occurrences are endpoints of the
+    candidate's own witnessed intervals (correction N1).  Occurrences are
+    seconds of the UTC day (every multiple divides 24 h).  A folded range is
+    in a cluster unless it certainly is not, so the compact path is never
+    looser than the exact raw one.
+    """
+
+    values = tuple(
+        (item[0], item[1], item[2], item[3] if len(item) > 3 else 0) for item in entries
+    )
+    total = sum(count for _low, _high, count, _own in values)
+    own_total = sum(own for _low, _high, _count, own in values)
+    multiples = [
+        (multiple, candidate_phase_tolerance(multiple))
+        for multiple in CANDIDATE_PERIODS
+        if multiple > period and multiple % period == 0
+    ]
+    if DAY % period == 0:
+        multiples.append((DAY, SPARSE_REFUTATION_DAY_TOLERANCE))
+    if total < 2:
+        return False
+    for multiple, tolerance in multiples:
+        for anchor_low, anchor_high, _count, _own in values:
+            width = anchor_high - anchor_low
+            members = [
+                (count, own)
+                for low, high, count, own in values
+                if _range_abs(low, high, anchor_low, multiple)[0] - width <= tolerance
+            ]
+            cluster = sum(count for count, _own in members)
+            if cluster >= total - 1:
+                return False
+            # Correction N1: refuters that are all endpoints of the candidate's
+            # own witnessed intervals need three occurrences (two coincidental
+            # administrative restarts ending witnessed intervals never refute
+            # the longer period).  Any independent lone refuter keeps the
+            # existing two-occurrence rule.
+            outside = total - cluster
+            outside_own = own_total - sum(own for _count, own in members)
+            if outside_own >= outside and outside < SELF_INTERVAL_REFUTATION_OCCURRENCES:
+                return False
+    return True
 
 
 def compact_phase_proposal(
@@ -2235,6 +2695,35 @@ def compact_phase_proposal(
     mad = _median_of_counts([(mad_value, entry.count) for entry, mad_value in aligned])
     count = sum(entry.count for entry, _mad in aligned)
     return offset, mad, count, max(entry.last_at for entry, _mad in aligned)
+
+
+def compact_refined_phase(
+    state: LearnedState,
+    *,
+    period: int,
+    phase: float,
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+) -> float:
+    """``authority._refined_sparse_phase`` over the sparse pool.
+
+    Members are the onsets wholly aligned with ``phase``; a folded bin sits
+    at the middle of its range and counts once per restart.  Ring onsets are
+    exact.
+    """
+
+    entries = [_bin_entry(item) for item in state.pool]
+    entries.extend(_ring_entry(item) for item in ring_sparse_events(state, ring_events))
+    values = [
+        (_signed_phase_residual(entry.mid, phase, period), entry.count)
+        for entry in entries
+        if _classify(entry, phase, period)[0] == _ALIGNED
+    ]
+    best, best_cost = 0.0, sum(abs(value) * count for value, count in values)
+    for centre in sorted({value for value, _count in values}):
+        cost = sum(abs(value - centre) * count for value, count in values)
+        if cost < best_cost - 1e-6:
+            best, best_cost = centre, cost
+    return (phase + best) % period
 
 
 def compact_harmonic_blockers(
@@ -2401,6 +2890,46 @@ def compact_folded_off_phase_ids(
     )
 
 
+def compact_folded_context_onsets(
+    state: LearnedState,
+    *,
+    period: int,
+    phase_offset: float,
+    tolerance: float,
+    incumbent_period: int,
+    incumbent_phase: float,
+    incumbent_tolerance: float,
+    first_at: float,
+    last_at: float,
+) -> int:
+    """Folded independent onsets certainly at a context's phase and off the incumbent.
+
+    Correction A1 (compact path): counted-onset bins only (followers carry no
+    occurrence), each wholly within ``tolerance`` of the context phase and
+    wholly outside the incumbent's tolerance.  A bin wholly inside
+    ``[first_at, last_at]`` contributes its count; a bin with one end inside
+    contributes one (a certain lower bound); otherwise none.
+    """
+
+    total = 0
+    for item in state.pool:
+        if item.last_at < first_at or item.first_at > last_at:
+            continue
+        if (
+            _range_abs(item.seconds_min, item.seconds_max, phase_offset, period)[1] > tolerance
+            or _range_abs(
+                item.seconds_min, item.seconds_max, incumbent_phase, incumbent_period
+            )[0]
+            <= incumbent_tolerance
+        ):
+            continue
+        if first_at <= item.first_at and item.last_at <= last_at:
+            total += item.count
+        elif first_at <= item.first_at <= last_at or first_at <= item.last_at <= last_at:
+            total += 1
+    return total
+
+
 def compact_folded_miss_ids(
     state: LearnedState, *, period: int, phase_offset: float, tolerance: float, since: float
 ) -> tuple[str, ...]:
@@ -2467,6 +2996,29 @@ def compact_sparse_structure_reasons(
     if not support.aligned_count or support.first_aligned_at is None:
         return ()
     first = support.first_aligned_at
+    if support.calibrated:
+        _h2, h3 = compact_harmonic_blockers(
+            state,
+            period,
+            normal_candidate,
+            ring_windows,
+            ring_events=ring_events,
+            phase_offset=phase_offset,
+        )
+        if h3 or not sparse_robust_refutation(support.refutation, period):
+            return (SPARSE_PERIOD_AMBIGUOUS_REASON,)
+        if (
+            sparse_identification_count_met(
+                effective=support.effective,
+                off_phase_weight=support.off_phase_weight,
+                period=period,
+            )
+            and support.last_aligned_at - first >= SCHEDULE_GATES[period].established_span
+            and support.quality_band >= SPARSE_PHASE_QUALITY_BAND_MINIMUM
+            and support.phase_confidence >= SPARSE_PHASE_CONFIDENCE_MINIMUM
+        ):
+            return (SPARSE_STRUCTURE_REASON,)
+        return ()
     refuted = all(
         any(
             _range_abs(low, high, first, multiple)[0] > candidate_phase_tolerance(multiple)
@@ -2625,6 +3177,7 @@ def compact_candidates(
     normal_score=None,
     ring_windows: Iterable[ExpectedWindowLedgerRecord] = (),
     challenger: bool = False,
+    calibrated: bool = True,
 ) -> tuple[CompactCandidate, ...]:
     """High (continuous) candidates from folded interval bins plus the ring.
 
@@ -2784,6 +3337,7 @@ def compact_candidates(
                 excluded_ring_event_ids=endpoints,
                 exclude_folded_high_endpoints=bool(folded),
                 exclude_anchor=excludes_anchor,
+                calibrated=calibrated,
             )
             sparse_reasons = compact_sparse_structure_reasons(
                 state,
@@ -2843,10 +3397,27 @@ def compact_sparse_confirmation(
     *,
     ring_events: Iterable[PhysicalRestartEvent] = (),
     ring_relationships: Iterable[IntervalRelationship] = (),
+    verified: bool = False,
+    calibrated: bool = True,
 ) -> float:
     return compact_sparse_confirmation_details(
-        state, candidate, ring_events=ring_events, ring_relationships=ring_relationships
+        state,
+        candidate,
+        ring_events=ring_events,
+        ring_relationships=ring_relationships,
+        verified=verified,
+        calibrated=calibrated,
     )[0]
+
+
+@dataclass(frozen=True)
+class CompactConfirmationTerms:
+    residual: float
+    confirming: bool
+    excluded: frozenset[str]
+    folded_high: bool
+    folded_confirmation: bool
+    anchor_id: str | None
 
 
 def compact_sparse_confirmation_details(
@@ -2855,17 +3426,68 @@ def compact_sparse_confirmation_details(
     *,
     ring_events: Iterable[PhysicalRestartEvent] = (),
     ring_relationships: Iterable[IntervalRelationship] = (),
+    verified: bool = False,
+    calibrated: bool = True,
 ) -> tuple[float, bool]:
-    """``authority._sparse_confirmed_candidate`` combined value (Stage 8.5).
+    """``authority._sparse_confirmed_candidate`` combined value (Stage 8.5);
+    the confirming terms are ``compact_confirmation_terms``."""
+
+    ring_events = tuple(ring_events)
+    terms = compact_confirmation_terms(
+        state,
+        candidate,
+        ring_events=ring_events,
+        ring_relationships=ring_relationships,
+        verified=verified,
+        calibrated=calibrated,
+    )
+    if terms is None:
+        return candidate.combined_confidence, False
+    return _compact_confirmed_value(
+        state,
+        candidate,
+        residual=terms.residual,
+        confirming=terms.confirming,
+        excluded=set(terms.excluded),
+        period=state.incumbent.period,
+        ring_events=ring_events,
+        folded_high=terms.folded_high,
+        folded_confirmation=terms.folded_confirmation,
+        anchor_id=terms.anchor_id,
+        calibrated=calibrated,
+    )
+
+
+def compact_confirmation_terms(
+    state: LearnedState,
+    candidate: CompactCandidate,
+    *,
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+    ring_relationships: Iterable[IntervalRelationship] = (),
+    verified: bool = False,
+    calibrated: bool = True,
+) -> "CompactConfirmationTerms | None":
+    """The confirming terms of ``compact_sparse_confirmation_details``.
+
+    ``None`` when the incumbent knowledge has no establishment boundary;
+    otherwise the residual over the confirming intervals and the evidence
+    they remove from the sparse slot (Stage 4 reuses them for the
+    established display).
+
+    ``authority._sparse_confirmed_candidate`` combined value (Stage 8.5).
 
     Folded high full intervals confirm only from bins wholly within the
     incumbent's phase tolerance (conservative); epoch confirmation scalars
-    and ring intervals are exact.
+    and ring intervals are exact.  ``verified`` (a regime established under
+    verified acquisition) uses ``authority._verified_confirmed_candidate``:
+    the base weight 0.5 over high relationships (folded ``base_residual``)
+    and post-establishment query-visible full intervals (epoch base
+    residual).
     """
 
     incumbent = state.incumbent
     if incumbent is None or incumbent.established_at is None:
-        return candidate.combined_confidence, False
+        return None
     period = incumbent.period
     established_at = incumbent.established_at
     ring_events = tuple(ring_events)
@@ -2875,6 +3497,51 @@ def compact_sparse_confirmation_details(
     confirming = False
     excluded: set[str] = set(candidate.ring_endpoint_ids)
     folded_high = False
+    if verified:
+        for item in state.intervals:
+            if (
+                item.period == period
+                and item.relationship_count
+                and item.phase_min is not None
+                and _range_abs(
+                    item.start + item.phase_min,
+                    item.start + item.phase_max,
+                    incumbent.phase_offset,
+                    period,
+                )[1]
+                <= incumbent.phase_tolerance
+            ):
+                residual *= item.base_residual
+                confirming = folded_high = True
+        folded_confirmation = state.epoch.confirmation_count > 0
+        if folded_confirmation and state.epoch.confirmation_base_residual is not None:
+            residual *= state.epoch.confirmation_base_residual
+            confirming = True
+        ring_values = tuple(ring_map.values())
+        for relationship in _ring_relationships(state, ring_relationships, ring_map):
+            if (
+                relationship.candidate_period_seconds != period
+                or _circular_distance(
+                    _relationship_phase_value(relationship, period),
+                    incumbent.phase_offset,
+                    period,
+                )
+                > incumbent.phase_tolerance
+            ):
+                continue
+            if _high_direct(relationship):
+                quality = relationship_authority_quality(relationship, ring_values)
+            elif relationship.right_at > established_at:
+                quality = _full_interval_quality(relationship, ring_map)
+            else:
+                continue
+            if quality > 0:
+                residual *= 1.0 - VERIFIED_INTERVAL_WEIGHT * quality
+                confirming = True
+                excluded.update((relationship.left_event_id, relationship.right_event_id))
+        return CompactConfirmationTerms(
+            residual, confirming, frozenset(excluded), folded_high, folded_confirmation, anchor_id
+        )
     for item in state.intervals:
         if (
             item.period == period
@@ -2912,6 +3579,25 @@ def compact_sparse_confirmation_details(
             residual *= 1.0 - SPARSE_CONFIRMATION_INTERVAL_WEIGHT * quality
             confirming = True
             excluded.update((relationship.left_event_id, relationship.right_event_id))
+    return CompactConfirmationTerms(
+        residual, confirming, frozenset(excluded), folded_high, folded_confirmation, anchor_id
+    )
+
+
+def _compact_confirmed_value(
+    state: LearnedState,
+    candidate: CompactCandidate,
+    *,
+    residual: float,
+    confirming: bool,
+    excluded: set[str],
+    period: int,
+    ring_events: tuple[PhysicalRestartEvent, ...],
+    folded_high: bool,
+    folded_confirmation: bool,
+    anchor_id: str | None,
+    calibrated: bool = True,
+) -> tuple[float, bool]:
     if not confirming:
         return candidate.combined_confidence, False
     confirmation = min(HIGH_AUTHORITY_CAP, 1.0 - residual)
@@ -2924,12 +3610,149 @@ def compact_sparse_confirmation_details(
         exclude_folded_high_endpoints=candidate.has_folded_evidence or folded_high,
         exclude_folded_confirmation_endpoints=folded_confirmation,
         exclude_anchor=anchor_id is not None and anchor_id in excluded,
+        calibrated=calibrated,
     )
     continuous = max(candidate.high_authority, confirmation)
     combined = continuous + (1.0 - continuous) * min(
         SPARSE_EVIDENCE_CEILING, SPARSE_EVIDENCE_CEILING * support.value
     )
     return round(max(candidate.combined_confidence, combined), 6), True
+
+
+def compact_witnessed_interval_exists(
+    state: LearnedState,
+    *,
+    period: int,
+    phase_offsets: Iterable[float],
+    tolerance: float,
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+    ring_relationships: Iterable[IntervalRelationship] = (),
+) -> bool:
+    """``authority._witnessed_interval_verifies`` over the learned state.
+
+    Every relationship is either unfolded (judged exactly by the raw
+    predicate over the ring) or folded exactly once into a schema-5
+    verification bin (existence exact from the phase extremes).  Schema-3/4
+    states carry no verification bins for intervals folded before the
+    upgrade; for those the folded high full intervals are read from their
+    interval bins only when the whole bin lies within tolerance
+    (conservative: never claims an interval that may not qualify).
+    """
+
+    phases = tuple(phase_offsets)
+    ring_events = tuple(ring_events)
+    ring_map = _ring_map(state, ring_events)
+    for relationship in _ring_relationships(state, ring_relationships, ring_map):
+        if (
+            relationship.candidate_period_seconds == period
+            and any(
+                _circular_distance(_relationship_phase_value(relationship, period), phase, period)
+                <= tolerance
+                for phase in phases
+            )
+            and _full_interval_quality(relationship, ring_map) > 0
+        ):
+            return True
+    for item in state.verifications:
+        if item.period == period and any(
+            min(
+                _circular_distance(item.start + item.phase_min, phase, period),
+                _circular_distance(item.start + item.phase_max, phase, period),
+            )
+            <= tolerance
+            for phase in phases
+        ):
+            return True
+    return any(
+        item.period == period
+        and item.full_interval_count
+        and item.phase_min is not None
+        and any(
+            _range_abs(item.start + item.phase_min, item.start + item.phase_max, phase, period)[1]
+            <= tolerance
+            for phase in phases
+        )
+        for item in state.intervals
+    )
+
+
+def compact_witnessed_interval_count(
+    state: LearnedState,
+    *,
+    period: int,
+    phase_offsets: Iterable[float],
+    tolerance: float,
+    after_at: float | None = None,
+    ring_events: Iterable[PhysicalRestartEvent] = (),
+    ring_relationships: Iterable[IntervalRelationship] = (),
+) -> int:
+    """``authority._witnessed_interval_count`` over the learned state.
+
+    Distinct qualifying intervals are independent (a DIRECT single-cycle
+    interval has no restart inside it, so two can only be adjacent or
+    disjoint).  Ring intervals are exact.  A folded verification bin adds its
+    count only when both phase extremes are within tolerance, otherwise at
+    most one; ``after_at`` keeps only bins wholly later.  Legacy interval bins
+    (schema 3/4 folds) overlap the verification bins for later folds, so the
+    larger of the two folded counts is used: never more than the truth.
+    """
+
+    phases = tuple(phase_offsets)
+    ring_events = tuple(ring_events)
+    ring_map = _ring_map(state, ring_events)
+    ring = 0
+    for relationship in _ring_relationships(state, ring_relationships, ring_map):
+        if (
+            relationship.candidate_period_seconds == period
+            and (after_at is None or relationship.left_at >= after_at)
+            and any(
+                _circular_distance(_relationship_phase_value(relationship, period), phase, period)
+                <= tolerance
+                for phase in phases
+            )
+            and _full_interval_quality(relationship, ring_map) > 0
+        ):
+            ring += 1
+
+    def within(start: float, low: float, high: float) -> tuple[bool, bool]:
+        both = any(
+            max(
+                _circular_distance(start + low, phase, period),
+                _circular_distance(start + high, phase, period),
+            )
+            <= tolerance
+            for phase in phases
+        )
+        either = any(
+            min(
+                _circular_distance(start + low, phase, period),
+                _circular_distance(start + high, phase, period),
+            )
+            <= tolerance
+            for phase in phases
+        )
+        return both, either
+
+    verified = 0
+    for item in state.verifications:
+        if item.period != period or (after_at is not None and item.first_at < after_at):
+            continue
+        both, either = within(item.start, item.phase_min, item.phase_max)
+        verified += item.count if both else (1 if either else 0)
+    legacy = 0
+    for item in state.intervals:
+        if (
+            item.period != period
+            or not item.full_interval_count
+            or item.phase_min is None
+            or item.first_at is None
+            or (after_at is not None and item.first_at < after_at)
+        ):
+            continue
+        both, _either = within(item.start, item.phase_min, item.phase_max)
+        if both:
+            legacy += item.full_interval_count
+    return ring + max(verified, legacy)
 
 
 def compact_last_aligned_evidence_at(
@@ -3633,6 +4456,18 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
             ]
             for item in state.normal_relationships
         ],
+        "verifications": [
+            [
+                item.period,
+                item.index,
+                item.count,
+                item.phase_min,
+                item.phase_max,
+                item.first_at,
+                item.last_at,
+            ]
+            for item in state.verifications
+        ],
         "incumbent": None
         if incumbent is None
         else {
@@ -3657,7 +4492,12 @@ def learned_state_to_mapping(state: LearnedState) -> dict:
         ],
         "epoch": {
             "regime_id": epoch.regime_id,
-            "values": [epoch.established_at, epoch.confirmation_count, epoch.confirmation_residual],
+            "values": [
+                epoch.established_at,
+                epoch.confirmation_count,
+                epoch.confirmation_residual,
+                epoch.confirmation_base_residual,
+            ],
             "challenger": [_interval_bin_to(item) for item in epoch.challenger],
             "recovery": [[item.left_at, item.right_at] for item in epoch.recovery],
         },
@@ -3674,7 +4514,7 @@ def learned_state_from_mapping(value: object) -> LearnedState:
         or version not in SUPPORTED_LEARNED_STATE_SCHEMA_VERSIONS
     ):
         raise LearnedStateError("unsupported learned-state schema version")
-    if version == LEARNED_STATE_SCHEMA_VERSION:
+    if version >= 4:
         followers = tuple(
             _follower_bin_from(item, f"followers[{index}]")
             for index, item in enumerate(
@@ -3774,6 +4614,37 @@ def learned_state_from_mapping(value: object) -> LearnedState:
         )
     _ordered_unique([(item.period, item.index) for item in normal_bins], "normal_relationships")
 
+    verifications = []
+    if version >= 5:
+        for index, raw in enumerate(
+            _array(data.get("verifications"), "verifications", maximum=INTERVAL_BIN_TOTAL)
+        ):
+            label = f"verifications[{index}]"
+            entry = _array(raw, label, length=7)
+            period = _period(entry[0], f"{label}.period")
+            low = _finite(entry[3], f"{label}.phase_min", maximum=INTERVAL_BIN_SECONDS)
+            high = _finite(entry[4], f"{label}.phase_max", maximum=INTERVAL_BIN_SECONDS)
+            first_at = _finite(entry[5], f"{label}.first_at")
+            last_at = _finite(entry[6], f"{label}.last_at")
+            if high < low or last_at <= first_at:
+                raise LearnedStateError(f"{label} extremes are inverted")
+            verifications.append(
+                VerificationBin(
+                    period,
+                    _integer(
+                        entry[1], f"{label}.index", maximum=period // INTERVAL_BIN_SECONDS - 1
+                    ),
+                    _integer(entry[2], f"{label}.count", minimum=1),
+                    low,
+                    high,
+                    first_at,
+                    last_at,
+                )
+            )
+        _ordered_unique([(item.period, item.index) for item in verifications], "verifications")
+    elif "verifications" in data:
+        raise LearnedStateError("schema-3/4 learned state cannot carry verification bins")
+
     incumbent = None
     if data.get("incumbent") is not None:
         entry = _mapping(data.get("incumbent"), "incumbent")
@@ -3829,7 +4700,20 @@ def learned_state_from_mapping(value: object) -> LearnedState:
     _ordered_unique([item.key for item in superseded], "superseded")
 
     epoch_data = _mapping(data.get("epoch"), "epoch")
-    epoch_values = _array(epoch_data.get("values"), "epoch.values", length=3)
+    epoch_values = _array(
+        epoch_data.get("values"), "epoch.values", length=4 if version >= 5 else 3
+    )
+    confirmation_count = _integer(epoch_values[1], "epoch.confirmation_count")
+    if version >= 5:
+        base_residual = _optional_finite(
+            epoch_values[3], "epoch.confirmation_base_residual", maximum=1.0
+        )
+        if base_residual is None and confirmation_count == 0:
+            raise LearnedStateError("an epoch without confirmations has a known base residual")
+    else:
+        # Legacy epoch: the base-weight residual is exact only when nothing
+        # was folded; otherwise it is unknown (never reconstructed).
+        base_residual = 1.0 if confirmation_count == 0 else None
     recovery = []
     for index, raw in enumerate(
         _array(
@@ -3848,8 +4732,9 @@ def learned_state_from_mapping(value: object) -> LearnedState:
         regime_id=_string(epoch_data.get("regime_id"), "epoch.regime_id", optional=True),
         established_at=_optional_finite(epoch_values[0], "epoch.established_at"),
         challenger=_interval_bins_from(epoch_data.get("challenger"), "epoch.challenger"),
-        confirmation_count=_integer(epoch_values[1], "epoch.confirmation_count"),
+        confirmation_count=confirmation_count,
         confirmation_residual=_finite(epoch_values[2], "epoch.confirmation_residual", maximum=1.0),
+        confirmation_base_residual=base_residual,
         recovery=tuple(recovery),
     )
     state = LearnedState(
@@ -3871,6 +4756,7 @@ def learned_state_from_mapping(value: object) -> LearnedState:
             data.get("tagged_weight_totals"), "tagged_weight_totals"
         ),
         followers=followers,
+        verifications=tuple(verifications),
     )
     if learned_state_entry_count(state) > LEARNED_STATE_MAX_ENTRIES:
         raise LearnedStateError("learned state exceeds its entry bound")

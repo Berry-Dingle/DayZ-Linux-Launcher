@@ -349,9 +349,10 @@ def test_compact_authority_keeps_confidence_when_folded_raw_is_deleted(name):
 
 
 def test_partial_learning_progress_survives_folding_deletion_and_inactivity(monkeypatch):
-    """A 76 % partially learned cycle (eight sparse restarts and one admin
-    restart) is folded completely, its raw evidence deleted and months pass:
-    the compact state still carries the same support."""
+    """A 63 % partially learned cycle (four sparse restarts and one admin
+    restart, below the Stage 2 identification requirement) is folded
+    completely, its raw evidence deleted and months pass: the compact state
+    still carries the same support."""
 
     original_plan = learned.plan_ring_folding
     monkeypatch.setattr(
@@ -359,7 +360,7 @@ def test_partial_learning_progress_survives_folding_deletion_and_inactivity(monk
         "plan_ring_folding",
         lambda state, events, capacity=learned.RECENT_RING_CAPACITY: original_plan(state, events, capacity=2),
     )
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.sparse_pipeline(s8.SPARSE_DISCRIMINATING[:4])
     pipeline.sparse("admin", [s8.at(6, 17, 20)])
     record = drive(pipeline, every=3)
     later = rebuild(record, pipeline.events, pipeline.coverage, updated_at=record["migration_audit"]["runtime_updated_at"] + 365 * scoring.DAY)
@@ -374,7 +375,7 @@ def test_partial_learning_progress_survives_folding_deletion_and_inactivity(monk
     assert state.watermark.folded_event_count >= len(pipeline.events) - 2
     support = learned.compact_sparse_support(state, period=P3, phase_offset=0.0, ring_events=events)
     assert support.value == pytest.approx(raw_value, abs=1e-6)
-    assert compact_tests.display(learned.compact_combined_confidence(0.0, support.value)) == 76
+    assert compact_tests.display(learned.compact_combined_confidence(0.0, support.value)) == 63
 
 
 def test_challenger_epoch_evidence_is_maintained_by_rebuild(monkeypatch):

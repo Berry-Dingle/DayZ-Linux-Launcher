@@ -307,8 +307,15 @@ def test_unpruned_raw_era_record_cuts_over_and_prunes_on_its_first_rebuild(monke
 
 MILESTONES = {
     # name: (factory, capacity, expected final displayed percent or None)
-    "eight_sparse_80": (r3._sparse_eight, 2, 80),
-    "sparse_then_interval_95": (r3._sparse_then_interval, 3, 95),
+    # Verified acquisition: eight sparse restarts await verification (79 %);
+    # with a witnessed interval recorded first they establish at 80 %; an
+    # offline-observed interval after them verifies at about 90 %.
+    "eight_sparse_awaiting_79": (r3._sparse_eight, 2, 79),
+    # Stage 4: delivered two restarts at a time, the cycle establishes on its
+    # earlier restarts and the later ones are post-establishment replication
+    # (an evaluation of the whole history at once still shows 80 %).
+    "verified_sparse_80": (s8.verified_sparse_pipeline, 2, 91),
+    "sparse_then_interval_90": (r3._sparse_then_interval, 3, 90),
     "two_intervals_80": (lambda: s8.three_hour_chain(3), 2, 80),
     "three_intervals_95": (lambda: s8.three_hour_chain(4), 2, 95),
     "anomaly_recovers": (s8._anomaly_mid_history, 3, None),
@@ -342,11 +349,13 @@ def test_learned_schedule_survives_pruning_with_a_tiny_ring(name, monkeypatch, t
 def test_partial_learner_survives_months_and_improves_after_its_events_are_gone(
     monkeypatch, tiny_ring
 ):
-    """76 %: eight sparse restarts plus one admin restart; all but two raw
-    events are pruned, a year passes, one more aligned restart reaches 80 %."""
+    """63 %: four sparse restarts plus one admin restart (below the Stage 2
+    identification requirement); all but two raw events are pruned, a year
+    passes, two more aligned restarts reach the pre-verification ceiling
+    (79 %, awaiting a witnessed interval)."""
 
     def pipeline():
-        value = s8.sparse_pipeline()
+        value = s8.sparse_pipeline(s8.SPARSE_DISCRIMINATING[:4])
         value.sparse("admin", [s8.at(6, 17, 20)])
         return value
 
@@ -354,14 +363,14 @@ def test_partial_learner_survives_months_and_improves_after_its_events_are_gone(
     source = pipeline()
     record = drive(source, every=1)
     assert len(record["physical_events"]) == 2
-    assert consumer(record)["percent"] == 76
+    assert consumer(record)["percent"] == 63
     later_at = record["migration_audit"]["runtime_updated_at"] + 365 * scoring.DAY
     later = integration.rebuild(record, source.events, source.coverage, updated_at=later_at)
-    assert consumer(later)["percent"] == 76
+    assert consumer(later)["percent"] == 63
     assert schema4.persisted_authority_decision(later).state.value != "established"
 
     grown = pipeline()
-    grown.sparse("one-more", [s8.at(9, 0)])
+    grown.sparse("two-more", [s8.at(9, 0), s8.at(10, 3)])
     improved = integration.rebuild(later, grown.events, grown.coverage)
     monkeypatch.setattr(schema4, "COMPACT_AUTHORITY_ENABLED", False)
     reference = integration.rebuild(drive(pipeline(), every=1), grown.events, grown.coverage)
@@ -370,7 +379,8 @@ def test_partial_learner_survives_months_and_improves_after_its_events_are_gone(
     assert r3.decision_summary(schema4.persisted_authority_decision(improved)) == (
         r3.decision_summary(schema4.persisted_authority_decision(reference))
     )
-    assert consumer(improved)["percent"] == 80
+    assert consumer(improved)["percent"] == 79
+    assert schema4.persisted_authority_decision(improved).state.value == "likely"
 
 
 def test_harmonic_blocker_survives_pruning_of_the_six_hour_history(monkeypatch, tiny_ring):

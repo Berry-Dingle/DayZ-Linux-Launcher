@@ -282,6 +282,23 @@ def test_01_isolated_off_phase_restart_keeps_established_prediction():
 
 
 def test_02_covered_misses_only_keep_established_prediction():
+    # Stage 5 correction: a strongly established (E2) cycle keeps its
+    # prediction through one genuine miss, and through misses that are not of
+    # consecutive occurrences (here 03:00 and 09:00, 06:00 unmonitored).
+    for times in ((at(3),), (at(3), at(9))):
+        evidence, original = established()
+        evidence.windows.extend(
+            miss(P3, when, key=f"miss-{index}") for index, when in enumerate(times)
+        )
+        value = evidence.evaluate(original)
+        assert value.state is State.CHANGE_SUSPECTED
+        assert value.suspicion_level == 1
+        assert value.prediction_usable and value.countdown_safe
+        assert value.incumbent_shadow_regime == original.incumbent_shadow_regime
+        assert value.combined_confidence == original.combined_confidence
+
+    # Two consecutive genuinely monitored misses (03:00 and 06:00) withhold
+    # the prediction (was: kept); the regime and its confidence are kept.
     evidence, original = established()
     evidence.windows.extend(
         (miss(P3, at(3), key="miss-1"), miss(P3, at(6), key="miss-2"))
@@ -289,7 +306,8 @@ def test_02_covered_misses_only_keep_established_prediction():
     value = evidence.evaluate(original)
     assert value.state is State.CHANGE_SUSPECTED
     assert value.suspicion_level == 1
-    assert value.prediction_usable and value.countdown_safe
+    assert authority.CONSECUTIVE_MISSES_REASON in value.reason_codes
+    assert not value.prediction_usable and not value.countdown_safe
     assert value.incumbent_shadow_regime == original.incumbent_shadow_regime
     assert value.combined_confidence == original.combined_confidence
 

@@ -366,6 +366,50 @@ def assert_same(raw_step, compact_step, label):
     assert consumer_summary(compact_step) == consumer_summary(raw_step), label
 
 
+_DISPLAY_FIELDS = {"combined", "best_learning"}
+
+
+def _displayed(step):
+    candidates = step.decision.candidates
+    return any(
+        authority.ESTABLISHED_DISPLAY_REASON in item.reason_codes for item in candidates
+    )
+
+
+def assert_same_display_bounded(raw_step, compact_step, label, *, consumer=True):
+    """Stage 4 parity for histories whose display uses post-establishment
+    replication.
+
+    Every decision field (and every consumer field but the percentage) is
+    equal.  The established display magnitude is equal too unless the
+    Stage 4 display applies, when the compact path may read it lower, never
+    higher: a folded UTC-minute bin straddling the establishment boundary
+    keeps no per-restart time or weight, so only one restart per side, at
+    its least possible weight, is certain (``_least_restart_weight``).
+    """
+
+    raw_summary = decision_summary(raw_step.decision)
+    compact_summary = decision_summary(compact_step.decision)
+    raw_display = {key: raw_summary.pop(key) for key in _DISPLAY_FIELDS}
+    compact_display = {key: compact_summary.pop(key) for key in _DISPLAY_FIELDS}
+    assert compact_summary == raw_summary, label
+    for key in _DISPLAY_FIELDS:
+        left, right = compact_display[key], raw_display[key]
+        if left is None or right is None or not _displayed(raw_step):
+            assert left == right, (label, key)
+        else:
+            assert left <= right + 1e-9, (label, key, left, right)
+    if not consumer:
+        return
+    raw_consumer, compact_consumer = consumer_summary(raw_step), consumer_summary(compact_step)
+    raw_percent, compact_percent = raw_consumer.pop("percent"), compact_consumer.pop("percent")
+    assert compact_consumer == raw_consumer, label
+    if _displayed(raw_step):
+        assert compact_percent <= raw_percent, (label, compact_percent, raw_percent)
+    else:
+        assert compact_percent == raw_percent, label
+
+
 INDEPENDENCE = {
     "sparse_eighty": (lambda: s8.sparse_pipeline(), 1, 3),
     "sparse_then_interval": (_sparse_then_interval, 1, 3),
@@ -392,11 +436,13 @@ def test_compact_only_runner_matches_full_history_raw_authority(name):
 
 
 def test_partial_learner_survives_six_months_then_improves():
-    """76 % partial learning (eight sparse restarts and one admin restart),
-    fully folded (raw discarded), then six months without observation, then
-    one more aligned restart reaches the 80 % milestone, as with full history."""
+    """63 % partial learning (four sparse restarts and one admin restart,
+    below the Stage 2 identification requirement), fully folded (raw
+    discarded), then six months without observation, then two more aligned
+    restarts reach the pre-verification ceiling (79 %, awaiting a witnessed
+    interval), as with full history."""
 
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.sparse_pipeline(s8.SPARSE_DISCRIMINATING[:4])
     pipeline.sparse("admin", [s8.at(6, 17, 20)])
     runner = CompactOnly(pipeline, capacity=2)
     batches = batches_of(pipeline, 1)
@@ -404,19 +450,22 @@ def test_partial_learner_survives_six_months_then_improves():
     for index, batch in enumerate(batches):
         compact = runner.step(batch)
         assert_same(raw[index], compact, index)
-    assert s8.percent(compact) == 76
+    assert s8.percent(compact) == 63
     assert runner.state.watermark.folded_event_count == len(pipeline.events) - runner.capacity
 
     later = max(item.finalized_at for item in pipeline.events) + 182 * scoring.DAY
     idle = runner.step((), now=later)
     assert decision_summary(idle.decision) == decision_summary(compact.decision)
-    assert s8.percent(idle) == 76
+    assert s8.percent(idle) == 63
 
-    ninth = pipeline.sparse("ninth", [s8.at(190, 9)])
+    ninth = pipeline.sparse("two-more", [s8.at(190, 9), s8.at(191, 12)])
     improved = runner.step(ninth)
     raw_improved = raw_steps(pipeline, [*batches, ninth])[-1]
     assert_same(raw_improved, improved, "improved")
-    assert s8.percent(improved) == 80
+    assert s8.percent(improved) == 79
+    assert improved.decision.state is authority.RegimeState.LIKELY
+    assert authority.AWAITING_VERIFICATION_REASON in improved.decision.reason_codes
+    # The sparse statistic itself still reaches the milestone.
     assert integration.compact_tests.display(improved.decision.combined_confidence) == 80
 
 
@@ -491,7 +540,7 @@ def test_folded_off_phase_restart_still_prevents_the_isolation_relief():
 
     from dataclasses import replace as dc_replace
 
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     established = list(pipeline.events)
     first_admin = pipeline.sparse("admin-a", [s8.at(8, *s8.ADMIN_RESTARTS[0])])
     ineligible = pipeline.sparse("blip", [s8.at(9, 2, 30)])

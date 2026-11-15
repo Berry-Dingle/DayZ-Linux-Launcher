@@ -30,6 +30,11 @@ RESTART_CONFIDENCE_STYLE_CLASSES = {
     "strong": "ping-good",
 }
 MAX_USER_VISIBLE_RESTART_CONFIDENCE_PERCENT = 95
+LEARNING_BLOCKED_TEXT = "Error: Learning Blocked"
+LEARNING_BLOCKED_TOOLTIP = (
+    "This server's saved learning history could not be validated. "
+    "Learning has been suspended to protect the stored data."
+)
 JOIN_STATUS_TRANSIENT_SECONDS = 20
 RESTART_PRESENTATION_TOOLTIPS = {
     "pattern_only": "Recurring timing is visible, but its duration is not established yet.",
@@ -49,6 +54,33 @@ RESTART_PRESENTATION_TOOLTIPS = {
     "confirmed_new_cycle": "A newer repeated cadence has replaced the previous cycle.",
     "prediction_temporarily_suspended": "The learned schedule is temporarily unsafe to predict.",
 }
+AWAITING_CYCLE_VERIFICATION_KEY = "awaiting_cycle_verification"
+
+
+def restart_presentation_tooltip(presentation: dict | None) -> str | None:
+    """Tooltip for the Restart Cycle value (static, or the awaiting period)."""
+
+    if not presentation:
+        return None
+    key = presentation.get("presentation_key")
+    if key == AWAITING_CYCLE_VERIFICATION_KEY:
+        period = presentation.get("awaiting_period_seconds")
+        if (
+            isinstance(period, bool)
+            or not isinstance(period, (int, float))
+            or not math.isfinite(period)
+            or period <= 0
+        ):
+            return None
+        hours = period / 3600
+        unit = "hour" if hours == 1 else "hours"
+        return (
+            f"Likely every {hours:g} {unit} - Keep monitoring through one complete "
+            "restart interval to confirm this schedule."
+        )
+    return RESTART_PRESENTATION_TOOLTIPS.get(key)
+
+
 _WHOLE_HOUR_CYCLE_RE = re.compile(
     r"^Every\s+(?P<hours>\d+(?:\.0+)?)\s+hours?$",
     re.IGNORECASE,
@@ -152,6 +184,8 @@ def restart_learning_presentation(summary: dict | None) -> dict | None:
         "presentation_key": str(summary.get("presentation_key") or ""),
         "authority_consumer": bool(summary.get("authority_consumer", False)),
     }
+    if summary.get("awaiting_period_seconds") is not None:
+        presentation["awaiting_period_seconds"] = summary.get("awaiting_period_seconds")
     if presentation["authority_consumer"]:
         presentation["countdown_safe"] = bool(summary.get("countdown_safe", False))
         presentation["reason_codes"] = tuple(summary.get("reason_codes") or ())
@@ -367,6 +401,16 @@ class ServerCompanionPanel(Gtk.Box):
         self.time_label = Gtk.Label()
         self.time_label.set_xalign(0.0)
         self.server_details_box.append(self.time_label)
+
+        # Correction (Learning Blocked): the selected server's stored learning
+        # record is quarantined or otherwise unwritable, so learning is
+        # suspended to protect it.  Visible feedback only.
+        self.learning_blocked_label = Gtk.Label(label=LEARNING_BLOCKED_TEXT)
+        self.learning_blocked_label.set_xalign(0.0)
+        self.learning_blocked_label.add_css_class("ping-orange")
+        self.learning_blocked_label.set_tooltip_text(LEARNING_BLOCKED_TOOLTIP)
+        self.learning_blocked_label.set_visible(False)
+        self.server_box.append(self.learning_blocked_label)
 
         self.restart_learning_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         self.restart_learning_box.add_css_class("companion-restart-learning")
@@ -850,7 +894,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.restart_cycle_value_label.set_text(presentation["cycle_text"])
         if hasattr(self.restart_cycle_value_label, "set_tooltip_text"):
             self.restart_cycle_value_label.set_tooltip_text(
-                RESTART_PRESENTATION_TOOLTIPS.get(presentation["presentation_key"])
+                restart_presentation_tooltip(presentation)
             )
         self.restart_next_value_label.set_text(presentation["next_text"])
         countdown_text = presentation["countdown_text"]
@@ -874,6 +918,11 @@ class ServerCompanionPanel(Gtk.Box):
             self._start_restart_countdown_colon()
         else:
             self._stop_restart_countdown_colon()
+
+    def set_learning_blocked(self, blocked: bool):
+        """Show the selected server's Learning Blocked status line."""
+
+        self.learning_blocked_label.set_visible(bool(blocked))
 
     def set_server_snapshot(self, snapshot: dict):
         self._stop_empty_breathe()
@@ -928,6 +977,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.name_label.set_tooltip_text(None)
         self.set_join_status(None)
         self.set_restart_learning_summary(None)
+        self.set_learning_blocked(False)
         self.server_box.set_visible(False)
         self.empty_label.set_visible(True)
         self._start_empty_breathe()

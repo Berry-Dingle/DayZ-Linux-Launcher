@@ -59,12 +59,36 @@ PRE_SHIFT_CONFIDENCE = round(authority.SPARSE_EVIDENCE_CEILING * 0.95, 6)
 
 
 def sparse_established():
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     step = s8.settled(pipeline)
     s8.assert_sparse_established(step)
     assert step.decision.combined_confidence == PRE_SHIFT_CONFIDENCE
     assert s8.percent(step) == 80
     return pipeline, step
+
+
+def oo_verified_sparse_established():
+    """Eight sparse restarts verified by an offline-observed interval.
+
+    The interval's high endpoints never enter the sparse pool, so the sparse
+    statistic is exactly that of the eight restarts (used where a test's
+    premise is the eight-restart statistic); its base authority lifts the
+    established confidence to about 90 %.
+    """
+
+    pipeline = s8.verify(
+        s8.sparse_pipeline(), outcome=s8.Outcome.CORROBORATED_OFFLINE_RESTART
+    )
+    step = s8.settled(pipeline)
+    s8.assert_sparse_established(step)
+    assert authority.VERIFIED_ESTABLISHMENT_REASON in regime(step).reason_codes
+    assert s8.percent(step) == 90
+    return pipeline, step
+
+
+def verifying_endpoint_ids(step):
+    times = set(s8.VERIFYING_INTERVAL)
+    return frozenset(item.event_id for item in step.events if item.canonical_phase_at in times)
 
 
 def regime(step):
@@ -125,8 +149,11 @@ def assert_fixed_point(pipeline, step):
 # --------------------------------------------------------------------------
 
 
-def test_one_observation_is_noticed_and_keeps_the_existing_safety_behaviour():
-    pipeline, original = sparse_established()
+@pytest.mark.parametrize(
+    "fixture", [sparse_established, oo_verified_sparse_established], ids=["qv", "oo"]
+)
+def test_one_observation_is_noticed_and_keeps_the_existing_safety_behaviour(fixture):
+    pipeline, original = fixture()
     step = ts.advance(pipeline, original, "shift-0", SHIFT[0])
 
     assert ts.time_shift_reasons(step) == {NOTICED}
@@ -135,12 +162,19 @@ def test_one_observation_is_noticed_and_keeps_the_existing_safety_behaviour():
     assert_sparse_regime_unchanged(step, original)
     value = step.consumer()
     # Unchanged Stage 8.7a treatment: the isolated restart keeps the sparse
-    # countdown and lowers the statistic, which withholds the warning.
+    # countdown; it never raises the statistic, and the warning follows the
+    # unchanged displayed-80 % rule.  (Stage 2 one-anomaly allowance: one
+    # isolated off-phase restart is deducted as one net occurrence, which a
+    # saturated identification statistic absorbs; it is still recorded as
+    # off-phase evidence.)
     assert value.presentation_state is Presentation.CONFIRMED_CYCLE
     assert value.countdown_visible
-    assert step.decision.combined_confidence < PRE_SHIFT_CONFIDENCE
-    assert s8.percent(step) < 80
-    assert not step.consumer(now=value.next_expected_restart_at - 300).scheduled_warning_eligible
+    assert step.decision.combined_confidence <= original.decision.combined_confidence
+    assert authority.SPARSE_PROPORTIONAL_ANOMALY_REASON in (
+        step.candidate(P3, regime(step).phase_offset).reason_codes
+    )
+    warning = step.consumer(now=value.next_expected_restart_at - 300).scheduled_warning_eligible
+    assert warning == (s8.percent(step) >= 80)
 
 
 @pytest.mark.parametrize("times", [SHIFT, SAME_DAY_SHIFT], ids=["days_apart", "same_day"])
@@ -202,25 +236,31 @@ def test_six_hour_spacing_on_one_shifted_phase_is_a_time_shift_of_the_establishe
 
 
 def test_the_pre_shift_boundary_excludes_the_first_shifted_observation():
-    pipeline, original = sparse_established()
+    pipeline, original = oo_verified_sparse_established()
     step = ts.observe_shift(pipeline, original, SHIFT)[-1]
     sparse = authority._sparse_evidence(tuple(step.events), None)
+    # The verifying interval's endpoints are the regime's own high evidence.
+    excluded = verifying_endpoint_ids(step)
+    assert len(excluded) == 2
 
     def support(before_at):
         return authority._sparse_support(
             period=P3,
             phase_offset=regime(original).phase_offset,
             sparse=sparse,
-            excluded_event_ids=frozenset(),
+            excluded_event_ids=excluded,
             before_at=before_at,
         )
 
     earned = support(SHIFT[0])
     assert earned.value == pytest.approx(0.95)
     assert earned.off_phase_weight == 0
-    # Including the first shifted observation would already erode it.
-    assert support(SHIFT[0] + 1).value < earned.value
-    assert support(None).value < support(SHIFT[0] + 1).value
+    # Including the first shifted observation would already count it against
+    # the earned phase (absorbed by the Stage 2 one-anomaly allowance), and
+    # all three erode it.
+    assert support(SHIFT[0] + 1).off_phase_weight == pytest.approx(1.0)
+    assert support(SHIFT[0] + 1).value <= earned.value
+    assert support(None).value < earned.value
     assert authority._time_shift_authority_until(regime(step).reason_codes) == SHIFT[0]
 
 
@@ -252,9 +292,10 @@ def test_confidence_is_carried_until_the_new_phase_supports_it_independently():
         assert step.consumer().countdown_visible
         assert regime(step).regime_id == regime(steps[2]).regime_id
     carried = [bool(markers(step)) for step in steps[2:]]
-    # The carrier lapses once and for all, at the eighth shifted restart (the
-    # native statistic reaches 0.95 there), and the regime stands on its own.
-    assert carried == [True] * 5 + [False] * 2
+    # The carrier lapses once and for all when the native statistic reaches
+    # 0.95 (Stage 2 identification: the fourth shifted restart; previously the
+    # eighth), and the regime stands on its own.
+    assert carried == [True] + [False] * 6
     assert ADOPTED in regime(steps[-1]).reason_codes
     assert_fixed_point(pipeline, steps[-1])
 
@@ -314,6 +355,10 @@ def test_markers_survive_the_serializer_round_trip():
 
 def _production_sparse(times):
     production = ts.Production()
+    # The witnessed interval is recorded first (as the runtime would), so it
+    # verifies even after it is folded out of the bounded ring.
+    s8.verify(production.pipeline)
+    production.rebuild()
     for index, when in enumerate(times):
         session, event = ts.shaped(f"sparse-{index}", when, production.pipeline.sequence)
         production.pipeline.sequence += 1
@@ -384,13 +429,13 @@ def test_production_adoption_over_folded_pre_shift_evidence_is_stable():
 
 
 def _basic_shift():
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     pipeline.sparse("shift", SHIFT + FURTHER_SHIFTED[:2])
     return pipeline
 
 
 def _long_shift():
-    pipeline = s8.Pipeline()
+    pipeline = s8.verify(s8.Pipeline())
     pipeline.sparse("aligned", s8.aligned_3h(30))
     pipeline.sparse("shift", (at(40, 1), at(41, 7), at(42, 16), at(43, 4), at(44, 10)))
     return pipeline
@@ -411,7 +456,10 @@ def test_compact_authority_with_folded_pre_shift_evidence_matches_raw(factory, c
     runner = compact_authority.CompactOnly(pipeline, capacity=capacity)
     for index, batch in enumerate(batches):
         compact = runner.step(batch)
-        compact_authority.assert_same(raw[index], compact, (index, capacity))
+        # Stage 4: before the shift the established display may read lower
+        # (never higher) on the compact path once replication onsets fold into
+        # minute bins straddling the establishment boundary.
+        compact_authority.assert_same_display_bounded(raw[index], compact, (index, capacity))
         if regime(raw[index]) is not None:
             # Regime identities differ by design (compact identity carries no
             # relationship IDs); everything Time Shift Detection decides agrees.
@@ -423,7 +471,7 @@ def test_compact_authority_with_folded_pre_shift_evidence_matches_raw(factory, c
             )
             assert left.established_at == right.established_at
             assert markers(compact) == markers(raw[index])
-            assert compact.decision.combined_confidence == raw[index].decision.combined_confidence
+            assert compact.decision.combined_confidence <= raw[index].decision.combined_confidence
     assert ADOPTED in regime(raw[-1]).reason_codes
     assert raw[-1].decision.combined_confidence == PRE_SHIFT_CONFIDENCE
     assert runner.state.watermark.folded_event_count >= len(pipeline.events) - capacity
@@ -436,7 +484,7 @@ def test_compact_boundary_inside_a_folded_minute_bin_only_lowers_the_value():
     be lower than the raw one; it is never higher.
     """
 
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     pipeline.sparse("admin", [at(7, 1)])
     pipeline.sparse("more", [at(8, 9)])
     pipeline.sparse("shift", SHIFT + FURTHER_SHIFTED[:2])

@@ -3171,6 +3171,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _refresh_server_companion_restart_learning_summary(self) -> None:
         key_of = getattr(self, "_server_companion_restart_learning_key", None)
         key = key_of() if callable(key_of) else None
+        DZLLWindow._refresh_server_companion_learning_blocked(self, key)
         if key and DZLLWindow._companion_authority_work_pending(self, key):
             # R8: present the rebuilt authority, not the one it replaces.
             # R8a: at most one deferred refresh is queued per server (it
@@ -3217,6 +3218,24 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if hasattr(panel, "set_restart_alert_usability"):
                 panel.set_restart_alert_usability(self._server_companion_restart_alert_usability_summary())
             self._server_companion_dock.update_undocked_size()
+
+    def _refresh_server_companion_learning_blocked(self, key) -> None:
+        """Show Learning Blocked only for a selected server whose stored
+        learning record is quarantined or otherwise persistence-blocked
+        (the runtime's authoritative per-server status; never inferred from
+        confidence).  A cheap per-server lookup; it starts no learning."""
+
+        panel = getattr(self, "server_companion_panel", None)
+        if panel is None or not hasattr(panel, "set_learning_blocked"):
+            return
+        runtime = getattr(self, "_companion_restart_phase2", None)
+        blocked = False
+        if key and runtime is not None and hasattr(runtime, "server_persistence_block"):
+            try:
+                blocked = runtime.server_persistence_block(key) is not None
+            except Exception:
+                blocked = False
+        panel.set_learning_blocked(blocked)
 
     def _surface_restart_learning_persistence_notice(self) -> bool:
         runtime = getattr(self, "_companion_restart_phase2", None)

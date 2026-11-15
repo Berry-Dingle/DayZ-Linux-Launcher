@@ -208,7 +208,10 @@ def test_d1_fifty_minute_burst_counts_as_one_correlated_contradiction():
     assert now.effective == pytest.approx(10.0)
     assert now.off_phase_weight == pytest.approx(1.0)
     assert now.consistency == pytest.approx(10 / 11, abs=1e-6)
-    assert now.phase_confidence == pytest.approx(0.95 * 10 / 11, abs=1e-6)
+    # Stage 2: one correlated contradiction is within the one-anomaly
+    # allowance (net nine occurrences, saturated).
+    assert now.within_tolerance
+    assert now.phase_confidence == pytest.approx(0.95)
     assert now.value == pytest.approx(0.95)
     # Every burst restart is still a persisted, classified, authentic event.
     assert all(authority._authentic_event(item) for item in events)
@@ -225,7 +228,10 @@ def test_d2_six_hour_crash_loop_keeps_multiple_independent_contradictions():
     assert now.off_phase_weight == pytest.approx(6.0)
     assert now.effective == pytest.approx(10.0)
     assert now.consistency == pytest.approx(10 / 16)
-    assert 0.0 < now.value < 0.6
+    # Six contradictions exceed the allowance: the proportional fall applies
+    # and the value stays below the identification milestone.
+    assert not now.within_tolerance
+    assert 0.0 < now.value < 0.9
     # Still well below the sparse establishment precision (SE3).
     assert now.phase_confidence < authority.SPARSE_PHASE_CONFIDENCE_MINIMUM
 
@@ -257,20 +263,29 @@ def test_g_quick_restarts_cannot_inflate_aligned_evidence():
     before = every_event_support(events, P3, 6 * HOUR)
     now = support(events, P3, 6 * HOUR)
 
-    # Four occurrences are no longer counted as twelve.
+    # Four occurrences are no longer counted as twelve: exactly the support
+    # of the four occurrences alone (Stage 2: the identification requirement).
+    clean = support(sparse_events([s8.at(0, 6), s8.at(1, 9), s8.at(2, 12), s8.at(3, 15)]), P3, 6 * HOUR)
     assert before.effective == pytest.approx(12.0)
-    assert now.effective == pytest.approx(4.0)
-    assert now.value == pytest.approx(0.75)
-    # SE1 (at least 5 effective aligned restarts at 3 h) now fails.
-    assert now.effective < scoring.GATES[P3].established_events <= before.effective
+    assert now.effective == pytest.approx(4.0) == clean.effective
+    assert now.value == pytest.approx(clean.value)
+    assert now.effective == authority.sparse_identification_occurrences(P3) < before.effective
 
 
 def test_g_four_occurrences_with_rerestarts_do_not_establish():
+    # Stage 2: four independent occurrences identify the cycle exactly as
+    # four clean ones do (the re-restarts add nothing); without a witnessed
+    # interval it only awaits verification.
     pipeline = s8.Pipeline()
     pipeline.sparse("g", g_times())
     step = settled_with(pipeline)
+    clean = s8.Pipeline()
+    clean.sparse("clean", [s8.at(0, 6), s8.at(1, 9), s8.at(2, 12), s8.at(3, 15)])
+    reference = settled_with(clean)
     assert not s8.established(step)
-    assert step.decision.incumbent_shadow_regime is None
+    assert step.decision.state is reference.decision.state is authority.RegimeState.LIKELY
+    assert authority.AWAITING_VERIFICATION_REASON in step.decision.reason_codes
+    assert step.decision.combined_confidence == reference.decision.combined_confidence
 
 
 def test_x_unscheduled_restart_just_before_a_scheduled_one_is_conservative():
@@ -307,7 +322,8 @@ def test_e_new_period_observed_sparsely_keeps_every_distinct_occurrence():
 
 def test_burst_counts_exactly_like_one_unscheduled_restart():
     """Eight discriminating sparse restarts plus a 50-minute burst behave as
-    eight plus a single admin restart (the existing 76 % partial learner)."""
+    eight plus a single admin restart (Stage 2: identified, awaiting
+    verification at 79 %)."""
 
     burst = s8.sparse_pipeline()
     burst.observe("burst", burst_times(day=7, hour=10, minute=40))
@@ -315,7 +331,7 @@ def test_burst_counts_exactly_like_one_unscheduled_restart():
     single.sparse("admin", [burst_times(day=7, hour=10, minute=40)[0]])
     left, right = settled_with(burst), settled_with(single)
 
-    assert s8.percent(left) == s8.percent(right) == 76
+    assert s8.percent(left) == s8.percent(right) == 79
     assert not s8.established(left) and not s8.established(right)
     assert left.candidate(P3, 6 * HOUR).aligned_normal_confidence == pytest.approx(
         right.candidate(P3, 6 * HOUR).aligned_normal_confidence
@@ -323,7 +339,7 @@ def test_burst_counts_exactly_like_one_unscheduled_restart():
 
 
 def test_burst_no_longer_blocks_sparse_establishment():
-    pipeline = s8.Pipeline()
+    pipeline = s8.verify(s8.Pipeline())
     pipeline.sparse("aligned", clean_history())
     # Mid-history, followed by aligned restarts (the real-world shape).
     pipeline.observe("burst", burst_times())
@@ -351,7 +367,7 @@ def test_burst_after_establishment_still_counts_for_suspicion_and_isolation():
     sparse establishment is level-one suspicion and never isolated, so the
     sparse countdown is withheld until the next aligned restart."""
 
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     first = settled_with(pipeline)
     assert s8.established(first)
     pipeline.observe("burst", burst_times(day=7, hour=10, minute=40))
@@ -369,7 +385,7 @@ def test_time_shift_detection_is_unaffected_by_followers():
     by a quick re-restart: the shift is adopted exactly as without them."""
 
     def scenario(with_followers):
-        pipeline = s8.sparse_pipeline()
+        pipeline = s8.verified_sparse_pipeline()
         established = list(pipeline.events)
         shifted = [s8.at(8, 7), s8.at(9, 10), s8.at(10, 13)]
         batches = [established]
@@ -455,6 +471,8 @@ def burst_history():
     """Sparse 3 h history, a 20-restart burst in one session, more sparse."""
 
     pipeline = s8.sparse_pipeline()
+    # Verified acquisition: a witnessed interval after the sparse restarts.
+    s8.verify(pipeline, (s8.at(6, 18), s8.at(6, 21)))
     pipeline.observe("burst", burst_times(day=7, hour=10, minute=40))
     pipeline.sparse("after", [s8.at(8, 18), s8.at(9, 0), s8.at(10, 9)])
     return pipeline
@@ -466,13 +484,18 @@ def test_compact_only_runner_matches_raw_when_folding_inside_and_after_a_burst(c
     batches = compact_authority.batches_of(pipeline, 1)
     raw = compact_authority.raw_steps(pipeline, batches)
     runner = compact_authority.CompactOnly(pipeline, capacity=capacity)
-    burst_chain = pipeline.events[8].continuity_chain_id
+    # The first burst restart follows the eight sparse restarts and the
+    # witnessed interval (2).
+    burst_chain = pipeline.events[10].continuity_chain_id
     burst_ids = {item.event_id for item in pipeline.events if item.continuity_chain_id == burst_chain}
     assert len(burst_ids) == 20
     inside = after = False
     for index, batch in enumerate(batches):
         compact = runner.step(batch)
-        compact_authority.assert_same(raw[index], compact, (capacity, index))
+        # Stage 4: the established display may read lower (never higher) on
+        # the compact path once replication onsets fold into minute bins
+        # straddling the establishment boundary; everything else is equal.
+        compact_authority.assert_same_display_bounded(raw[index], compact, (capacity, index))
         ring_ids = {item.event_id for item in runner.ring}
         # A ring smaller than the burst chain folds a prefix of it (the
         # boundary falls inside the burst); later steps fold it entirely.
@@ -495,7 +518,7 @@ def _isolation_scenario():
     apart).  Full history sees F and B after the last aligned restart, so B
     is not an isolated anomaly."""
 
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     established = list(pipeline.events)
     pair = pipeline.observe("pair", [s8.at(8, 6), s8.at(8, 6, 25)])
     pipeline.sparse("blip", [s8.at(8, 20, 30), s8.at(9, 1, 30)])
@@ -519,7 +542,8 @@ def test_follower_presence_survives_folding_for_stage_8_7a_isolation():
     pipeline, pair, batches = _isolation_scenario()
     raw, steps, runner = _run_isolation(pipeline, batches)
     for index, compact in enumerate(steps):
-        compact_authority.assert_same(raw[index], compact, index)
+        # Stage 4: display bounded as in the folding parity test above.
+        compact_authority.assert_same_display_bounded(raw[index], compact, index)
         assert (authority.ISOLATED_OFF_PHASE_RESTART_REASON in compact.decision.reason_codes) is (
             authority.ISOLATED_OFF_PHASE_RESTART_REASON in raw[index].decision.reason_codes
         ), index
@@ -542,7 +566,7 @@ def test_isolation_parity_depends_on_follower_presence(monkeypatch):
 
 
 def _production_burst_pipeline():
-    pipeline = s8.Pipeline()
+    pipeline = s8.verify(s8.Pipeline())
     pipeline.sparse("aligned", s8.aligned_3h(50))
     pipeline.observe("burst", burst_times(day=50, hour=10, minute=40))
     # Enough later restarts for the burst chain to leave the 80-event ring.
@@ -564,7 +588,7 @@ def test_production_rebuild_raw_and_compact_agree_across_retention(monkeypatch):
         ), index
         assert not schema4._validate_server_record(s8.SERVER, right)
     final = schema4.persisted_learned_state(compact[-1])
-    assert final.schema_version == learned.LEARNED_STATE_SCHEMA_VERSION == 4
+    assert final.schema_version == learned.LEARNED_STATE_SCHEMA_VERSION == 5
     assert sum(item.count for item in final.followers) == 19
     assert s8.established(integration.record_step(compact[-1]))
 
@@ -586,6 +610,19 @@ def test_repeated_rebuild_and_reopen_are_fixed_points(monkeypatch):
 # --------------------------------------------------------------------------
 
 
+def _legacy_mapping(state, version):
+    """The mapping an older build persisted: schema 4 has no verification
+    bins and a three-value epoch; schema 3 also has no followers."""
+
+    data = learned.learned_state_to_mapping(state)
+    data["schema_version"] = version
+    data.pop("verifications")
+    data["epoch"]["values"] = data["epoch"]["values"][:3]
+    if version == 3:
+        del data["followers"]
+    return data
+
+
 def _state_with_followers():
     events = sparse_events([*clean_history(), *burst_times()])
     state = learned.empty_learned_state(s8.SERVER)
@@ -599,24 +636,24 @@ def test_schema_4_round_trip_keeps_followers():
     state = _state_with_followers()
     payload = learned.learned_state_json_bytes(state)
     data = json.loads(payload)
-    assert data["schema_version"] == 4
+    assert data["schema_version"] == learned.LEARNED_STATE_SCHEMA_VERSION
     assert len(data["followers"]) == len(state.followers)
     assert learned.learned_state_from_json_bytes(payload) == state
 
 
 def test_schema_3_state_loads_unchanged_as_legacy():
     state = _state_with_followers()
-    data = learned.learned_state_to_mapping(replace(state, followers=()))
-    data["schema_version"] = 3
-    del data["followers"]
+    data = _legacy_mapping(replace(state, followers=()), 3)
     loaded = learned.learned_state_from_mapping(json.loads(json.dumps(data)))
 
     assert loaded.followers == ()
     assert loaded.pool == state.pool
     assert loaded.pool_weight_total == state.pool_weight_total
     assert loaded.watermark == state.watermark
-    # Upgraded in memory only by the empty presence collection.
-    assert loaded.schema_version == 4
+    # Upgraded in memory only by the empty presence (and verification)
+    # collections.
+    assert loaded.schema_version == learned.LEARNED_STATE_SCHEMA_VERSION
+    assert loaded.verifications == ()
     assert learned.learned_state_to_mapping(loaded)["followers"] == []
     # A legacy pool's latest restart is the conservative carried onset.
     assert learned.last_counted_onset_at(loaded) == max(item.last_at for item in state.pool)
@@ -649,9 +686,7 @@ def test_legacy_folded_bins_are_never_reinterpreted():
         pool_weight_total=total,
         watermark=learned.FoldWatermark(last.canonical_phase_at, last.event_id, len(events), len(events)),
     )
-    data = learned.learned_state_to_mapping(legacy)
-    data["schema_version"] = 3
-    del data["followers"]
+    data = _legacy_mapping(legacy, 3)
     loaded = learned.learned_state_from_mapping(json.loads(json.dumps(data)))
     assert loaded.pool == legacy.pool
     legacy_support = learned.compact_sparse_support(loaded, period=P3, phase_offset=0.0)
@@ -662,7 +697,10 @@ def test_legacy_folded_bins_are_never_reinterpreted():
 @pytest.mark.parametrize(
     "mutate",
     [
-        pytest.param(lambda data: data.update(schema_version=5), id="future_version"),
+        pytest.param(
+            lambda data: data.update(schema_version=learned.LEARNED_STATE_SCHEMA_VERSION + 1),
+            id="future_version",
+        ),
         pytest.param(lambda data: data.update(schema_version=True), id="bool_version"),
         pytest.param(lambda data: data.pop("followers"), id="v4_missing_followers"),
         pytest.param(lambda data: data.update(schema_version=3), id="v3_with_followers"),
@@ -715,9 +753,7 @@ def _as_schema3(state):
     """The same learned state as an unreleased pre-A1 build persisted it."""
 
     assert state.followers == ()
-    data = learned.learned_state_to_mapping(state)
-    data["schema_version"] = 3
-    del data["followers"]
+    data = _legacy_mapping(state, 3)
     return learned.learned_state_from_mapping(json.loads(json.dumps(data)))
 
 
@@ -753,7 +789,7 @@ def test_released_format_record_upgrades_from_its_complete_history(monkeypatch):
     state = schema4.persisted_learned_state(settled)
 
     assert not schema4._validate_server_record(s8.SERVER, settled)
-    assert state.schema_version == 4
+    assert state.schema_version == learned.LEARNED_STATE_SCHEMA_VERSION
     # Every retained restart is either still raw or folded exactly once.
     assert state.watermark.folded_event_count + len(
         schema4.learned_state_ring_events(settled, state)
@@ -791,7 +827,11 @@ def test_legacy_schema3_state_without_bursts_continues_exactly(monkeypatch):
     pipeline = s8.Pipeline()
     early = pipeline.sparse("early", s8.aligned_3h(5))
     later = [pipeline.sparse(f"later-{day}", [s8.at(day, (3 * day) % 24)]) for day in range(5, 10)]
-    batches = [[event] for event in early] + later
+    # Verified acquisition: a witnessed interval after the upgrade.
+    witnessed = pipeline.observe(
+        "witnessed", [s8.at(11, 3), s8.at(11, 6)], outcome=s8.Outcome.STRONG_QUERY_VISIBLE_RESTART
+    )
+    batches = [[event] for event in early] + later + [witnessed]
     runner = _legacy_runner(monkeypatch, pipeline, batches[:5], capacity=2)
     assert runner.state.pool and runner.state.followers == ()
     raw = compact_authority.raw_steps(pipeline, batches)
@@ -844,10 +884,10 @@ def test_upgraded_established_regime_keeps_identity_and_adapts(monkeypatch):
     upgrade unchanged, absorbs a later burst as level-one suspicion, and
     still adopts a genuine clock shift through Time Shift Detection."""
 
-    pipeline = s8.sparse_pipeline()
+    pipeline = s8.verified_sparse_pipeline()
     runner = _legacy_runner(monkeypatch, pipeline, [[event] for event in pipeline.events], capacity=2)
     before = runner.prior.incumbent_shadow_regime
-    assert before is not None and runner.state.schema_version == 4
+    assert before is not None and runner.state.schema_version == learned.LEARNED_STATE_SCHEMA_VERSION
     # Time Shift Detection reads unfolded restarts only (pre-existing), so
     # continue with a ring that can hold its three observations.
     runner.capacity = 8

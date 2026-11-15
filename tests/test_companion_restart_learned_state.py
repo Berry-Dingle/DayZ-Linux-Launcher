@@ -126,6 +126,8 @@ def assert_high_parity(step, state, ring=(), conservative=False):
                 value,
                 ring_events=ring,
                 ring_relationships=step.relationships,
+                verified=authority.VERIFIED_ESTABLISHMENT_REASON
+                in step.decision.incumbent_shadow_regime.reason_codes,
             )
             value = replace(value, combined_confidence=confirmed)
         assert value.high_authority == pytest.approx(item.high_authority, abs=1e-6)
@@ -510,7 +512,10 @@ def test_plan_ring_folding_never_exceeds_capacity_and_keeps_the_anchor():
 # --------------------------------------------------------------------------
 
 
-def test_eight_sparse_observations_reach_80_percent():
+def test_eight_sparse_observations_reach_the_pre_verification_ceiling():
+    """The sparse statistic still saturates at the 80 % milestone; without a
+    witnessed interval that is the pre-verification ceiling (Awaiting, 79 %)."""
+
     pipeline = s8.sparse_pipeline()
     step = s8.settled(pipeline)
     state = fold_events(step, step.events)
@@ -526,13 +531,19 @@ def test_eight_sparse_observations_reach_80_percent():
     assert authority.SPARSE_STRUCTURE_REASON in reasons
     assert learned.sparse_milestone_reached(support.value)
     assert display(learned.compact_combined_confidence(0.0, support.value)) == 80
-    assert s8.percent(step) == 80
+    assert step.decision.state is authority.RegimeState.LIKELY
+    assert authority.AWAITING_VERIFICATION_REASON in step.decision.reason_codes
+    assert s8.percent(step) == 79
 
 
 @pytest.mark.parametrize("ring", [False, True], ids=["folded", "ring"])
-def test_sparse_plus_one_complete_interval_reaches_95_percent(ring):
+def test_sparse_plus_one_complete_interval_verifies_at_90_percent(ring):
     sparse_step, step = s8._sparse_plus_matching_interval()
-    state = learned.observe_decision(fold_events(sparse_step, sparse_step.events), sparse_step.decision)
+    # Eight sparse restarts await verification; the witnessed interval
+    # establishes, with the base interval weight (about 90 %).
+    assert sparse_step.decision.state is authority.RegimeState.LIKELY
+    assert authority.VERIFIED_ESTABLISHMENT_REASON in step.decision.incumbent_shadow_regime.reason_codes
+    state = learned.observe_decision(fold_events(sparse_step, sparse_step.events), step.decision)
     assert authority.SPARSE_ESTABLISHMENT_REASON in state.incumbent.reason_codes
     new = tuple(item for item in step.events if item.event_id not in {e.event_id for e in sparse_step.events})
     ring_events = new if ring else ()
@@ -540,7 +551,7 @@ def test_sparse_plus_one_complete_interval_reaches_95_percent(ring):
         state = fold_events(step, new, state)
     candidate = next(item for item in compact_high(step, state, ring_events) if item.period == P3)
     confirmed = learned.compact_sparse_confirmation(
-        state, candidate, ring_events=ring_events, ring_relationships=step.relationships
+        state, candidate, ring_events=ring_events, ring_relationships=step.relationships, verified=True
     )
     incumbent = step.decision.incumbent_shadow_regime
     raw = next(
@@ -550,8 +561,8 @@ def test_sparse_plus_one_complete_interval_reaches_95_percent(ring):
     )
 
     assert confirmed == pytest.approx(raw.combined_confidence, abs=1e-6)
-    assert display(confirmed) == 95
-    assert s8.percent(step) == 95
+    assert display(confirmed) == 90
+    assert s8.percent(step) == 90
 
 
 def test_sparse_confirmation_through_a_partially_folded_chain():
@@ -731,13 +742,15 @@ def test_sparse_establishment_is_never_promoted_by_folding():
 
 
 def test_recovered_off_phase_anomaly_matches_proportional_rule():
-    pipeline = s8.sparse_pipeline()
+    # Stage 2: four aligned restarts and one admin restart (net three) are
+    # uncertain; one more aligned restart reaches the saturated statistic.
+    pipeline = s8.sparse_pipeline(s8.SPARSE_DISCRIMINATING[:4])
     pipeline.sparse("admin", [s8.at(6, 17, 20)])
     uncertain = pipeline.evaluate()
-    pipeline.sparse("ninth", [s8.at(7, 9)])
+    pipeline.sparse("fifth", [s8.at(7, 9)])
     recovered = pipeline.evaluate()
 
-    for step, percent in ((uncertain, 76), (recovered, 80)):
+    for step, percent in ((uncertain, 63), (recovered, 80)):
         state = fold_events(step, step.events)
         support = learned.compact_sparse_support(state, period=P3, phase_offset=0.0)
         assert support.off_phase_weight == pytest.approx(1.0)
@@ -1060,10 +1073,11 @@ def test_storage_is_bounded_regardless_of_observation_count():
 
 
 def test_entry_bound_is_compact():
-    # Pool, follower presence (burst independence), five interval-bin key
-    # spaces, divisors, recovery, open-run residuals, incumbent and chain.
-    assert learned.LEARNED_STATE_MAX_ENTRIES == 1440 + 1440 + 5 * 420 + 9 + 2 + 721 + 2
-    assert learned.LEARNED_STATE_MAX_ENTRIES < 6000
+    # Pool, follower presence (burst independence), six interval-bin key
+    # spaces (including schema-5 verification), divisors, recovery, open-run
+    # residuals, incumbent and chain.
+    assert learned.LEARNED_STATE_MAX_ENTRIES == 1440 + 1440 + 6 * 420 + 9 + 2 + 721 + 2
+    assert learned.LEARNED_STATE_MAX_ENTRIES < 6500
 
 
 def _maximal_state():
@@ -1141,7 +1155,14 @@ def _maximal_state():
         epoch=learned.EpochEvidence(text, time_value, interval_bins(), 10**9, long, (
             learned.RecoveryInterval(time_value, time_value + 1),
             learned.RecoveryInterval(time_value + 2, time_value + 3),
-        )),
+        ), long),
+        verifications=tuple(
+            learned.VerificationBin(
+                period, index, 10**9, long, 299.12345678901234, time_value, time_value + 1
+            )
+            for period in scoring.CANDIDATE_PERIODS
+            for index in range(period // learned.INTERVAL_BIN_SECONDS)
+        ),
         open_chain=learned.OpenChain(
             text, text, time_value, 1439, 1.0, tuple(scoring.CANDIDATE_PERIODS), True,
             learned.OpenRun(P3, 10**9, long, time_value, time_value, 1234.5678901234567, residuals, -long, long),

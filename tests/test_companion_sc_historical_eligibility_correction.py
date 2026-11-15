@@ -24,6 +24,7 @@ import test_companion_restart_compact_authority as compact_authority
 import test_companion_sc_historical_acquisition_recovery as har
 import test_companion_sc_learning_policy_stage8_baseline as s8
 import test_companion_sc_time_shift_detection as ts
+from dzll_launcher import companion_restart_phase2_authority as authority
 from dzll_launcher import companion_restart_phase2_continuity as continuity
 from dzll_launcher import companion_restart_phase2_schema4 as schema4
 
@@ -289,25 +290,39 @@ def test_folding_never_receives_obsolete_eligibility(without_correction):
 
 
 def _red_dawn_like_with_interrupted_pairs():
-    pipeline = har.red_dawn_like(intervals=False)
+    # Like Red Dawn: no qualifying witnessed interval (only interrupted pairs).
+    pipeline = har.red_dawn_like(intervals=False, verified=False)
     for day in (10, 11, 12):
         session_with(pipeline, f"pair-{day}", [at(day, 11), at(day, 15)], interruptions=[at(day, 13, 20)])
     return pipeline
 
 
+def _awaiting_four_hours(step):
+    regime = step.decision.incumbent_shadow_regime
+    assert step.decision.state is State.LIKELY
+    assert authority.AWAITING_VERIFICATION_REASON in step.decision.reason_codes
+    assert regime.candidate_period_seconds == 4 * s8.HOUR
+    assert not har.recovered(step)
+    assert not step.consumer().countdown_visible
+
+
 def test_time_shift_carrier_and_historical_recovery_use_corrected_authority(without_correction):
-    # Recovered at the sparse-supported value under the current rules.
+    # Verified acquisition: under the current rules the interrupted pairs are
+    # not witnessed intervals, so the recovered 4 h cycle awaits verification
+    # at the sparse-supported value (a new history; established regimes are
+    # grandfathered, see the next test).
     production = ts.Production(_red_dawn_like_with_interrupted_pairs())
     clean = production.rebuild()
-    assert har.recovered(clean)
+    _awaiting_four_hours(clean)
     assert clean.decision.high_confidence == 0.0
     assert clean.decision.combined_confidence == pytest.approx(0.798, abs=1e-6)
     assert tamper(production.record) == 3
     stored = copy.deepcopy(production.record)
 
-    # With the correction the obsolete stored flags change nothing.
+    # With the correction the obsolete stored flags change nothing: they
+    # neither verify nor inflate.
     corrected = production.rebuild()
-    assert har.recovered(corrected)
+    _awaiting_four_hours(corrected)
     assert corrected.decision.combined_confidence == pytest.approx(0.798, abs=1e-6)
     assert corrected.decision.high_confidence == 0.0
 

@@ -562,6 +562,31 @@ def sparse_pipeline(times=SPARSE_DISCRIMINATING, *, outcome=Outcome.CORROBORATED
     return pipeline
 
 
+# Verified acquisition (Stage 1): a newly established cycle needs one fully
+# witnessed restart-to-restart interval.  Fixtures that need an established
+# sparse regime add this query-visible interval (03:00 -> 06:00 on day -2, the
+# 3 h grid used throughout).  Its endpoints are pre-establishment
+# identification evidence, so it verifies without adding confirmation
+# magnitude: the established sparse regime keeps the Stage 8.5 80 %.
+VERIFYING_INTERVAL = (at(-2, 3), at(-2, 6))
+
+
+def verify(pipeline, times=VERIFYING_INTERVAL, *, name="verify", outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART):
+    """Add one fully witnessed interval (its own monitoring session)."""
+
+    pipeline.observe(name, times, outcome=outcome)
+    return pipeline
+
+
+def verified_sparse_pipeline(times=SPARSE_DISCRIMINATING, *, outcome=Outcome.CORROBORATED_OFFLINE_RESTART):
+    """The witnessed interval first (time order equals insertion order, so
+    one-event-at-a-time runners deliver it before the sparse restarts)."""
+
+    pipeline = verify(Pipeline())
+    pipeline.sparse("sparse", times, outcome=outcome)
+    return pipeline
+
+
 def settled(pipeline):
     """Evaluate, then rebuild once with the persisted prior (runtime-like)."""
 
@@ -682,8 +707,17 @@ def test_s04_precondition_sparse_events_are_independent_and_discriminating():
     )
 
 
-def test_s04_eight_discriminating_sparse_events_establish_at_80_percent():
-    step = settled(sparse_pipeline())
+def test_s04_eight_discriminating_sparse_events_await_verification_then_establish():
+    # Verified acquisition: eight sparse restarts identify the cycle at the
+    # pre-verification ceiling; a witnessed interval establishes it.
+    awaiting = settled(sparse_pipeline())
+    value = awaiting.consumer()
+    assert awaiting.decision.state is State.LIKELY
+    assert value.presentation_state is Presentation.AWAITING_CYCLE_VERIFICATION
+    assert not value.countdown_visible and not value.scheduled_warning_eligible
+    assert percent(awaiting) == 79
+
+    step = settled(verified_sparse_pipeline())
     value = step.consumer()
     shown = percent(step)
 
@@ -715,11 +749,17 @@ def test_s05_precondition_matching_interval_is_high_eligible_at_sparse_phase():
     assert step.candidate(P3).h1_gate
 
 
-def test_s05_sparse_establishment_plus_one_complete_interval_reaches_95_percent():
+def test_s05_sparse_identification_plus_one_complete_interval_verifies_and_two_reach_95():
+    # One witnessed interval verifies (base interval weight, about 90 %); a
+    # second independent interval reaches the 95 % ceiling.
     _sparse_step, step = _sparse_plus_matching_interval()
 
     assert established(step), step.decision.state
-    assert percent(step) == DISPLAY_CEILING_PERCENT, percent(step)
+    assert percent(step) == 90, percent(step)
+    pipeline = sparse_pipeline()
+    pipeline.observe("complete", [at(6, 18), at(6, 21)])
+    pipeline.observe("second", [at(7, 12), at(7, 15)])
+    assert percent(settled(pipeline)) == DISPLAY_CEILING_PERCENT
 
 
 def test_s06_repeated_clock_slots_on_different_days_are_new_physical_events():
@@ -965,7 +1005,9 @@ def test_s14_continuous_qv_eventually_reaches_95_percent_countdown():
     """Existing: continuous QV reaches a countdown at the ceiling via the
     normal-schedule path, and never gains high authority."""
 
-    steps = _qv_trajectory()
+    # Verified acquisition: 80 % at establishment (ten restarts), then one
+    # base-weight step per later witnessed interval: 95 % at thirteen.
+    steps = _qv_trajectory(13)
     final = steps[-1]
 
     assert not any(item.high_authority_eligible for step in steps for item in step.relationships)
@@ -975,7 +1017,7 @@ def test_s14_continuous_qv_eventually_reaches_95_percent_countdown():
 
 def test_s14_continuous_qv_reaches_80_percent_milestone_before_95():
     observed = [
-        (step.consumer().countdown_visible, percent(step)) for step in _qv_trajectory()
+        (step.consumer().countdown_visible, percent(step)) for step in _qv_trajectory(13)
     ]
 
     assert any(
@@ -992,7 +1034,11 @@ SPARSE_QV_TEN = SPARSE_DISCRIMINATING + (at(7, 9), at(8, 12))
 
 
 def test_s14_sparse_qv_establishes_at_80_percent():
-    step = settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    awaiting = settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    assert awaiting.decision.state is State.LIKELY and percent(awaiting) == 79
+    step = settled(
+        verify(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    )
     shown = percent(step)
 
     assert established(step), step.decision.state
@@ -1020,7 +1066,8 @@ def test_s15_sparse_off_phase_evidence_never_escalates_against_established_cycle
     step = pipeline.evaluate(original.decision)
     value = step.consumer()
 
-    assert step.decision.suspicion_level <= 1
+    # Sparse evidence never authorises a challenger context or replaces the
+    # incumbent: no witnessed interval exists at the alternative schedule.
     assert all(
         item.authorization_state is authority.ChallengerAuthorization.LATENT
         and not item.high_relationship_ids
@@ -1034,11 +1081,14 @@ def test_s15_sparse_off_phase_evidence_never_escalates_against_established_cycle
         step.decision.incumbent_shadow_regime.phase_offset
         == original.decision.incumbent_shadow_regime.phase_offset
     )
-    # Time Shift Detection: these restarts repeat several different phases,
-    # so no shift is adopted and nothing escalates, but a repeated new phase
-    # withholds the prediction until the schedule is clear again.
-    assert authority.TIME_SHIFT_SUSPECTED_REASON in step.decision.reason_codes
-    assert value.presentation_state is Presentation.POSSIBLE_TIME_CHANGE
+    # Stage 3: these restarts are a coherent 4 h schedule (10:30, 14:30,
+    # 18:30, ...) identified after establishment, so the strongly
+    # established cycle's countdown is suspended as a suspected schedule
+    # change (a period change is not labelled a time shift).
+    assert step.decision.suspicion_level == 2
+    assert authority.CHALLENGER_SUSPENDS_STRONG_REASON in step.decision.reason_codes
+    assert authority.TIME_SHIFT_ADOPTED_REASON not in step.decision.reason_codes
+    assert value.presentation_state is Presentation.SCHEDULE_CHANGE_SUSPECTED
     assert value.cycle_period_seconds == P3
     assert not value.countdown_visible
 
@@ -1185,10 +1235,9 @@ def test_s81_two_interval_regime_identity_is_stable_across_rebuilds():
     "build",
     [
         pytest.param(imprecise_h2, id="imprecise_phase"),
-        pytest.param(
-            lambda: three_hour_chain(5, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART),
-            id="normal_origin",
-        ),
+        # Normal-origin LIKELY: an identified sparse candidate awaiting a
+        # witnessed interval (Stage 2: four strong occurrences).
+        pytest.param(lambda: sparse_pipeline(SPARSE_DISCRIMINATING[:4]), id="normal_origin"),
     ],
 )
 def test_s81_likely_is_a_fixed_point_of_identical_rebuilds(build):
@@ -1554,6 +1603,15 @@ def test_s82_two_interval_warning_is_at_most_once_across_settle_and_reopen():
 # --------------------------------------------------------------------------
 
 
+def sparse_value(effective, *, off=0.0, consistency=1.0, band=1.0, period=P3):
+    """The Stage 2 identification statistic (acquisition and regimes
+    established under verified acquisition)."""
+
+    return authority.sparse_identification_magnitudes(
+        effective=effective, band=band, off_phase_weight=off, consistency=consistency, period=period
+    )[0]
+
+
 def sparse_support(step, period, phase=None):
     candidate = step.candidate(period, phase)
     return candidate.aligned_normal_confidence
@@ -1583,11 +1641,8 @@ def test_s83_sparse_observations_accumulate_across_days_and_sessions():
     final = sparse_pipeline().evaluate()
     candidate = final.candidate(P3)
 
-    assert supports == [
-        round(scoring._event_count_cap(3), 6),
-        round(scoring._event_count_cap(5), 6),
-        round(scoring._event_count_cap(8), 6),
-    ]
+    assert supports == [sparse_value(3), sparse_value(5), sparse_value(8)]
+    assert supports[0] < supports[1] == supports[2] == 0.95
     assert candidate.high_authority == 0
     assert candidate.combined_confidence == round(
         authority.SPARSE_EVIDENCE_CEILING * supports[-1], 6
@@ -1604,7 +1659,7 @@ def test_s83_long_horizon_evidence_survives_the_schema3_recent_window():
 
     assert times[-1] - times[0] > 7 * DAY
     assert step.score.candidate(P3).aligned_event_count < 8
-    assert sparse_support(step, P3) == round(scoring._event_count_cap(8), 6)
+    assert sparse_support(step, P3) == sparse_value(8)
 
 
 def test_s83_repeated_clock_slots_on_different_days_count_separately():
@@ -1615,8 +1670,10 @@ def test_s83_repeated_clock_slots_on_different_days_count_separately():
     pipeline.sparse("repeat", repeats)
     after = pipeline.evaluate()
 
-    assert sparse_support(before, P3) == round(scoring._event_count_cap(4), 6)
-    assert sparse_support(after, P3) == round(scoring._event_count_cap(8), 6)
+    assert sparse_support(before, P3) == sparse_value(4)
+    assert sparse_support(after, P3) == sparse_value(8)
+    # Four slots twice: the repeats are new independent evidence.
+    assert len({item.event_id for item in after.events}) == 8
 
 
 def test_s83_one_physical_restart_delivered_twice_counts_once():
@@ -1625,7 +1682,8 @@ def test_s83_one_physical_restart_delivered_twice_counts_once():
     twice.events.extend(once.events)
 
     assert twice.evaluate().decision == once.evaluate().decision
-    assert sparse_support(twice.evaluate(), P3) == round(scoring._event_count_cap(4), 6)
+    assert sparse_support(twice.evaluate(), P3) == sparse_value(4)
+    assert sparse_support(sparse_pipeline(SPARSE_DISCRIMINATING[:3]).evaluate(), P3) < sparse_value(4)
 
 
 def test_s83_no_relationships_are_fabricated_across_unmonitored_gaps():
@@ -1659,6 +1717,7 @@ def test_s83_normal_only_phase_comes_from_long_horizon_evidence():
     assert abs(((long_horizon.phase_offset - at(0, 9)) + P3 / 2) % P3 - P3 / 2) < 1
     # Stage 8.7a: the two off-phase restarts are net evidence against, and
     # 10/12 consistency is below the SE3-accepted proportion.
+    assert long_horizon.aligned_normal_confidence == sparse_value(10, off=2, consistency=10 / 12)
     assert long_horizon.aligned_normal_confidence == round(
         scoring._event_count_cap(10 - 2)
         * min(1.0, (10 / 12) / authority.SPARSE_CONSISTENCY_TOLERANCE),
@@ -1678,7 +1737,7 @@ def test_s83_sparse_and_continuous_evidence_reinforce_one_candidate():
     assert after.regime_id == before.regime_id
     assert after.high_authority == before.high_authority == 0.80
     assert before.aligned_normal_confidence == 0
-    assert after.aligned_normal_confidence == round(scoring._event_count_cap(5), 6)
+    assert after.aligned_normal_confidence == sparse_value(5)
     assert after.combined_confidence == round(
         0.80 + 0.20 * authority.SPARSE_EVIDENCE_CEILING * after.aligned_normal_confidence, 6
     )
@@ -1693,7 +1752,7 @@ def test_s83_own_high_endpoints_are_excluded_from_sparse_support():
 
     assert sparse_support(only_continuous, P3) == 0
     assert only_continuous.candidate(P3).combined_confidence == 0.95
-    assert sparse_support(with_one_sparse, P3) == round(scoring._event_count_cap(1), 6)
+    assert sparse_support(with_one_sparse, P3) == sparse_value(1)
 
 
 def test_s83_alternative_periods_evaluate_the_same_restarts_independently():
@@ -1705,11 +1764,9 @@ def test_s83_alternative_periods_evaluate_the_same_restarts_independently():
     # 6 h phase is 12:00/18:00 (2 aligned of the 3 restarts from 12:00 on).
     assert sparse_support(step, P3) == 0
     assert abs(((six.phase_offset - at(0, 12)) + P3) % (2 * P3) - P3) < 1
-    assert six.aligned_normal_confidence == round(
-        scoring._event_count_cap(2 - 1)
-        * min(1.0, (2 / 3) / authority.SPARSE_CONSISTENCY_TOLERANCE),
-        6,
-    )
+    # Stage 2: one off-phase restart is within the one-anomaly allowance
+    # (net deduction only).
+    assert six.aligned_normal_confidence == sparse_value(2, off=1, consistency=2 / 3, period=P3 * 2)
     assert not six.h1_gate and not six.h2_gate
     assert step.decision.selected_shadow_regime.candidate_period_seconds == P3
 
@@ -1781,7 +1838,13 @@ def test_s83_superseded_history_rebuild_is_stable():
 def test_s83_sparse_only_evidence_establishes_only_through_the_sparse_gate():
     # Stage 8.5 replaced the pre-8.5 guard: sparse-only evidence establishes
     # through the authority sparse gate, never above the sparse ceiling.
-    step = settled(sparse_pipeline(SPARSE_DISCRIMINATING + tuple(at(day, 0) for day in (7, 8, 9))))
+    # Verified acquisition: without a witnessed interval it only awaits
+    # verification (no countdown).
+    times = SPARSE_DISCRIMINATING + tuple(at(day, 0) for day in (7, 8, 9))
+    awaiting = settled(sparse_pipeline(times))
+    assert awaiting.decision.state is State.LIKELY
+    assert not awaiting.consumer().countdown_visible
+    step = settled(verify(sparse_pipeline(times)))
     value = step.consumer()
     regime = step.decision.incumbent_shadow_regime
 
@@ -1888,8 +1951,9 @@ def assert_learning(shown):
 
 
 def test_s84_sparse_learning_shows_its_long_horizon_schema4_candidate():
-    # Seven sparse restarts (Stage 8.5: one short of establishment).
-    step = settled(sparse_pipeline(SPARSE_DISCRIMINATING[:7]))
+    # Four confirmed (unpopulated) offline restarts: effective 3.2, below the
+    # Stage 2 identification requirement.
+    step = settled(sparse_pipeline(SPARSE_DISCRIMINATING[:4], outcome=Outcome.CONFIRMED_OFFLINE_RESTART))
     value = step.consumer()
     shown = panel(step)
     leading = max(step.decision.candidates, key=lambda item: item.combined_confidence)
@@ -1898,13 +1962,13 @@ def test_s84_sparse_learning_shows_its_long_horizon_schema4_candidate():
     assert step.decision.state is State.NORMAL_LEARNING
     assert leading.candidate_period_seconds == P3
     assert not leading.high_relationship_ids  # a sparse (normal-only) candidate
-    assert leading.aligned_normal_confidence == round(scoring._event_count_cap(7), 6)
+    assert leading.aligned_normal_confidence == sparse_value(3.2)
     assert_learning(shown)
     assert shown["confidence_visible"]
-    assert value.confidence_display_value == leading.combined_confidence == 0.77
-    assert shown["confidence_percent"] == 77
-    # Not the schema-3 recent-window fundamental (16 %).
-    assert schema3 == (P3, 0.1625)
+    assert value.confidence_display_value == leading.combined_confidence == round(0.84 * sparse_value(3.2), 6)
+    assert shown["confidence_percent"] == 66
+    # Not the schema-3 recent-window fundamental.
+    assert schema3 is None or schema3[1] * 100 < 66
     assert consumers4.LEARNING_CONFIDENCE_REASON in value.reason_codes
 
 
@@ -1931,7 +1995,9 @@ def test_s84_learning_confidence_never_comes_from_a_different_period():
     assert again.confidence_display_value == step.consumer().confidence_display_value
 
     # Discriminating evidence: the leading candidate is the supported period.
-    discriminating = settled(sparse_pipeline(SPARSE_DISCRIMINATING[:7]))
+    discriminating = settled(
+        sparse_pipeline(SPARSE_DISCRIMINATING[:4], outcome=Outcome.CONFIRMED_OFFLINE_RESTART)
+    )
     lead = max(discriminating.decision.candidates, key=lambda item: item.combined_confidence)
     assert lead.candidate_period_seconds == P3
     assert discriminating.consumer().confidence_display_value == lead.combined_confidence
@@ -1948,10 +2014,9 @@ def test_s84_learning_confidence_never_comes_from_a_different_period():
     "build",
     [
         pytest.param(imprecise_h2, id="h2_continuity_likely"),
-        pytest.param(
-            lambda: three_hour_chain(5, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART),
-            id="normal_origin_likely",
-        ),
+        # Normal-origin LIKELY is now an identified candidate awaiting
+        # verification: shown as "Awaiting Cycle Verification" (learning-like).
+        pytest.param(lambda: sparse_pipeline(SPARSE_DISCRIMINATING[:4]), id="normal_origin_likely"),
     ],
 )
 def test_s84_unknown_server_likely_consistently_shows_learning(build):
@@ -1966,9 +2031,17 @@ def test_s84_unknown_server_likely_consistently_shows_learning(build):
         shown = panel(step)
         warning = step.consumer(now=occurrence - 300)
         assert step.decision.state is State.LIKELY
-        assert value.presentation_state is Presentation.PATTERN_ONLY
+        assert value.presentation_state in {
+            Presentation.PATTERN_ONLY,
+            Presentation.AWAITING_CYCLE_VERIFICATION,
+        }
         assert not value.visible_cycle and value.cycle_period_seconds is None
-        assert_learning(shown)
+        if value.presentation_state is Presentation.PATTERN_ONLY:
+            assert_learning(shown)
+        else:
+            assert shown["cycle_text"] == "Awaiting Cycle Verification"
+            assert shown["confidence_label"] == "Learning Confidence:"
+            assert not shown["countdown_visible"] and not shown["next_visible"]
         assert shown["confidence_visible"]
         assert shown["confidence_percent"] <= 79
         assert not warning.scheduled_warning_eligible
@@ -2178,7 +2251,7 @@ def test_s84_presentation_is_stable_across_rebuild_and_reopen(name):
 @pytest.mark.parametrize(
     "times",
     [
-        pytest.param(SPARSE_DISCRIMINATING[:7], id="seven_discriminating"),
+        pytest.param(SPARSE_DISCRIMINATING[:3], id="three_discriminating"),
         pytest.param(SAME_CLOCK + tuple(at(day, 9) for day in range(8, 12)), id="same_clock_twelve"),
     ],
 )
@@ -2291,42 +2364,50 @@ def assert_sparse_established(step, *, label="Every 3 Hours"):
 
 
 def test_s85_sparse_evidence_accumulates_across_days_and_weeks():
-    _pipeline, steps = incremental(Pipeline, SPARSE_WEEKS)
+    pipeline, steps = incremental(Pipeline, SPARSE_WEEKS)
 
     assert SPARSE_WEEKS[-1] - SPARSE_WEEKS[0] > 3 * 7 * DAY
     assert not any(item.high_authority_eligible for item in steps[-1].relationships)
-    for step in steps[:-1]:
+    for step in steps:
         assert step.decision.state is not State.ESTABLISHED
         assert not step.consumer().countdown_visible
         assert panel(step)["confidence_percent"] <= 79
-    _value, shown = assert_sparse_established(steps[-1])
+    # The accumulated evidence reaches the pre-verification ceiling ...
+    assert steps[-1].decision.state is State.LIKELY
+    assert panel(steps[-1])["confidence_percent"] == 79
+    # ... and one witnessed interval later establishes it.
+    verify(pipeline, (at(28, 3), at(28, 6)))
+    step = pipeline.evaluate(persisted(steps[-1].decision))
+    _value, shown = assert_sparse_established(step)
     assert shown["confidence_percent"] == 80
 
 
 def test_s85_repeated_clock_times_are_independent_observations():
-    step = settled(sparse_pipeline(TWO_SLOTS))
+    step = settled(verify(sparse_pipeline(TWO_SLOTS)))
     _value, shown = assert_sparse_established(step)
+    sparse = [item for item in step.events if item.canonical_phase_at not in VERIFYING_INTERVAL]
 
-    assert len({item.canonical_phase_at % DAY for item in step.events}) == 2
-    assert len({item.event_id for item in step.events}) == 8
+    assert len({item.canonical_phase_at % DAY for item in sparse}) == 2
+    assert len({item.event_id for item in sparse}) == 8
     assert shown["confidence_percent"] == 80
 
 
-@pytest.mark.parametrize("count", [7, 8])
+@pytest.mark.parametrize("count", [3, 4])
 def test_s85_duplicate_physical_restart_is_counted_once(count):
     single = sparse_pipeline(SPARSE_DISCRIMINATING[:count])
     double = single.copy()
     double.events.extend(single.events)
 
     assert double.evaluate().decision == single.evaluate().decision
-    assert (single.evaluate().decision.state is State.ESTABLISHED) is (count == 8)
+    # Four identify the cycle (awaiting a witnessed interval); three do not.
+    assert (single.evaluate().decision.state is State.LIKELY) is (count == 4)
 
 
 @pytest.mark.parametrize(
     "times,outcome,ambiguous",
     [
-        pytest.param(SPARSE_DISCRIMINATING[:7], Outcome.CORROBORATED_OFFLINE_RESTART, False, id="seven_restarts"),
-        pytest.param(SPARSE_DISCRIMINATING, Outcome.CONFIRMED_OFFLINE_RESTART, False, id="eight_weaker_restarts"),
+        pytest.param(SPARSE_DISCRIMINATING[:3], Outcome.CORROBORATED_OFFLINE_RESTART, True, id="three_restarts"),
+        pytest.param(SPARSE_DISCRIMINATING[:4], Outcome.CONFIRMED_OFFLINE_RESTART, False, id="four_weaker_restarts"),
         pytest.param(SAME_CLOCK + tuple(at(day, 9) for day in range(8, 12)), Outcome.CORROBORATED_OFFLINE_RESTART, True, id="same_clock"),
         pytest.param(SIX_HOUR_SPARSE, Outcome.CORROBORATED_OFFLINE_RESTART, True, id="harmonic_six_hour"),
     ],
@@ -2344,7 +2425,7 @@ def test_s85_insufficient_or_ambiguous_sparse_evidence_withholds_establishment(t
 
 
 def test_s85_eight_strong_sparse_restarts_establish_with_prediction_and_warning():
-    step = settled(sparse_pipeline())
+    step = settled(verified_sparse_pipeline())
     value, shown = assert_sparse_established(step)
     regime = step.decision.incumbent_shadow_regime
     occurrence = value.next_expected_restart_at
@@ -2358,16 +2439,18 @@ def test_s85_eight_strong_sparse_restarts_establish_with_prediction_and_warning(
     assert due.scheduled_warning_eligible and due.scheduled_pre_restart_alert_eligible
 
 
-def test_s85_sparse_established_plus_one_full_interval_reaches_95_percent():
+def test_s85_sparse_identified_plus_one_full_interval_verifies_at_90_percent():
     sparse_step, step = _sparse_plus_matching_interval()
+    assert sparse_step.decision.state is State.LIKELY
     value, shown = assert_sparse_established(step)
     interval = step.high_direct(P3)[0]
     seen_slots = {item % DAY for item in SPARSE_DISCRIMINATING}
 
     # Both interval endpoints repeat clock slots the sparse evidence had seen.
     assert {interval.left_at % DAY, interval.right_at % DAY} <= seen_slots
-    assert shown["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    assert shown["confidence_percent"] == 90
     assert authority.SPARSE_CONFIRMATION_REASON in step.decision.reason_codes
+    assert authority.VERIFIED_ESTABLISHMENT_REASON in step.decision.incumbent_shadow_regime.reason_codes
     assert (
         step.decision.incumbent_shadow_regime.regime_id
         == sparse_step.decision.incumbent_shadow_regime.regime_id
@@ -2383,29 +2466,43 @@ def test_s85_strong_confirmation_does_not_depend_on_arrival_order():
     together = sparse_pipeline()
     together.observe("complete", [at(6, 18), at(6, 21)])
     seven = Pipeline()
-    seven.sparse("sparse", SPARSE_DISCRIMINATING[:7])
+    seven.sparse("sparse", SPARSE_DISCRIMINATING[:3])
     seven.observe("complete", [at(6, 18), at(6, 21)])
     before_eighth = seven.evaluate()
-    seven.sparse("eighth", [SPARSE_DISCRIMINATING[7]])
+    seven.sparse("fourth", [SPARSE_DISCRIMINATING[3]])
     after_eighth = seven.evaluate(persisted(before_eighth.decision))
 
-    assert panel(later)["confidence_percent"] == DISPLAY_CEILING_PERCENT
-    assert panel(settled(together))["confidence_percent"] == DISPLAY_CEILING_PERCENT
-    # Seven sparse restarts plus an interval: still learning, capped.
+    assert panel(later)["confidence_percent"] == 90
+    assert panel(settled(together))["confidence_percent"] == 90
+    # Three sparse restarts plus an interval: still learning, capped (one
+    # witnessed interval alone never establishes).
     assert before_eighth.decision.state is not State.ESTABLISHED
     assert panel(before_eighth)["confidence_percent"] <= 79
-    assert panel(after_eighth)["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    assert panel(after_eighth)["confidence_percent"] == 90
 
 
 def test_s85_matching_timestamps_across_an_unobserved_gap_never_confirm():
-    pipeline = sparse_pipeline()
+    # Nor verify: eight sparse restarts plus the gap pair still await.
+    unverified = sparse_pipeline()
+    unverified.sparse("gap", [at(9, 9), at(9, 12)])
+    assert settled(unverified).decision.state is State.LIKELY
+
+    pipeline = verified_sparse_pipeline()
     established_step = settled(pipeline)
     pipeline.sparse("gap", [at(9, 9), at(9, 12)])
     step = pipeline.evaluate(persisted(established_step.decision))
 
     assert not step.high_direct(P3)
     assert authority.SPARSE_CONFIRMATION_REASON not in step.decision.reason_codes
-    assert panel(step)["confidence_percent"] == 80
+    # Stage 4: the pair is two independent post-establishment onsets
+    # (replication), exactly as if seen on different days, never an interval
+    # (one witnessed QV interval would show 90 %).
+    apart = verified_sparse_pipeline()
+    apart_step = settled(apart)
+    apart.sparse("apart", [at(9, 9), at(10, 12)])
+    apart_step = apart.evaluate(persisted(apart_step.decision))
+    assert step.decision.combined_confidence == apart_step.decision.combined_confidence
+    assert panel(step)["confidence_percent"] == 85
 
 
 @pytest.mark.parametrize(
@@ -2416,8 +2513,10 @@ def test_s85_matching_timestamps_across_an_unobserved_gap_never_confirm():
         pytest.param(Outcome.STRONG_QUERY_VISIBLE_RESTART, SPARSE_QV_TEN, id="qv_strong"),
     ],
 )
-def test_s85_oo_and_qv_reach_the_same_80_and_95_percent_milestones(outcome, times):
-    pipeline = sparse_pipeline(times, outcome=outcome)
+def test_s85_oo_and_qv_reach_the_same_80_90_and_95_percent_milestones(outcome, times):
+    # Verified by a witnessed interval among the identification evidence:
+    # 80 %; each later witnessed interval adds the base interval weight.
+    pipeline = verify(sparse_pipeline(times, outcome=outcome))
     sparse_step = settled(pipeline)
     _value, shown = assert_sparse_established(sparse_step)
     assert shown["confidence_percent"] == 80
@@ -2425,28 +2524,34 @@ def test_s85_oo_and_qv_reach_the_same_80_and_95_percent_milestones(outcome, time
     pipeline.observe("full-interval", [at(9, 18), at(9, 21)], outcome=outcome)
     step = pipeline.evaluate(persisted(sparse_step.decision))
     assert_sparse_established(step)
-    assert panel(step)["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    assert panel(step)["confidence_percent"] == 90
     assert authority.SPARSE_CONFIRMATION_REASON in step.decision.reason_codes
     if outcome is Outcome.STRONG_QUERY_VISIBLE_RESTART:
         # The QV interval confirms without becoming high-eligible.
         assert not step.high_direct(P3)
         assert step.candidate(P3).high_authority == 0
+    pipeline.observe("second-interval", [at(10, 12), at(10, 15)], outcome=outcome)
+    second = pipeline.evaluate(persisted(step.decision))
+    assert panel(second)["confidence_percent"] == DISPLAY_CEILING_PERCENT
 
 
 def test_s85_continuous_qv_milestones_80_then_95_percent():
-    steps = _qv_trajectory()
+    steps = _qv_trajectory(13)
     by_count = {index + 2: step for index, step in enumerate(steps)}
 
     assert not any(item.high_authority_eligible for step in steps for item in step.relationships)
-    for count in range(2, 10):
+    # Stage 2: five strong QV occurrences (effective 4.0) identify the
+    # cycle; its own QV intervals verify it.
+    for count in range(2, 5):
         assert by_count[count].decision.state is not State.ESTABLISHED
         assert not by_count[count].consumer().countdown_visible
-    assert_sparse_established(by_count[10])
-    assert panel(by_count[10])["confidence_percent"] == 80
-    occurrence = by_count[10].consumer().next_expected_restart_at
-    assert by_count[10].consumer(now=occurrence - 300).scheduled_warning_eligible
-    assert 80 < panel(by_count[11])["confidence_percent"] < DISPLAY_CEILING_PERCENT
-    assert panel(by_count[12])["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    assert_sparse_established(by_count[5])
+    assert panel(by_count[5])["confidence_percent"] == 80
+    occurrence = by_count[5].consumer().next_expected_restart_at
+    assert by_count[5].consumer(now=occurrence - 300).scheduled_warning_eligible
+    assert 80 < panel(by_count[6])["confidence_percent"] < DISPLAY_CEILING_PERCENT
+    assert 80 < panel(by_count[7])["confidence_percent"] < DISPLAY_CEILING_PERCENT
+    assert panel(by_count[8])["confidence_percent"] == DISPLAY_CEILING_PERCENT
 
 
 def test_s85_unconfirmed_qv_events_contribute_no_qualifying_learning():
@@ -2462,7 +2567,7 @@ def test_s85_unconfirmed_qv_events_contribute_no_qualifying_learning():
     )
 
     # An unconfirmed drain cannot be the endpoint of a confirming interval.
-    pipeline = sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)
+    pipeline = verify(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
     established_step = settled(pipeline)
     observe_mixed(
         pipeline,
@@ -2471,7 +2576,15 @@ def test_s85_unconfirmed_qv_events_contribute_no_qualifying_learning():
     )
     step = pipeline.evaluate(persisted(established_step.decision))
     assert authority.SPARSE_CONFIRMATION_REASON not in step.decision.reason_codes
-    assert panel(step)["confidence_percent"] == 80
+    # Stage 4: the drain adds nothing; the QV restart is one post-establishment
+    # replication onset, exactly as without the drain (an interval would
+    # show 90 %).
+    alone = verify(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    alone_step = settled(alone)
+    alone.sparse("qv-only", [at(9, 18)], outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)
+    alone_step = alone.evaluate(persisted(alone_step.decision))
+    assert step.decision.combined_confidence == alone_step.decision.combined_confidence
+    assert panel(step)["confidence_percent"] == 82
 
 
 def test_s85_period_alternatives_and_harmonic_divisors():
@@ -2492,7 +2605,8 @@ def test_s85_period_alternatives_and_harmonic_divisors():
         genuine_miss(2 * HOUR, at(10, 2), key="divisor-2h-a"),
         genuine_miss(2 * HOUR, at(11, 4), key="divisor-2h-b"),
     )
-    pipeline = sparse_pipeline(SIX_HOUR_SPARSE)
+    # Verified by one witnessed 6 h interval (00:00 -> 06:00).
+    pipeline = verify(sparse_pipeline(SIX_HOUR_SPARSE), (at(-2, 0), at(-2, 6)))
     first = pipeline.evaluate(ledger=ledger)
     again = pipeline.evaluate(persisted(first.decision), ledger=ledger)
     for step in (first, again):
@@ -2534,19 +2648,25 @@ def test_s85_sparse_evidence_never_authorises_challengers_or_replaces_an_incumbe
     value = step.consumer()
 
     assert step.decision.incumbent_shadow_regime.regime_id == original.decision.incumbent_shadow_regime.regime_id
-    assert step.decision.suspicion_level <= 1
+    assert step.decision.selected_shadow_regime.regime_id == original.decision.incumbent_shadow_regime.regime_id
     assert all(
         item.authorization_state is authority.ChallengerAuthorization.LATENT
         and not item.high_relationship_ids
         for item in step.decision.challenger_contexts
     )
-    assert value.presentation_state is Presentation.CONFIRMED_CYCLE
-    assert value.countdown_visible
+    # Stage 3: the identified sparse 4 h schedule cannot replace the strongly
+    # established cycle without witnessed intervals, but it suspends its
+    # countdown (suspected schedule change, incumbent retained).
+    assert step.decision.state is State.CHALLENGER_ACCUMULATING
+    assert step.decision.suspicion_level == 2
+    assert authority.CHALLENGER_SUSPENDS_STRONG_REASON in step.decision.reason_codes
+    assert value.presentation_state is Presentation.SCHEDULE_CHANGE_SUSPECTED
+    assert not value.countdown_visible
 
 
 def test_s85_stage6_and_stage7_protections_apply_to_sparse_incumbents():
     def with_challenger(*sessions):
-        pipeline = sparse_pipeline()
+        pipeline = verified_sparse_pipeline()
         incumbent = settled(pipeline)
         for index, times in enumerate(sessions):
             pipeline.observe(f"challenger-{index}", times)
@@ -2574,7 +2694,7 @@ def test_s85_stage6_and_stage7_protections_apply_to_sparse_incumbents():
     assert old.status is authority.RegimeRecordStatus.SUPERSEDED
     # Later sparse 3 h restarts never re-establish the superseded regime by
     # the sparse gate (acquisition only): ordinary gates decide.
-    pipeline = sparse_pipeline()
+    pipeline = verified_sparse_pipeline()
     pipeline_incumbent = settled(pipeline)
     pipeline.observe("challenger", [at(9, 1), at(9, 5), at(9, 9), at(9, 13)])
     after = pipeline.evaluate(persisted(pipeline_incumbent.decision))
@@ -2645,7 +2765,7 @@ def test_s85_sparse_presentation_is_stable_across_rebuild_and_reopen(name):
 
 
 def test_s85_sparse_warning_is_at_most_once_across_settle_reopen_and_confirmation():
-    pipeline = sparse_pipeline()
+    pipeline = verified_sparse_pipeline()
     first_step = pipeline.evaluate()
     occurrence = first_step.consumer().next_expected_restart_at
     due = occurrence - 300
@@ -2862,7 +2982,7 @@ def test_s86_ambiguous_drain_never_becomes_a_relationship_endpoint_but_still_blo
 
 
 def test_s86_ambiguous_drains_add_no_learning_and_keep_rebuilds_stable():
-    plain = sparse_pipeline()
+    plain = verified_sparse_pipeline()
     with_drains = plain.copy()
     with_drains.sparse("drain", [at(day, 3) for day in (7, 8, 9, 10, 11)], outcome=Outcome.AMBIGUOUS_DRAIN)
     before = settled(plain)
@@ -2906,11 +3026,13 @@ def test_s86_queue_confirmed_restart_has_the_genuine_qv_learning_profile():
         physical_event(1, at(0, 9), Session("s", at(0, 8), at(0, 10)), outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)
     )
     # Stage 8.5 milestones for genuine QV restarts are unchanged.
-    sparse_step = settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    sparse_step = settled(
+        verify(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    )
     assert panel(sparse_step)["confidence_percent"] == 80
-    steps = _qv_trajectory()
-    assert panel(steps[8])["confidence_percent"] == 80
-    assert panel(steps[10])["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    steps = _qv_trajectory(13)
+    assert panel(steps[3])["confidence_percent"] == 80  # five restarts
+    assert panel(steps[6])["confidence_percent"] == DISPLAY_CEILING_PERCENT  # eight
 
 
 # --------------------------------------------------------------------------
@@ -2956,9 +3078,10 @@ def admin_restarts(count, days):
 
 
 def _anomaly_mid_history():
-    """Nine aligned 3 h restarts with one admin restart after the fourth."""
+    """Nine aligned 3 h restarts with one admin restart after the fourth
+    (verified by the witnessed interval recorded first)."""
 
-    pipeline = Pipeline()
+    pipeline = verify(Pipeline())
     pipeline.sparse("aligned-a", SPARSE_DISCRIMINATING[:4])
     pipeline.sparse("admin", [ADMIN_RESTART])
     pipeline.sparse("aligned-b", SPARSE_DISCRIMINATING[4:] + (at(7, 9),))
@@ -2979,7 +3102,7 @@ def test_s87a_admin_restarts_are_pairwise_incoherent():
 
 
 def test_s87a_eight_perfectly_aligned_sparse_restarts_establish_normally():
-    step = settled(sparse_pipeline())
+    step = settled(verified_sparse_pipeline())
     _value, shown = assert_sparse_established(step)
     candidate = _three_hour_sparse(step)
 
@@ -2990,15 +3113,23 @@ def test_s87a_eight_perfectly_aligned_sparse_restarts_establish_normally():
 
 
 def test_s87a_one_anomaly_then_further_aligned_evidence_establishes():
-    pipeline = sparse_pipeline()
+    # Stage 2 (variant B): five aligned restarts and one isolated admin
+    # restart are net four occurrences, but the anomaly costs one further
+    # aligned occurrence before identification.
+    pipeline = sparse_pipeline(SPARSE_DISCRIMINATING[:5])
     pipeline.sparse("admin", [at(6, 17, 20)])
     uncertain = settled(pipeline)
     assert uncertain.decision.state is State.NORMAL_LEARNING
     assert_learning(panel(uncertain))
-    assert panel(uncertain)["confidence_percent"] == 76
+    assert panel(uncertain)["confidence_percent"] == 79
 
-    pipeline.sparse("ninth", [at(7, 9)])
-    step = pipeline.evaluate(persisted(uncertain.decision))
+    pipeline.sparse("sixth", [at(7, 9)])
+    identified = pipeline.evaluate(persisted(uncertain.decision))
+    # The sixth restart identifies the cycle; it awaits a witnessed interval.
+    assert identified.decision.state is State.LIKELY
+    assert panel(identified)["confidence_percent"] == 79
+    verify(pipeline, (at(8, 3), at(8, 6)))
+    step = pipeline.evaluate(persisted(identified.decision))
     value, shown = assert_sparse_established(step)
     anomaly = next(item for item in step.events if item.canonical_phase_at == at(6, 17, 20))
     candidate = _three_hour_sparse(step)
@@ -3008,7 +3139,7 @@ def test_s87a_one_anomaly_then_further_aligned_evidence_establishes():
     assert authority.SPARSE_PROPORTIONAL_ANOMALY_REASON in candidate.reason_codes
     # The genuine off-phase restart is preserved as evidence and diagnostics.
     assert anomaly.event_id in _off_phase_ids(step)
-    assert len(step.events) == 10
+    assert len(step.events) == 9
     assert not any(item.high_authority_eligible for item in step.relationships)
 
 
@@ -3017,7 +3148,7 @@ def test_s87a_one_anomaly_then_further_aligned_evidence_establishes():
     [(9, 1), (20, 1), (20, 2), (50, 2), (98, 2)],
 )
 def test_s87a_occasional_anomalies_never_veto_a_strongly_supported_cycle(aligned_count, anomaly_count):
-    pipeline = Pipeline()
+    pipeline = verify(Pipeline())
     pipeline.sparse("aligned", aligned_3h(aligned_count))
     pipeline.sparse("admin", admin_restarts(anomaly_count, (2, 5)))
     step = settled(pipeline)
@@ -3033,7 +3164,7 @@ def test_s87a_occasional_anomalies_never_veto_a_strongly_supported_cycle(aligned
 
 def test_s87a_large_histories_stay_usable_without_quadratic_pair_construction():
     count = 400
-    pipeline = Pipeline()
+    pipeline = verify(Pipeline())
     pipeline.sparse("aligned", aligned_3h(count))
     pipeline.sparse("admin", admin_restarts(6, (3, 50, 100, 150, 200, 300)))
     step = pipeline.evaluate()
@@ -3063,8 +3194,20 @@ def test_s87a_large_histories_stay_usable_without_quadratic_pair_construction():
     )
     assert support.value == 0.95
     assert round(authority.SPARSE_EVIDENCE_CEILING * support.value * 100) == 80
-    assert support.phase_confidence == round(0.95 * 20_000 / 20_400, 6)
-    assert round(authority.SPARSE_EVIDENCE_CEILING * support.phase_confidence * 100) < 80
+    # Stage 2: 2 % unrelated anomalies are within the tolerated proportion,
+    # so the identification phase statistic is saturated too.
+    assert support.within_tolerance and support.phase_confidence == 0.95
+    # The Stage 8.5 statistic (regimes established before verified
+    # acquisition) still multiplies by the ratio.
+    legacy = authority._sparse_support(
+        period=P3,
+        phase_offset=0.0,
+        sparse=authority._SparseEvidence(events=events, historical=(), calibrated=False),
+        excluded_event_ids=frozenset(),
+    )
+    assert legacy.value == 0.95
+    assert legacy.phase_confidence == round(0.95 * 20_000 / 20_400, 6)
+    assert round(authority.SPARSE_EVIDENCE_CEILING * legacy.phase_confidence * 100) < 80
 
 
 def test_s87a_anomalies_before_and_after_initial_establishment():
@@ -3082,22 +3225,27 @@ def test_s87a_anomalies_before_and_after_initial_establishment():
     assert authority.ISOLATED_OFF_PHASE_RESTART_REASON in after.decision.reason_codes
     assert regime.regime_id == established_step.decision.incumbent_shadow_regime.regime_id
     assert after.consumer().countdown_visible
-    # Two anomalies against ten aligned restarts (17 %) exceed the tolerated
-    # proportion: the cycle is kept, but below the 80 % warning milestone.
+    # Stage 4 (was: below the 80 % milestone): the two anomalies are mutually
+    # unrelated (isolated), so they no longer dilute the established display;
+    # the aligned restart after them is post-establishment replication.  The
+    # warning stays eligible.
     pipeline.sparse("aligned-after", [at(10, 12)])
     partial = pipeline.evaluate(persisted(after.decision))
     assert partial.decision.state is State.ESTABLISHED and partial.consumer().countdown_visible
-    assert panel(partial)["confidence_percent"] < 80
-    # Further aligned evidence restores the proportion in place.
+    assert panel(partial)["confidence_percent"] == 82
+    due = partial.consumer(now=partial.consumer().next_expected_restart_at - 300)
+    assert due.scheduled_warning_eligible
+    # Further aligned evidence progresses toward the 95 % display ceiling in
+    # place (same regime).
     pipeline.sparse("aligned-more", aligned_3h(8, start_day=11))
     recovered = pipeline.evaluate(persisted(partial.decision))
     assert_sparse_established(recovered)
-    assert panel(recovered)["confidence_percent"] == 80
+    assert panel(recovered)["confidence_percent"] == DISPLAY_CEILING_PERCENT
     assert recovered.decision.incumbent_shadow_regime.regime_id == regime.regime_id
 
 
 def test_s87a_unrelated_anomalies_over_weeks_each_recover_without_reset():
-    pipeline = Pipeline()
+    pipeline = verify(Pipeline())
     pipeline.sparse("aligned", aligned_3h(24))
     steps = [settled(pipeline)]
     regime = steps[0].decision.incumbent_shadow_regime
@@ -3112,17 +3260,23 @@ def test_s87a_unrelated_anomalies_over_weeks_each_recover_without_reset():
     for name, when, anomaly in schedule:
         pipeline.sparse(name, [when])
         step = pipeline.evaluate(persisted(steps[-1].decision))
+        previous = steps[-1].decision.combined_confidence
         steps.append(step)
         current = step.decision.incumbent_shadow_regime
         assert current.regime_id == regime.regime_id
         assert current.established_at == regime.established_at
         assert (current.candidate_period_seconds, current.phase_offset) == (P3, 0.0)
         assert step.consumer().countdown_visible
+        # Stage 4: an unrelated anomaly never lowers the established display
+        # (was: unchanged at 80 %); aligned onsets after establishment are
+        # replication, up to the 95 % ceiling.
+        assert step.decision.combined_confidence >= previous
+        assert 80 <= panel(step)["confidence_percent"] <= DISPLAY_CEILING_PERCENT
         if anomaly:
             assert authority.ISOLATED_OFF_PHASE_RESTART_REASON in step.decision.reason_codes
+            assert step.decision.combined_confidence == previous
         else:
             assert step.decision.state is State.ESTABLISHED
-            assert panel(step)["confidence_percent"] == 80
     assert len(_off_phase_ids(steps[-1]) & {item.event_id for item in steps[-1].events}) == 3
 
 
@@ -3142,8 +3296,10 @@ def test_s87a_persistent_significant_disagreement_prevents_establishment(aligned
         assert authority.SPARSE_PROPORTIONAL_ANOMALY_REASON not in candidate.reason_codes
 
     # Proportion, not lifetime count, decides: enough later aligned evidence
-    # brings the same anomalies within tolerance.
+    # brings the same anomalies within tolerance (and a witnessed interval
+    # verifies the cycle).
     pipeline.sparse("later", aligned_3h(aligned_count, start_day=aligned_count + 1))
+    verify(pipeline, (at(2 * aligned_count + 2, 3), at(2 * aligned_count + 2, 6)))
     assert_sparse_established(settled(pipeline))
 
 
@@ -3152,13 +3308,15 @@ def _h2_incumbent():
 
 
 def _sparse_thirty():
-    pipeline = Pipeline()
+    pipeline = verify(Pipeline())
     pipeline.sparse("aligned", aligned_3h(30))
     return pipeline
 
 
 INCUMBENT_BUILDERS = {
-    "sparse_eight": (sparse_pipeline, 76),
+    # Verified by the query-visible interval recorded first: its two aligned
+    # endpoints keep one admin restart within the proportional tolerance.
+    "sparse_eight": (verified_sparse_pipeline, 80),
     "sparse_thirty": (_sparse_thirty, 80),
     "two_interval_h2": (_h2_incumbent, 80),
     "three_interval_h3": (lambda: three_hour_chain(4), DISPLAY_CEILING_PERCENT),
@@ -3203,7 +3361,7 @@ def test_s87a_established_regime_keeps_period_phase_and_predictions_after_isolat
     "second",
     [pytest.param((17, 20), id="same_clock"), pytest.param((14, 20), id="three_hour_alternative_phase")],
 )
-@pytest.mark.parametrize("builder", [_h2_incumbent, sparse_pipeline], ids=["h2", "sparse"])
+@pytest.mark.parametrize("builder", [_h2_incumbent, verified_sparse_pipeline], ids=["h2", "sparse"])
 def test_s87a_coherent_or_repeated_off_phase_restarts_keep_existing_suspicion(builder, second):
     # Coherent: a second off-grid restart sharing a phase with the first (the
     # same clock time, or the same alternative 3 h phase).  It is possible
@@ -3229,25 +3387,46 @@ def test_s87a_coherent_or_repeated_off_phase_restarts_keep_existing_suspicion(bu
         pipeline.sparse(name, [when])
         steps.append(pipeline.evaluate(persisted(steps[-1].decision)))
     assert steps[-1].decision.suspicion_level == 1
-    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in steps[-1].decision.reason_codes
-    assert not steps[-1].consumer().countdown_visible
+    if builder is _h2_incumbent:
+        # Stage 3: a strongly established (two-interval) cycle tolerates
+        # mutually unrelated anomalies; the prediction is kept.
+        assert authority.STRONG_ANOMALY_TOLERANCE_REASON in steps[-1].decision.reason_codes
+        assert steps[-1].consumer().countdown_visible
+    else:
+        assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in steps[-1].decision.reason_codes
+        assert not steps[-1].consumer().countdown_visible
 
 
 def test_s87a_isolated_admin_restart_never_relaxes_other_suspicion():
-    # An in-phase genuine miss (not an off-phase restart) keeps the existing
-    # H2 treatment: level one withholds the H2 countdown.
-    pipeline = _h2_incumbent()
+    # An in-phase genuine miss (not an off-phase restart) is never treated as
+    # an isolated restart.  Against a newly established (E1) cycle level one
+    # withholds the countdown, as before.
+    pipeline = verified_sparse_pipeline()
     established_step = settled(pipeline)
-    ledger = (genuine_miss(P3, at(1, 0), key="incumbent-miss"),)
+    assert authority.REGIME_STRONG_REASON not in established_step.decision.incumbent_shadow_regime.reason_codes
+    ledger = (genuine_miss(P3, at(7, 0), key="incumbent-miss"),)
     missed = pipeline.evaluate(persisted(established_step.decision), ledger=ledger)
     assert missed.decision.suspicion_level == 1
     assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in missed.decision.reason_codes
     assert not missed.consumer().countdown_visible
 
+    # Stage 5 correction: this H2 incumbent is strongly established (two
+    # witnessed intervals, E2), which rides through one genuine miss (an
+    # administrator may skip one automatic restart).
+    pipeline = _h2_incumbent()
+    established_step = settled(pipeline)
+    assert authority.REGIME_STRONG_REASON in established_step.decision.incumbent_shadow_regime.reason_codes
+    ledger = (genuine_miss(P3, at(1, 0), key="incumbent-miss"),)
+    missed = pipeline.evaluate(persisted(established_step.decision), ledger=ledger)
+    assert missed.decision.suspicion_level == 1
+    assert authority.ISOLATED_OFF_PHASE_RESTART_REASON not in missed.decision.reason_codes
+    assert authority.STRONG_ANOMALY_TOLERANCE_REASON in missed.decision.reason_codes
+    assert missed.consumer().countdown_visible
+
 
 def test_s87a_genuine_recent_challenger_is_detected_despite_a_large_incumbent_history():
     def with_challenger(*sessions):
-        pipeline = Pipeline()
+        pipeline = verify(Pipeline())
         pipeline.sparse("history", aligned_3h(100))
         incumbent = settled(pipeline)
         assert_sparse_established(incumbent)
@@ -3289,8 +3468,11 @@ def test_s87a_continuous_versus_sparse_conflict_safeguard_holds_with_large_spars
 def test_s87a_clean_milestones_and_evidence_weights_are_unchanged():
     clean = _three_hour_sparse(settled(sparse_pipeline()))
     assert clean.aligned_normal_confidence == 0.95
-    assert panel(_sparse_plus_matching_interval()[1])["confidence_percent"] == DISPLAY_CEILING_PERCENT
-    qv = settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART))
+    # Verified acquisition: the clean sparse statistic is the pre-verification
+    # ceiling; one witnessed interval verifies at about 90 %.
+    assert panel(settled(sparse_pipeline()))["confidence_percent"] == 79
+    assert panel(_sparse_plus_matching_interval()[1])["confidence_percent"] == 90
+    qv = settled(verify(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)))
     assert panel(qv)["confidence_percent"] == 80
     assert panel(settled(sparse_pipeline(SPARSE_QV_TEN[:9], outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)))[
         "confidence_percent"
@@ -3313,7 +3495,7 @@ def test_s87a_clean_milestones_and_evidence_weights_are_unchanged():
 
 @pytest.mark.parametrize("contamination", ["sleep_gap", "onset_unobserved"])
 def test_s87a_unobserved_or_interrupted_off_phase_incidents_stay_neutral(contamination):
-    pipeline = sparse_pipeline()
+    pipeline = verified_sparse_pipeline()
     clean = settled(pipeline)
     (event,) = pipeline.sparse("incident", [at(6, 17, 20)])
     if contamination == "sleep_gap":
@@ -3384,7 +3566,7 @@ def assert_conflict_pending(step):
 
 @pytest.mark.parametrize(
     "sparse_times",
-    [pytest.param((), id="no_sparse_history"), pytest.param(SPARSE_DISCRIMINATING[:4], id="four_sparse")],
+    [pytest.param((), id="no_sparse_history"), pytest.param(SPARSE_DISCRIMINATING[:3], id="three_sparse")],
 )
 def test_s87_two_clean_intervals_without_substantial_sparse_conflict_establish_immediately(sparse_times):
     first = _sparse_conflict_pipeline(sparse_times).evaluate()
@@ -3483,10 +3665,10 @@ def test_s87_already_counted_endpoint_never_satisfies_the_extra_confirmation():
 @pytest.mark.parametrize(
     "sparse_times,outcome,ledger",
     [
-        pytest.param(SPARSE_DISCRIMINATING[:4], Outcome.CORROBORATED_OFFLINE_RESTART, (), id="insufficient"),
+        pytest.param(SPARSE_DISCRIMINATING[:3], Outcome.CORROBORATED_OFFLINE_RESTART, (), id="insufficient"),
         pytest.param(SAME_CLOCK, Outcome.CORROBORATED_OFFLINE_RESTART, (), id="ambiguous_same_clock"),
         pytest.param(SPARSE_DISCRIMINATING, Outcome.AMBIGUOUS_DRAIN, (), id="unconfirmed_drains"),
-        pytest.param(SPARSE_DISCRIMINATING, Outcome.PROBABLE_QUERY_VISIBLE_RESTART, (), id="weak_probable_qv"),
+        pytest.param(SPARSE_DISCRIMINATING[:7], Outcome.PROBABLE_QUERY_VISIBLE_RESTART, (), id="weak_probable_qv"),
         pytest.param(
             SPARSE_DISCRIMINATING,
             Outcome.CORROBORATED_OFFLINE_RESTART,
@@ -3506,7 +3688,7 @@ def test_s87_established_regimes_keep_stage6_challenger_and_recovery_rules():
     # A sparse-established 3 h incumbent: a 4 h two-interval challenger is
     # judged by the unchanged Stage 6 rules (provisional, countdown hidden),
     # never by the acquisition-only conflict gate.
-    pipeline = sparse_pipeline()
+    pipeline = verified_sparse_pipeline()
     incumbent = settled(pipeline)
     pipeline.observe("challenger", [at(9, 1), at(9, 5), at(9, 9)])
     provisional = pipeline.evaluate(persisted(incumbent.decision))
@@ -3636,7 +3818,12 @@ def test_s87_legacy_non_authentic_relationships_add_no_challenger_evidence(outco
         for item in legacy.decision.challenger_contexts
     )
     assert legacy.consumer().countdown_visible
-    # Without the authority filter they would raise a latent challenger.
+    # Without the authority filter they would become latent challenger
+    # evidence.  (Correction A1: a latent context also needs two independent
+    # authentic off-phase onsets or a high relationship, which non-authentic
+    # incidents never supply, so even unfiltered they cannot raise level-one
+    # challenger suspicion: a second, independent layer.)
+    legacy_ids = {value.relationship_id for value in legacy_endpoints}
     monkeypatch.setattr(authority, "relationship_endpoint_outcome_eligible", lambda event: True)
     unfiltered = authority.evaluate_authority(
         server_key=SERVER,
@@ -3646,8 +3833,12 @@ def test_s87_legacy_non_authentic_relationships_add_no_challenger_evidence(outco
         events=legacy.events,
         prior_decision=persisted(established_step.decision),
     )
-    assert unfiltered.suspicion_level == 1
-    assert "latent_normal_challenger_context" in unfiltered.reason_codes
+    assert any(
+        set(item.normal_relationship_ids) & legacy_ids for item in unfiltered.challenger_contexts
+    )
+    assert all(not item.off_phase_event_ids for item in unfiltered.challenger_contexts)
+    assert "latent_normal_challenger_context" not in unfiltered.reason_codes
+    assert unfiltered.prediction_usable
 
 
 def test_s87_genuine_qv_and_oo_events_still_form_relationships():
@@ -3677,7 +3868,7 @@ def test_s87_genuine_qv_and_oo_events_still_form_relationships():
     ]
     # Continuous QV and OO trajectories keep their milestones.
     assert percent(three_hour_chain(3).evaluate()) == 80
-    assert panel(_qv_trajectory()[10])["confidence_percent"] == DISPLAY_CEILING_PERCENT
+    assert panel(_qv_trajectory(13)[11])["confidence_percent"] == DISPLAY_CEILING_PERCENT
 
 
 STAGE87_BUILDERS = {
@@ -3717,12 +3908,15 @@ def test_s87_persistence_and_rebuild_are_stable(name):
 
 
 def test_s87_existing_milestones_warnings_and_presentation_are_unchanged():
-    # Sparse: eight strong restarts 80 %, plus one full interval 95 %.
-    assert panel(settled(sparse_pipeline()))["confidence_percent"] == 80
-    assert panel(_sparse_plus_matching_interval()[1])["confidence_percent"] == DISPLAY_CEILING_PERCENT
-    assert panel(settled(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)))[
-        "confidence_percent"
-    ] == 80
+    # Sparse (verified acquisition): eight strong restarts await verification
+    # at 79 %; verified among the identification evidence 80 %; one full
+    # offline-observed interval about 90 %.
+    assert panel(settled(sparse_pipeline()))["confidence_percent"] == 79
+    assert panel(settled(verified_sparse_pipeline()))["confidence_percent"] == 80
+    assert panel(_sparse_plus_matching_interval()[1])["confidence_percent"] == 90
+    assert panel(
+        settled(verify(sparse_pipeline(SPARSE_QV_TEN, outcome=Outcome.STRONG_QUERY_VISIBLE_RESTART)))
+    )["confidence_percent"] == 80
     # Continuous: two intervals 80 % with warning, three 95 %.
     two = three_hour_chain(3).evaluate()
     assert percent(two) == 80 and two.decision.combined_confidence == 0.80
@@ -3736,3 +3930,5 @@ def test_s87_existing_milestones_warnings_and_presentation_are_unchanged():
     assert authority.TWO_INTERVAL_ESTABLISHMENT_PHASE_QUALITY_MINIMUM == 0.909
     assert consumers4.SCHEDULED_WARNING_MINIMUM_CONFIDENCE_PERCENT == 80
     assert authority.ORIGINAL_CYCLE_RECOVERY_CONFIRMATIONS == 2
+    assert authority.SPARSE_CONFIRMATION_INTERVAL_WEIGHT == 0.75  # legacy regimes
+    assert authority.VERIFIED_INTERVAL_WEIGHT == 0.50

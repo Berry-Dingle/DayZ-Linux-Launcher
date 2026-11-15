@@ -510,7 +510,12 @@ def test_spotty_aligned_normal_evidence_only_refines_remaining_uncertainty():
     )
     reinforced = evaluate(events + spotty, relationships, streaks, prior=base)
     updated = candidate(reinforced, 3 * HOUR)
-    expected = round(scoring._event_count_cap(6.4), 6)
+    # The incumbent was established under verified acquisition (H3), so the
+    # Stage 2 identification statistic applies.
+    assert authority.VERIFIED_ESTABLISHMENT_REASON in base.incumbent_shadow_regime.reason_codes
+    expected = authority.sparse_identification_magnitudes(
+        effective=6.4, band=1.0, off_phase_weight=0.0, consistency=1.0, period=3 * HOUR
+    )[0]
     assert updated.high_authority == original.high_authority
     assert updated.aligned_normal_confidence == expected
     # Stage 8.5: sparse ceiling S = 0.84; sparse evidence still fills only
