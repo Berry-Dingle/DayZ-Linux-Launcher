@@ -519,7 +519,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             filter_state=lambda: getattr(self, "_filter_state", None),
             ping_cutoff=lambda: getattr(self, "_ping_cutoff_ms", 0),
             key_for_obj=self._browser_reorder_key_for_obj,
-            row_height_px=BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX,
+            visible_range=self._browser_live_visible_range,
         )
         self._row_widgets = weakref.WeakSet()
         self._browser_bound_rows = BoundRowTracker()

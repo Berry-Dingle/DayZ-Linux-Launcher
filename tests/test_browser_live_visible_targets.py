@@ -486,3 +486,83 @@ def test_filter_rebuild_retargets_the_next_tick(tick_host):
     queried_ips = {objs[i].ip for i in dispatched_after}
     assert expected_ips <= queried_ips
     assert queried_ips != {objs[i].ip for i in dispatched_before}
+
+
+# ----------------------------- [browser-reorder] diagnostics share the range
+from dzll_launcher.browser_diagnostics import BrowserReorderDebug  # noqa: E402
+
+
+def reorder_debug(host, enabled=True):
+    # Wired as DZLLWindow.__init__ wires it: the window's own visible range.
+    return BrowserReorderDebug(
+        enabled=enabled,
+        store=lambda: host.column_view_store,
+        scroller=lambda: host.scroller,
+        filter_state=dict,
+        ping_cutoff=lambda: 0,
+        key_for_obj=lambda obj: fav_key(obj.ip, obj.gport),
+        visible_range=MethodType(DZLLWindow._browser_live_visible_range, host),
+    )
+
+
+def first_target_key(host):
+    visible, _ahead = DZLLWindow._browser_live_candidate_groups(host)
+    return visible[0][0]
+
+
+@pytest.mark.parametrize("variable", [False, True], ids=["uniform", "variable-heights"])
+@pytest.mark.parametrize("first_visible", [0, 175, 350, 560])
+def test_reorder_scroll_key_reports_the_realised_first_row(first_visible, variable):
+    store, objs = make_store()
+    tracker = BoundRowTracker()
+    heights = (lambda i: 150.0 if i % 4 == 0 else 44.0) if variable else None
+    cells = bind_window(tracker, store, first_visible, heights)
+    # The adjustment disagrees with the realised rows, as with mixed heights.
+    host = host_for(store, Scroller(adjustment=Adjustment(value=17776.0, upper=600 * 62.3)), tracker)
+    key = reorder_debug(host).scroll_key()
+    first = truly_visible(cells)[0]
+    assert key == fav_key(objs[first].ip, objs[first].gport)
+    assert key == first_target_key(host)
+
+
+@pytest.mark.parametrize("pitch", [40.0, 53.0, 80.0])
+def test_reorder_scroll_key_uses_the_pitch_fallback(pitch):
+    store, objs = make_store()
+    host = host_for(store, Scroller(adjustment=Adjustment(value=350 * pitch, upper=600 * pitch)))
+    key = reorder_debug(host).scroll_key()
+    assert key == fav_key(objs[350].ip, objs[350].gport)  # 64 px alone would not give row 350
+    assert key == first_target_key(host)
+
+
+def test_reorder_scroll_key_uses_the_fixed_last_resort():
+    store, objs = make_store()
+    host = host_for(store, Scroller(adjustment=Adjustment(value=64.0 * 120 + 10, upper=0.0)))
+    key = reorder_debug(host).scroll_key()
+    assert key == fav_key(objs[120].ip, objs[120].gport)
+    assert key == first_target_key(host)
+
+
+def test_reorder_scroll_key_does_not_touch_refresh_state():
+    store, _objs = make_store()
+    tracker = BoundRowTracker()
+    bind_window(tracker, store, 200)
+    host = host_for(store, Scroller(adjustment=Adjustment(value=0.0, upper=600 * ROW_H)), tracker)
+    host._browser_live_token = 41
+    host._browser_live_target_keys = {"10.0.0.1:2302"}
+    host._browser_live_range_source = "pitch"
+    entries = dict(tracker._entries)
+    reorder_debug(host).scroll_key()
+    assert host._browser_live_token == 41
+    assert host._browser_live_target_keys == {"10.0.0.1:2302"}
+    assert host._browser_live_range_source == "pitch"
+    assert tracker._entries == entries
+
+
+def test_disabled_reorder_debug_never_queries_the_tracker():
+    class ExplodingTracker(BoundRowTracker):
+        def visible_positions(self, viewport, model):
+            raise AssertionError("tracker queried while diagnostics are disabled")
+
+    store, _objs = make_store()
+    host = host_for(store, Scroller(), ExplodingTracker())
+    assert reorder_debug(host, enabled=False).scroll_key() == "-"

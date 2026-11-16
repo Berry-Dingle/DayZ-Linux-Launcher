@@ -443,15 +443,20 @@ class BrowserReorderDebug:
         filter_state: Callable[[], Any],
         ping_cutoff: Callable[[], Any],
         key_for_obj: Callable[[Any], str],
-        row_height_px: int,
+        visible_range: Callable[[Any, int, Any], tuple],
     ) -> None:
+        """``visible_range(model, total, scroller)`` returns ``(start, end,
+        source)``; the window passes its browser-live
+        ``_browser_live_visible_range`` so this trace reports the same first
+        visible row as refresh targeting (realised rows, then average pitch,
+        then the fixed fallback height)."""
         self.enabled = bool(enabled)
         self._store = store
         self._scroller = scroller
         self._filter_state = filter_state
         self._ping_cutoff = ping_cutoff
         self._key_for_obj = key_for_obj
-        self._row_height_px = row_height_px
+        self._visible_range = visible_range
 
     def log(self, message: str, **fields) -> None:
         if not self.enabled:
@@ -485,15 +490,16 @@ class BrowserReorderDebug:
         if store is None:
             return "-"
         try:
-            vadj = self._scroller().get_vadjustment()
-            if not vadj:
+            scroller = self._scroller()
+            if scroller is None or not scroller.get_vadjustment():
                 return "-"
-            row_h = max(1, int(self._row_height_px))
-            index = int(max(0.0, float(vadj.get_value())) // row_h)
             count = int(store.get_n_items())
+            if count <= 0:
+                return "-"
+            index = int(self._visible_range(store, count, scroller)[0])
             if index >= count:
-                index = max(0, count - 1)
-            if index < 0 or count <= 0:
+                index = count - 1
+            if index < 0:
                 return "-"
             return self._key_for_obj(store.get_item(index))
         except Exception:

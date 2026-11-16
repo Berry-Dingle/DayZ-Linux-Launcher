@@ -53,7 +53,7 @@ def reorder(enabled=True, **overrides):
         filter_state=lambda: {"online_only": True, "max_players_cutoff": 0},
         ping_cutoff=lambda: 150,
         key_for_obj=lambda obj: f"key:{obj}",
-        row_height_px=64,
+        visible_range=lambda _model, _total, _scroller: (1, 2, "stub"),
     )
     kwargs.update(overrides)
     return BrowserReorderDebug(**kwargs)
@@ -160,6 +160,35 @@ def test_reorder_scroll_key_survives_missing_scroller():
         raise AttributeError("scroller")
 
     assert reorder(scroller=missing).scroll_key() == "-"
+
+
+def test_reorder_scroll_key_uses_the_injected_visible_range():
+    calls = []
+    store = Store(["a", "b", "c"])
+    scroller = SimpleNamespace(get_vadjustment=lambda: SimpleNamespace(get_value=lambda: 0.0))
+
+    def visible_range(model, total, view):
+        calls.append((model, total, view))
+        return (2, 3, "realised")
+
+    assert reorder(store=lambda: store, scroller=lambda: scroller, visible_range=visible_range).scroll_key() == "key:c"
+    assert calls == [(store, 3, scroller)]
+
+
+def test_reorder_scroll_key_clamps_and_tolerates_bad_ranges():
+    def raising(*_args):
+        raise RuntimeError("range unavailable")
+
+    def not_called(*_args):
+        raise AssertionError("visible range queried without rows or adjustment")
+
+    assert reorder(visible_range=lambda *_a: (99, 100, "pitch")).scroll_key() == "key:c"
+    assert reorder(visible_range=lambda *_a: (-1, 0, "pitch")).scroll_key() == "-"
+    assert reorder(visible_range=raising).scroll_key() == "-"
+    assert reorder(store=lambda: Store([]), visible_range=not_called).scroll_key() == "-"
+    no_adjustment = SimpleNamespace(get_vadjustment=lambda: None)
+    assert reorder(scroller=lambda: no_adjustment, visible_range=not_called).scroll_key() == "-"
+    assert reorder(scroller=lambda: None, visible_range=not_called).scroll_key() == "-"
 
 
 def test_perf_ticks_report_and_reset_counters(capsys):

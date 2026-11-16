@@ -172,3 +172,21 @@ def test_tracker_follows_binding_and_is_cleared_at_shutdown(browser):
     assert len(tracker) == 1
     window._shutdown_cleanup()
     assert len(tracker) == 0
+
+
+def test_reorder_diagnostics_share_the_refresh_visible_range(browser):
+    window = browser(tall_every=4)
+    debug = window._browser_reorder
+    assert debug._visible_range.__func__ is DZLLWindow._browser_live_visible_range
+    assert debug._visible_range.__self__ is window
+    debug.enabled = True
+    try:
+        for fraction in (0.0, 0.6, 0.95):
+            _scroll_to(window, fraction)
+            first = _rows_on_screen(window)[0]
+            obj = next(o for o in window.column_view_store if o.name == f"Visible Target {first:04d}")
+            assert debug.scroll_key() == window._browser_reorder_key_for_obj(obj)
+            visible, _ahead = window._browser_live_candidate_groups()
+            assert visible[0][0] == fav_key(obj.ip, obj.gport)
+    finally:
+        debug.enabled = False
