@@ -1911,7 +1911,7 @@ def _bind_name_cell_light(
         perf_metrics.count("drag_skipped_popup_preparation")
 
 
-def _make_name_factory(perf_metrics=None, drag_light=None):
+def _make_name_factory(perf_metrics=None, drag_light=None, bound_rows=None):
     factory = Gtk.SignalListItemFactory()
 
     def setup(_factory, list_item):
@@ -2074,6 +2074,8 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
                 list_item,
                 render_full,
             )
+            if bound_rows is not None:
+                bound_rows.add(cell, list_item)
         finally:
             if perf_metrics is not None:
                 perf_metrics.finish(token)
@@ -2082,6 +2084,8 @@ def _make_name_factory(perf_metrics=None, drag_light=None):
         token = perf_metrics.start("name", "unbind") if perf_metrics is not None else None
         try:
             cell = list_item.get_child()
+            if bound_rows is not None:
+                bound_rows.discard(cell)
             _unregister_bound_cell(drag_light, cell, list_item)
             if _drag_light_active(drag_light):
                 _bind_name_cell_light(cell, None, perf_metrics)
@@ -2397,6 +2401,7 @@ def build_server_column_view(
     ubuntu_geometry: bool = False,
     perf_metrics=None,
     drag_light=None,
+    bound_rows=None,
 ) -> tuple[Gtk.ColumnView, dict[str, bool]]:
     view = Gtk.ColumnView.new(selection_model)
     view._dzll_on_sort_header_clicked = on_header_sort
@@ -2431,7 +2436,7 @@ def build_server_column_view(
     name_column = _append_column(
         view,
         "NAME / IP / MODS",
-        _make_name_factory(perf_metrics, drag_light),
+        _make_name_factory(perf_metrics, drag_light, bound_rows),
         320,
         expand=True,
         header_xalign=0.0,

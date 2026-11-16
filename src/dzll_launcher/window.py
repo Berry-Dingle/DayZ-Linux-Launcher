@@ -147,6 +147,7 @@ from .companion_learning_transfer_ui import CompanionLearningTransferController
 from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
 from .visible_refresh_indicator import VisibleRefreshIndicator
+from .bound_row_tracker import BoundRowTracker
 from .startup_ui import build_startup_overlay
 
 from .workshop_mods import (
@@ -521,6 +522,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             row_height_px=BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX,
         )
         self._row_widgets = weakref.WeakSet()
+        self._browser_bound_rows = BoundRowTracker()
         self._fast_scroll_render_refresh_id = 0
         self._scrollbar_interaction = ScrollbarInteractionState()
         self._scroll_drag_factory_metrics = ScrollbarFactoryMetrics(
@@ -1067,6 +1069,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 if SCROLL_DRAG_LIGHT_BIND_ENABLED
                 else None
             ),
+            bound_rows=self._browser_bound_rows,
         )
         self._set_background_download_column_visible(
             bool(self.settings.get("show_background_download_buttons", False))
@@ -2547,6 +2550,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         try:
             self._stop_browser_live_refresh()
+        except Exception:
+            pass
+        try:
+            bound_rows = getattr(self, "_browser_bound_rows", None)
+            if bound_rows is not None:
+                bound_rows.clear()
         except Exception:
             pass
         try:
@@ -7631,6 +7640,54 @@ class DZLLWindow(Gtk.ApplicationWindow):
             return True
         return False
 
+    def _browser_live_visible_range(self, model, total, scroller):
+        """Return ``(start, end, source)`` for the rows in the browser viewport.
+
+        ``source`` names the method that produced the range:
+
+        - ``"realised"``: rows GTK has bound and placed inside the viewport
+          (exact, independent of row heights).
+        - ``"pitch"``: GTK's average row pitch, adjustment span / row count.
+          Used before any row is allocated; inexact with mixed row heights.
+        - ``"fixed"``: ``BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX``, only when the
+          adjustment gives no usable span.
+        """
+        tracker = getattr(self, "_browser_bound_rows", None)
+        if tracker is not None:
+            try:
+                positions = tracker.visible_positions(scroller, model)
+            except Exception:
+                positions = []
+            if positions:
+                return positions[0], min(total, positions[-1] + 1), "realised"
+
+        source = "fixed"
+        first = 0
+        visible_count = 1
+        try:
+            row_h = max(1.0, float(BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX))
+        except Exception:
+            row_h = 64.0
+        try:
+            vadj = scroller.get_vadjustment()
+            if vadj:
+                lower = float(vadj.get_lower())
+                span = float(vadj.get_upper()) - lower
+                if span > 0.0:
+                    row_h = max(1.0, span / float(total))
+                    source = "pitch"
+                value = max(0.0, float(vadj.get_value()) - lower)
+                page = max(1.0, float(vadj.get_page_size()))
+                first = max(0, int(value // row_h))
+                visible_count = max(1, int(-(-page // row_h)) + 1)
+        except Exception:
+            source = "fixed"
+            first = 0
+            visible_count = 1
+
+        start = min(max(0, first), max(0, total - 1))
+        return start, min(total, start + visible_count), source
+
     def _browser_live_candidate_groups(self):
         model = getattr(self, "column_view_store", None)
         if model is None and ENABLE_LEGACY_GTK_SORT_MODEL:
@@ -7648,27 +7705,10 @@ class DZLLWindow(Gtk.ApplicationWindow):
         if total <= 0:
             return [], []
 
-        row_h = int(BROWSER_LIVE_FALLBACK_ROW_HEIGHT_PX)
-        try:
-            row_h = max(1, int(row_h))
-        except Exception:
-            row_h = 64
-
-        first = 0
-        visible_count = 1
-        try:
-            vadj = scroller.get_vadjustment()
-            if vadj:
-                value = max(0.0, float(vadj.get_value()))
-                page = max(1.0, float(vadj.get_page_size()))
-                first = max(0, int(value // row_h))
-                visible_count = max(1, int((page + row_h - 1) // row_h) + 1)
-        except Exception:
-            first = 0
-            visible_count = 1
-
-        start = min(max(0, first), max(0, total - 1))
-        visible_end = min(total, start + visible_count)
+        start, visible_end, source = DZLLWindow._browser_live_visible_range(
+            self, model, total, scroller
+        )
+        self._browser_live_range_source = source
         ahead_end = min(total, visible_end + int(BROWSER_LIVE_AHEAD_ROWS))
 
         def collect_range(first_idx, end_idx, seen):
