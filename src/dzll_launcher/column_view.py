@@ -430,6 +430,13 @@ def _normalize_column_title_button(button, column_index: int, *, is_last: bool) 
     _add_css_classes(button, "dzll-column-title-flat")
     if is_last:
         _add_css_classes(button, "dzll-column-title-join")
+    # The untitled action columns (monitor, download, join) have no right
+    # border. Mark them by class rather than position: GTK appends a
+    # re-inserted column's title button (the optional background-download
+    # column) to the end of the header's children, so nth-child selectors
+    # no longer match it.
+    if not _column_header_title_for_button(button):
+        _add_css_classes(button, "dzll-column-title-action")
     try:
         button.set_halign(Gtk.Align.FILL)
         button.set_hexpand(True)

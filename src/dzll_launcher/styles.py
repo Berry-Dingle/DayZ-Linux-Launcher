@@ -1448,7 +1448,13 @@ def get_app_css(
         columnview.dzll-column-view > header > button.dzll-column-title-join:active,
         columnview.dzll-column-view > header > button.dzll-column-title-join:checked,
         columnview.dzll-column-view > header > button.dzll-column-title-join:focus,
-        columnview.dzll-column-view > header > button.dzll-column-title-join:focus-visible {{
+        columnview.dzll-column-view > header > button.dzll-column-title-join:focus-visible,
+        columnview.dzll-column-view > header > button.dzll-column-title-action,
+        columnview.dzll-column-view > header > button.dzll-column-title-action:hover,
+        columnview.dzll-column-view > header > button.dzll-column-title-action:active,
+        columnview.dzll-column-view > header > button.dzll-column-title-action:checked,
+        columnview.dzll-column-view > header > button.dzll-column-title-action:focus,
+        columnview.dzll-column-view > header > button.dzll-column-title-action:focus-visible {{
           border-right: 0;
         }}
 
