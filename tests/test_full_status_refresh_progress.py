@@ -53,14 +53,31 @@ class FakeProgressBar:
         self.history.append(fraction)
 
 
-class FakeStack:
+class FakeButton(FakeBox):
     def __init__(self):
-        self.visible_child = None
-        self.history = []
+        super().__init__()
+        self.visible = True
+        self.tooltip = "Refresh all server status"
 
-    def set_visible_child(self, child):
-        self.visible_child = child
-        self.history.append(child)
+    def get_tooltip_text(self):
+        return self.tooltip
+
+    def set_tooltip_text(self, text):
+        self.tooltip = text
+
+
+class FakeIcon:
+    def __init__(self):
+        self.classes = set()
+
+    def has_css_class(self, name):
+        return name in self.classes
+
+    def add_css_class(self, name):
+        self.classes.add(name)
+
+    def remove_css_class(self, name):
+        self.classes.discard(name)
 
 
 class FakeFuture:
@@ -73,13 +90,11 @@ class FakeFuture:
 
 def progress_host(*, total=10, completed=0, generation=1, running=True):
     """A controller with fake sidebar widgets. ``host.c`` is the controller."""
-    refresh_btn = FakeBox()
-    refresh_btn.visible = True
     prefix_label = FakeLabel()
     prefix_label.text = "Refreshing:"
     host = SimpleNamespace(
-        refresh_status_btn=refresh_btn,
-        status_refresh_slot=FakeStack(),
+        refresh_status_btn=FakeButton(),
+        refresh_status_icon=FakeIcon(),
         status_refresh_progress_box=FakeBox(),
         status_refresh_progress_prefix_label=prefix_label,
         status_refresh_progress_count_label=FakeLabel(),
@@ -97,7 +112,7 @@ def progress_host(*, total=10, completed=0, generation=1, running=True):
             progress_box=host.status_refresh_progress_box,
             count_label=host.status_refresh_progress_count_label,
             progress_bar=host.status_refresh_progress_bar,
-            slot=host.status_refresh_slot,
+            icon=host.refresh_status_icon,
         ),
         server_keys=lambda: list(host.servers),
         lookup_server=lambda key: host.servers.get(key),
@@ -125,42 +140,43 @@ def test_toolbar_order_has_no_separator_and_keeps_fixed_sidebar_width():
     source = SIDEBAR_SOURCE.read_text(encoding="utf-8")
     body = source[source.index("def build_sidebar_toolbar"):source.index("def build_sidebar(")]
 
-    settings = body.index("search_header.append(settings_btn)")
-    mods = body.index("search_header.append(window.mod_manager_header_btn)")
-    slot = body.index("search_header.append(window.status_refresh_slot)")
-    refresh = body.index('status_refresh_slot.add_named(window.refresh_status_btn, "refresh")')
-    progress = body.index('status_refresh_slot.add_named(window.status_refresh_progress_box, "progress")')
-    assert settings < mods < refresh < progress < slot
+    column = body.index("search_header.append(toolbar_icons_column)")
+    settings = body.index("toolbar_icons_row.append(settings_btn)")
+    mods = body.index("toolbar_icons_row.append(window.mod_manager_header_btn)")
+    companion = body.index("toolbar_icons_row.append(window.server_companion_toggle_btn)")
+    refresh = body.index("toolbar_icons_row.append(window.refresh_status_btn)")
+    progress = body.index("toolbar_icons_column.append(window.status_refresh_progress_box)")
+    assert column < settings < mods < companion < refresh < progress
+    assert "Gtk.Stack" not in body
     assert "Gtk.Separator" not in body
     assert '"|"' not in body and "'|'" not in body
     assert config.SIDEBAR_WIDTH == 220
     assert "toolbar_cell.set_size_request(SIDEBAR_WIDTH, -1)" in body
 
 
-def test_progress_widget_is_compact_expanding_and_hidden_initially():
+def test_progress_widget_sits_under_icons_at_their_width_and_is_hidden_initially():
     source = SIDEBAR_SOURCE.read_text(encoding="utf-8")
     assert "toolbar_cell.set_halign(Gtk.Align.FILL)" in source
     assert "toolbar_cell.set_overflow(Gtk.Overflow.HIDDEN)" in source
     assert "search_header.set_halign(Gtk.Align.FILL)" in source
     assert "search_header.set_overflow(Gtk.Overflow.HIDDEN)" in source
-    assert "status_refresh_progress_box.set_hexpand(True)" in source
+    assert "toolbar_icons_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)" in source
+    assert "toolbar_icons_column.set_hexpand(False)" in source
+    assert "toolbar_icons_column.set_halign(Gtk.Align.START)" in source
+    assert "status_refresh_progress_box.set_hexpand(False)" in source
     assert "status_refresh_progress_box.set_size_request(1, -1)" in source
     assert "status_refresh_progress_box.set_halign(Gtk.Align.FILL)" in source
     assert "status_refresh_progress_box.set_visible(False)" in source
     assert 'Gtk.Label(label="Refreshing:", xalign=0.0)' in source
     assert "status_refresh_progress_prefix_label.set_halign(Gtk.Align.START)" in source
-    assert "status_refresh_progress_count_label = Gtk.Label(xalign=1.0)" in source
+    assert "status_refresh_progress_count_label = Gtk.Label(xalign=0.0)" in source
     assert "status_refresh_progress_count_label.set_hexpand(True)" in source
     assert "status_refresh_progress_count_label.set_halign(Gtk.Align.FILL)" in source
+    # The count label must never widen the icon column.
     assert "status_refresh_progress_count_label.set_width_chars(1)" in source
     assert "status_refresh_progress_count_label.set_max_width_chars(1)" in source
     assert "status_refresh_progress_count_label.set_ellipsize(Pango.EllipsizeMode.START)" in source
     assert "status_refresh_progress_bar.set_show_text(False)" in source
-    assert "status_refresh_slot.set_hexpand(True)" in source
-    assert "status_refresh_slot.set_size_request(1, -1)" in source
-    assert "status_refresh_slot.set_hhomogeneous(False)" in source
-    assert "status_refresh_slot.set_vhomogeneous(True)" in source
-    assert "status_refresh_slot.set_transition_type(Gtk.StackTransitionType.NONE)" in source
     assert "status_refresh_progress_box.append(window.status_refresh_progress_text_row)" in source
     assert source.index("status_refresh_progress_box.append(window.status_refresh_progress_text_row)") < source.index("status_refresh_progress_box.append(window.status_refresh_progress_bar)")
 
@@ -171,27 +187,26 @@ def test_toolbar_spacing_is_tightened_locally_without_global_spacing_changes():
     assert "Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)" in body
     assert "spacing=8" not in body
     assert 'add_css_class("dzll-sidebar-toolbar-row")' in body
-    assert "status_refresh_progress_box.set_margin_start(9)" in body
-    assert "status_refresh_slot.set_margin_start" not in body
+    assert "status_refresh_progress_box.set_margin_start" not in body
     assert "settings_btn.set_margin" not in body
     assert "mod_manager_header_btn.set_margin" not in body
 
 
-def test_refresh_and_progress_share_one_slot_without_spinner_or_button_recreation():
+def test_refresh_button_spins_its_own_icon_and_toggles_the_sweep():
     sidebar = SIDEBAR_SOURCE.read_text(encoding="utf-8")
     source = CONTROLLER_SOURCE.read_text(encoding="utf-8")
-    slot_state = source[source.index("def _set_slot_running"):source.index("def _attempt_finished")]
+    running_state = source[source.index("def _set_slot_running"):source.index("def _attempt_finished")]
     refresh = sidebar[sidebar.index("window.refresh_status_btn = Gtk.Button()"):
                       sidebar.index("window.status_refresh_progress_box = Gtk.Box")]
-    assert "Gtk.Spinner" not in slot_state
-    assert "spinner.start" not in slot_state
-    assert "spinner.stop" not in slot_state
-    assert "set_child" not in slot_state
-    assert "slot.set_visible_child(progress)" in slot_state
-    assert "slot.set_visible_child(btn)" in slot_state
+    assert "Gtk.Spinner" not in running_state
+    assert "Gtk.Spinner" not in refresh
+    assert "set_child" not in running_state
+    assert "add_css_class(STATUS_REFRESH_SPINNING_CLASS)" in running_state
+    assert "remove_css_class(STATUS_REFRESH_SPINNING_CLASS)" in running_state
     assert "refresh_status_btn.set_size_request" not in refresh
-    assert "refresh_status_btn.set_child(Gtk.Image.new_from_icon_name" in refresh
-    assert "refresh_status_btn.connect(\"clicked\", window._status_refresh.start)" in refresh
+    assert 'window.refresh_status_icon = _sidebar_toolbar_icon("refreshIcon.svg")' in refresh
+    assert "refresh_status_btn.set_child(window.refresh_status_icon)" in refresh
+    assert 'refresh_status_btn.connect("clicked", window._status_refresh.toggle)' in refresh
 
 
 def test_idle_progress_is_hidden_and_reset():
@@ -208,21 +223,29 @@ def test_idle_progress_is_hidden_and_reset():
     assert host.status_refresh_progress_count_label.text == ""
     assert host.status_refresh_progress_count_label.tooltip is None
     assert host.status_refresh_progress_bar.fraction == 0.0
-    assert host.status_refresh_slot.visible_child is host.refresh_status_btn
 
 
-def test_slot_switches_between_original_refresh_and_progress_exclusively():
+def test_running_spins_the_original_icon_and_restores_it_with_tooltip():
     host = progress_host()
     host.c._ensure_cursor_controller = lambda _btn: False
     host.c._apply_cursor_for_state = lambda _btn: False
+    spinning = status_refresh_controller.STATUS_REFRESH_SPINNING_CLASS
 
     original_refresh = host.refresh_status_btn
+    original_icon = host.refresh_status_icon
     host.c._set_slot_running(True, generation=1)
-    assert host.status_refresh_slot.visible_child is host.status_refresh_progress_box
+    assert spinning in host.refresh_status_icon.classes
+    assert host.refresh_status_btn.tooltip == "Stop refreshing"
+    assert host.status_refresh_progress_box.visible is True
+
+    # A second running call must not capture "Stop refreshing" as the idle tooltip.
+    host.c._set_slot_running(True, generation=1)
 
     host.c._set_slot_running(False, generation=1)
-    assert host.status_refresh_slot.visible_child is original_refresh
+    assert spinning not in host.refresh_status_icon.classes
+    assert host.refresh_status_btn.tooltip == "Refresh all server status"
     assert host.refresh_status_btn is original_refresh
+    assert host.refresh_status_icon is original_icon
 
 
 def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
@@ -236,7 +259,7 @@ def test_manual_sweep_freezes_total_and_renders_initial_formatted_label():
 
     assert host.c.total == 8_900
     assert len(host.c.queue) == 8_900
-    assert host.status_refresh_progress_count_label.text == "0 / 8,900"
+    assert host.status_refresh_progress_count_label.text == "0/8900"
     assert host.status_refresh_progress_bar.fraction == 0.0
     assert host.status_refresh_progress_box.visible is True
 
@@ -311,38 +334,37 @@ def test_authoritative_helper_is_the_only_increment_owner_and_clamps():
 def test_render_is_monotonic_clamped_and_uses_completed_over_total():
     host = progress_host(total=8, completed=3)
     host.c._render_progress(1)
-    assert host.status_refresh_progress_count_label.text == "3 / 8"
+    assert host.status_refresh_progress_count_label.text == "3/8"
     assert host.status_refresh_progress_bar.fraction == pytest.approx(3 / 8)
 
     host.c.completed = 1
     host.c._render_progress(1)
-    assert host.status_refresh_progress_count_label.text == "3 / 8"
+    assert host.status_refresh_progress_count_label.text == "3/8"
     host.c.completed = 99
     host.c._render_progress(1)
-    assert host.status_refresh_progress_count_label.text == "8 / 8"
+    assert host.status_refresh_progress_count_label.text == "8/8"
     assert host.status_refresh_progress_bar.fraction == 1.0
 
 
 def test_full_progress_text_format_is_not_shortened_or_abbreviated():
-    host = progress_host(total=8_484, completed=1_464)
+    host = progress_host(total=11_090, completed=1_256)
 
     host.c._render_progress(1)
 
     assert host.status_refresh_progress_prefix_label.text == "Refreshing:"
-    assert host.status_refresh_progress_count_label.text == "1,464 / 8,484"
-    assert host.status_refresh_progress_count_label.tooltip == "Refreshing: 1,464 / 8,484"
-    assert " / " in host.status_refresh_progress_count_label.text
+    assert host.status_refresh_progress_count_label.text == "1256/11090"
+    assert host.status_refresh_progress_count_label.tooltip == "Refreshing: 1256/11090"
 
 
-def test_initial_and_final_text_keep_exact_thousands_separated_values():
+def test_initial_and_final_text_keep_exact_unseparated_values():
     host = progress_host(total=8_484, completed=0)
 
     host.c._render_progress(1)
-    assert host.status_refresh_progress_count_label.text == "0 / 8,484"
+    assert host.status_refresh_progress_count_label.text == "0/8484"
 
     host.c.completed = 8_484
     host.c._render_progress(1)
-    assert host.status_refresh_progress_count_label.text == "8,484 / 8,484"
+    assert host.status_refresh_progress_count_label.text == "8484/8484"
     assert host.status_refresh_progress_bar.fraction == 1.0
 
 
@@ -387,7 +409,7 @@ def test_final_completion_force_renders_total_then_hides_and_resets(monkeypatch)
     host.c._maybe_finish(1)
 
     assert 91 in removed
-    assert "2 / 2" in host.status_refresh_progress_count_label.history
+    assert "2/2" in host.status_refresh_progress_count_label.history
     assert host.status_refresh_progress_bar.history[-2:] == [1.0, 0.0]
     assert host.status_refresh_progress_box.visible is False
     assert host.c.running is False
@@ -422,7 +444,7 @@ def test_shutdown_clears_timer_and_blocks_later_updates(monkeypatch):
     assert host.status_refresh_progress_count_label.text == ""
 
 
-def test_repeated_click_while_running_is_ignored():
+def test_repeated_start_while_running_is_ignored():
     host = progress_host(running=True)
     host.servers = {"new": object()}
     host.c.queue = deque(["existing"])
@@ -431,6 +453,63 @@ def test_repeated_click_while_running_is_ignored():
 
     assert list(host.c.queue) == ["existing"]
     assert host.c.generation == 1
+
+
+def test_toggle_starts_when_idle_and_stops_when_running():
+    host = progress_host(running=False)
+    calls = []
+    host.c.start = lambda: calls.append("start")
+    host.c.stop = lambda: calls.append("stop")
+
+    host.c.toggle()
+    host.c.running = True
+    host.c.toggle()
+
+    assert calls == ["start", "stop"]
+
+
+def test_stop_applies_buffered_results_finishes_and_ignores_late_futures(monkeypatch):
+    host = progress_host(total=10, completed=3)
+    host.c.queue = deque(["a", "b", "c"])
+    host.c.inflight = 2
+    host.c.buffer = [("s1", {"ok": True})]
+    host.c.flush_id = 77
+    host.c.progress_update_id = 78
+    host.c._ensure_cursor_controller = lambda _btn: False
+    host.c._apply_cursor_for_state = lambda _btn: False
+    host.c._set_slot_running(True, generation=1)
+    removed = []
+    monkeypatch.setattr(status_refresh_controller.GLib, "source_remove", removed.append)
+    monkeypatch.setattr(status_refresh_controller.GLib, "idle_add", lambda *_args: 0)
+
+    host.c.stop()
+
+    assert 77 in removed and 78 in removed
+    assert host.applied == [([("s1", {"ok": True})], {"reason": "manual-status-refresh"})]
+    assert host.browser_refreshes == [True]
+    assert host.c.running is False
+    assert not host.c.queue
+    assert host.c.buffer == []
+    assert host.c.inflight == 0
+    assert host.c.generation == 2
+    assert host.status_refresh_progress_box.visible is False
+    assert status_refresh_controller.STATUS_REFRESH_SPINNING_CLASS not in host.refresh_status_icon.classes
+
+    # A query that was in flight when the sweep stopped returns later.
+    host.c._pump = lambda _generation: False
+    host.c._on_future_done(1, FakeFuture((1, ("late", {"ok": True}))))
+    assert host.c.completed == 3
+    assert host.c.buffer == []
+    assert len(host.applied) == 1
+
+
+def test_stop_when_idle_does_nothing():
+    host = progress_host(running=False)
+
+    host.c.stop()
+
+    assert host.c.generation == 1
+    assert host.browser_refreshes == []
 
 
 def test_progress_is_manual_sweep_only_and_no_manual_spinner_path_remains():
@@ -444,9 +523,9 @@ def test_progress_is_manual_sweep_only_and_no_manual_spinner_path_remains():
     assert "_status_refresh" not in row
     assert "_status_refresh" not in startup
 
-    slot_state = controller[controller.index("def _set_slot_running"):controller.index("def _attempt_finished")]
-    assert "Gtk.Spinner" not in slot_state
-    assert "spinner" not in slot_state
+    running_state = controller[controller.index("def _set_slot_running"):controller.index("def _attempt_finished")]
+    assert "Gtk.Spinner" not in running_state
+    assert "spinner" not in running_state
 
 
 def test_progress_css_is_narrowly_scoped_and_thin():
@@ -457,3 +536,11 @@ def test_progress_css_is_narrowly_scoped_and_thin():
     assert ".dzll-app-root .status-refresh-progress-bar progress" in source
     assert "min-height: 3px" in source
     assert "progressbar.status-refresh-progress-bar" not in source
+
+
+def test_refresh_spin_css_is_scoped_and_turns_counter_clockwise():
+    source = STYLES_SOURCE.read_text(encoding="utf-8")
+    assert "@keyframes dzll-status-refresh-spin" in source
+    assert "to {{ -gtk-icon-transform: rotate(-1turn); }}" in source
+    assert ".dzll-app-root image.status-refresh-spinning {{" in source
+    assert "animation: dzll-status-refresh-spin 1s linear infinite;" in source

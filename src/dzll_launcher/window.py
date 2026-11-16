@@ -711,7 +711,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 progress_box=getattr(self, "status_refresh_progress_box", None),
                 count_label=getattr(self, "status_refresh_progress_count_label", None),
                 progress_bar=getattr(self, "status_refresh_progress_bar", None),
-                slot=getattr(self, "status_refresh_slot", None),
+                icon=getattr(self, "refresh_status_icon", None),
             ),
             server_keys=lambda: list(getattr(self, "_obj_by_key", {}) or {}),
             lookup_server=lambda key: self._obj_by_key.get(key),
@@ -1110,26 +1110,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         self._browser_toast_timeout_id = 0
         self.server_list_overlay.add_overlay(self.browser_toast_label)
-
-        server_companion_show_icon = Gtk.Image.new_from_icon_name("system-shutdown-symbolic")
-        server_companion_show_icon.set_pixel_size(16)
-        server_companion_show_icon.add_css_class("server-companion-power-off-icon")
-        self.server_companion_show_icon = server_companion_show_icon
-        self.server_companion_redock_icon = Gtk.Label(label="↙")
-        self.server_companion_show_btn = Gtk.Button()
-        self.server_companion_show_btn.set_can_focus(False)
-        self.server_companion_show_btn.set_child(server_companion_show_icon)
-        self.server_companion_show_btn.add_css_class("flat")
-        self.server_companion_show_btn.add_css_class("server-companion-power-off-button")
-        self.server_companion_show_btn.set_tooltip_text("Show Server Companion")
-        self.server_companion_show_btn.set_size_request(28, 28)
-        self.server_companion_show_btn.set_halign(Gtk.Align.END)
-        self.server_companion_show_btn.set_valign(Gtk.Align.START)
-        self.server_companion_show_btn.set_margin_top(5 if self._ubuntu_geometry else 4)
-        self.server_companion_show_btn.set_margin_end(12)
-        self.server_companion_show_btn.connect("clicked", self._on_server_companion_title_button_clicked)
-        attach_pointer_cursor(self.server_companion_show_btn)
-        self.server_list_overlay.add_overlay(self.server_companion_show_btn)
 
         main.append(self.server_list_overlay)
 
@@ -2639,36 +2619,23 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._refresh_server_companion_power_controls()
 
     def _refresh_server_companion_power_controls(self):
-        show_btn = getattr(self, "server_companion_show_btn", None)
-        if show_btn is None:
+        toggle_btn = getattr(self, "server_companion_toggle_btn", None)
+        if toggle_btn is None:
             return
 
         enabled = bool(self.settings.get("show_server_companion", False))
-        undocked = enabled and not bool(self._server_companion_dock.docked)
-        show_btn.set_visible((not enabled) or undocked)
+        toggle_btn.set_tooltip_text(
+            "Turn off Server Companion" if enabled else "Turn on Server Companion"
+        )
+        dot = getattr(self, "server_companion_toggle_dot", None)
+        if dot is not None:
+            dot.set_visible(enabled)
 
-        icon = getattr(self, "server_companion_show_icon", None)
-        if undocked:
-            show_btn.remove_css_class("server-companion-power-off-button")
-            show_btn.set_tooltip_text("Redock Server Companion")
-            redock_icon = getattr(self, "server_companion_redock_icon", None)
-            if redock_icon is not None:
-                show_btn.set_child(redock_icon)
-        else:
-            show_btn.add_css_class("server-companion-power-off-button")
-            show_btn.set_tooltip_text("Show Server Companion")
-            if icon is not None:
-                show_btn.set_child(icon)
-
-    def _on_server_companion_title_button_clicked(self, *_args):
-        dock = self._server_companion_dock
-        if bool(dock.reparenting):
+    def _on_server_companion_toggle_clicked(self, *_args):
+        if bool(self._server_companion_dock.reparenting):
             return
-        if bool(self.settings.get("show_server_companion", False)):
-            if not bool(dock.docked):
-                dock.dock()
-            return
-        self.set_server_companion_enabled(True)
+        enabled = bool(self.settings.get("show_server_companion", False))
+        self.set_server_companion_enabled(not enabled)
 
     def set_server_companion_enabled(self, enabled: bool):
         enabled = bool(enabled)

@@ -590,6 +590,15 @@ def get_app_css(
           color: @dzll_accent;
         }}
 
+        @keyframes dzll-status-refresh-spin {{
+          from {{ -gtk-icon-transform: rotate(0turn); }}
+          to {{ -gtk-icon-transform: rotate(-1turn); }}
+        }}
+
+        .dzll-app-root image.status-refresh-spinning {{
+          animation: dzll-status-refresh-spin 1s linear infinite;
+        }}
+
         .dzll-app-root progressbar trough,
         .server-companion-panel progressbar trough {{
           background: @dzll_surface_control;
@@ -1132,6 +1141,15 @@ def get_app_css(
         .dzll-app-root .visible-refresh-label:backdrop {{
           color: mix(@dzll_text_disclaimer, @dzll_text_secondary, 0.3);
           font-size: 0.78em;
+        }}
+
+        .server-companion-toggle-dot {{
+          background-color: @dzll_mod_focus;
+          border-radius: 999px;
+          min-width: 6px;
+          min-height: 6px;
+          margin-top: 0;
+          margin-right: -3px;
         }}
 
         .visible-refresh-dot {{

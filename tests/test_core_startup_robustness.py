@@ -452,8 +452,11 @@ def test_real_window_companion_undock_close_redock_and_shutdown(isolated_window_
         assert undocked.get_child() is panel
         assert revealer.get_child() is None
         assert dock.shrink_source_id
-        assert window.server_companion_show_btn.get_visible()
-        assert window.server_companion_show_btn.get_tooltip_text() == "Redock Server Companion"
+        toggle = window.server_companion_toggle_btn
+        dot = window.server_companion_toggle_dot
+        assert not hasattr(window, "server_companion_show_btn")
+        assert toggle.get_tooltip_text() == "Turn off Server Companion"
+        assert dot.get_visible()
 
         undocked.close()  # real close-request: redocks and keeps the window alive
         assert dock.docked is True
@@ -461,7 +464,23 @@ def test_real_window_companion_undock_close_redock_and_shutdown(isolated_window_
         assert dock.shrink_source_id == 0
         assert revealer.get_child() is panel
         assert revealer.get_reveal_child() is True
-        assert not window.server_companion_show_btn.get_visible()
+        assert toggle.get_tooltip_text() == "Turn off Server Companion"
+
+        dock.undock()
+        toggle.emit("clicked")  # turning off while undocked reattaches the panel
+        assert window.settings["show_server_companion"] is False
+        assert dock.docked is True
+        assert dock.undocked_window is None
+        assert revealer.get_child() is panel
+        assert toggle.get_tooltip_text() == "Turn on Server Companion"
+        assert not dot.get_visible()
+
+        toggle.emit("clicked")
+        assert window.settings["show_server_companion"] is True
+        assert dock.docked is True
+        assert revealer.get_reveal_child() is True
+        assert toggle.get_tooltip_text() == "Turn off Server Companion"
+        assert dot.get_visible()
 
         dock.undock()
         assert dock.docked is False

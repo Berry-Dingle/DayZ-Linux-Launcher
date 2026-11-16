@@ -1034,6 +1034,15 @@ def build_search_area(window) -> Gtk.Widget:
 
     return search_frame
 
+SIDEBAR_TOOLBAR_ICON_PX = 16
+
+
+def _sidebar_toolbar_icon(filename: str) -> Gtk.Image:
+    image = Gtk.Image.new_from_file(os.path.join(IMAGES_DIR, filename))
+    image.set_pixel_size(SIDEBAR_TOOLBAR_ICON_PX)
+    return image
+
+
 def build_sidebar_toolbar(window) -> Gtk.Widget:
     toolbar_cell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
     toolbar_cell.add_css_class("dzll-sidebar-toolbar")
@@ -1054,10 +1063,23 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     search_header.set_valign(Gtk.Align.CENTER)
     search_header.set_overflow(Gtk.Overflow.HIDDEN)
 
+    # The four menu icons sit in a row; the refresh progress appears directly
+    # beneath them and is constrained to the row's width.
+    toolbar_icons_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+    toolbar_icons_column.add_css_class("dzll-sidebar-toolbar-icons")
+    toolbar_icons_column.set_hexpand(False)
+    toolbar_icons_column.set_halign(Gtk.Align.START)
+    toolbar_icons_column.set_valign(Gtk.Align.START)
+
+    toolbar_icons_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+    toolbar_icons_row.set_halign(Gtk.Align.START)
+    toolbar_icons_column.append(toolbar_icons_row)
+    search_header.append(toolbar_icons_column)
+
     settings_btn = Gtk.Button()
     settings_btn.set_can_focus(False)
     settings_btn.add_css_class("flat")
-    settings_btn.set_child(Gtk.Image.new_from_icon_name("preferences-system-symbolic"))
+    settings_btn.set_child(_sidebar_toolbar_icon("settingsIcon.svg"))
     settings_btn.set_tooltip_text("Settings")
     try:
         settings_btn.set_accessible_name("Settings")
@@ -1065,40 +1087,67 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
         pass
     settings_btn.connect("clicked", window._on_settings_clicked)
     attach_pointer_cursor(settings_btn)
-    search_header.append(settings_btn)
+    toolbar_icons_row.append(settings_btn)
 
     window.mod_manager_header_btn = Gtk.Button()
     window.mod_manager_header_btn.set_can_focus(False)
     window.mod_manager_header_btn.add_css_class("flat")
-    window.mod_manager_header_btn.set_child(Gtk.Image.new_from_icon_name("view-list-symbolic"))
+    window.mod_manager_header_btn.set_child(_sidebar_toolbar_icon("listIcon.svg"))
     window.mod_manager_header_btn.set_tooltip_text("Manage installed mods")
     window.mod_manager_header_btn.connect("clicked", lambda *_: window.open_mods_manager())
     attach_pointer_cursor(window.mod_manager_header_btn)
-    search_header.append(window.mod_manager_header_btn)
+    toolbar_icons_row.append(window.mod_manager_header_btn)
+
+    # Server Companion on/off. A small teal dot on the icon's top-right corner
+    # shows that the companion is on.
+    companion_enabled = bool((getattr(window, "settings", None) or {}).get("show_server_companion", False))
+    companion_icon_overlay = Gtk.Overlay()
+    companion_icon_overlay.set_child(_sidebar_toolbar_icon("eyeIcon.svg"))
+    window.server_companion_toggle_dot = Gtk.Box()
+    window.server_companion_toggle_dot.add_css_class("server-companion-toggle-dot")
+    window.server_companion_toggle_dot.set_halign(Gtk.Align.END)
+    window.server_companion_toggle_dot.set_valign(Gtk.Align.START)
+    window.server_companion_toggle_dot.set_can_target(False)
+    window.server_companion_toggle_dot.set_visible(companion_enabled)
+    companion_icon_overlay.add_overlay(window.server_companion_toggle_dot)
+
+    window.server_companion_toggle_btn = Gtk.Button()
+    window.server_companion_toggle_btn.set_can_focus(False)
+    window.server_companion_toggle_btn.add_css_class("flat")
+    window.server_companion_toggle_btn.set_child(companion_icon_overlay)
+    window.server_companion_toggle_btn.set_tooltip_text(
+        "Turn off Server Companion" if companion_enabled else "Turn on Server Companion"
+    )
+    window.server_companion_toggle_btn.connect(
+        "clicked", lambda *_: window._on_server_companion_toggle_clicked()
+    )
+    attach_pointer_cursor(window.server_companion_toggle_btn)
+    toolbar_icons_row.append(window.server_companion_toggle_btn)
 
     window.refresh_status_btn = Gtk.Button()
     window.refresh_status_btn.set_can_focus(False)
     window.refresh_status_btn.add_css_class("flat")
-    window.refresh_status_btn.set_child(Gtk.Image.new_from_icon_name("view-refresh-symbolic"))
+    window.refresh_status_icon = _sidebar_toolbar_icon("refreshIcon.svg")
+    window.refresh_status_btn.set_child(window.refresh_status_icon)
     window.refresh_status_btn.set_tooltip_text("Refresh live ping, player count, queue and online status for all servers.")
-    window.refresh_status_btn.connect("clicked", window._status_refresh.start)
+    window.refresh_status_btn.connect("clicked", window._status_refresh.toggle)
     attach_pointer_cursor(window.refresh_status_btn)
+    toolbar_icons_row.append(window.refresh_status_btn)
 
     window.status_refresh_progress_box = Gtk.Box(
         orientation=Gtk.Orientation.VERTICAL,
         spacing=2,
     )
     window.status_refresh_progress_box.add_css_class("status-refresh-progress")
-    window.status_refresh_progress_box.set_hexpand(True)
+    window.status_refresh_progress_box.set_hexpand(False)
     window.status_refresh_progress_box.set_size_request(1, -1)
-    window.status_refresh_progress_box.set_margin_start(9)
     window.status_refresh_progress_box.set_halign(Gtk.Align.FILL)
-    window.status_refresh_progress_box.set_valign(Gtk.Align.CENTER)
+    window.status_refresh_progress_box.set_valign(Gtk.Align.START)
     window.status_refresh_progress_box.set_visible(False)
 
     window.status_refresh_progress_text_row = Gtk.Box(
         orientation=Gtk.Orientation.HORIZONTAL,
-        spacing=2,
+        spacing=4,
     )
     window.status_refresh_progress_text_row.set_hexpand(True)
     window.status_refresh_progress_text_row.set_halign(Gtk.Align.FILL)
@@ -1110,7 +1159,7 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     window.status_refresh_progress_prefix_label.set_ellipsize(Pango.EllipsizeMode.END)
     window.status_refresh_progress_text_row.append(window.status_refresh_progress_prefix_label)
 
-    window.status_refresh_progress_count_label = Gtk.Label(xalign=1.0)
+    window.status_refresh_progress_count_label = Gtk.Label(xalign=0.0)
     window.status_refresh_progress_count_label.add_css_class("status-refresh-progress-label")
     window.status_refresh_progress_count_label.set_hexpand(True)
     window.status_refresh_progress_count_label.set_halign(Gtk.Align.FILL)
@@ -1129,21 +1178,7 @@ def build_sidebar_toolbar(window) -> Gtk.Widget:
     window.status_refresh_progress_bar.set_fraction(0.0)
     window.status_refresh_progress_box.append(window.status_refresh_progress_bar)
 
-    window.status_refresh_slot = Gtk.Stack()
-    window.status_refresh_slot.add_css_class("status-refresh-slot")
-    window.status_refresh_slot.set_hexpand(True)
-    window.status_refresh_slot.set_size_request(1, -1)
-    window.status_refresh_slot.set_halign(Gtk.Align.FILL)
-    window.status_refresh_slot.set_valign(Gtk.Align.CENTER)
-    window.status_refresh_slot.set_hhomogeneous(False)
-    window.status_refresh_slot.set_vhomogeneous(True)
-    window.status_refresh_slot.set_transition_type(Gtk.StackTransitionType.NONE)
-    window.refresh_status_btn.set_halign(Gtk.Align.START)
-    window.refresh_status_btn.set_valign(Gtk.Align.CENTER)
-    window.status_refresh_slot.add_named(window.refresh_status_btn, "refresh")
-    window.status_refresh_slot.add_named(window.status_refresh_progress_box, "progress")
-    window.status_refresh_slot.set_visible_child(window.refresh_status_btn)
-    search_header.append(window.status_refresh_slot)
+    toolbar_icons_column.append(window.status_refresh_progress_box)
 
     toolbar_cell.append(search_header)
     return toolbar_cell

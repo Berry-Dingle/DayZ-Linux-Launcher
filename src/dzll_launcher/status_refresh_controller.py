@@ -3,8 +3,9 @@
 The controller queries every server once through the shared live executor,
 with ``STARTUP_LIVE_REST_WORKERS`` queries in flight at most. Worker results
 return to the GTK thread through ``GLib.idle_add``, are buffered, and are
-applied in batches. A sidebar progress bar replaces the refresh button
-while the sweep runs.
+applied in batches. While the sweep runs, the refresh icon spins and a
+progress bar appears beneath the sidebar icons. Clicking the button
+again stops the sweep.
 
 Every callback carries the sweep generation. A callback from a superseded or
 cancelled sweep is ignored.
@@ -31,6 +32,7 @@ from .config import (
 from .live import query_server_live
 
 STATUS_REFRESH_PROGRESS_UPDATE_MS = 125
+STATUS_REFRESH_SPINNING_CLASS = "status-refresh-spinning"
 
 
 @dataclass(frozen=True)
@@ -41,7 +43,7 @@ class StatusRefreshWidgets:
     progress_box: Any = None
     count_label: Any = None
     progress_bar: Any = None
-    slot: Any = None
+    icon: Any = None
 
 
 class StatusRefreshController:
@@ -82,6 +84,7 @@ class StatusRefreshController:
         self.started_at = 0.0
         self.last_log_completed = 0
         self.progress_update_id = 0
+        self.idle_tooltip = None
         self.progress_last_rendered = 0
         self.scroll_value = None
         self.cursor_controller_attached = False
@@ -93,10 +96,7 @@ class StatusRefreshController:
         if btn is None:
             return False
         try:
-            if bool(self.running):
-                btn.set_cursor(None)
-            else:
-                btn.set_cursor(Gdk.Cursor.new_from_name("pointer"))
+            btn.set_cursor(Gdk.Cursor.new_from_name("pointer"))
         except Exception:
             pass
         return False
@@ -146,8 +146,6 @@ class StatusRefreshController:
         box = widgets.progress_box
         count_label = widgets.count_label
         bar = widgets.progress_bar
-        slot = widgets.slot
-        refresh_btn = widgets.button
         if not visible:
             self.progress_last_rendered = 0
             try:
@@ -158,16 +156,12 @@ class StatusRefreshController:
                     bar.set_fraction(0.0)
                 if box is not None:
                     box.set_visible(False)
-                if slot is not None and refresh_btn is not None:
-                    slot.set_visible_child(refresh_btn)
             except Exception:
                 pass
             return False
         try:
             if box is not None:
                 box.set_visible(True)
-            if slot is not None and box is not None:
-                slot.set_visible_child(box)
         except Exception:
             pass
         return False
@@ -188,7 +182,7 @@ class StatusRefreshController:
         previous = max(0, int(self.progress_last_rendered or 0))
         completed = min(total, max(previous, current))
         self.progress_last_rendered = completed
-        count_text = f"{completed:,} / {total:,}"
+        count_text = f"{completed}/{total}"
         tooltip_text = f"Refreshing: {count_text}"
         widgets = self._widgets()
         count_label = widgets.count_label
@@ -236,17 +230,22 @@ class StatusRefreshController:
         widgets = self._widgets()
         btn = widgets.button
         progress = widgets.progress_box
-        slot = widgets.slot
-        if btn is None or progress is None or slot is None:
+        icon = widgets.icon
+        if btn is None or progress is None:
             return False
         self._ensure_cursor_controller(btn)
         try:
             if running:
                 progress.set_visible(True)
-                slot.set_visible_child(progress)
+                if icon is not None and not icon.has_css_class(STATUS_REFRESH_SPINNING_CLASS):
+                    self.idle_tooltip = btn.get_tooltip_text()
+                    icon.add_css_class(STATUS_REFRESH_SPINNING_CLASS)
+                    btn.set_tooltip_text("Stop refreshing")
                 self._apply_cursor_for_state(btn)
             else:
-                slot.set_visible_child(btn)
+                if icon is not None and icon.has_css_class(STATUS_REFRESH_SPINNING_CLASS):
+                    icon.remove_css_class(STATUS_REFRESH_SPINNING_CLASS)
+                    btn.set_tooltip_text(self.idle_tooltip)
                 self._apply_cursor_for_state(btn)
         except Exception:
             return False
@@ -280,6 +279,13 @@ class StatusRefreshController:
                     self.flush_id = 0
         self._schedule_progress_update(generation)
         return True
+
+    def toggle(self, *_args):
+        """Refresh-button handler: start a sweep, or stop the running one."""
+        if bool(self.running):
+            self.stop()
+        else:
+            self.start()
 
     def start(self, *_args):
         """Begin a sweep of every current server. Ignored while one is running."""
@@ -447,6 +453,10 @@ class StatusRefreshController:
             self._flush_results(generation)
             return False
 
+        self._complete_sweep(generation, outcome="complete")
+        return False
+
+    def _complete_sweep(self, generation: int, outcome: str):
         self._cancel_progress_update(generation)
         self._render_progress(generation, force=True)
         self.running = False
@@ -471,11 +481,37 @@ class StatusRefreshController:
             elapsed = time.monotonic() - float(self.started_at or time.monotonic())
             rate = (completed / elapsed) if elapsed > 0 else 0.0
             print(
-                f"[STATUS-REFRESH] complete completed={completed}/{total} "
+                f"[STATUS-REFRESH] {outcome} completed={completed}/{total} "
                 f"elapsed={elapsed:.2f}s rate={rate:.1f}/s",
                 flush=True,
             )
         return False
+
+    def stop(self, *_args):
+        """Stop the running sweep at the user's request.
+
+        Results already received are applied and the browser is refreshed as
+        on completion. Unstarted queries are dropped, and queries still in
+        flight are ignored when they return.
+        """
+        if not bool(self.running):
+            return
+        generation = self.generation
+        self.queue = deque()
+        tid = int(self.flush_id or 0)
+        if tid:
+            try:
+                GLib.source_remove(tid)
+            except Exception:
+                pass
+        self.flush_id = 0
+        results = list(self.buffer or ())
+        self.buffer = []
+        if results:
+            self._apply_live_results(results, reason="manual-status-refresh")
+        self._complete_sweep(generation, outcome="stopped")
+        self.generation = int(self.generation or 0) + 1
+        self.inflight = 0
 
     def cancel(self):
         """Stop the current sweep and invalidate its pending callbacks (used at shutdown)."""

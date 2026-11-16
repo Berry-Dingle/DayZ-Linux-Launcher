@@ -15,98 +15,61 @@ def app_css() -> str:
 
 class _FakeButton:
     def __init__(self):
-        self.visible = None
-        self.classes = {"server-companion-power-off-button"}
         self.tooltip = ""
-        self.child = None
-
-    def set_visible(self, visible):
-        self.visible = bool(visible)
-
-    def add_css_class(self, name):
-        self.classes.add(name)
-
-    def remove_css_class(self, name):
-        self.classes.discard(name)
 
     def set_tooltip_text(self, text):
         self.tooltip = text
 
-    def set_child(self, child):
-        self.child = child
 
-
-class _FakeIcon:
+class _FakeDot:
     def __init__(self):
-        self.icon_name = "system-shutdown-symbolic"
-        self.classes = {"server-companion-power-off-icon"}
+        self.visible = None
 
-    def set_from_icon_name(self, name):
-        self.icon_name = name
-
-    def add_css_class(self, name):
-        self.classes.add(name)
-
-    def remove_css_class(self, name):
-        self.classes.discard(name)
-
-
-class _FakeLabel:
-    def __init__(self, text):
-        self.text = text
+    def set_visible(self, visible):
+        self.visible = bool(visible)
 
 
 def _companion_control_host(*, enabled: bool, docked: bool):
     return SimpleNamespace(
         settings={"show_server_companion": enabled},
         _server_companion_dock=SimpleNamespace(docked=docked),
-        server_companion_show_btn=_FakeButton(),
-        server_companion_show_icon=_FakeIcon(),
-        server_companion_redock_icon=_FakeLabel("↙"),
+        server_companion_toggle_btn=_FakeButton(),
+        server_companion_toggle_dot=_FakeDot(),
     )
 
 
-def test_companion_title_button_hidden_docked_and_shown_undocked():
-    docked = _companion_control_host(enabled=True, docked=True)
-    DZLLWindow._refresh_server_companion_power_controls(docked)
-    assert docked.server_companion_show_btn.visible is False
+def test_companion_toggle_tooltip_and_dot_follow_enabled_state():
+    off = _companion_control_host(enabled=False, docked=True)
+    DZLLWindow._refresh_server_companion_power_controls(off)
+    assert off.server_companion_toggle_btn.tooltip == "Turn on Server Companion"
+    assert off.server_companion_toggle_dot.visible is False
 
-    undocked = _companion_control_host(enabled=True, docked=False)
-    DZLLWindow._refresh_server_companion_power_controls(undocked)
-    assert undocked.server_companion_show_btn.visible is True
-    assert undocked.server_companion_show_btn.tooltip == "Redock Server Companion"
-    assert undocked.server_companion_show_btn.child is undocked.server_companion_redock_icon
-    assert undocked.server_companion_show_btn.child.text == "↙"
-    assert "server-companion-power-off-button" not in undocked.server_companion_show_btn.classes
+    for docked in (True, False):
+        on = _companion_control_host(enabled=True, docked=docked)
+        DZLLWindow._refresh_server_companion_power_controls(on)
+        assert on.server_companion_toggle_btn.tooltip == "Turn off Server Companion"
+        assert on.server_companion_toggle_dot.visible is True
 
 
-def test_companion_redock_click_uses_existing_path_once_and_preserves_state():
-    monitored = object()
-    snapshot = {"name": "Preserved server", "queue": 3}
+def test_companion_toggle_click_flips_enabled_state_and_ignores_reparenting():
     host = SimpleNamespace(
-        settings={"show_server_companion": True},
-        _server_companion_dock=SimpleNamespace(docked=False, reparenting=False),
-        _server_companion_obj=monitored,
-        _server_companion_snapshot=snapshot,
+        settings={"show_server_companion": False},
+        _server_companion_dock=SimpleNamespace(docked=True, reparenting=False),
     )
     calls = []
 
-    def dock():
-        calls.append("dock")
-        host._server_companion_dock.docked = True
+    def set_enabled(enabled):
+        calls.append(enabled)
+        host.settings["show_server_companion"] = enabled
 
-    host._server_companion_dock.dock = dock
-    DZLLWindow._on_server_companion_title_button_clicked(host)
-    DZLLWindow._on_server_companion_title_button_clicked(host)
+    host.set_server_companion_enabled = set_enabled
+    DZLLWindow._on_server_companion_toggle_clicked(host)
+    DZLLWindow._on_server_companion_toggle_clicked(host)
+    assert calls == [True, False]
 
-    assert calls == ["dock"]
-    assert host._server_companion_obj is monitored
-    assert host._server_companion_snapshot is snapshot
-
-    host._server_companion_dock.docked = False
     host._server_companion_dock.reparenting = True
-    DZLLWindow._on_server_companion_title_button_clicked(host)
-    assert calls == ["dock"]
+    DZLLWindow._on_server_companion_toggle_clicked(host)
+    assert calls == [True, False]
 
     dock_source = (ROOT / "src/dzll_launcher/server_companion_dock.py").read_text(encoding="utf-8")
     dock_block = dock_source.split("    def dock(self):", 1)[1].split(
@@ -131,25 +94,30 @@ def test_disclaimer_has_one_forced_break_and_word_wrapping():
     assert "disclaimer.set_max_width_chars(1)" in sidebar
 
 
-def test_sidebar_and_redock_control_retain_fixed_compact_structure():
+def test_sidebar_companion_toggle_replaces_title_row_control():
     sidebar = (ROOT / "src/dzll_launcher/sidebar_ui.py").read_text(encoding="utf-8")
     window = (ROOT / "src/dzll_launcher/window.py").read_text(encoding="utf-8")
     companion = (ROOT / "src/dzll_launcher/server_companion_ui.py").read_text(encoding="utf-8")
+    css = app_css()
     assert "sidebar_frame.set_size_request(SIDEBAR_WIDTH, -1)" in sidebar
     assert "sidebar_frame.set_hexpand(False)" in sidebar
     assert "sidebar_frame.set_halign(Gtk.Align.START)" in sidebar
     assert "effective = SIDEBAR_WIDTH - (SIDEBAR_INNER_PADDING * 2)" in sidebar
-    assert 'self.server_companion_redock_icon = Gtk.Label(label="↙")' in window
+    # The browser title-row power/redock button is gone; the undocked panel
+    # keeps its own redock control.
+    assert "server_companion_show_btn" not in window
+    assert "server_companion_redock_icon" not in window
     assert 'self.dock_toggle_btn.set_label("↙")' in companion
-    control_block = window.split("server_companion_show_icon =", 1)[1].split(
-        "main.append(self.server_list_overlay)", 1
+    control_block = sidebar.split("window.server_companion_toggle_btn = Gtk.Button()", 1)[1].split(
+        "toolbar_icons_row.append(window.server_companion_toggle_btn)", 1
     )[0]
-    assert "Gtk.Button()" in control_block
-    assert "Gtk.MenuButton" not in control_block
-    assert "Gtk.DropDown" not in control_block
-    assert "DZLL Server Companion" not in control_block
-    assert "set_size_request(28, 28)" in control_block
     assert 'add_css_class("flat")' in control_block
+    assert "Gtk.MenuButton" not in control_block
+    assert "window._on_server_companion_toggle_clicked()" in control_block
+    assert '_sidebar_toolbar_icon("eyeIcon.svg")' in sidebar
+    dot = css.split(".server-companion-toggle-dot {", 1)[1].split("}", 1)[0]
+    assert "background-color: @dzll_mod_focus;" in dot
+    assert "border-radius: 999px;" in dot
 
 
 def test_general_settings_actions_share_horizontal_size_group():

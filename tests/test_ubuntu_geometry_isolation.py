@@ -142,4 +142,6 @@ def test_final_header_increase_and_sc_alignment_are_ubuntu_only():
 
     assert "min-height: 38px;" in ubuntu_header
     assert "min-height" not in shared_header
-    assert "set_margin_top(5 if self._ubuntu_geometry else 4)" in window
+    # The Ubuntu-only margin belonged to the browser title-row Server Companion
+    # button, which moved to the sidebar toolbar.
+    assert "server_companion_show_btn" not in window
