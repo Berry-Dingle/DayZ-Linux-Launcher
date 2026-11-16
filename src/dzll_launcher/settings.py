@@ -16,6 +16,7 @@ DEFAULTS: Dict[str, Any] = {
     "high_ping_cutoff_ms": 250,
     "hide_below_max_players": 0,
     "hide_test_servers": True,
+    "hide_news_ticker": False,
     "prioritise_trusted_servers": False,
     "hide_official_servers": False,
     "pin_favorite_servers": False,

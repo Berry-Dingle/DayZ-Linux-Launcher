@@ -61,6 +61,9 @@ from .config import (
     OFFLINE_RECHECK_SECS,
     REFRESH_RATE_LIMIT_SECS,
     IMAGES_DIR,
+    NEWS_CACHE_PATH,
+    NEWS_STARTUP_DELAY_SECS,
+    NEWS_STATE_PATH,
     DISCLAIMER_TEXT,
     DEAD_MAX_FAILS,
     RELEASES_URL,
@@ -147,6 +150,9 @@ from .companion_learning_transfer_ui import CompanionLearningTransferController
 from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
 from .visible_refresh_indicator import VisibleRefreshIndicator
+from . import news_feed as news_feed_module
+from .news_feed import NewsFeedController
+from .news_ticker_ui import NewsTickerSection
 from .bound_row_tracker import BoundRowTracker
 from .startup_ui import build_startup_overlay
 
@@ -1115,6 +1121,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._visible_refresh_indicator = VisibleRefreshIndicator()
         main.append(self._visible_refresh_indicator.widget)
+        DZLLWindow._build_news_ticker(self)
         try:
             vadj = self.scroller.get_vadjustment()
             if vadj:
@@ -2374,6 +2381,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
         source_attrs = (
             "_steam_global_players_startup_source_id",
             "_steam_global_players_poll_source_id",
+            "_news_startup_source_id",
             "_settings_init_idle_id",
             "_startup_update_idle_id",
         )
@@ -2542,6 +2550,15 @@ class DZLLWindow(Gtk.ApplicationWindow):
             indicator = getattr(self, "_visible_refresh_indicator", None)
             if indicator is not None:
                 indicator.cleanup()
+        except Exception:
+            pass
+        try:
+            news_feed = getattr(self, "_news_feed", None)
+            if news_feed is not None:
+                news_feed.shutdown()
+            news_ticker = getattr(self, "_news_ticker", None)
+            if news_ticker is not None:
+                news_ticker.cleanup()
         except Exception:
             pass
         try:
@@ -11201,6 +11218,59 @@ class DZLLWindow(Gtk.ApplicationWindow):
     # ----------------------------
     def _set_widget_sensitive(self, *a, **kw):
         return self._settings_ui._set_widget_sensitive(*a, **kw)
+
+    # ----------------------------
+    # News ticker
+    # ----------------------------
+    def _build_news_ticker(self):
+        self._news_ticker = NewsTickerSection(
+            on_dismiss=lambda: DZLLWindow._on_news_dismiss_clicked(self)
+        )
+        self._visible_refresh_indicator.set_leading(self._news_ticker.widget)
+        self._news_feed = NewsFeedController(
+            is_hidden=lambda: bool(self.settings.get("hide_news_ticker", False)),
+            submit=lambda work: self._executor.submit(work),
+            schedule_idle=GLib.idle_add,
+            timeout_add_seconds=GLib.timeout_add_seconds,
+            source_remove=GLib.source_remove,
+            on_changed=lambda: DZLLWindow._apply_news_items(self),
+            # Looked up per call so tests can replace the network fetch.
+            fetch=lambda etag: news_feed_module.fetch_bulletin(etag),
+            cache_path=NEWS_CACHE_PATH,
+            state_path=NEWS_STATE_PATH,
+        )
+        # Cache load and the GitHub check start after the window is up.
+        self._news_startup_source_id = int(
+            GLib.timeout_add_seconds(
+                NEWS_STARTUP_DELAY_SECS, lambda: DZLLWindow._news_startup_tick(self)
+            ) or 0
+        )
+
+    def _news_startup_tick(self):
+        self._news_startup_source_id = 0
+        if not getattr(self, "_shutdown_cleanup_done", False):
+            news_feed = getattr(self, "_news_feed", None)
+            if news_feed is not None:
+                news_feed.start()
+        return False
+
+    def _apply_news_items(self):
+        news_ticker = getattr(self, "_news_ticker", None)
+        news_feed = getattr(self, "_news_feed", None)
+        if news_ticker is None or news_feed is None:
+            return
+        news_ticker.set_items(news_feed.items)
+
+    def _on_news_dismiss_clicked(self):
+        news_feed = getattr(self, "_news_feed", None)
+        if news_feed is not None:
+            news_feed.dismiss()
+        DZLLWindow._apply_news_items(self)
+
+    def _apply_news_ticker_setting(self):
+        news_feed = getattr(self, "_news_feed", None)
+        if news_feed is not None:
+            news_feed.set_hidden(bool(self.settings.get("hide_news_ticker", False)))
 
     def _apply_setting_runtime_effects(self, *a, **kw):
         return self._settings_ui._apply_setting_runtime_effects(*a, **kw)

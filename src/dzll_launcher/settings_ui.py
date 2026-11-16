@@ -1413,6 +1413,7 @@ class SettingsUI:
             default=False,
         ))
         box.append(self._settings_row_switch("Hide Test Servers By Default", "hide_test_servers", default=True))
+        box.append(self._settings_row_switch("Hide News Ticker", "hide_news_ticker", default=False))
         # These controls are currently exposed in the sidebar; the underlying
         # settings are intentionally retained for persistence and future reuse.
 
@@ -1905,6 +1906,7 @@ class SettingsUI:
         self._win._apply_setting_runtime_effects("high_ping_cutoff_ms")
         self._win._apply_setting_runtime_effects("hide_below_max_players")
         self._win._apply_setting_runtime_effects("hide_test_servers")
+        self._win._apply_setting_runtime_effects("hide_news_ticker")
         self._win._apply_setting_runtime_effects("hide_official_servers")
         self._win._apply_setting_runtime_effects("prioritise_trusted_servers")
         self._win._apply_setting_runtime_effects("pin_favorite_servers")
@@ -1991,6 +1993,9 @@ class SettingsUI:
 
         if key == "hide_test_servers":
             self._win._on_filter_changed(reason="settings")
+
+        if key == "hide_news_ticker":
+            self._win._apply_news_ticker_setting()
 
         if key == "hide_official_servers":
             self._win._on_filter_changed(reason="settings")

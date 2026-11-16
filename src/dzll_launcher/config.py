@@ -102,6 +102,16 @@ DB_URL = f"{REPO_RAW_BASE}/{DATA_BRANCH}/data/dzll-servers.db"
 DB_LOCAL_DIR = os.path.expanduser("~/.local/share/dzll")
 DB_LOCAL_PATH = os.path.join(DB_LOCAL_DIR, "dzll-servers.db")
 
+# News ticker (bottom status bar). The bulletin lives on its own branch.
+NEWS_BRANCH = "news"
+NEWS_URL = f"{REPO_RAW_BASE}/{NEWS_BRANCH}/news.json"
+NEWS_CACHE_PATH = os.path.join(CACHE_DIR, "news_cache.json")
+# Dismissal is user state, not cache: it must survive a cleared cache.
+NEWS_STATE_PATH = os.path.join(CFG_DIR, "news_state.json")
+NEWS_POLL_SECS = 45 * 60
+NEWS_STARTUP_DELAY_SECS = 2
+NEWS_FETCH_TIMEOUT_SECS = 8.0
+
 # Live refresh rules
 STARTUP_WARMUP_READY_PERCENT = 65
 STARTUP_WARMUP_MAX_WAIT_SECS = 20

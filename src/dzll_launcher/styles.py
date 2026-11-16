@@ -1143,6 +1143,48 @@ def get_app_css(
           font-size: 0.78em;
         }}
 
+        /* News ticker (left of the status text in the same bar). Label
+           colours are scoped under .dzll-app-root so they outrank the
+           app-wide label colour. */
+        .dzll-app-root .news-ticker-title,
+        .dzll-app-root .news-ticker-title:backdrop {{
+          color: @dzll_mod_focus;
+          font-size: 0.78em;
+          font-weight: bold;
+        }}
+
+        .dzll-app-root .news-ticker-text,
+        .dzll-app-root .news-ticker-text:backdrop {{
+          color: mix(@dzll_text_disclaimer, @dzll_text_secondary, 0.6);
+          font-size: 0.78em;
+        }}
+
+        .dzll-app-root button.flat.news-ticker-dismiss,
+        .dzll-app-root button.flat.news-ticker-dismiss:hover,
+        .dzll-app-root button.flat.news-ticker-dismiss:active {{
+          min-height: 0;
+          min-width: 0;
+          padding: 0;
+          margin-top: 0;
+          margin-bottom: 0;
+          border: 0;
+          border-radius: 0;
+          background: transparent;
+          box-shadow: none;
+          font-size: 0.78em;
+        }}
+
+        .dzll-app-root button.flat.news-ticker-dismiss label,
+        .dzll-app-root button.flat.news-ticker-dismiss:backdrop label {{
+          color: @dzll_mod_focus;
+          min-height: 0;
+          padding: 0;
+        }}
+
+        .dzll-app-root button.flat.news-ticker-dismiss:hover label {{
+          color: shade(@dzll_mod_focus, 1.25);
+        }}
+
         .server-companion-toggle-dot {{
           background-color: @dzll_mod_focus;
           border-radius: 999px;

@@ -193,6 +193,14 @@ def isolated_window_state(tmp_path, monkeypatch):
     # These tests exercise window construction and cleanup, not the network
     # startup updater. Prevent its idle callback from starting an executor job.
     monkeypatch.setattr(window_module.DZLLWindow, "_begin_startup_update", lambda self: False)
+    # News ticker: keep its files in the fixture and never reach GitHub.
+    monkeypatch.setattr(window_module, "NEWS_CACHE_PATH", str(cache_dir / "news_cache.json"))
+    monkeypatch.setattr(window_module, "NEWS_STATE_PATH", str(config_dir / "news_state.json"))
+    monkeypatch.setattr(
+        window_module.news_feed_module,
+        "fetch_bulletin",
+        lambda etag=None, **_kw: window_module.news_feed_module.FetchResult("error"),
+    )
     return {"config": config_dir, "cache": cache_dir}
 
 

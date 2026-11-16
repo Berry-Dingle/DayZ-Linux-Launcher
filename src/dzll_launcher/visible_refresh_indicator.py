@@ -87,6 +87,22 @@ class VisibleRefreshIndicator:
         self.divider = divider
         self.label = label
         self.dot = dot
+        self.leading = None
+
+    def set_leading(self, widget: Gtk.Widget) -> None:
+        """Place ``widget`` (the news slot) left of the status text.
+
+        The leading widget takes the flexible space; the status text keeps its
+        natural width at the right end. The bar becomes targetable so the
+        leading widget can be hovered and clicked; the status text stays
+        untargetable as before.
+        """
+        widget.set_hexpand(True)
+        self.content.set_hexpand(False)
+        self.content.set_can_target(False)
+        self.widget.prepend(widget)
+        self.widget.set_can_target(True)
+        self.leading = widget
 
     @property
     def pulse_active(self) -> bool:
