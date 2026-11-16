@@ -47,8 +47,8 @@ def test_pill_layout_and_text(indicator):
     assert indicator.label.get_next_sibling() is indicator.dot
     assert pill.get_halign() == Gtk.Align.END
     assert pill.get_valign() == Gtk.Align.END
-    assert pill.get_margin_end() == vri.VISIBLE_REFRESH_PILL_MARGIN_END >= 16
-    assert pill.get_margin_bottom() == vri.VISIBLE_REFRESH_PILL_MARGIN_BOTTOM > 0
+    assert pill.get_margin_end() == vri.VISIBLE_REFRESH_PILL_MARGIN_END == 14
+    assert pill.get_margin_bottom() == vri.VISIBLE_REFRESH_PILL_MARGIN_BOTTOM == 6
     assert pill.get_can_target() is False
     assert pill.get_can_focus() is False
     assert indicator.dot.get_size_request() == (7, 7)
@@ -154,8 +154,12 @@ def test_css_uses_dzll_tokens_and_a_plain_dot():
     assert "box-shadow: none;" in dot
     assert "animation" not in dot
     pulse = block(".visible-refresh-dot.visible-refresh-dot-pulse")
-    assert "opacity:" in pulse
     assert "animation" not in pulse
+    # Rests off (dim) and flashes on when rows update.
+    assert "opacity: 0.2;" in dot
+    assert "opacity: 1;" in pulse
+    label = block(".visible-refresh-label")
+    assert "font-weight" not in label
     pill = block(".visible-refresh-pill")
     assert "@dzll_surface_control" in pill and "@dzll_border" in pill
 

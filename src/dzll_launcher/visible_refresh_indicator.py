@@ -1,8 +1,9 @@
 # visible_refresh_indicator.py
 #
 # Small "Updating Visible Rows" pill shown in the bottom-right corner of the
-# server browser. Its dot blinks once each time the browser's visible-row live
-# refresh actually applies results (see DZLLWindow._apply_browser_live_results).
+# server browser. Its dot rests off (dim) and flashes on once each time the
+# browser's visible-row live refresh actually applies results (see
+# DZLLWindow._apply_browser_live_results).
 # There is no periodic timer here: the only timer is the one-shot source that
 # ends a blink, and it is replaced (not stacked) by a repeated refresh.
 
@@ -14,8 +15,8 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk
 
 VISIBLE_REFRESH_LABEL_TEXT = "Updating Visible Rows"
-VISIBLE_REFRESH_PILL_MARGIN_END = 22  # clears the overlay scrollbar
-VISIBLE_REFRESH_PILL_MARGIN_BOTTOM = 12
+VISIBLE_REFRESH_PILL_MARGIN_END = 14  # clears the overlay scrollbar
+VISIBLE_REFRESH_PILL_MARGIN_BOTTOM = 6
 VISIBLE_REFRESH_DOT_SIZE = 7
 VISIBLE_REFRESH_PULSE_HOLD_MS = 180
 VISIBLE_REFRESH_PULSE_CLASS = "visible-refresh-dot-pulse"

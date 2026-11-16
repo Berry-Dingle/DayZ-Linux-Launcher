@@ -1120,7 +1120,6 @@ def get_app_css(
         .visible-refresh-label {{
           color: @dzll_text_secondary;
           font-size: 0.78em;
-          font-weight: 600;
         }}
 
         .visible-refresh-dot {{
@@ -1129,12 +1128,12 @@ def get_app_css(
           box-shadow: none;
           min-width: 7px;
           min-height: 7px;
-          opacity: 1;
+          opacity: 0.2;
           transition: opacity 320ms ease-out;
         }}
 
         .visible-refresh-dot.visible-refresh-dot-pulse {{
-          opacity: 0.15;
+          opacity: 1;
           transition: opacity 90ms ease-in;
         }}
 
