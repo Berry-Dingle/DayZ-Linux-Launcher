@@ -202,6 +202,8 @@ def test_architecture_specific_package_metadata():
     assert "Architecture: amd64" in (repo / "debian/control").read_text()
     arch_recipe = (repo / "packaging/arch/PKGBUILD.template").read_text()
     assert "arch=('x86_64')" in arch_recipe
+    # makepkg's default strip alters the pinned SDK binary.
+    assert "options=('!strip')" in arch_recipe
     assert "v0.4.2-beta.tar.gz" in arch_recipe
     assert 'cd "DayZ-Linux-Launcher-0.4.2-beta"' in arch_recipe
     assert "REPLACE_WITH_V0_4_2_BETA_TAG_ARCHIVE_SHA256" in arch_recipe

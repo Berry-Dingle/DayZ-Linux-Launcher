@@ -133,3 +133,6 @@ htmlcov/
 /CLAUDE.md
 /DZLL_TECHNICAL_HANDOVER.md
 /.qwen/
+/.agents/
+/.aws/
+/.codex/
