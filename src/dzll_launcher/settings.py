@@ -19,6 +19,13 @@ DEFAULTS: Dict[str, Any] = {
     "prioritise_trusted_servers": False,
     "hide_official_servers": False,
     "pin_favorite_servers": False,
+    # Sidebar filter toggles (restored at startup)
+    "filter_show_favourites": False,
+    "filter_1pp_only": False,
+    "filter_3pp_only": False,
+    "filter_no_password": False,
+    "filter_online_only": False,
+    "filter_played_only": False,
     # Title bar counts
     "show_counts_in_title_bar": False,
     "show_counts_servers_loaded": True,
@@ -121,6 +128,9 @@ def load_settings() -> Dict[str, Any]:
         out["steam_install_type"] = "auto"
     if bool(out.get("skip_dayz_launcher", True)) and bool(out.get("minimize_dayz_launcher", False)):
         out["minimize_dayz_launcher"] = False
+    # The perspective filters are mutually exclusive in the sidebar.
+    if out["filter_1pp_only"] and out["filter_3pp_only"]:
+        out["filter_3pp_only"] = False
     return out
 
 def save_settings(settings: Dict[str, Any]) -> None:

@@ -14,6 +14,7 @@ from gi.repository import Gtk, Pango, GLib, Gio
 
 from .config import IMAGES_DIR, APP_VERSION, RELEASES_URL
 from .settings import save_settings, reset_settings, autodetect_workshop_dir
+from .sidebar_ui import store_sidebar_filter_toggle_states
 from .storage import save_last_played
 from .ui_row import hr, attach_pointer_cursor
 from .mods_ui import ModsManagerOverlay
@@ -1850,6 +1851,13 @@ class SettingsUI:
     def _on_reset_settings_clicked(self, *_args):
         # Reset DZLL settings only
         self._win.settings = reset_settings()
+        # Reset leaves the visible sidebar filter toggles unchanged, so keep
+        # their persisted state matching what the browser is showing.
+        if store_sidebar_filter_toggle_states(self._win):
+            try:
+                save_settings(self._win.settings)
+            except Exception:
+                pass
 
         try:
             self._win._ping_cutoff_ms = int(self._win.settings.get("high_ping_cutoff_ms", 250) or 250)

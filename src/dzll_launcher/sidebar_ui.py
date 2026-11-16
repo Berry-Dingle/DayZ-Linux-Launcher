@@ -40,6 +40,16 @@ MOD_CHIP_ROW_HEIGHT_ESTIMATE = 24
 MOD_CHIP_SCROLLBAR_HEIGHT_ALLOWANCE = 12
 SIDEBAR_DISCLAIMER_VERSION_SPACING = 8
 
+# Top sidebar filter toggles: (window attribute, persisted settings key).
+SIDEBAR_FILTER_TOGGLE_SETTINGS = (
+    ("cb_show_fav", "filter_show_favourites"),
+    ("cb_1pp_only", "filter_1pp_only"),
+    ("cb_3pp_only", "filter_3pp_only"),
+    ("cb_no_password", "filter_no_password"),
+    ("cb_online_only", "filter_online_only"),
+    ("cb_played_only", "filter_played_only"),
+)
+
 
 def format_sidebar_version_text(app_version=None) -> str:
     """Return the sidebar version label, e.g. ``vX.Y.Z-beta`` -> ``DZLL - vX.Y.Z Beta``.
@@ -59,6 +69,56 @@ def format_sidebar_version_text(app_version=None) -> str:
     if stage_words:
         text += " " + " ".join(word[:1].upper() + word[1:] for word in stage_words)
     return text
+
+
+def _sidebar_settings_dict(window):
+    settings = getattr(window, "settings", None)
+    return settings if isinstance(settings, dict) else None
+
+
+def store_sidebar_filter_toggle_states(window) -> bool:
+    """Copy the current top filter toggle states into ``window.settings``.
+
+    Returns True when any stored value changed. Does not save.
+    """
+    settings = _sidebar_settings_dict(window)
+    if settings is None:
+        return False
+    changed = False
+    for attr, key in SIDEBAR_FILTER_TOGGLE_SETTINGS:
+        toggle = getattr(window, attr, None)
+        if toggle is None:
+            continue
+        try:
+            active = bool(toggle.get_active())
+        except Exception:
+            continue
+        if settings.get(key) is not active:
+            settings[key] = active
+            changed = True
+    return changed
+
+
+def connect_filter_toggle_persistence(window, toggle, key):
+    """Save ``key`` whenever ``toggle`` changes state (no-op when unchanged)."""
+
+    def _on_toggled(_toggle):
+        settings = _sidebar_settings_dict(window)
+        if settings is None:
+            return
+        try:
+            active = bool(toggle.get_active())
+        except Exception:
+            return
+        if settings.get(key) is active:
+            return
+        settings[key] = active
+        try:
+            save_settings(settings)
+        except Exception as exc:
+            print(f"[UI] Could not save sidebar filter {key}: {exc}", flush=True)
+
+    toggle.connect("toggled", _on_toggled)
 
 
 def remove_mod_chip_term_from_search_text(raw_text: str, chip_index: int) -> str:
@@ -1096,6 +1156,10 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
       - window.cb_show_fav / cb_1pp_only / cb_no_password / cb_online_only / cb_played_only
       - window.reset_btn
       - window.sidebar_version_label
+
+    The top filter toggles are restored from ``window.settings`` when they are
+    created, before any filter or persistence handler is connected, so restoring
+    them triggers no filter refresh and no settings write.
     """
     sidebar_frame = Gtk.Overlay()
     sidebar_frame.add_css_class("sidebar-frame")
@@ -1197,14 +1261,22 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     window.map_dropdown.connect("notify::selected", lambda *_: timed_filter_callback("map", "map"))
     sidebar.append(window.map_dropdown)
 
-    row, window.cb_show_fav = sidebar_mini_toggle_row("Show Favourites")
+    saved_filters = _sidebar_settings_dict(window) or {}
+
+    def saved_filter(key):
+        return saved_filters.get(key) is True
+
+    restore_1pp = saved_filter("filter_1pp_only")
+    restore_3pp = saved_filter("filter_3pp_only") and not restore_1pp
+
+    row, window.cb_show_fav = sidebar_mini_toggle_row("Show Favourites", saved_filter("filter_show_favourites"))
     window.cb_show_fav.connect("toggled", lambda *_: timed_filter_callback("show-favorites", "favourites"))
     sidebar.append(row)
 
-    row, window.cb_1pp_only = sidebar_mini_toggle_row("1st Person Only")
+    row, window.cb_1pp_only = sidebar_mini_toggle_row("1st Person Only", restore_1pp)
     sidebar.append(row)
 
-    row, window.cb_3pp_only = sidebar_mini_toggle_row("3rd Person Only")
+    row, window.cb_3pp_only = sidebar_mini_toggle_row("3rd Person Only", restore_3pp)
     sidebar.append(row)
 
     connect_mutually_exclusive_checkbuttons(
@@ -1213,17 +1285,24 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
         timed_perspective_callback,
     )
 
-    row, window.cb_no_password = sidebar_mini_toggle_row("No Password")
+    row, window.cb_no_password = sidebar_mini_toggle_row("No Password", saved_filter("filter_no_password"))
     window.cb_no_password.connect("toggled", lambda *_: timed_filter_callback("no-password", "password"))
     sidebar.append(row)
 
-    row, window.cb_online_only = sidebar_mini_toggle_row("Online Only")
+    row, window.cb_online_only = sidebar_mini_toggle_row("Online Only", saved_filter("filter_online_only"))
     window.cb_online_only.connect("toggled", lambda *_: timed_filter_callback("online-only", "online"))
     sidebar.append(row)
 
-    row, window.cb_played_only = sidebar_mini_toggle_row("Previously Joined", tooltip="Show servers you have joined before")
+    row, window.cb_played_only = sidebar_mini_toggle_row(
+        "Previously Joined",
+        saved_filter("filter_played_only"),
+        tooltip="Show servers you have joined before",
+    )
     window.cb_played_only.connect("toggled", lambda *_: timed_filter_callback("played-only", "played"))
     sidebar.append(row)
+
+    for attr, key in SIDEBAR_FILTER_TOGGLE_SETTINGS:
+        connect_filter_toggle_persistence(window, getattr(window, attr), key)
 
     sidebar.append(hr())
 
