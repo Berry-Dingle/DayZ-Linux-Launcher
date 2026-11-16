@@ -1109,6 +1109,35 @@ def get_app_css(
           color: @dzll_text_primary;
         }}
 
+        .visible-refresh-pill {{
+          background: @dzll_surface_control;
+          border: 1px solid @dzll_border;
+          border-radius: 999px;
+          box-shadow: none;
+          padding: 2px 8px;
+        }}
+
+        .visible-refresh-label {{
+          color: @dzll_text_secondary;
+          font-size: 0.78em;
+          font-weight: 600;
+        }}
+
+        .visible-refresh-dot {{
+          background-color: @dzll_mod_focus;
+          border-radius: 999px;
+          box-shadow: none;
+          min-width: 7px;
+          min-height: 7px;
+          opacity: 1;
+          transition: opacity 320ms ease-out;
+        }}
+
+        .visible-refresh-dot.visible-refresh-dot-pulse {{
+          opacity: 0.15;
+          transition: opacity 90ms ease-in;
+        }}
+
         .browser-toast {{
           background: @dzll_surface_control;
           border: 1px solid @dzll_border;

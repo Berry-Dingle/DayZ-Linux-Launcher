@@ -146,6 +146,7 @@ from .companion_learning_transfer import apply_pending_import_at_startup
 from .companion_learning_transfer_ui import CompanionLearningTransferController
 from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
+from .visible_refresh_indicator import VisibleRefreshIndicator
 from .startup_ui import build_startup_overlay
 
 from .workshop_mods import (
@@ -1106,6 +1107,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
             pass
         self._browser_toast_timeout_id = 0
         self.server_list_overlay.add_overlay(self.browser_toast_label)
+
+        self._visible_refresh_indicator = VisibleRefreshIndicator()
+        self.server_list_overlay.add_overlay(self._visible_refresh_indicator.widget)
 
         server_companion_show_icon = Gtk.Image.new_from_icon_name("system-shutdown-symbolic")
         server_companion_show_icon.set_pixel_size(16)
@@ -2543,6 +2547,12 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         try:
             self._stop_browser_live_refresh()
+        except Exception:
+            pass
+        try:
+            indicator = getattr(self, "_visible_refresh_indicator", None)
+            if indicator is not None:
+                indicator.cleanup()
         except Exception:
             pass
         try:
@@ -7863,12 +7873,22 @@ class DZLLWindow(Gtk.ApplicationWindow):
             if filtered:
                 applied_rows = len(filtered)
                 self._apply_live_results(filtered, reason="browser-live")
+                DZLLWindow._pulse_visible_refresh_indicator(self)
         finally:
             if PERF_LOG_ENABLED and applied_rows > 0 and start is not None:
                 duration_ms = (time.perf_counter() - start) * 1000.0
                 print(f"[PERF] browser-live apply: rows={applied_rows} duration={duration_ms:.1f}ms", flush=True)
             self._browser_live_inflight = False
         return False
+
+    def _pulse_visible_refresh_indicator(self):
+        indicator = getattr(self, "_visible_refresh_indicator", None)
+        if indicator is None:
+            return
+        try:
+            indicator.pulse()
+        except Exception:
+            pass
 
     def _diagnose_rejected_browser_results(self, token, target_keys, results, classification, reason):
         result_keys = {k for k, _info in (results or [])}
