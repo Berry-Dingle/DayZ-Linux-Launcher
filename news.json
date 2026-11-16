@@ -3,7 +3,7 @@
   "items": [
     {
       "type": "info",
-      "message": "Welcome to the DZLL news ticker! This is where you will find all the latest goss and updates"
+      "message": "Welcome to the DZLL news ticker rev 1! This is where you will find all the latest goss and updates"
     },
     {
       "type": "warning",
