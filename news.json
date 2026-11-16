@@ -1,0 +1,18 @@
+{
+  "revision": 1,
+  "items": [
+    {
+      "type": "info",
+      "message": "Welcome to the DZLL news ticker!"
+    },
+    {
+      "type": "warning",
+      "message": "This is a test warning announcement."
+    },
+    {
+      "type": "info",
+      "message": "Visit GitHub for DZLL releases.",
+      "url": "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
+    }
+  ]
+}
