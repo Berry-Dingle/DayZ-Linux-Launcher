@@ -1,9 +1,9 @@
 # visible_refresh_indicator.py
 #
-# Small "Updating Visible Rows" pill shown in the bottom-right corner of the
-# server browser. Its dot rests off (dim) and flashes on once each time the
-# browser's visible-row live refresh actually applies results (see
-# DZLLWindow._apply_browser_live_results).
+# Full-width "Updating Visible Rows" status bar beneath the server browser,
+# with the text and dot at its bottom-right. The dot rests off (dim) and
+# flashes on once each time the browser's visible-row live refresh actually
+# applies results (see DZLLWindow._apply_browser_live_results).
 # There is no periodic timer here: the only timer is the one-shot source that
 # ends a blink, and it is replaced (not stacked) by a repeated refresh.
 
@@ -15,9 +15,13 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk
 
 VISIBLE_REFRESH_LABEL_TEXT = "Updating Visible Rows"
-VISIBLE_REFRESH_PILL_MARGIN_END = 14  # clears the overlay scrollbar
-VISIBLE_REFRESH_PILL_MARGIN_BOTTOM = 6
+# Text and dot keep the former pill's right offset (14 margin + 1 border +
+# 8 padding). Top 6 + 1 px border and bottom 7 centre the text vertically.
+VISIBLE_REFRESH_CONTENT_MARGIN_END = 23
+VISIBLE_REFRESH_CONTENT_MARGIN_BOTTOM = 7
+VISIBLE_REFRESH_CONTENT_MARGIN_TOP = 6
 VISIBLE_REFRESH_DOT_SIZE = 7
+VISIBLE_REFRESH_DIVIDER_GAP = 4  # extra space after the divider (plus box spacing)
 VISIBLE_REFRESH_PULSE_HOLD_MS = 180
 VISIBLE_REFRESH_PULSE_CLASS = "visible-refresh-dot-pulse"
 
@@ -27,17 +31,29 @@ class VisibleRefreshIndicator:
         self._pulse_source_id = 0
         self._closed = False
 
-        pill = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        pill.add_css_class("visible-refresh-pill")
-        pill.set_halign(Gtk.Align.END)
-        pill.set_valign(Gtk.Align.END)
-        pill.set_hexpand(False)
-        pill.set_vexpand(False)
-        pill.set_margin_end(VISIBLE_REFRESH_PILL_MARGIN_END)
-        pill.set_margin_bottom(VISIBLE_REFRESH_PILL_MARGIN_BOTTOM)
-        # Decorative only: pointer input passes through to the rows beneath.
-        pill.set_can_target(False)
-        pill.set_can_focus(False)
+        # The bar is a normal box below the server list (not an overlay), so
+        # the list's height excludes it and the last row is never covered.
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        bar.add_css_class("visible-refresh-bar")
+        bar.set_hexpand(True)
+        bar.set_vexpand(False)
+        bar.set_can_target(False)
+        bar.set_can_focus(False)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        content.set_hexpand(True)
+        content.set_halign(Gtk.Align.END)
+        content.set_valign(Gtk.Align.CENTER)
+        content.set_margin_end(VISIBLE_REFRESH_CONTENT_MARGIN_END)
+        content.set_margin_top(VISIBLE_REFRESH_CONTENT_MARGIN_TOP)
+        content.set_margin_bottom(VISIBLE_REFRESH_CONTENT_MARGIN_BOTTOM)
+        bar.append(content)
+
+        # Spans only the text row, so it never reaches the bar's borders.
+        divider = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        divider.add_css_class("visible-refresh-divider")
+        divider.set_valign(Gtk.Align.FILL)
+        divider.set_margin_end(VISIBLE_REFRESH_DIVIDER_GAP)
 
         label = Gtk.Label(label=VISIBLE_REFRESH_LABEL_TEXT)
         label.add_css_class("visible-refresh-label")
@@ -49,8 +65,9 @@ class VisibleRefreshIndicator:
         dot.set_halign(Gtk.Align.CENTER)
         dot.set_valign(Gtk.Align.CENTER)
 
-        pill.append(label)
-        pill.append(dot)
+        content.append(divider)
+        content.append(label)
+        content.append(dot)
         # Weak reference: the widget must not keep the indicator alive, and a
         # late GTK teardown (e.g. interpreter exit) must find nothing to do.
         owner = weakref.ref(self)
@@ -62,10 +79,12 @@ class VisibleRefreshIndicator:
                     getattr(indicator, method_name)()
             return _handler
 
-        pill.connect("unrealize", _call("reset"))
-        pill.connect("destroy", _call("cleanup"))
+        bar.connect("unrealize", _call("reset"))
+        bar.connect("destroy", _call("cleanup"))
 
-        self.widget = pill
+        self.widget = bar
+        self.content = content
+        self.divider = divider
         self.label = label
         self.dot = dot
 

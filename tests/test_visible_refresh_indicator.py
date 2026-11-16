@@ -1,4 +1,4 @@
-"""Visible-row refresh pill: real refresh trigger, repeat behaviour and cleanup."""
+"""Visible-row refresh status bar: real refresh trigger, repeat behaviour and cleanup."""
 
 import time
 from types import SimpleNamespace
@@ -13,6 +13,7 @@ from gi.repository import Gdk, GLib, Gtk
 from dzll_launcher import visible_refresh_indicator as vri
 from dzll_launcher.styles import get_app_css
 from dzll_launcher.window import DZLLWindow
+from test_core_startup_robustness import isolated_window_state  # noqa: F401  (fixture)
 
 PULSE = vri.VISIBLE_REFRESH_PULSE_CLASS
 
@@ -40,19 +41,29 @@ def _iterate_until(predicate, timeout=2.0):
     return predicate()
 
 
-def test_pill_layout_and_text(indicator):
-    pill = indicator.widget
+def test_bar_layout_and_text(indicator):
+    bar = indicator.widget
+    content = indicator.content
     assert indicator.label.get_text() == "Updating Visible Rows"
-    assert pill.get_first_child() is indicator.label
+    assert bar.has_css_class("visible-refresh-bar")
+    assert bar.get_hexpand() is True
+    assert bar.get_vexpand() is False
+    assert bar.get_first_child() is content and content.get_next_sibling() is None
+    assert content.get_first_child() is indicator.divider
+    assert indicator.divider.get_next_sibling() is indicator.label
+    assert indicator.divider.get_orientation() == Gtk.Orientation.VERTICAL
+    assert indicator.divider.get_margin_end() == vri.VISIBLE_REFRESH_DIVIDER_GAP > 0
     assert indicator.label.get_next_sibling() is indicator.dot
-    assert pill.get_halign() == Gtk.Align.END
-    assert pill.get_valign() == Gtk.Align.END
-    assert pill.get_margin_end() == vri.VISIBLE_REFRESH_PILL_MARGIN_END == 14
-    assert pill.get_margin_bottom() == vri.VISIBLE_REFRESH_PILL_MARGIN_BOTTOM == 6
-    assert pill.get_can_target() is False
-    assert pill.get_can_focus() is False
+    assert content.get_halign() == Gtk.Align.END
+    # Text and dot keep the former pill's 23 px right offset; the bar is
+    # 1 + 6 + text + 7 px tall.
+    assert content.get_margin_end() == vri.VISIBLE_REFRESH_CONTENT_MARGIN_END == 23
+    assert content.get_margin_bottom() == vri.VISIBLE_REFRESH_CONTENT_MARGIN_BOTTOM == 7
+    assert content.get_margin_top() == vri.VISIBLE_REFRESH_CONTENT_MARGIN_TOP == 6
+    assert bar.get_can_target() is False
+    assert bar.get_can_focus() is False
     assert indicator.dot.get_size_request() == (7, 7)
-    assert pill.get_visible() is True
+    assert bar.get_visible() is True
 
 
 def test_idle_indicator_has_no_timer(indicator):
@@ -158,10 +169,18 @@ def test_css_uses_dzll_tokens_and_a_plain_dot():
     # Rests off (dim) and flashes on when rows update.
     assert "opacity: 0.2;" in dot
     assert "opacity: 1;" in pulse
-    label = block(".visible-refresh-label")
+    divider = block(".dzll-app-root separator.visible-refresh-divider")
+    assert "background: @dzll_divider;" in divider
+    label = block(".dzll-app-root .visible-refresh-label:backdrop")
+    assert "color: mix(@dzll_text_disclaimer, @dzll_text_secondary, 0.3);" in label  # slightly lighter than the disclaimer
     assert "font-weight" not in label
-    pill = block(".visible-refresh-pill")
-    assert "@dzll_surface_control" in pill and "@dzll_border" in pill
+    bar = block(".dzll-app-root .visible-refresh-bar")
+    assert "background: shade(@dzll_surface_panel, 0.85);" in bar  # darker sidebar tone
+    assert "margin-top: -2px;" in bar  # last row's border tucks under the bar
+    assert "border: 0;" in bar
+    assert "border-top: 1px solid @dzll_divider;" in bar  # same as row borders
+    assert "border-radius: 0;" in bar
+    assert ".visible-refresh-pill" not in css
 
 
 # --- integration with the real browser live-refresh completion path ---
@@ -259,3 +278,22 @@ def test_window_without_indicator_is_tolerated():
     del host._visible_refresh_indicator
     _apply(host)
     assert host.applied
+
+
+def test_real_window_reserves_space_below_the_server_list(isolated_window_state):
+    from test_core_startup_robustness import _close_window, _new_app
+
+    app = _new_app()
+    window = DZLLWindow(app)
+    try:
+        bar = window._visible_refresh_indicator.widget
+        # A sibling below the server list, not an overlay on top of it.
+        assert bar.get_prev_sibling() is window.server_list_overlay
+        assert bar.get_next_sibling() is None
+        assert bar.get_parent() is window.server_list_overlay.get_parent()
+        child = window.server_list_overlay.get_first_child()
+        while child is not None:
+            assert child is not bar
+            child = child.get_next_sibling()
+    finally:
+        _close_window(app, window)

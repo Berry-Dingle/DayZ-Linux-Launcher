@@ -1108,9 +1108,6 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._browser_toast_timeout_id = 0
         self.server_list_overlay.add_overlay(self.browser_toast_label)
 
-        self._visible_refresh_indicator = VisibleRefreshIndicator()
-        self.server_list_overlay.add_overlay(self._visible_refresh_indicator.widget)
-
         server_companion_show_icon = Gtk.Image.new_from_icon_name("system-shutdown-symbolic")
         server_companion_show_icon.set_pixel_size(16)
         server_companion_show_icon.add_css_class("server-companion-power-off-icon")
@@ -1132,6 +1129,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.server_list_overlay.add_overlay(self.server_companion_show_btn)
 
         main.append(self.server_list_overlay)
+
+        self._visible_refresh_indicator = VisibleRefreshIndicator()
+        main.append(self._visible_refresh_indicator.widget)
         try:
             vadj = self.scroller.get_vadjustment()
             if vadj:

@@ -1109,16 +1109,28 @@ def get_app_css(
           color: @dzll_text_primary;
         }}
 
-        .visible-refresh-pill {{
-          background: @dzll_surface_control;
-          border: 1px solid @dzll_border;
-          border-radius: 999px;
+        .dzll-app-root .visible-refresh-bar {{
+          background: shade(@dzll_surface_panel, 0.85);
+          /* Overlap the list by 2 px so the last row's bottom border sits
+             under the bar's top border instead of doubling it. */
+          margin-top: -2px;
+          border: 0;
+          border-top: 1px solid @dzll_divider;
+          border-radius: 0;
           box-shadow: none;
-          padding: 2px 8px;
+          padding: 0;
         }}
 
-        .visible-refresh-label {{
-          color: @dzll_text_secondary;
+        .dzll-app-root separator.visible-refresh-divider {{
+          background: @dzll_divider;
+          min-width: 1px;
+          margin-top: 2px;
+          margin-bottom: 2px;
+        }}
+
+        .dzll-app-root .visible-refresh-label,
+        .dzll-app-root .visible-refresh-label:backdrop {{
+          color: mix(@dzll_text_disclaimer, @dzll_text_secondary, 0.3);
           font-size: 0.78em;
         }}
 
