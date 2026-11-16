@@ -15,6 +15,10 @@
 # (queue_draw), never the allocation, so it costs no relayout of the browser.
 # The frame tick runs only while the marquee is mapped, has text and is not
 # hovered.
+#
+# An announcement with an https URL ends with a blue, underlined "Click here".
+# Only that link is clickable: hovering it shows the URL as a tooltip and a
+# pointer cursor, and a click opens it in the default browser.
 
 import os
 
@@ -23,7 +27,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Graphene", "1.0")
 gi.require_version("Pango", "1.0")
-from gi.repository import GLib, Graphene, Gtk, Pango
+from gi.repository import Gdk, Gio, GLib, Graphene, Gtk, Pango
 
 from .config import IMAGES_DIR
 from .ui_row import attach_pointer_cursor
@@ -54,6 +58,39 @@ NEWS_DISMISS_MARGIN_START = 12
 NEWS_DISMISS_MARGIN_END = 10
 
 _WARNING_RGB = (0xD6, 0xA9, 0x4F)  # @dzll_warning
+# A cool blue that sits beside the teal (@dzll_mod_focus #4fb8b2) accents.
+_LINK_RGB = (0x5A, 0xB0, 0xE8)
+NEWS_LINK_TEXT = "Click here"
+NEWS_LINK_JOIN = " "
+
+
+def announcement_entry(item):
+    """Return (text, rgb or None, link byte range or None, url or None)."""
+    text, rgb = announcement_display(item)
+    url = getattr(item, "url", None)
+    if not is_openable_url(url):
+        return text, rgb, None, None
+    start = len((text + NEWS_LINK_JOIN).encode("utf-8"))
+    text = text + NEWS_LINK_JOIN + NEWS_LINK_TEXT
+    return text, rgb, (start, len(text.encode("utf-8"))), url
+
+
+def is_openable_url(url) -> bool:
+    """Only https links (already enforced when the bulletin is parsed)."""
+    return isinstance(url, str) and url.lower().startswith("https://") and not any(
+        ch.isspace() for ch in url
+    )
+
+
+def open_news_url(url) -> bool:
+    """Open a bulletin link in the default browser. Never raises."""
+    if not is_openable_url(url):
+        return False
+    try:
+        Gio.AppInfo.launch_default_for_uri(url, None)
+        return True
+    except Exception:
+        return False
 
 
 def _attr_fg(rgb, start, end):
@@ -117,7 +154,8 @@ class NewsMarquee(Gtk.Widget):
         self.set_overflow(Gtk.Overflow.HIDDEN)
         self.set_hexpand(True)
         self.set_valign(Gtk.Align.CENTER)
-        self._entries = ()  # ((text, rgb or None), ...)
+        self._entries = ()  # ((text, rgb, link byte range, url), ...)
+        self._link_px = []  # per entry: (x0, x1) of "Click here", or None
         self._layouts = []
         self._widths = []
         self._bullet_rise = None
@@ -139,7 +177,7 @@ class NewsMarquee(Gtk.Widget):
 
     @property
     def text(self) -> str:
-        return "\n".join(text for text, _rgb in self._entries)
+        return "\n".join(entry[0] for entry in self._entries)
 
     @property
     def ticking(self) -> bool:
@@ -163,7 +201,7 @@ class NewsMarquee(Gtk.Widget):
         return self._clip_width(self.get_width())
 
     def set_items(self, items) -> None:
-        entries = tuple(announcement_display(item) for item in items)
+        entries = tuple(announcement_entry(item) for item in items)
         if entries == self._entries:
             return
         self._entries = entries
@@ -189,6 +227,29 @@ class NewsMarquee(Gtk.Widget):
     def cleanup(self) -> None:
         self._closed = True
         self._remove_tick()
+
+    def item_at(self, x, width=None):
+        """Index of the announcement drawn under widget x, or None."""
+        self._ensure_layouts()
+        viewport = self._clip_width(self.get_width() if width is None else width)
+        if x < 0 or x >= viewport:
+            return None
+        for index, left in self.positions(width):
+            if left <= x < left + self._widths[index]:
+                return index
+        return None
+
+    def url_at(self, x, width=None):
+        """The URL when widget x is over a "Click here" link, or None."""
+        self._ensure_layouts()
+        viewport = self._clip_width(self.get_width() if width is None else width)
+        if x < 0 or x >= viewport:
+            return None
+        for index, left in self.positions(width):
+            span = self._link_px[index] if index < len(self._link_px) else None
+            if span is not None and left + span[0] <= x < left + span[1]:
+                return self._entries[index][3]
+        return None
 
     def positions(self, width=None):
         """[(index, x)] of the announcements visible at ``width`` (widget px)."""
@@ -303,19 +364,33 @@ class NewsMarquee(Gtk.Widget):
         layouts = []
         widths = []
         line_h = 0
-        for text, rgb in self._entries:
+        link_px = []
+        for text, rgb, link, _url in self._entries:
             layout = self.create_pango_layout(text)
             attrs = Pango.AttrList()
+            message_end = link[0] if link else len(text.encode("utf-8"))
             if rgb is not None:
-                attrs.insert(_attr_fg(rgb, 0, len(text.encode("utf-8"))))
+                attrs.insert(_attr_fg(rgb, 0, message_end))
+            if link is not None:
+                attrs.insert(_attr_fg(_LINK_RGB, link[0], link[1]))
+                underline = Pango.attr_underline_new(Pango.Underline.SINGLE)
+                underline.start_index, underline.end_index = link
+                attrs.insert(underline)
             if text.startswith(NEWS_ITEM_BULLET):
                 for attr in self._bullet_attrs():
                     attrs.insert(attr)
             layout.set_attributes(attrs)
             w, h = layout.get_pixel_size()
+            if link is not None:
+                # The link is the last run, so it ends at the layout width.
+                x0 = layout.index_to_pos(link[0]).x / Pango.SCALE
+                link_px.append((x0, float(w)))
+            else:
+                link_px.append(None)
             layouts.append(layout)
             widths.append(max(1, w))
             line_h = max(line_h, h)
+        self._link_px = link_px
         ellipsis = self.create_pango_layout(NEWS_ELLIPSIS_TEXT)
         self._ellipsis_w, ellipsis_h = ellipsis.get_pixel_size()
         self._ellipsis_layout = ellipsis
@@ -404,8 +479,9 @@ class NewsTickerSection:
     to its right keeps its end alignment.
     """
 
-    def __init__(self, on_dismiss):
+    def __init__(self, on_dismiss, open_url=open_news_url):
         self._on_dismiss = on_dismiss
+        self._open_url = open_url
 
         slot = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
         slot.add_css_class("news-ticker-slot")
@@ -438,8 +514,17 @@ class NewsTickerSection:
         marquee = NewsMarquee()
         hover = Gtk.EventControllerMotion.new()
         hover.connect("enter", lambda *_a: marquee.set_paused(True))
-        hover.connect("leave", lambda *_a: marquee.set_paused(False))
+        hover.connect("leave", lambda *_a: self._on_marquee_leave())
+        hover.connect("motion", lambda _c, x, _y: self._update_link_cursor(x))
         marquee.add_controller(hover)
+
+        # Linked announcements: pointer cursor, URL tooltip, click to open.
+        click = Gtk.GestureClick.new()
+        click.set_button(Gdk.BUTTON_PRIMARY)
+        click.connect("released", self._on_marquee_released)
+        marquee.add_controller(click)
+        marquee.set_has_tooltip(True)
+        marquee.connect("query-tooltip", self._on_marquee_query_tooltip)
 
         dismiss = Gtk.Button(label=NEWS_DISMISS_TEXT)
         dismiss.set_has_frame(False)
@@ -462,6 +547,7 @@ class NewsTickerSection:
         self.divider = divider
         self.marquee = marquee
         self.hover = hover
+        self.click = click
         self.dismiss_button = dismiss
 
     @property
@@ -479,6 +565,38 @@ class NewsTickerSection:
 
     def cleanup(self) -> None:
         self.marquee.cleanup()
+
+    def _update_link_cursor(self, x) -> None:
+        cursor = "pointer" if self.marquee.url_at(x) else None
+        try:
+            self.marquee.set_cursor(Gdk.Cursor.new_from_name(cursor) if cursor else None)
+        except Exception:
+            pass
+
+    def _on_marquee_leave(self) -> None:
+        self.marquee.set_paused(False)
+        try:
+            self.marquee.set_cursor(None)
+        except Exception:
+            pass
+
+    def _on_marquee_released(self, _gesture, n_press, x, _y) -> bool:
+        if n_press != 1:
+            return False
+        url = self.marquee.url_at(x)
+        if not url:
+            return False
+        try:
+            return bool(self._open_url(url))
+        except Exception:
+            return False
+
+    def _on_marquee_query_tooltip(self, _widget, x, _y, _keyboard, tooltip) -> bool:
+        url = self.marquee.url_at(x)
+        if not url:
+            return False
+        tooltip.set_text(url)
+        return True
 
     def _on_dismiss_clicked(self, *_args):
         # Hide at once; the controller persists the dismissal off-thread.

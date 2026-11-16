@@ -178,7 +178,7 @@ def test_each_announcement_starts_with_a_bullet_and_keeps_warning_colour():
     marquee = ntu.NewsMarquee()
     marquee.set_items(ITEMS)
     lines = marquee.text.split("\n")
-    assert lines == [ntu.announcement_display(i)[0] for i in ITEMS]
+    assert lines == [ntu.announcement_entry(i)[0] for i in ITEMS]
     assert all(line.startswith(ntu.NEWS_ITEM_BULLET) for line in lines)
     assert all(line.count("●") == 1 for line in lines)  # no separators between items
 
@@ -599,3 +599,160 @@ def test_bullet_is_vertically_centred_and_followed_by_a_2px_gap(app_css):
     gap = (layout.index_to_pos(text_start).x - plain.index_to_pos(text_start).x) / scale
     assert gap == pytest.approx(ntu.NEWS_ITEM_BULLET_GAP_PX, abs=0.05)
     assert layout.index_to_pos(0).x == 0  # nothing added before the bullet
+
+
+# --- clickable links -------------------------------------------------------------
+
+URL = "https://github.com/x/releases"
+LINKED = (
+    NewsItem("info", "No link here"),
+    NewsItem("info", "Visit GitHub for DZLL releases.", URL),
+)
+
+
+def _linked_ticker(width=700, opened=None):
+    ticker = ntu.NewsTickerSection(
+        on_dismiss=lambda: None,
+        open_url=(lambda url: opened.append(url) or True) if opened is not None else (lambda url: True),
+    )
+    ticker.set_items(LINKED)
+    marquee = ticker.marquee
+    marquee._ensure_layouts()
+    # The linked announcement fully on screen; pin the widget width.
+    marquee._current = 1
+    marquee._distance = float(marquee._widths[1] + 10)
+    marquee.get_width = lambda: width
+    left = dict(marquee.positions(width))[1]
+    x0, x1 = marquee._link_px[1]
+    return ticker, marquee, left, x0, x1
+
+
+def test_linked_announcement_ends_with_click_here():
+    entry = ntu.announcement_entry(LINKED[1])
+    text, rgb, link, url = entry
+    assert text == "● Visit GitHub for DZLL releases. Click here"
+    assert text.encode("utf-8")[link[0]:link[1]].decode("utf-8") == "Click here"
+    assert url == URL and rgb is None
+    assert ntu.announcement_entry(LINKED[0])[2:] == (None, None)
+    warning = ntu.announcement_entry(NewsItem("warning", "Careful", URL))
+    assert warning[0].endswith("Careful Click here") and warning[1] == ntu._WARNING_RGB
+
+
+def test_only_click_here_is_blue_and_underlined():
+    marquee = ntu.NewsMarquee()
+    marquee.set_items((LINKED[0], LINKED[1], NewsItem("warning", "Careful", URL)))
+    marquee._ensure_layouts()
+
+    def attrs(layout, kind):
+        return [a for a in layout.get_attributes().get_attributes() if a.klass.type == kind]
+
+    assert attrs(marquee._layouts[0], Pango.AttrType.UNDERLINE) == []
+    for index in (1, 2):
+        link = marquee._entries[index][2]
+        (u,) = attrs(marquee._layouts[index], Pango.AttrType.UNDERLINE)
+        assert (u.start_index, u.end_index) == link
+        colours = {
+            (a.start_index, a.end_index): a.as_color().color.to_string()
+            for a in attrs(marquee._layouts[index], Pango.AttrType.FOREGROUND)
+        }
+        r, g, b = ntu._LINK_RGB
+        assert colours[link] == "#%04x%04x%04x" % (r * 257, g * 257, b * 257)
+    # The warning message keeps its colour up to the link.
+    warn_colours = {
+        (a.start_index, a.end_index)
+        for a in attrs(marquee._layouts[2], Pango.AttrType.FOREGROUND)
+    }
+    assert (0, marquee._entries[2][2][0]) in warn_colours
+
+
+def test_only_the_click_here_text_is_clickable():
+    opened = []
+    ticker, marquee, left, x0, x1 = _linked_ticker(opened=opened)
+    assert 0 < x0 < x1 == marquee._widths[1]
+    assert ticker._on_marquee_released(ticker.click, 1, left + x0 + 1, 5) is True
+    assert ticker._on_marquee_released(ticker.click, 1, left + x1 - 1, 5) is True
+    assert opened == [URL, URL]
+    assert ticker._on_marquee_released(ticker.click, 1, left + 2, 5) is False  # message text
+    assert ticker._on_marquee_released(ticker.click, 1, left + x0 - 2, 5) is False
+    assert ticker._on_marquee_released(ticker.click, 1, left + x1 + 2, 5) is False  # gap
+    assert ticker._on_marquee_released(ticker.click, 2, left + x0 + 1, 5) is False  # double click
+    assert opened == [URL, URL]
+
+
+def test_hit_testing_ignores_the_ellipsis_slot_and_plain_items():
+    ticker, marquee, left, x0, x1 = _linked_ticker()
+    viewport = marquee._clip_width(700)
+    assert marquee.url_at(viewport + 1) is None
+    assert marquee.url_at(-1) is None
+    assert marquee.item_at(left + 1) == 1
+    pos = dict(marquee.positions(700))
+    if 0 in pos and pos[0] + marquee._widths[0] > 1:
+        assert marquee.url_at(max(0.0, pos[0]) + 1) is None
+
+
+def test_tooltip_and_cursor_only_over_click_here():
+    class Tip:
+        text = None
+
+        def set_text(self, text):
+            self.text = text
+
+    ticker, marquee, left, x0, x1 = _linked_ticker()
+    tip = Tip()
+    assert ticker._on_marquee_query_tooltip(marquee, left + x0 + 1, 5, False, tip) is True
+    assert tip.text == URL
+    assert ticker._on_marquee_query_tooltip(marquee, left + 2, 5, False, Tip()) is False
+    ticker._update_link_cursor(left + x0 + 1)
+    assert marquee.get_cursor() is not None and marquee.get_cursor().get_name() == "pointer"
+    ticker._update_link_cursor(left + 2)
+    assert marquee.get_cursor() is None
+    ticker._update_link_cursor(left + x0 + 1)
+    ticker._on_marquee_leave()
+    assert marquee.get_cursor() is None and marquee.paused is False
+
+
+def test_link_keeps_the_line_height(app_css):
+    marquee = ntu.NewsMarquee()
+    root = Gtk.Box()
+    root.add_css_class("dzll-app-root")
+    root.append(marquee)
+    marquee.set_items((LINKED[0],))
+    plain_h = marquee.measure(Gtk.Orientation.VERTICAL, -1)[1]
+    marquee.set_items(LINKED)
+    assert marquee.measure(Gtk.Orientation.VERTICAL, -1)[1] == plain_h
+
+
+@pytest.mark.parametrize(
+    "url", ["http://example.com", "javascript:alert(1)", "steam://run/221100", "file:///etc/passwd", "https://a b", None, 5]
+)
+def test_unsafe_or_missing_urls_get_no_link(url, monkeypatch):
+    launched = []
+    monkeypatch.setattr(ntu.Gio.AppInfo, "launch_default_for_uri", lambda u, ctx: launched.append(u))
+    assert ntu.open_news_url(url) is False
+    assert launched == []
+    text, _rgb, link, link_url = ntu.announcement_entry(NewsItem("info", "x", url))
+    assert (link, link_url) == (None, None)
+    assert ntu.NEWS_LINK_TEXT not in text
+
+
+def test_open_news_url_uses_the_default_browser_and_never_raises(monkeypatch):
+    launched = []
+    monkeypatch.setattr(ntu.Gio.AppInfo, "launch_default_for_uri", lambda u, ctx: launched.append(u))
+    assert ntu.open_news_url("https://github.com/x") is True
+    assert launched == ["https://github.com/x"]
+
+    def boom(u, ctx):
+        raise RuntimeError("no handler")
+
+    monkeypatch.setattr(ntu.Gio.AppInfo, "launch_default_for_uri", boom)
+    assert ntu.open_news_url("https://github.com/x") is False
+    assert "xdg-open" not in inspect.getsource(ntu)
+
+
+def test_link_change_alone_rebuilds_the_layouts():
+    marquee = ntu.NewsMarquee()
+    marquee.set_items((NewsItem("info", "same"),))
+    marquee._ensure_layouts()
+    marquee.set_items((NewsItem("info", "same", "https://github.com/x"),))
+    assert marquee._entries[0][3] == "https://github.com/x"
+    assert marquee._layouts == []  # rebuilt on next draw
