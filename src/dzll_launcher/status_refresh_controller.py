@@ -9,6 +9,12 @@ again stops the sweep.
 
 Every callback carries the sweep generation. A callback from a superseded or
 cancelled sweep is ignored.
+
+The same widgets also show an *external* sweep that the controller does not
+run, such as the window's startup A2S sweep (``show_external_progress`` /
+``end_external_progress``). It looks exactly like a manual sweep, and clicking
+the spinning button asks the owner to stop it through the ``on_stop``
+callback it supplied.
 """
 
 from __future__ import annotations
@@ -85,6 +91,11 @@ class StatusRefreshController:
         self.last_log_completed = 0
         self.progress_update_id = 0
         self.idle_tooltip = None
+        self.external_active = False
+        self.external_completed = 0
+        self.external_total = 0
+        self.external_update_id = 0
+        self._external_stop = None
         self.progress_last_rendered = 0
         self.scroll_value = None
         self.cursor_controller_attached = False
@@ -182,6 +193,11 @@ class StatusRefreshController:
         previous = max(0, int(self.progress_last_rendered or 0))
         completed = min(total, max(previous, current))
         self.progress_last_rendered = completed
+        self._show_count(completed, total)
+        return False
+
+    def _show_count(self, completed: int, total: int):
+        """Show ``Refreshing: completed/total`` and the bar. Shared by manual and external sweeps."""
         count_text = f"{completed}/{total}"
         tooltip_text = f"Refreshing: {count_text}"
         widgets = self._widgets()
@@ -193,10 +209,9 @@ class StatusRefreshController:
                 count_label.set_tooltip_text(tooltip_text)
             if bar is not None:
                 bar.set_fraction(completed / total)
-            self._set_progress_visible(True, generation=generation)
+            self._set_progress_visible(True)
         except Exception:
             pass
-        return False
 
     def _schedule_progress_update(self, generation: int):
         if generation != self.generation:
@@ -281,11 +296,85 @@ class StatusRefreshController:
         return True
 
     def toggle(self, *_args):
-        """Refresh-button handler: start a sweep, or stop the running one."""
+        """Refresh-button handler: start a sweep, or stop the running one.
+
+        While an external sweep is shown, the click asks its owner to stop it.
+        """
         if bool(self.running):
             self.stop()
+        elif bool(self.external_active):
+            on_stop = self._external_stop
+            self.end_external_progress()
+            if callable(on_stop):
+                try:
+                    on_stop()
+                except Exception:
+                    pass
         else:
             self.start()
+
+    # ------------------------------------------------------ external sweeps
+
+    def show_external_progress(self, completed: int, total: int, on_stop=None) -> bool:
+        """Show progress for a sweep the controller does not run.
+
+        The first call spins the refresh icon and shows the progress line.
+        Later calls update the count; repaints are coalesced like a manual
+        sweep's. Ignored while a manual sweep owns the widgets, or with no
+        targets. Returns True when the progress is shown.
+        """
+        if self._is_shut_down() or bool(self.running):
+            return False
+        total = max(0, int(total or 0))
+        if total <= 0:
+            return False
+        completed = min(total, max(0, int(completed or 0)))
+        self._external_stop = on_stop
+        self.external_total = total
+        self.external_completed = completed
+        if not bool(self.external_active):
+            self.external_active = True
+            self._set_slot_running(True)
+            self._render_external_progress()
+            return True
+        if not int(self.external_update_id or 0):
+            try:
+                self.external_update_id = GLib.timeout_add(
+                    STATUS_REFRESH_PROGRESS_UPDATE_MS,
+                    self._render_external_progress,
+                )
+            except Exception:
+                self.external_update_id = 0
+        return True
+
+    def _render_external_progress(self):
+        self.external_update_id = 0
+        if not bool(self.external_active) or self._is_shut_down():
+            return False
+        total = max(0, int(self.external_total or 0))
+        if total <= 0:
+            return False
+        completed = min(total, max(0, int(self.external_completed or 0)))
+        self._show_count(completed, total)
+        return False
+
+    def end_external_progress(self):
+        """Hide external-sweep progress and restore the idle refresh icon. Idempotent."""
+        source_id = int(self.external_update_id or 0)
+        if source_id:
+            try:
+                GLib.source_remove(source_id)
+            except Exception:
+                pass
+        self.external_update_id = 0
+        was_active = bool(self.external_active)
+        self.external_active = False
+        self._external_stop = None
+        self.external_completed = 0
+        self.external_total = 0
+        if was_active and not bool(self.running):
+            self._set_slot_running(False)
+            self._set_progress_visible(False)
 
     def start(self, *_args):
         """Begin a sweep of every current server. Ignored while one is running."""
@@ -515,6 +604,7 @@ class StatusRefreshController:
 
     def cancel(self):
         """Stop the current sweep and invalidate its pending callbacks (used at shutdown)."""
+        self.end_external_progress()
         generation = int(self.generation or 0)
         tid = int(self.flush_id or 0)
         if tid:

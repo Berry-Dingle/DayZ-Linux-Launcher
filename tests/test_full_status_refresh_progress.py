@@ -512,7 +512,7 @@ def test_stop_when_idle_does_nothing():
     assert host.browser_refreshes == []
 
 
-def test_progress_is_manual_sweep_only_and_no_manual_spinner_path_remains():
+def test_progress_shows_manual_and_startup_sweeps_and_no_manual_spinner_path_remains():
     controller = CONTROLLER_SOURCE.read_text(encoding="utf-8")
     source = WINDOW_SOURCE.read_text(encoding="utf-8")
     manual = controller[controller.index("    def start(self"):controller.index("    def _query_one")]
@@ -521,7 +521,12 @@ def test_progress_is_manual_sweep_only_and_no_manual_spinner_path_remains():
     startup = source[source.index("def _submit_startup_rest_batches"):source.index("def _refresh_browser_after_status_refresh")]
     assert "_render_progress" in manual
     assert "_status_refresh" not in row
-    assert "_status_refresh" not in startup
+    # The startup sweep only *displays* its progress through the controller's
+    # external-sweep API; it never runs a manual sweep.
+    assert "controller.show_external_progress(" in startup
+    assert "controller.end_external_progress()" in startup
+    assert "_status_refresh.start" not in startup
+    assert "_status_refresh.toggle" not in startup
 
     running_state = controller[controller.index("def _set_slot_running"):controller.index("def _attempt_finished")]
     assert "Gtk.Spinner" not in running_state

@@ -5467,6 +5467,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
         self._server_companion_rows_loaded = True
         DZLLWindow._log_a2s_sweep_terminal(self, "superseded")
+        DZLLWindow._end_startup_sweep_progress(self)
         self._startup_live_generation = int(getattr(self, "_startup_live_generation", 0) or 0) + 1
         self._restore_server_companion_if_enabled()
         self._set_updating(True, "Updating The Server Database, Please Wait…")
@@ -5946,6 +5947,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             terminal_outcome = "published_post_load_failed"
             logger.exception("Experimental startup row batching failed after publication")
             DZLLWindow._log_a2s_sweep_terminal(self, "cancelled")
+            DZLLWindow._end_startup_sweep_progress(self)
             self._startup_live_generation = int(
                 getattr(self, "_startup_live_generation", 0) or 0
             ) + 1
@@ -7129,6 +7131,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
 
     def _submit_startup_rest_batches(self, keys, warmup_count=0):
         DZLLWindow._log_a2s_sweep_terminal(self, "superseded")
+        DZLLWindow._end_startup_sweep_progress(self)
         keys = list(keys or [])
         eligible_keys = keys[:max(0, int(warmup_count or 0))]
         startup_completed = bool(
@@ -7359,6 +7362,50 @@ class DZLLWindow(Gtk.ApplicationWindow):
                 self._startup_live_rest_inflight = max(0, int(getattr(self, "_startup_live_rest_inflight", 0) or 0) - 1)
                 self._startup_live_rest_completed = int(getattr(self, "_startup_live_rest_completed", 0) or 0) + 1
 
+        DZLLWindow._show_startup_sweep_progress(self, generation)
+        self._maybe_finish_startup_rest_sweep(generation)
+        return False
+
+    def _show_startup_sweep_progress(self, generation: int):
+        """Show the startup A2S sweep in the sidebar refresh button and progress line."""
+        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
+            return False
+        if getattr(self, "_startup_sweep_progress_stopped_generation", None) == generation:
+            return False
+        controller = getattr(self, "_status_refresh", None)
+        if controller is None:
+            return False
+        try:
+            controller.show_external_progress(
+                int(getattr(self, "_startup_live_rest_completed", 0) or 0),
+                int(getattr(self, "_startup_live_rest_total", 0) or 0),
+                on_stop=lambda gen=generation: DZLLWindow._stop_startup_rest_sweep(self, gen),
+            )
+        except Exception:
+            pass  # Progress display must never affect the sweep.
+        return False
+
+    def _end_startup_sweep_progress(self):
+        controller = getattr(self, "_status_refresh", None)
+        if controller is None:
+            return
+        try:
+            controller.end_external_progress()
+        except Exception:
+            pass  # Progress display must never affect the sweep.
+
+    def _stop_startup_rest_sweep(self, generation: int):
+        """User stop from the refresh button: drop queued servers, let in-flight queries finish.
+
+        The sweep then completes through ``_maybe_finish_startup_rest_sweep``
+        as usual (results flushed, warm-up revealed, suggestion sweep marked
+        complete), so no startup invariant is skipped.
+        """
+        if generation != int(getattr(self, "_startup_live_generation", 0) or 0):
+            return False
+        self._startup_sweep_progress_stopped_generation = generation
+        DZLLWindow._log_a2s_sweep_terminal(self, "stopped", generation)
+        self._startup_live_rest_queue = deque()
         self._maybe_finish_startup_rest_sweep(generation)
         return False
 
@@ -7462,6 +7509,7 @@ class DZLLWindow(Gtk.ApplicationWindow):
             )
             self._complete_startup_warmup(generation, reveal_reason=reveal_reason)
         self._suggestion_sweep_complete = True
+        DZLLWindow._end_startup_sweep_progress(self)
         DZLLWindow._log_a2s_sweep_terminal(self, "exhausted", generation)
         if PERF_LOG_ENABLED and getattr(self, "_startup_perf_sweep_logged_generation", 0) != generation:
             self._startup_perf_sweep_logged_generation = generation
