@@ -1172,6 +1172,42 @@ def get_app_css(
           border: 0;
         }}
 
+        /* Suggestion rows are Gtk.ListBox rows: own their colours so themes
+           (e.g. Breeze `list row`, `row.activatable:hover`) cannot paint a
+           light base or system-blue highlight behind DZLL text. */
+        .mod-suggestion-list row,
+        .mod-suggestion-list row:backdrop {{
+          background: transparent;
+          color: @dzll_text_primary;
+          box-shadow: none;
+        }}
+
+        .mod-suggestion-list row label {{
+          color: @dzll_text_primary;
+        }}
+
+        .mod-suggestion-list row:hover,
+        .mod-suggestion-list row:active {{
+          background: @dzll_accent_hover;
+          color: @dzll_text_on_accent;
+        }}
+
+        .mod-suggestion-list row:selected,
+        .mod-suggestion-list row:selected:backdrop {{
+          background: @dzll_selection;
+          color: @dzll_text_on_accent;
+        }}
+
+        .mod-suggestion-list row:selected:hover {{
+          background: @dzll_accent_hover;
+        }}
+
+        .mod-suggestion-list row:hover label,
+        .mod-suggestion-list row:active label,
+        .mod-suggestion-list row:selected label {{
+          color: @dzll_text_on_accent;
+        }}
+
         .mod-suggestion-scroller scrollbar,
         .mod-suggestion-scroller scrollbar trough {{
           background: transparent;

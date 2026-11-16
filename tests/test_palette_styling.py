@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 from dzll_launcher.styles import get_app_css
@@ -93,6 +94,45 @@ def test_tooltip_label_text_colour_is_owned_by_dzll():
     css = app_css()
     rule = css.split("tooltip.background label {", 1)[1].split("}", 1)[0]
     assert "color: @dzll_text_primary;" in rule
+
+
+def _rule_after(css: str, selector_head: str) -> str:
+    return css.split(selector_head, 1)[1].split("{", 1)[1].split("}", 1)[0]
+
+
+def test_mod_suggestion_rows_own_background_text_hover_and_selection():
+    css = app_css()
+    base = _rule_after(css, ".mod-suggestion-list row,\n        .mod-suggestion-list row:backdrop")
+    assert "background: transparent;" in base
+    assert "color: @dzll_text_primary;" in base
+    assert "color: @dzll_text_primary;" in _rule_after(css, ".mod-suggestion-list row label ")
+
+    hover = _rule_after(css, ".mod-suggestion-list row:hover,\n        .mod-suggestion-list row:active ")
+    assert "background: @dzll_accent_hover;" in hover
+    assert "color: @dzll_text_on_accent;" in hover
+
+    selected = _rule_after(
+        css, ".mod-suggestion-list row:selected,\n        .mod-suggestion-list row:selected:backdrop ")
+    assert "background: @dzll_selection;" in selected
+    assert "color: @dzll_text_on_accent;" in selected
+    assert "background: @dzll_accent_hover;" in _rule_after(css, ".mod-suggestion-list row:selected:hover ")
+
+    labels = css.split(".mod-suggestion-list row:hover label,", 1)[1].split("}", 1)[0]
+    assert ".mod-suggestion-list row:active label" in labels
+    assert ".mod-suggestion-list row:selected label" in labels
+    assert "color: @dzll_text_on_accent;" in labels
+
+    # Only existing DZLL tokens; no hard-coded colours in the suggestion row rules.
+    block = css.split(".mod-suggestion-list row,", 1)[1].split(".mod-suggestion-scroller scrollbar,", 1)[0]
+    assert "#" not in block
+
+
+def test_mod_suggestion_row_colours_keep_readable_contrast():
+    css = app_css()
+    tokens = dict(re.findall(r"@define-color (\w+) (#[0-9a-fA-F]{6});", css))
+    assert _contrast(tokens["dzll_text_primary"], tokens["dzll_surface_content"]) >= 4.5
+    for background in ("dzll_selection", "dzll_accent_hover"):
+        assert _contrast(tokens["dzll_text_on_accent"], tokens[background]) >= 4.5
 
 
 def test_root_and_feature_styling_hooks_are_applied():
