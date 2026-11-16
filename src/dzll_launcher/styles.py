@@ -1792,6 +1792,12 @@ def get_app_css(
           font-style: italic;
           font-size: 0.88em;
         }}
+
+        .dzll-app-root .sidebar-version,
+        .dzll-app-root .sidebar-version:backdrop {{
+          color: @dzll_text_disclaimer;
+          font-size: 0.82em;
+        }}
         
         /* ---------- Startup dimmer + band ---------- */
         .startup-dim {{

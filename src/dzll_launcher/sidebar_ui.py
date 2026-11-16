@@ -13,6 +13,7 @@ gi.require_version("GdkPixbuf", "2.0")
 from gi.repository import Gtk, Gio, Pango, GLib, Gdk, GdkPixbuf
 
 from .config import (
+    APP_VERSION,
     SIDEBAR_WIDTH,
     SIDEBAR_INNER_PADDING,
     DISCLAIMER_TEXT,
@@ -37,6 +38,27 @@ MOD_CHIP_AREA_OVERFLOW_PAD_BOTTOM = 2
 MOD_CHIP_AREA_MARGIN_BOTTOM = 2
 MOD_CHIP_ROW_HEIGHT_ESTIMATE = 24
 MOD_CHIP_SCROLLBAR_HEIGHT_ALLOWANCE = 12
+SIDEBAR_DISCLAIMER_VERSION_SPACING = 8
+
+
+def format_sidebar_version_text(app_version=None) -> str:
+    """Return the sidebar version label, e.g. ``vX.Y.Z-beta`` -> ``DZLL - vX.Y.Z Beta``.
+
+    The version is read from ``config.APP_VERSION`` (the same value shown in
+    Settings > About), so it follows each release bump automatically.
+    """
+    raw = str(APP_VERSION if app_version is None else app_version).strip()
+    if not raw:
+        return "DZLL"
+    base, _sep, stage = raw.partition("-")
+    base = base.strip()
+    if base and not base.lower().startswith("v"):
+        base = f"v{base}"
+    text = f"DZLL - {base}"
+    stage_words = stage.replace("-", " ").split()
+    if stage_words:
+        text += " " + " ".join(word[:1].upper() + word[1:] for word in stage_words)
+    return text
 
 
 def remove_mod_chip_term_from_search_text(raw_text: str, chip_index: int) -> str:
@@ -1073,6 +1095,7 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
       - window.map_dropdown
       - window.cb_show_fav / cb_1pp_only / cb_no_password / cb_online_only / cb_played_only
       - window.reset_btn
+      - window.sidebar_version_label
     """
     sidebar_frame = Gtk.Overlay()
     sidebar_frame.add_css_class("sidebar-frame")
@@ -1498,6 +1521,19 @@ def build_sidebar(window, include_toolbar: bool = True) -> Gtk.Widget:
     disclaimer.set_size_request(effective, -1)
     disclaimer.add_css_class("disclaimer")
     bottom_section.append(disclaimer)
+
+    version_gap = Gtk.Box()
+    version_gap.set_size_request(-1, SIDEBAR_DISCLAIMER_VERSION_SPACING)
+    bottom_section.append(version_gap)
+
+    version_label = Gtk.Label(label=format_sidebar_version_text())
+    version_label.set_xalign(0.5)
+    version_label.set_justify(Gtk.Justification.CENTER)
+    version_label.set_halign(Gtk.Align.CENTER)
+    version_label.set_hexpand(False)
+    version_label.add_css_class("sidebar-version")
+    window.sidebar_version_label = version_label
+    bottom_section.append(version_label)
     sidebar.append(bottom_section)
 
     return sidebar_frame
