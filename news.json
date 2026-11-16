@@ -1,17 +1,17 @@
 {
-  "revision": 1,
+  "revision": 2,
   "items": [
     {
       "type": "info",
-      "message": "Welcome to the DZLL news ticker!"
+      "message": "Welcome to the DZLL news ticker! This is where you will find all the latest goss and updates"
     },
     {
       "type": "warning",
-      "message": "This is a test warning announcement."
+      "message": "This is a test warning announcement. If there are any serious issues you need to know about you will find it here"
     },
     {
       "type": "info",
-      "message": "Visit GitHub for DZLL releases.",
+      "message": "Visit GitHub for DZLL releases. Thanks for using DZLL and thanks for all your support",
       "url": "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
     }
   ]
