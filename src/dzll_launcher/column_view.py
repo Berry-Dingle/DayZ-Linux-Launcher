@@ -2518,7 +2518,7 @@ def build_server_column_view(
         active_css_class="monitor-btn-active",
         is_active=is_monitored,
         tooltip_text="Monitor this server in\nthe Server Companion",
-        active_tooltip_text="Currently monitoring this server",
+        active_tooltip_text="Currently monitoring this server\nClick to stop monitoring",
         factory_name="monitor",
         perf_metrics=perf_metrics,
         drag_light=drag_light,

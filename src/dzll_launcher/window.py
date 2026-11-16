@@ -9149,6 +9149,11 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._hi_executor.submit(worker)
 
     def _monitor_server_companion_for_obj(self, obj: ServerObject):
+        # Clicking the eye of the server already being monitored stops
+        # monitoring it (the panel's Clear path) but keeps the panel open.
+        if self._is_server_companion_monitoring_obj(obj):
+            self.clear_server_companion()
+            return
         self.set_server_companion_server(obj)
         if not bool(self.settings.get("show_server_companion", False)):
             self.set_server_companion_enabled(True)
