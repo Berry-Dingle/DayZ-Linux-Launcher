@@ -42,8 +42,8 @@ NEWS_ITEM_BULLET_SCALE = 0.75
 # Extra space between the bullet and the announcement text.
 NEWS_ITEM_BULLET_GAP_PX = 2
 NEWS_WARNING_PREFIX = "⚠ "
+# Drawn flush against the clipped text edge ("text..."), with no gap.
 NEWS_ELLIPSIS_TEXT = "..."
-NEWS_ELLIPSIS_GAP_PX = 4
 NEWS_SCROLL_PX_PER_SEC = 32.0
 # The next announcement enters when the previous one's trailing edge reaches
 # this fraction of the viewport width (0.5 = the midpoint).
@@ -319,7 +319,7 @@ class NewsMarquee(Gtk.Widget):
 
         if distance < self._widths[self._current]:
             snapshot.save()
-            snapshot.translate(_point(viewport + NEWS_ELLIPSIS_GAP_PX, y))
+            snapshot.translate(_point(viewport, y))
             snapshot.append_layout(self._ellipsis_layout, color)
             snapshot.restore()
 
@@ -342,7 +342,7 @@ class NewsMarquee(Gtk.Widget):
         self._distance = min(self._distance, self._widths[self._current] + gap)
 
     def _clip_width(self, width):
-        return max(0, int(width) - self._ellipsis_w - NEWS_ELLIPSIS_GAP_PX)
+        return max(0, int(width) - self._ellipsis_w)
 
     def _pixel(self, value) -> float:
         try:

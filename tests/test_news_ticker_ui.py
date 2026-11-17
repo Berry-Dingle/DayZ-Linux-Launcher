@@ -308,6 +308,48 @@ def test_ellipsis_marks_unrevealed_text_at_the_right_edge():
     assert marquee.ellipsis_visible(width=width) is False
 
 
+def test_ellipsis_touches_the_clipped_text_with_no_gap(monkeypatch):
+    # "news text line..." rather than "news text line ...": the ellipsis
+    # starts exactly where the text clip ends.
+    width = 300
+    marquee, viewport = _viewport_marquee(ITEMS, width)
+    assert viewport == width - marquee._ellipsis_w
+    assert not hasattr(ntu, "NEWS_ELLIPSIS_GAP_PX")
+
+    class _Snap:
+        def __init__(self):
+            self.clip = None
+            self.at = (0.0, 0.0)
+            self.drawn = []
+
+        def push_clip(self, rect):
+            self.clip = rect.get_width()
+
+        def pop(self):
+            pass
+
+        def save(self):
+            pass
+
+        def restore(self):
+            self.at = (0.0, 0.0)
+
+        def translate(self, point):
+            self.at = (point.x, point.y)
+
+        def append_layout(self, layout, _color):
+            self.drawn.append((layout, self.at[0]))
+
+    monkeypatch.setattr(marquee, "get_width", lambda: width)
+    monkeypatch.setattr(marquee, "get_height", lambda: 20)
+    snap = _Snap()
+    marquee.do_snapshot(snap)
+    assert snap.clip == viewport
+    ((_, ellipsis_x),) = [d for d in snap.drawn if d[0] is marquee._ellipsis_layout]
+    assert ellipsis_x == viewport
+    assert ellipsis_x + marquee._ellipsis_w == width  # flush right, nothing wasted
+
+
 def test_ticking_only_while_mapped_with_text_and_not_hovered():
     indicator, ticker, window = _status_bar()
     try:
