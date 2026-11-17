@@ -145,7 +145,12 @@ from .styles import add_platform_css_classes, get_app_css
 from .update_ui import UpdateUI
 from .restart_learning_notice_ui import RestartLearningNoticeUI
 from .startup_presentation import StartupPresentationCoordinator
-from .companion_learning_transfer import apply_pending_import_at_startup
+from .companion_learning_deletion import (
+    StartupDeletionResult,
+    apply_pending_deletion_at_startup,
+    pending_learning_changes_conflict,
+)
+from .companion_learning_transfer import StartupImportResult, apply_pending_import_at_startup
 from .companion_learning_transfer_ui import CompanionLearningTransferController
 from .settings_ui import SettingsUI
 from .sidebar_ui import build_search_area, build_sidebar, build_sidebar_toolbar
@@ -607,15 +612,31 @@ class DZLLWindow(Gtk.ApplicationWindow):
         # validation, schema-3 projection, scoring) loads off the GTK thread.
         # Until it is installed a non-learning placeholder stands in.
         self._companion_import_startup_result = None
+        self._companion_deletion_startup_result = None
         self._companion_restart_phase2 = Phase2RestartRuntime.loading_placeholder(
             active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH
         )
 
         def load_phase2_learning_runtime():
-            import_result = apply_pending_import_at_startup(
-                config_dir=Path(COMPANION_RESTART_LEARNING_PHASE2_PATH).parent,
-                live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
-            )
+            learning_dir = Path(COMPANION_RESTART_LEARNING_PHASE2_PATH).parent
+            # A staged import and a staged deletion are mutually exclusive;
+            # if both exist neither is applied.  Either one is applied under
+            # the writer lock before the learning runtime opens.
+            if pending_learning_changes_conflict(learning_dir):
+                import_result = StartupImportResult(
+                    "none", live_path=Path(COMPANION_RESTART_LEARNING_PHASE2_PATH)
+                )
+                deletion_result = StartupDeletionResult("conflict")
+            else:
+                import_result = apply_pending_import_at_startup(
+                    config_dir=learning_dir,
+                    live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+                )
+                deletion_result = apply_pending_deletion_at_startup(
+                    config_dir=learning_dir,
+                    live_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
+                )
+            self._companion_deletion_startup_result = deletion_result
             if import_result.safe_to_initialize:
                 loaded = _initialize_companion_restart_runtime_for_window(
                     active_path=COMPANION_RESTART_LEARNING_PHASE2_PATH,
@@ -1198,6 +1219,9 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self.server_companion_panel.set_on_alert_test_clicked(self.test_server_companion_alert_sound)
         self.server_companion_panel.set_on_dock_toggle(self._server_companion_dock.toggle)
         self.server_companion_panel.set_on_power_off(lambda *_: self.set_server_companion_enabled(False))
+        self.server_companion_panel.set_on_delete_learning(
+            self._on_server_companion_delete_learning_clicked
+        )
         self.server_companion_panel.set_docked(True)
         self.server_companion_panel.set_restart_alert_enabled(self._server_companion_restart_alert_enabled)
         self.server_companion_panel.set_alert_sound(self._server_companion_alert_sound)
@@ -2864,6 +2888,17 @@ class DZLLWindow(Gtk.ApplicationWindow):
         self._companion_import_startup_result = import_result
         self._companion_restart_phase2 = runtime
         DZLLWindow._enable_companion_background_persistence(self)
+        # Settings was built before the loader applied any pending import or
+        # deletion, so its pending line and button states are stale until
+        # refreshed here.
+        controller = getattr(self, "companion_learning_transfer", None)
+        if controller is not None:
+            try:
+                controller.refresh_pending_state()
+            except Exception as exc:
+                self._debug_server_companion_alert(
+                    f"learning transfer pending refresh failed safely: {exc!r}"
+                )
         notice = None
         try:
             notice = self._server_companion_import_startup_notice() or runtime.pending_notice
@@ -3237,6 +3272,41 @@ class DZLLWindow(Gtk.ApplicationWindow):
             except Exception:
                 blocked = False
         panel.set_learning_blocked(blocked)
+        DZLLWindow._refresh_server_companion_delete_learning_state(self, key)
+
+    def _refresh_server_companion_delete_learning_state(self, key=None) -> None:
+        """Enable the panel bin, or disable it with the reason as tooltip."""
+
+        panel = getattr(self, "server_companion_panel", None)
+        controller = getattr(self, "companion_learning_transfer", None)
+        if panel is None or controller is None or not hasattr(panel, "set_delete_learning_state"):
+            return
+        if key is None:
+            key_of = getattr(self, "_server_companion_restart_learning_key", None)
+            key = key_of() if callable(key_of) else None
+        try:
+            reason = controller.server_deletion_block_reason(key)
+        except Exception:
+            logger.exception("SC learning deletion: bin state evaluation failed")
+            reason = None
+        panel.set_delete_learning_state(reason is None, reason)
+
+    def _on_server_companion_delete_learning_clicked(self) -> None:
+        """Panel bin: confirm deleting the monitored server's learning data.
+
+        The server identity and name are captured now, so a later server
+        switch cannot change what the confirmation deletes.
+        """
+
+        key = self._server_companion_restart_learning_key()
+        controller = getattr(self, "companion_learning_transfer", None)
+        if not key or controller is None:
+            return
+        snapshot = getattr(self, "_server_companion_snapshot", None) or {}
+        name = str(snapshot.get("name") or "") if isinstance(snapshot, dict) else ""
+        if not name:
+            name = str(getattr(getattr(self, "_server_companion_obj", None), "name", "") or "")
+        controller.choose_delete_server(key, name)
 
     def _surface_restart_learning_persistence_notice(self) -> bool:
         runtime = getattr(self, "_companion_restart_phase2", None)
@@ -5029,7 +5099,18 @@ class DZLLWindow(Gtk.ApplicationWindow):
     def _server_companion_import_startup_notice(self):
         result = getattr(self, "_companion_import_startup_result", None)
         if result is None or not result.notice_title:
-            return None
+            deletion = getattr(self, "_companion_deletion_startup_result", None)
+            if deletion is None or not deletion.notice_title:
+                return None
+            return RuntimeNotice(
+                kind=(
+                    "learning_data_deleted"
+                    if deletion.status == "applied"
+                    else "initialization_failed"
+                ),
+                title=deletion.notice_title,
+                body=deletion.notice_body or "",
+            )
         return RuntimeNotice(
             kind=(
                 "corrupt_state_recovered"

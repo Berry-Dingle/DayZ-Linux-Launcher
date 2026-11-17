@@ -64,7 +64,8 @@ def test_ui_routes_three_decisions_and_prevents_duplicate_actions():
     assert '("Keep Pending Import", self._hide_feedback, ())' in source
     assert '("Cancel Pending Import", confirmed, ())' in source
     assert "self._feedback_buttons.set_homogeneous(pending_cancel_actions)" in source
-    assert "width = 160 if pending_cancel_actions else 140" in source
+    assert 'button.add_css_class("warning-btn")' in source
+    assert "width = 160 if pending_cancel_actions else 140" not in source
     restart_later_tail = source.split(
         "if restart_now:", 1
     )[1].split("    def _refresh_sensitivity", 1)[0]
@@ -84,7 +85,7 @@ def test_user_visible_replacement_copy_is_not_additive():
     assert "will be imported" not in combined
     assert "Imported {self.server_count}" not in combined
     assert 'return "Server Companion learning database replaced"' in transfer_source
-    assert 'f"The new database contains {records}. "' in transfer_source
+    assert 'f"The new database contains {records}.\\n"' in transfer_source
 
 
 def test_startup_apply_precedes_runtime_initialization_and_power_path_is_unchanged():

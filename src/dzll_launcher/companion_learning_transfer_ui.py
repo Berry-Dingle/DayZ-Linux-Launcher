@@ -6,13 +6,21 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
-from gi.repository import GLib, Gtk
+from gi.repository import GLib, Gtk, Pango
 
+from .companion_learning_deletion import (
+    SCOPE_ALL,
+    SCOPE_SERVERS,
+    pending_deletion_exists,
+    pending_import_exists,
+    stage_pending_deletion,
+)
 from .companion_learning_transfer import (
     PendingImportError,
     cancel_pending_import,
     default_export_filename,
     format_learned_server_records,
+    format_quarantined_note,
     pending_import_paths,
     read_pending_import,
     stage_pending_import,
@@ -20,6 +28,22 @@ from .companion_learning_transfer import (
     write_export_file,
 )
 from .config import CFG_DIR
+
+
+DELETE_ALL_TOOLTIP = "Permanently delete all restart-learning data."
+DELETE_BLOCKED_BY_IMPORT_TOOLTIP = (
+    "Unavailable while a learning database replacement is pending.\n"
+    "Cancel it or restart DZLL first."
+)
+# Overlay card geometry: the standard confirmation card width (as the Flatpak
+# recovery and join cards) with the body wrapped at a readable width.
+FEEDBACK_CARD_WIDTH = 520
+FEEDBACK_TEXT_MAX_WIDTH_CHARS = 60
+# Actions that safely cancel a confirmation; a click outside the card runs it.
+FEEDBACK_SCRIM_DISMISS_LABELS = frozenset({"Cancel", "Keep Pending Import"})
+DELETE_LOADING_TOOLTIP = "Unavailable while Server Companion learning is loading."
+DELETE_NO_LEARNING_TOOLTIP = "No learning data has been saved for this server."
+DANGER_ACTION_CSS = "companion-learning-danger-action"
 
 
 logger = logging.getLogger(__name__)
@@ -35,6 +59,7 @@ class CompanionLearningTransferController:
         self._export_button = None
         self._import_button = None
         self._cancel_button = None
+        self._delete_all_button = None
         self._pending_container = None
         self._status_label = None
         self._import_chooser = None
@@ -45,14 +70,16 @@ class CompanionLearningTransferController:
         self._feedback_title = None
         self._feedback_body = None
         self._feedback_buttons = None
+        self._feedback_dismiss = None
 
     def bind_settings_widgets(
         self, *, export_button, import_button, cancel_button, pending_container,
-        status_label,
+        status_label, delete_all_button=None,
     ) -> None:
         self._export_button = export_button
         self._import_button = import_button
         self._cancel_button = cancel_button
+        self._delete_all_button = delete_all_button
         self._pending_container = pending_container
         self._status_label = status_label
         self.refresh_pending_state()
@@ -62,6 +89,29 @@ class CompanionLearningTransferController:
         if self._pending_container is not None:
             self._pending_container.set_visible(pending is not None)
         self._refresh_sensitivity()
+        refresh = getattr(self._win, "_refresh_server_companion_delete_learning_state", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                logger.exception("SC learning deletion: bin state refresh failed")
+
+    def server_deletion_block_reason(self, server_key: str | None) -> str | None:
+        """Why the panel bin is unavailable for ``server_key``, or ``None``."""
+
+        runtime = getattr(self._win, "_companion_restart_phase2", None)
+        if runtime is None or bool(getattr(runtime, "loading", False)):
+            return DELETE_LOADING_TOOLTIP
+        if pending_import_exists(CFG_DIR):
+            return DELETE_BLOCKED_BY_IMPORT_TOOLTIP
+        has_learning = getattr(runtime, "has_learning_for", None)
+        if server_key and callable(has_learning):
+            try:
+                if not has_learning(server_key):
+                    return DELETE_NO_LEARNING_TOOLTIP
+            except Exception:
+                logger.exception("SC learning deletion: learning lookup failed")
+        return None
 
     def choose_export(self, *_args) -> None:
         if self._busy:
@@ -131,11 +181,16 @@ class CompanionLearningTransferController:
                 if error is not None:
                     self._show_message("Export failed", str(error), error=True)
                     return
-                self._show_message(
-                    "Learning data exported",
+                body = (
                     "Exported a database containing "
-                    f"{format_learned_server_records(snapshot.server_count)} to:\n{path}",
+                    f"{format_learned_server_records(snapshot.server_count)} to:\n{path}"
                 )
+                note = format_quarantined_note(
+                    len(getattr(snapshot, "quarantined_server_keys", ()) or ())
+                )
+                if note:
+                    body += f"\n\n{note}"
+                self._show_message("Learning data exported", body)
 
             self._run_off_gtk_thread(
                 lambda: write_export_file(path, snapshot.canonical_bytes), written
@@ -177,6 +232,14 @@ class CompanionLearningTransferController:
     def choose_import(self, *_args) -> None:
         if self._busy:
             logger.debug("SC learning import: duplicate action blocked while busy")
+            return
+        if pending_deletion_exists(CFG_DIR):
+            self._show_message(
+                "Import unavailable",
+                "A Server Companion learning data deletion is pending. "
+                "Restart DZLL to complete it before importing a database.",
+                error=True,
+            )
             return
         logger.debug("SC learning import: opening native file chooser")
         self._set_busy(True, "Choose a schema-4 JSON file…")
@@ -240,7 +303,8 @@ class CompanionLearningTransferController:
 
         self._show_feedback(
             "Cancel pending learning database replacement?",
-            "This removes only the staged private copy. The current Server Companion learning database is unchanged.",
+            "This removes only the staged private copy.\n"
+            "The current Server Companion learning database is unchanged.",
             actions=(
                 ("Keep Pending Import", self._hide_feedback, ()),
                 ("Cancel Pending Import", confirmed, ()),
@@ -340,9 +404,12 @@ class CompanionLearningTransferController:
             "The current Server Companion learning database will be completely replaced with the selected database.\n"
             "A permanent backup of the current database will be created before replacement.\n\n"
             f"File: {validated.source_filename}\nSchema: {validated.schema_version}\n"
-            f"The selected database contains {records}.\n"
+            f"The selected database contains {records}.\n\n"
             "DZLL must restart to complete the replacement."
         )
+        note = format_quarantined_note(getattr(validated, "quarantined_server_count", 0))
+        if note:
+            body += f"\n\n{note}"
         if replacing:
             body += "\n\nThe currently staged replacement will be replaced by this selected database."
         body += "\n\nLearning data may contain server addresses and historical observations."
@@ -405,15 +472,142 @@ class CompanionLearningTransferController:
                 return
             self._show_message(
                 "Database replacement staged",
-                "DZLL will close. Reopen it to apply the pending database replacement.",
+                "DZLL will close.\nReopen it to apply the pending database replacement.",
             )
             app.quit()
             return
+
+    # ------------------------------------------------------------------
+    # Learning data deletion (staged; applied at the next startup)
+    # ------------------------------------------------------------------
+
+    def choose_delete_all(self, *_args) -> None:
+        if self._busy:
+            return
+        if pending_import_exists(CFG_DIR):
+            self._show_message(
+                "Deletion unavailable", DELETE_BLOCKED_BY_IMPORT_TOOLTIP, error=True
+            )
+            return
+        body = (
+            "All restart-learning data for every server will be permanently deleted.\n"
+            "This cannot be undone.\n"
+            "DZLL does not keep a backup of the deleted data.\n\n"
+            "Exporting your learning data first is strongly recommended, so it can be "
+            "imported again later.\n\n"
+            "DZLL will restart to complete the deletion.\n"
+            "Server Companion will open without a monitored server.\n"
+            "Settings, favourites and alert preferences are not changed."
+        )
+        self._show_deletion_confirmation(
+            "Delete all Server Companion learning data?",
+            body,
+            scope=SCOPE_ALL,
+            server_keys=(),
+        )
+
+    def choose_delete_server(self, server_key: str | None, server_name: str = "") -> None:
+        if self._busy:
+            return
+        key = str(server_key or "").strip()
+        if not key:
+            return
+        reason = self.server_deletion_block_reason(key)
+        if reason is not None:
+            self._show_message("Deletion unavailable", reason, error=True)
+            return
+        name = str(server_name or "").strip() or key
+        body = (
+            f"Server: {name}\n\n"
+            "Only the restart-learning data for this monitored server will be "
+            "permanently deleted.\n"
+            "Learning data for all other servers is kept.\n"
+            "This cannot be undone.\n"
+            "DZLL does not keep a backup of the deleted data.\n\n"
+            "Exporting your learning data first is recommended.\n\n"
+            "DZLL will restart to complete the deletion.\n"
+            "Server Companion will open without a monitored server."
+        )
+        self._show_deletion_confirmation(
+            "Delete learning data for this server?",
+            body,
+            scope=SCOPE_SERVERS,
+            server_keys=(key,),
+        )
+
+    def _show_deletion_confirmation(self, title, body, *, scope, server_keys) -> None:
+        keys = tuple(server_keys)
+
+        def export_first():
+            self._hide_feedback()
+            self.choose_export()
+
+        def delete_now():
+            self._hide_feedback()
+            self._stage_deletion(scope=scope, server_keys=keys)
+
+        self._show_feedback(
+            title,
+            body,
+            actions=(
+                ("Cancel", self._hide_feedback, ()),
+                ("Export Data", export_first, ()),
+                ("Delete and Restart", delete_now, (DANGER_ACTION_CSS,)),
+            ),
+            error=True,
+        )
+
+    def _stage_deletion(self, *, scope: str, server_keys: tuple[str, ...]) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self._set_busy(True, "Preparing learning data deletion…")
+        logger.debug(
+            "SC learning deletion: staging scope=%s servers=%d", scope, len(server_keys)
+        )
+        self._run_off_gtk_thread(
+            lambda: stage_pending_deletion(
+                config_dir=CFG_DIR, scope=scope, server_keys=server_keys
+            ),
+            lambda _result, error: self._deletion_staged(error),
+        )
+
+    def _deletion_staged(self, error) -> None:
+        self._set_busy(False)
+        if bool(getattr(self._win, "_shutdown_cleanup_done", False)):
+            return
+        if error is not None:
+            logger.error("SC learning deletion staging failed: %s", error)
+            self._show_message("Learning data deletion failed", str(error), error=True)
+            return
+        # D5: after the restart Server Companion shows no monitored server.
+        # The panel's Clear path ends monitoring and forgets the last server.
+        if getattr(self._win, "_server_companion_obj", None) is not None:
+            try:
+                self._win.clear_server_companion()
+            except Exception:
+                logger.exception("SC learning deletion: clearing the monitored server failed")
+        app = self._win.get_application()
+        request = getattr(app, "request_restart", None)
+        if callable(request):
+            request()
+            return
+        self._show_message(
+            "Learning data deletion staged",
+            "DZLL will close.\nReopen it to complete the deletion.",
+        )
+        app.quit()
 
     def _refresh_sensitivity(self) -> None:
         for button in (self._export_button, self._import_button, self._cancel_button):
             if button is not None:
                 button.set_sensitive(not self._busy)
+        if self._delete_all_button is not None:
+            blocked = pending_import_exists(CFG_DIR)
+            self._delete_all_button.set_sensitive(not self._busy and not blocked)
+            self._delete_all_button.set_tooltip_text(
+                DELETE_BLOCKED_BY_IMPORT_TOOLTIP if blocked else DELETE_ALL_TOOLTIP
+            )
 
     def _set_busy(self, busy: bool, status: str = "") -> None:
         self._busy = bool(busy)
@@ -445,6 +639,13 @@ class CompanionLearningTransferController:
                 self._status_label.set_visible(True)
 
     def _ensure_feedback_overlay(self) -> None:
+        """Build the card in the standard DZLL confirmation style.
+
+        Same pattern as the Mod Manager and Flatpak confirmations: a centred
+        ``warning-card`` with a left-aligned ``dzll-overlay-heading`` title,
+        ``confirmation-body`` text and ``warning-btn`` buttons.
+        """
+
         if self._feedback_revealer is not None:
             return
         owner = getattr(self._win, "_main_overlay", None)
@@ -457,41 +658,47 @@ class CompanionLearningTransferController:
         scrim.set_visible(False)
         scrim.set_can_target(True)
         scrim.add_css_class("settings-scrim")
+        # A click outside a confirmation cancels it (never a result message).
+        scrim_click = Gtk.GestureClick.new()
+        scrim_click.set_button(0)
+        scrim_click.connect("pressed", lambda *_args: self._on_feedback_scrim_pressed())
+        scrim.add_controller(scrim_click)
         owner.add_overlay(scrim)
 
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        card.add_css_class("update-card")
-        card.add_css_class("restart-learning-notice-card")
-        card.set_size_request(640, -1)
-        card.set_margin_start(12)
-        card.set_margin_end(12)
-        card.set_margin_top(12)
-        card.set_margin_bottom(12)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        card.add_css_class("warning-card")
+        card.add_css_class("companion-learning-card")
+        card.set_size_request(FEEDBACK_CARD_WIDTH, -1)
 
         title = Gtk.Label()
-        title.add_css_class("update-title")
+        title.set_xalign(0.0)
         title.set_wrap(True)
-        title.set_justify(Gtk.Justification.CENTER)
+        title.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        title.set_max_width_chars(FEEDBACK_TEXT_MAX_WIDTH_CHARS)
+        title.add_css_class("dzll-overlay-heading")
+        title.add_css_class("confirmation-title")
         card.append(title)
 
         body = Gtk.Label()
-        body.add_css_class("update-subtitle")
+        body.set_xalign(0.0)
         body.set_wrap(True)
-        body.set_justify(Gtk.Justification.CENTER)
+        # Paths and long server names may have no spaces to break at.
+        body.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        body.set_max_width_chars(FEEDBACK_TEXT_MAX_WIDTH_CHARS)
         body.set_selectable(True)
+        body.add_css_class("confirmation-body")
         card.append(body)
 
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
         buttons.set_halign(Gtk.Align.CENTER)
-        buttons.set_margin_top(20)
+        buttons.set_margin_top(12)
         card.append(buttons)
 
         revealer = Gtk.Revealer()
-        revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
         revealer.set_transition_duration(150)
         revealer.set_halign(Gtk.Align.CENTER)
-        revealer.set_valign(Gtk.Align.START)
-        revealer.set_margin_top(50)
+        revealer.set_valign(Gtk.Align.CENTER)
         revealer.set_reveal_child(False)
         revealer.set_visible(False)
         revealer.set_child(card)
@@ -517,10 +724,14 @@ class CompanionLearningTransferController:
             str(action[0]) for action in actions
         } == {"Keep Pending Import", "Cancel Pending Import"}
         self._feedback_buttons.set_homogeneous(pending_cancel_actions)
+        # Only a confirmation with a safe cancelling action is dismissed by a
+        # click outside the card; result messages need their own button.
+        self._feedback_dismiss = None
         for label, callback, css_classes in actions:
+            if str(label) in FEEDBACK_SCRIM_DISMISS_LABELS:
+                self._feedback_dismiss = (str(label), callback)
             button = Gtk.Button(label=label)
-            width = 160 if pending_cancel_actions else 140
-            button.set_size_request(width, -1)
+            button.add_css_class("warning-btn")
             for css_class in css_classes:
                 button.add_css_class(css_class)
             button.connect(
@@ -530,6 +741,8 @@ class CompanionLearningTransferController:
                 ),
             )
             self._feedback_buttons.append(button)
+        # Warning and error titles are red (the card keeps the shared
+        # ``restart-notice-error`` modifier).
         if error:
             self._feedback_card.add_css_class("restart-notice-error")
         else:
@@ -537,6 +750,13 @@ class CompanionLearningTransferController:
         self._feedback_scrim.set_visible(True)
         self._feedback_revealer.set_visible(True)
         self._feedback_revealer.set_reveal_child(True)
+
+    def _on_feedback_scrim_pressed(self) -> None:
+        dismiss = getattr(self, "_feedback_dismiss", None)
+        if dismiss is None:
+            return
+        label, callback = dismiss
+        self._invoke_feedback_action(label, callback)
 
     def _invoke_feedback_action(self, label: str, callback) -> None:
         try:

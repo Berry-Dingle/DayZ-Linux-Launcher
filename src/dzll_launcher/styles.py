@@ -1816,6 +1816,57 @@ def get_app_css(
           color: @dzll_error;
         }}
 
+        .dzll-app-root button.server-companion-delete-learning-button {{
+          background: transparent;
+          padding: 1px;
+          min-height: 0;
+          min-width: 0;
+          border: none;
+          box-shadow: none;
+          outline: none;
+        }}
+
+        .dzll-app-root button.server-companion-delete-learning-button image {{
+          color: @dzll_error;
+        }}
+
+        .dzll-app-root button.server-companion-delete-learning-button:hover image {{
+          color: @dzll_destructive_border;
+        }}
+
+        .dzll-app-root button.server-companion-delete-learning-button:disabled image {{
+          color: @dzll_text_disabled;
+        }}
+
+        .server-companion-panel:backdrop button.server-companion-delete-learning-button image {{
+          color: @dzll_error;
+          opacity: 1;
+        }}
+
+        .dzll-app-root button.companion-learning-danger-action {{
+          background: alpha(@dzll_destructive, 0.78);
+          color: @dzll_text_on_accent;
+          border: 1px solid alpha(@dzll_destructive_border, 0.62);
+        }}
+
+        .dzll-app-root button.companion-learning-danger-action label {{
+          color: @dzll_text_on_accent;
+        }}
+
+        .dzll-app-root button.companion-learning-danger-action:hover {{
+          background: alpha(@dzll_destructive_hover, 0.88);
+          border-color: @dzll_destructive_border;
+        }}
+
+        .dzll-app-root button.companion-learning-danger-action:active {{
+          background: @dzll_destructive_pressed;
+          border-color: @dzll_destructive_border;
+        }}
+
+        .dzll-app-root button.companion-learning-danger-action:disabled {{
+          opacity: 0.55;
+        }}
+
         .companion-restart-learning {{
           padding: 2px 0 0 0;
         }}
@@ -2089,15 +2140,18 @@ def get_app_css(
           font-size: 1.05em;
         }}
 
-        .restart-learning-notice-card.restart-notice-reset .update-title {{
+        /* Learning notice and learning confirmation cards use the standard
+           warning-card; their kind colours the title.  Scoped under the app
+           root so the rule outranks ".dzll-app-root label". */
+        .dzll-app-root .warning-card.restart-notice-reset .confirmation-title {{
           color: @dzll_restart_learning;
         }}
 
-        .restart-learning-notice-card.restart-notice-recovery .update-title {{
+        .dzll-app-root .warning-card.restart-notice-recovery .confirmation-title {{
           color: @dzll_warning;
         }}
 
-        .restart-learning-notice-card.restart-notice-error .update-title {{
+        .dzll-app-root .warning-card.restart-notice-error .confirmation-title {{
           color: @dzll_error;
         }}
 

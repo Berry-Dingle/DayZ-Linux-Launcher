@@ -31,6 +31,7 @@ RESTART_CONFIDENCE_STYLE_CLASSES = {
 }
 MAX_USER_VISIBLE_RESTART_CONFIDENCE_PERCENT = 95
 LEARNING_BLOCKED_TEXT = "Error: Learning Blocked"
+DELETE_LEARNING_TOOLTIP = "Delete learning data for this server"
 LEARNING_BLOCKED_TOOLTIP = (
     "This server's saved learning history could not be validated. "
     "Learning has been suspended to protect the stored data."
@@ -256,6 +257,8 @@ class ServerCompanionPanel(Gtk.Box):
         self._on_clear = None
         self._on_dock_toggle = None
         self._on_power_off = None
+        self._on_delete_learning = None
+        self._docked = True
         self._join_sensitivity_resolver = None
         self._alert_sound_value = "female"
         self._empty_breathe_timer_id = 0
@@ -344,6 +347,9 @@ class ServerCompanionPanel(Gtk.Box):
         self.server_box.set_visible(False)
         inner.append(self.server_box)
 
+        name_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self.server_box.append(name_row)
+
         self.name_label = Gtk.Label()
         self.name_label.set_wrap(False)
         self.name_label.set_single_line_mode(True)
@@ -352,7 +358,23 @@ class ServerCompanionPanel(Gtk.Box):
         self.name_label.set_hexpand(True)
         self.name_label.set_xalign(0.0)
         self.name_label.add_css_class("server-name")
-        self.server_box.append(self.name_label)
+        name_row.append(self.name_label)
+
+        # Delete this server's learning data.  Docked only: the confirmation
+        # card belongs to the main window.
+        delete_icon = Gtk.Image.new_from_icon_name("user-trash-symbolic")
+        delete_icon.set_pixel_size(16)
+        self.delete_learning_btn = Gtk.Button()
+        self.delete_learning_btn.set_can_focus(False)
+        self.delete_learning_btn.set_child(delete_icon)
+        self.delete_learning_btn.add_css_class("flat")
+        self.delete_learning_btn.add_css_class("server-companion-delete-learning-button")
+        self.delete_learning_btn.set_tooltip_text(DELETE_LEARNING_TOOLTIP)
+        self.delete_learning_btn.set_valign(Gtk.Align.CENTER)
+        self.delete_learning_btn.set_visible(False)
+        self.delete_learning_btn.connect("clicked", self._on_delete_learning_clicked)
+        attach_pointer_cursor(self.delete_learning_btn)
+        name_row.append(self.delete_learning_btn)
 
         self.server_details_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         self.server_details_box.add_css_class("companion-details")
@@ -609,10 +631,37 @@ class ServerCompanionPanel(Gtk.Box):
     def set_on_dock_toggle(self, callback):
         self._on_dock_toggle = callback
 
+    def set_on_delete_learning(self, callback):
+        self._on_delete_learning = callback if callable(callback) else None
+
+    def set_delete_learning_state(self, sensitive: bool, tooltip: str | None = None):
+        """Enable the bin, or disable it with the reason as its tooltip."""
+
+        self.delete_learning_btn.set_sensitive(bool(sensitive))
+        self.delete_learning_btn.set_tooltip_text(
+            DELETE_LEARNING_TOOLTIP if sensitive or not tooltip else str(tooltip)
+        )
+
+    def delete_learning_visible(self) -> bool:
+        return bool(self.delete_learning_btn.get_visible())
+
+    def _refresh_delete_learning_visibility(self):
+        self.delete_learning_btn.set_visible(
+            bool(self._docked and self._snapshot is not None)
+        )
+
+    def _on_delete_learning_clicked(self, _btn):
+        if not self.delete_learning_visible():
+            return
+        if callable(self._on_delete_learning):
+            self._on_delete_learning()
+
     def set_on_power_off(self, callback):
         self._on_power_off = callback
 
     def set_docked(self, docked: bool):
+        self._docked = bool(docked)
+        self._refresh_delete_learning_visibility()
         if bool(docked):
             self.add_css_class("server-companion-panel-docked")
             self.dock_toggle_btn.set_label("↗")
@@ -969,6 +1018,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.time_label.set_text(f"Time: {time_text}")
         self.empty_label.set_visible(False)
         self.server_box.set_visible(True)
+        self._refresh_delete_learning_visibility()
         self.play_pause_btn.set_sensitive(True)
         self.refresh_join_sensitivity()
 
@@ -978,6 +1028,7 @@ class ServerCompanionPanel(Gtk.Box):
         self.set_join_status(None)
         self.set_restart_learning_summary(None)
         self.set_learning_blocked(False)
+        self._refresh_delete_learning_visibility()
         self.server_box.set_visible(False)
         self.empty_label.set_visible(True)
         self._start_empty_breathe()

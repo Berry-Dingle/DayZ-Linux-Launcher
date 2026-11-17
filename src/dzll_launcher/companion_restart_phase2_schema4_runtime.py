@@ -198,6 +198,9 @@ class Schema4ExportSnapshot:
     schema_version: int
     server_count: int
     sha256: str
+    # Quarantined records are exported as their inert wrappers (they are
+    # never used for learning and can be deleted by the user).
+    quarantined_server_keys: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -1134,7 +1137,12 @@ class AuthoritativeSchema4Runtime:
 
     def _export_from(self, root: Mapping[str, object]) -> Schema4ExportSnapshot:
         payload, report = self._writer.payload_for(root)
-        if not report.valid:
+        # The same acceptance rule as persistence: one quarantined server
+        # must not block exporting every other server.  Its wrapper is
+        # exported unchanged and stays inert after an import.
+        if not report.root_valid or any(
+            item.code != "server_quarantined" for item in report.issues
+        ):
             raise Schema4ValidationError(
                 "authoritative export snapshot failed strict validation"
             )
@@ -1143,6 +1151,7 @@ class AuthoritativeSchema4Runtime:
             schema_version=SCHEMA4_ROOT_VERSION,
             server_count=len(root.get("servers", {})),
             sha256=_sha256(payload),
+            quarantined_server_keys=tuple(report.quarantined_server_keys),
         )
 
     def export_snapshot(self) -> Schema4ExportSnapshot:
@@ -1534,6 +1543,19 @@ class AuthoritativeSchema4Runtime:
             decision_ids=tuple(sorted(decisions)),
             recovery=self._recovery,
         )
+
+    def has_server_record(self, server_key: str) -> bool:
+        """Read-only: a stored record (valid or quarantined) or schema-3 entry."""
+
+        if not self.enabled or self._state is None:
+            return False
+        key = str(server_key)
+        with self._mutex:
+            if key in self._state.get("servers", {}):
+                return True
+            snapshot = self._state.get("schema3_snapshot")
+            servers = snapshot.get("servers") if isinstance(snapshot, Mapping) else None
+            return isinstance(servers, Mapping) and key in servers
 
     def server_write_block(self, server_key: str) -> tuple[str, tuple[str, ...]] | None:
         """Return why this server's record must not be written, or ``None``.

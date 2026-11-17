@@ -20,9 +20,14 @@ from .companion_restart_phase2_runtime import (
 )
 from .companion_restart_phase2_detection import DetectionConfig
 from .companion_restart_phase2_schema4 import (
+    QUARANTINE_DETAIL_CHARACTERS,
+    QUARANTINE_PAYLOAD_RETENTION_BYTES,
+    QUARANTINE_VALIDATION_ERROR_LIMIT,
     SCHEMA4_ROOT_VERSION,
     Schema4ValidationError,
     Schema4VersionError,
+    bound_quarantine_wrapper,
+    canonical_json_bytes,
     deserialize_schema4_bytes,
     deserialize_schema4_state,
     schema_version_from_bytes,
@@ -64,6 +69,16 @@ SERVER_FIELDS = frozenset({
     "prior_authority_decision_id", "authority_decision", "consumer_state",
     "migration_audit", "reason_codes", "learned_state",
 })
+# A quarantined server travels as the inert wrapper the runtime stores: it is
+# never trusted, rebuilt or learned from, and the user can delete it.
+QUARANTINE_WRAPPER_REQUIRED_FIELDS = frozenset({
+    "schema_version", "semantic_version", "server_key", "authority_status",
+    "validation_errors", "validation_error_count", "quarantined_payload_sha256",
+    "quarantined_payload_bytes", "reason_codes",
+})
+QUARANTINE_WRAPPER_PAYLOAD_FIELDS = frozenset({
+    "quarantined_payload", "quarantined_payload_summary",
+})
 
 
 class ExternalLearningValidationError(ValueError):
@@ -80,6 +95,20 @@ def format_learned_server_records(count: int) -> str:
     return f"{value} learned server {noun}"
 
 
+def format_quarantined_note(count: int) -> str:
+    """Explain quarantined records, or return "" when there are none."""
+
+    value = int(count)
+    if value <= 0:
+        return ""
+    noun = "record is" if value == 1 else "records are"
+    return (
+        f"{value} quarantined {noun} included.\n"
+        "Quarantined records are damaged and are never used for learning.\n"
+        "They can be deleted from Server Companion."
+    )
+
+
 @dataclass(frozen=True)
 class ValidatedLearningImport:
     canonical_bytes: bytes
@@ -87,6 +116,7 @@ class ValidatedLearningImport:
     schema_version: int
     server_count: int
     source_filename: str
+    quarantined_server_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -99,6 +129,7 @@ class PendingLearningImport:
     source_filename: str
     staged_at: str
     canonical_bytes: bytes
+    quarantined_server_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -126,16 +157,16 @@ class StartupImportResult:
         if self.status == "applied":
             records = format_learned_server_records(self.server_count)
             return (
-                "The previous Server Companion learning database was replaced successfully. "
-                f"The new database contains {records}. "
+                "The previous Server Companion learning database was replaced successfully.\n"
+                f"The new database contains {records}.\n"
                 "A permanent backup of the previous database was retained."
             )
         if self.status == "rolled_back":
-            return f"The replacement database could not be installed and the previous learning database was restored. {self.error or ''}".strip()
+            return f"The replacement database could not be installed.\nThe previous learning database was restored.\n{self.error or ''}".strip()
         if self.status == "rollback_failed":
-            return f"Database replacement and rollback verification failed. Learning is disabled for this launch. {self.error or ''}".strip()
+            return f"Database replacement and rollback verification failed.\nLearning is disabled for this launch.\n{self.error or ''}".strip()
         if self.status in {"pending_invalid", "apply_failed"}:
-            return f"The pending database replacement was not applied. The current learning database was left unchanged. {self.error or ''}".strip()
+            return f"The pending database replacement was not applied.\nThe current learning database was left unchanged.\n{self.error or ''}".strip()
         return None
 
 
@@ -192,8 +223,12 @@ def _validate_external_learning_bytes(
     if not isinstance(servers, dict):
         raise ExternalLearningValidationError("servers must be an object.")
     _validate_server_keys_and_fields(servers)
+    quarantined_keys = frozenset(_quarantined_keys(servers))
     _validate_root_scalars(state)
-    _reject_boolean_numeric_fields(state)
+    # Quarantined payloads (and their schema-3 entries) are opaque: they are
+    # preserved verbatim and never read, so only their JSON validity is
+    # required of them.  Everything else keeps the strict numeric checks.
+    _reject_boolean_numeric_fields(_without_opaque_quarantine(state, quarantined_keys))
     _reject_nonfinite_tree(state)
     try:
         # The strictly parsed document is validated directly rather than
@@ -202,14 +237,14 @@ def _validate_external_learning_bytes(
     except (Schema4ValidationError, Schema4VersionError, TypeError, ValueError) as exc:
         raise ExternalLearningValidationError(str(exc)) from exc
     del state
-    if not loaded.report.valid:
-        detail = "; ".join(f"{item.code}: {item.detail}" for item in loaded.report.issues)
-        raise ExternalLearningValidationError(detail or "Schema-4 validation failed.")
-    if loaded.report.quarantined_server_keys:
-        raise ExternalLearningValidationError(
-            "The selected database may not contain quarantined records."
+    if not _report_acceptable(loaded.report, quarantined_keys):
+        detail = "; ".join(
+            f"{item.code}: {item.detail}"
+            for item in loaded.report.issues
+            if item.code != "server_quarantined"
         )
-    _validate_schema3_projection(loaded.state)
+        raise ExternalLearningValidationError(detail or "Schema-4 validation failed.")
+    _validate_schema3_projection(loaded.state, quarantined_keys)
     try:
         canonical = serialize_schema4_state(loaded.state)
         roundtrip = deserialize_schema4_bytes(canonical, quarantine_invalid_servers=False)
@@ -218,7 +253,7 @@ def _validate_external_learning_bytes(
         raise ExternalLearningValidationError(f"Canonical validation failed: {exc}") from exc
     if canonical != canonical_again:
         raise ExternalLearningValidationError("The document is not stable under canonical round trip.")
-    if not roundtrip.report.valid:
+    if not _report_acceptable(roundtrip.report, quarantined_keys):
         raise ExternalLearningValidationError("Canonical document failed strict validation.")
     return ValidatedLearningImport(
         canonical_bytes=canonical,
@@ -226,6 +261,7 @@ def _validate_external_learning_bytes(
         schema_version=SCHEMA4_ROOT_VERSION,
         server_count=len(roundtrip.state["servers"]),
         source_filename=Path(source_filename).name if source_filename else "selected file",
+        quarantined_server_count=len(quarantined_keys),
     )
 
 
@@ -245,6 +281,14 @@ def stage_pending_import(
     replace_existing: bool = False,
     now: datetime | None = None,
 ) -> PendingLearningImport:
+    from .companion_learning_deletion import pending_deletion_exists
+
+    if pending_deletion_exists(config_dir):
+        # A staged deletion and a staged replacement are mutually exclusive.
+        raise PendingImportError(
+            "A Server Companion learning data deletion is pending. "
+            "Restart DZLL to complete it before importing a database."
+        )
     payload_path, metadata_path = pending_import_paths(config_dir)
     existing = read_pending_import(config_dir, strict=False)
     if (payload_path.exists() or metadata_path.exists()) and not replace_existing:
@@ -365,6 +409,7 @@ def read_pending_import(
             payload_path, metadata_path, digest, validated.schema_version,
             validated.server_count, str(metadata.get("source_filename") or "pending import"),
             str(metadata.get("staged_at") or ""), validated.canonical_bytes,
+            validated.quarantined_server_count,
         )
     except Exception:
         if strict:
@@ -503,16 +548,138 @@ def _validate_server_keys_and_fields(servers: Mapping[str, object]) -> None:
             raise ExternalLearningValidationError(f"Invalid server identity {key!r}.")
         if not isinstance(record, dict):
             raise ExternalLearningValidationError(f"Server {key!r} must be an object.")
-        unknown = record.keys() - SERVER_FIELDS
-        if unknown:
-            raise ExternalLearningValidationError(f"Server {key!r} has unknown fields: {', '.join(sorted(unknown))}")
         if record.get("server_key") != key:
             raise ExternalLearningValidationError(f"Server key mismatch for {key!r}.")
         if record.get("authority_status") == "quarantined":
-            raise ExternalLearningValidationError(f"Server {key!r} is quarantined.")
+            _validate_quarantine_wrapper(key, record)
+            continue
+        unknown = record.keys() - SERVER_FIELDS
+        if unknown:
+            raise ExternalLearningValidationError(f"Server {key!r} has unknown fields: {', '.join(sorted(unknown))}")
 
 
-def _validate_schema3_projection(state: Mapping[str, object]) -> None:
+def _quarantined_keys(servers: Mapping[str, object]) -> list[str]:
+    return [
+        str(key)
+        for key, record in servers.items()
+        if isinstance(record, Mapping) and record.get("authority_status") == "quarantined"
+    ]
+
+
+def _report_acceptable(report, quarantined_keys: frozenset[str]) -> bool:
+    """Valid except for the quarantine wrappers the document itself carries."""
+
+    return (
+        report.root_valid
+        and all(item.code == "server_quarantined" for item in report.issues)
+        and frozenset(report.quarantined_server_keys) == quarantined_keys
+    )
+
+
+def _without_opaque_quarantine(
+    state: Mapping[str, object], quarantined_keys: frozenset[str]
+) -> Mapping[str, object]:
+    if not quarantined_keys:
+        return state
+    view = dict(state)
+    view["servers"] = {
+        key: (
+            {
+                name: value
+                for name, value in record.items()
+                if name not in QUARANTINE_WRAPPER_PAYLOAD_FIELDS
+            }
+            if key in quarantined_keys and isinstance(record, Mapping)
+            else record
+        )
+        for key, record in state["servers"].items()
+    }
+    snapshot = state.get("schema3_snapshot")
+    if isinstance(snapshot, Mapping) and isinstance(snapshot.get("servers"), Mapping):
+        view["schema3_snapshot"] = {
+            **snapshot,
+            "servers": {
+                key: value
+                for key, value in snapshot["servers"].items()
+                if key not in quarantined_keys
+            },
+        }
+    return view
+
+
+def _validate_quarantine_wrapper(key: str, record: Mapping[str, object]) -> None:
+    """Strictly check a quarantine wrapper's own fields; its payload stays opaque."""
+
+    def invalid(reason: str) -> ExternalLearningValidationError:
+        return ExternalLearningValidationError(
+            f"Server {key!r} has an invalid quarantined record: {reason}."
+        )
+
+    payload_fields = record.keys() & QUARANTINE_WRAPPER_PAYLOAD_FIELDS
+    missing = QUARANTINE_WRAPPER_REQUIRED_FIELDS - record.keys()
+    unknown = record.keys() - QUARANTINE_WRAPPER_REQUIRED_FIELDS - QUARANTINE_WRAPPER_PAYLOAD_FIELDS
+    if missing:
+        raise invalid(f"missing fields {', '.join(sorted(missing))}")
+    if unknown:
+        raise invalid(f"unknown fields {', '.join(sorted(unknown))}")
+    if len(payload_fields) != 1:
+        raise invalid("exactly one of quarantined_payload or quarantined_payload_summary is required")
+    if type(record["schema_version"]) is not int or record["schema_version"] != SCHEMA4_ROOT_VERSION:
+        raise invalid("schema_version must be 4")
+    if type(record["semantic_version"]) is not int or record["semantic_version"] < 1:
+        raise invalid("semantic_version must be a positive integer")
+    errors = record["validation_errors"]
+    if not isinstance(errors, list) or len(errors) > QUARANTINE_VALIDATION_ERROR_LIMIT:
+        raise invalid("validation_errors must be a bounded list")
+    for item in errors:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"code", "detail"}
+            or not all(isinstance(item[name], str) for name in ("code", "detail"))
+            or any(len(item[name]) > QUARANTINE_DETAIL_CHARACTERS for name in ("code", "detail"))
+        ):
+            raise invalid("each validation error must be a bounded code and detail")
+    count = record["validation_error_count"]
+    if type(count) is not int or count < len(errors):
+        raise invalid("validation_error_count is inconsistent")
+    reasons = record["reason_codes"]
+    if not isinstance(reasons, list) or not all(isinstance(item, str) for item in reasons):
+        raise invalid("reason_codes must be a list of strings")
+    digest = record["quarantined_payload_sha256"]
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(char not in "0123456789abcdef" for char in digest)
+    ):
+        raise invalid("quarantined_payload_sha256 must be a SHA-256 hex digest")
+    size = record["quarantined_payload_bytes"]
+    if type(size) is not int or size < 0:
+        raise invalid("quarantined_payload_bytes must be a non-negative integer")
+    if "quarantined_payload" in record:
+        try:
+            payload_bytes = canonical_json_bytes(record["quarantined_payload"])
+        except (TypeError, ValueError) as exc:
+            raise invalid(f"payload is not canonical JSON ({exc})") from exc
+        if len(payload_bytes) != size or _sha256(payload_bytes) != digest:
+            raise invalid("payload does not match its recorded size and SHA-256")
+        if size > QUARANTINE_PAYLOAD_RETENTION_BYTES:
+            raise invalid("payload exceeds the quarantine retention bound")
+    else:
+        if not isinstance(record["quarantined_payload_summary"], dict):
+            raise invalid("quarantined_payload_summary must be an object")
+        if size <= QUARANTINE_PAYLOAD_RETENTION_BYTES:
+            raise invalid("a summarized payload must exceed the retention bound")
+    try:
+        bounded = bound_quarantine_wrapper(record)
+    except Exception as exc:
+        raise invalid(f"wrapper cannot be bounded ({exc})") from exc
+    if canonical_json_bytes(bounded) != canonical_json_bytes(record):
+        raise invalid("wrapper exceeds the quarantine bounds")
+
+
+def _validate_schema3_projection(
+    state: Mapping[str, object], quarantined_keys: frozenset[str] = frozenset()
+) -> None:
     snapshot = state.get("schema3_snapshot")
     try:
         normalized = normalize_phase2_state(snapshot)
@@ -520,9 +687,20 @@ def _validate_schema3_projection(state: Mapping[str, object]) -> None:
         raise ExternalLearningValidationError(f"Invalid embedded schema-3 projection: {exc}") from exc
     projected = normalized.get("servers", {})
     authoritative = state.get("servers", {})
-    if set(projected) != set(authoritative):
+    # A quarantined server's schema-3 entry is optional and opaque (the
+    # runtime never projects it); it must only be an object.
+    if set(projected) - quarantined_keys != set(authoritative) - quarantined_keys:
         raise ExternalLearningValidationError("Embedded schema-3 server keys do not match authoritative servers.")
+    if not set(projected) <= set(authoritative):
+        raise ExternalLearningValidationError("Embedded schema-3 server keys do not match authoritative servers.")
+    for key in quarantined_keys:
+        if key in projected and not isinstance(projected[key], dict):
+            raise ExternalLearningValidationError(
+                f"Embedded schema-3 record for quarantined server {key!r} must be an object."
+            )
     for key, record in authoritative.items():
+        if key in quarantined_keys:
+            continue
         legacy = record.get("legacy_schema3_record")
         if not isinstance(legacy, dict) or projected.get(key) != legacy:
             raise ExternalLearningValidationError(f"Embedded schema-3 record mismatch for {key!r}.")

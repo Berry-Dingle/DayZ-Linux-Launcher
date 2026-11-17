@@ -597,6 +597,26 @@ class Phase2RestartRuntime:
 
         return dict(self._server_persistence_blocks)
 
+    def has_learning_for(self, server_key: str) -> bool:
+        """Read-only: whether any learning exists for ``server_key``.
+
+        True for an in-session server or a stored record (valid or
+        quarantined).  Used only to offer deleting it; it starts nothing.
+        """
+
+        key = str(server_key or "").strip()
+        if not key:
+            return False
+        if key in self._servers:
+            return True
+        backend = self._authoritative_schema4_backend
+        if backend is None or not self.authoritative_schema4_runtime_enabled:
+            return key in (self.state.get("servers") or {})
+        try:
+            return bool(backend.has_server_record(key))
+        except Exception:
+            return False
+
     def server_persistence_block(self, server_key: str) -> ServerPersistenceBlock | None:
         """Return why ``server_key`` cannot be saved, consulting the backend once."""
 

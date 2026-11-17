@@ -1425,15 +1425,25 @@ class SettingsUI:
         learning_heading.add_css_class("companion-learning-data-title")
         learning_box.append(learning_heading)
 
-        learning_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        # Export and Import share one row with equal widths; the destructive
+        # Delete All sits on its own row beneath, spanning both exactly.
+        learning_actions = Gtk.Grid()
+        learning_actions.set_column_spacing(8)
+        learning_actions.set_row_spacing(8)
+        learning_actions.set_column_homogeneous(True)
         learning_actions.set_halign(Gtk.Align.START)
         export_learning_btn = Gtk.Button(label="Export Data")
         export_learning_btn.set_tooltip_text("Export restart-learning data.")
         import_learning_btn = Gtk.Button(label="Import Data")
         import_learning_btn.set_tooltip_text("Replace restart-learning data.")
-        for action in (export_learning_btn, import_learning_btn):
+        delete_learning_btn = Gtk.Button(label="Delete All Learned Data")
+        delete_learning_btn.set_tooltip_text("Permanently delete all restart-learning data.")
+        delete_learning_btn.add_css_class("companion-learning-danger-action")
+        for action in (export_learning_btn, import_learning_btn, delete_learning_btn):
             attach_pointer_cursor(action)
-            learning_actions.append(action)
+        learning_actions.attach(export_learning_btn, 0, 0, 1, 1)
+        learning_actions.attach(import_learning_btn, 1, 0, 1, 1)
+        learning_actions.attach(delete_learning_btn, 0, 1, 2, 1)
         learning_box.append(learning_actions)
 
         pending_learning_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -1471,12 +1481,14 @@ class SettingsUI:
         export_learning_btn.connect("clicked", transfer.choose_export)
         import_learning_btn.connect("clicked", transfer.choose_import)
         cancel_pending_btn.connect("clicked", transfer.cancel_pending)
+        delete_learning_btn.connect("clicked", transfer.choose_delete_all)
         transfer.bind_settings_widgets(
             export_button=export_learning_btn,
             import_button=import_learning_btn,
             cancel_button=cancel_pending_btn,
             pending_container=pending_learning_box,
             status_label=learning_status_label,
+            delete_all_button=delete_learning_btn,
         )
 
         box.append(hr())

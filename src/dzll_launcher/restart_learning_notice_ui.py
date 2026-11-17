@@ -9,6 +9,12 @@ from .companion_restart_phase2_runtime import RuntimeNotice
 from .ui_row import attach_pointer_cursor
 
 
+# The standard confirmation card width (as the Flatpak recovery and join
+# cards) with the text wrapped at a readable width.
+NOTICE_CARD_WIDTH = 520
+NOTICE_TEXT_MAX_WIDTH_CHARS = 60
+
+
 class RestartLearningNoticeUI:
     def __init__(self, window):
         self._win = window
@@ -31,57 +37,66 @@ class RestartLearningNoticeUI:
 
         self.revealer = Gtk.Revealer()
         self.revealer.set_reveal_child(False)
-        self.revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_DOWN)
+        self.revealer.set_transition_type(Gtk.RevealerTransitionType.CROSSFADE)
         self.revealer.set_transition_duration(180)
         self.revealer.set_halign(Gtk.Align.CENTER)
-        self.revealer.set_valign(Gtk.Align.START)
-        self.revealer.set_margin_top(10)
+        self.revealer.set_valign(Gtk.Align.CENTER)
         self.revealer.set_child(self._build_card())
         overlay.add_overlay(self.revealer)
         return self.revealer
 
     def _build_card(self):
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
-        card.add_css_class("update-card")
+        """The standard DZLL card: centred ``warning-card``, left-aligned text.
+
+        An informational notice: it is dismissed only with OK, never by a
+        click outside the card.
+        """
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        card.add_css_class("warning-card")
         card.add_css_class("restart-learning-notice-card")
         self.card = card
-        card.set_size_request(620, -1)
-        card.set_margin_start(10)
-        card.set_margin_end(10)
-        card.set_margin_top(6)
-        card.set_margin_bottom(6)
+        card.set_size_request(NOTICE_CARD_WIDTH, -1)
 
         self.title_label = Gtk.Label()
-        self.title_label.add_css_class("update-title")
+        self.title_label.set_xalign(0.0)
         self.title_label.set_wrap(True)
-        self.title_label.set_justify(Gtk.Justification.CENTER)
+        self.title_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.title_label.set_max_width_chars(NOTICE_TEXT_MAX_WIDTH_CHARS)
+        self.title_label.add_css_class("dzll-overlay-heading")
+        self.title_label.add_css_class("confirmation-title")
         card.append(self.title_label)
 
         self.body_label = Gtk.Label()
-        self.body_label.add_css_class("update-subtitle")
+        self.body_label.set_xalign(0.0)
         self.body_label.set_wrap(True)
         self.body_label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-        self.body_label.set_justify(Gtk.Justification.CENTER)
-        self.body_label.set_max_width_chars(82)
+        self.body_label.set_max_width_chars(NOTICE_TEXT_MAX_WIDTH_CHARS)
+        self.body_label.add_css_class("confirmation-body")
         card.append(self.body_label)
 
         self.path_label = Gtk.Label()
+        self.path_label.set_xalign(0.0)
         self.path_label.set_wrap(True)
         self.path_label.set_wrap_mode(Pango.WrapMode.CHAR)
+        self.path_label.set_max_width_chars(NOTICE_TEXT_MAX_WIDTH_CHARS)
         self.path_label.set_selectable(True)
         self.path_label.add_css_class("dim-label")
         card.append(self.path_label)
 
-        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=20)
         buttons.set_halign(Gtk.Align.CENTER)
+        buttons.set_margin_top(12)
         buttons.set_homogeneous(True)
         self.copy_button = Gtk.Button(label="COPY BACKUP PATH")
         self.copy_button.set_size_request(160, -1)
+        self.copy_button.add_css_class("warning-btn")
         self.copy_button.connect("clicked", self._copy_path)
         attach_pointer_cursor(self.copy_button)
         buttons.append(self.copy_button)
         ok_button = Gtk.Button(label="OK")
         ok_button.set_size_request(160, -1)
+        ok_button.add_css_class("warning-btn")
         ok_button.add_css_class("suggested-action")
         ok_button.connect("clicked", self.hide)
         attach_pointer_cursor(ok_button)

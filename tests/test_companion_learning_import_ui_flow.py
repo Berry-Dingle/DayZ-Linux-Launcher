@@ -39,6 +39,10 @@ class FakeWidget:
     def set_wrap(self, _value): pass
     def set_justify(self, _value): pass
     def set_selectable(self, _value): pass
+    def set_xalign(self, _value): pass
+    def add_controller(self, controller): self.controllers = getattr(self, 'controllers', []) + [controller]
+    def set_wrap_mode(self, _value): pass
+    def set_max_width_chars(self, _value): pass
     def set_halign(self, _value): pass
     def set_homogeneous(self, value): self.homogeneous = bool(value)
     def set_valign(self, _value): pass
@@ -52,6 +56,14 @@ class FakeWidget:
     def set_child(self, child): self.children = [child]
     def set_reveal_child(self, value): self.revealed = bool(value)
     def connect(self, _signal, callback): self.callback = callback
+
+
+class FakeGesture:
+    def __init__(self): self.pressed = None
+    @classmethod
+    def new(cls): return cls()
+    def set_button(self, _value): pass
+    def connect(self, _signal, callback): self.pressed = callback
 
 
 class FakeOverlay:
@@ -263,19 +275,21 @@ def test_warning_overlay_is_attached_and_revealed_on_main_owner(tmp_path, monkey
         Label=FakeWidget,
         Button=FakeWidget,
         Revealer=FakeWidget,
+        GestureClick=FakeGesture,
         Orientation=SimpleNamespace(VERTICAL=1, HORIZONTAL=2),
         Justification=SimpleNamespace(CENTER=1),
         Align=SimpleNamespace(CENTER=1, START=2),
-        RevealerTransitionType=SimpleNamespace(SLIDE_DOWN=1),
+        RevealerTransitionType=SimpleNamespace(SLIDE_DOWN=1, CROSSFADE=2),
     )
     monkeypatch.setattr(ui, "Gtk", fake_gtk)
+    cancelled = []
     value._show_feedback(
         "Warning",
         "Body",
         actions=(
-            ("Cancel", lambda: None, ()),
+            ("Cancel", lambda: cancelled.append(True), ()),
             ("Restart Later", lambda: None, ()),
-            ("Restart Now", lambda: None, ()),
+            ("Restart Now", lambda: None, ("suggested-action",)),
         ),
         error=True,
     )
@@ -284,17 +298,26 @@ def test_warning_overlay_is_attached_and_revealed_on_main_owner(tmp_path, monkey
     assert owner.overlays[1] is value._feedback_revealer
     assert value._feedback_scrim.visible
     assert value._feedback_revealer.visible and value._feedback_revealer.revealed
-    assert value._feedback_revealer.margin_top == 50
+    # The standard DZLL confirmation card, centred, with a red warning title.
+    assert {"warning-card", "companion-learning-card", "restart-notice-error"} <= value._feedback_card.classes
+    assert {"dzll-overlay-heading", "confirmation-title"} <= value._feedback_title.classes
+    assert "confirmation-body" in value._feedback_body.classes
     button_row = value._feedback_buttons
-    assert button_row.margin_top == 20
-    assert [child.size_request for child in button_row.children] == [
-        (140, -1), (140, -1), (140, -1)
-    ]
+    assert button_row.margin_top == 12
+    assert all("warning-btn" in child.classes for child in button_row.children)
+    assert "suggested-action" in button_row.children[2].classes
+    # A click outside the card runs the confirmation's Cancel action.
+    scrim_gesture = value._feedback_scrim.controllers[0]
+    scrim_gesture.pressed()
+    assert cancelled == [True]
     value._show_message("Complete", "Done")
     assert not button_row.homogeneous
     assert len(button_row.children) == 1
     assert button_row.children[0].text == "OK"
-    assert button_row.children[0].size_request == (140, -1)
+    # A result message is never dismissed by a click outside the card.
+    assert value._feedback_dismiss is None
+    scrim_gesture.pressed()
+    assert value._feedback_revealer.visible
     value._show_feedback(
         "Cancel pending learning import?",
         "Body",
@@ -305,9 +328,7 @@ def test_warning_overlay_is_attached_and_revealed_on_main_owner(tmp_path, monkey
         error=True,
     )
     assert button_row.homogeneous
-    assert [child.size_request for child in button_row.children] == [
-        (160, -1), (160, -1)
-    ]
+    assert value._feedback_dismiss[0] == "Keep Pending Import"
 
 
 def test_real_warning_overlay_is_visible_above_window_when_display_available():
