@@ -3,16 +3,20 @@
   "items": [
     {
       "type": "info",
-      "message": "Welcome to the DZLL news ticker rev 1! This is where you will find all the latest goss and updates"
+      "message": "Welcome to the DZLL 0.5.0 Beta. I hope you like the new changes. This news ticker will keep you updated when a new release drops and any other DZLL related news if left enabled. Clicking dismiss only dismisses this announcement and you will continue to recieve future announcements. You can turn off DZLL NEWS permanently in the setting menu"
     },
     {
       "type": "warning",
-      "message": "This is a test warning announcement. If there are any serious issues you need to know about you will find it here"
+      "message": "This is a warning announcement. If there are any serious issues you need to know about you will find them here"
     },
     {
       "type": "info",
-      "message": "Visit GitHub for DZLL releases. Thanks for using DZLL and thanks for all your support",
-      "url": "https://github.com/Berry-Dingle/DayZ-Linux-Launcher/releases"
+      "message": "Thank you for using DZLL. If you would like to support the project you can by making a donation, just ",
+      "url": "https://buymeacoffee.com/berry.dingle"
+    },
+    {
+      "type": "info",
+      "message": "Did you know? 99% of all Dayz servers have fake queues and that amoung these fake servers they claim over 13,250,466 players are online"
     }
   ]
 }
