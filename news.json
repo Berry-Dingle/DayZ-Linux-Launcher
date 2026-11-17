@@ -3,7 +3,7 @@
   "items": [
     {
       "type": "info",
-      "message": "Welcome to the DZLL 0.5.0 Beta. I hope you like the new changes. This news ticker will keep you updated when a new release drops and any other DZLL related news if left enabled. Clicking dismiss only dismisses this announcement and you will continue to recieve future announcements. You can turn off DZLL NEWS permanently in the setting menu"
+      "message": "Welcome to the DZLL 0.5.0 Beta. I hope you like the new changes. This news ticker will keep you updated when a new release drops and any other DZLL related news if left enabled. Clicking dismiss only dismisses this announcement and you will continue to recieve future announcements. You can turn off DZLL NEWS permanently in the settings menu"
     },
     {
       "type": "warning",
