@@ -171,16 +171,31 @@ def test_window_resize_reallocates_the_marquee(app_css):
 
 def test_each_announcement_starts_with_a_bullet_and_keeps_warning_colour():
     assert ntu.announcement_display(ITEMS[0]) == ("● Welcome to the DZLL news ticker!", None)
+    # Warnings use the triangle as their bullet: no ● in front of it.
     assert ntu.announcement_display(ITEMS[1]) == (
-        "● " + ntu.NEWS_WARNING_PREFIX + "This is a test warning announcement.",
+        ntu.NEWS_WARNING_PREFIX + "This is a test warning announcement.",
         ntu._WARNING_RGB,
     )
     marquee = ntu.NewsMarquee()
     marquee.set_items(ITEMS)
     lines = marquee.text.split("\n")
     assert lines == [ntu.announcement_entry(i)[0] for i in ITEMS]
-    assert all(line.startswith(ntu.NEWS_ITEM_BULLET) for line in lines)
-    assert all(line.count("●") == 1 for line in lines)  # no separators between items
+    for item, line in zip(ITEMS, lines):
+        if item.type == "warning":
+            assert line.startswith(ntu.NEWS_WARNING_PREFIX) and "●" not in line
+        else:
+            assert line.startswith(ntu.NEWS_ITEM_BULLET) and line.count("●") == 1
+    assert sum(line.count("●") for line in lines) == 2  # no separators between items
+
+
+def test_warning_items_get_no_bullet_styling():
+    marquee = ntu.NewsMarquee()
+    marquee.set_items((NewsItem("warning", "Careful"), NewsItem("warning", "Careful", URL)))
+    marquee._ensure_layouts()
+    for text, layout in zip(marquee.text.split("\n"), marquee._layouts):
+        assert text.startswith(ntu.NEWS_WARNING_PREFIX)
+        kinds = {a.klass.type for a in layout.get_attributes().get_attributes()}
+        assert not kinds & {Pango.AttrType.SCALE, Pango.AttrType.RISE, Pango.AttrType.LETTER_SPACING}
 
 
 def test_gap_is_half_the_scrolling_viewport():
@@ -546,7 +561,9 @@ def test_bullet_is_scaled_between_the_small_and_large_glyphs(app_css):
     root.append(marquee)
     marquee.set_items(ITEMS)
     marquee._ensure_layouts()
-    for layout in marquee._layouts:
+    bulleted = [l for i, l in zip(ITEMS, marquee._layouts) if i.type != "warning"]
+    assert bulleted
+    for layout in bulleted:
         scales = [
             a for a in layout.get_attributes().get_attributes()
             if a.klass.type == Pango.AttrType.SCALE

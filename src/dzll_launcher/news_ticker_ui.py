@@ -5,7 +5,7 @@
 #   [icon] DZLL NEWS | scrolling announcements ...   Dismiss | Updating Visible Rows •
 #
 # Announcements scroll right to left one after another, each starting with
-# a bullet. The next announcement enters at the right edge of the scrolling
+# a bullet (warnings start with their ⚠ instead, which acts as the bullet). The next announcement enters at the right edge of the scrolling
 # viewport when the trailing edge of the previous one reaches the viewport's
 # midpoint, so consecutive announcements are always half a viewport apart,
 # including when the bulletin loops from the last back to the first.
@@ -104,7 +104,8 @@ def _attr_fg(rgb, start, end):
 def announcement_display(item):
     """Return (text, rgb or None) for one bulletin item."""
     if getattr(item, "type", "info") == "warning":
-        return NEWS_ITEM_BULLET + NEWS_WARNING_PREFIX + item.message, _WARNING_RGB
+        # The warning triangle is the bullet for warning items.
+        return NEWS_WARNING_PREFIX + item.message, _WARNING_RGB
     return NEWS_ITEM_BULLET + item.message, None
 
 
