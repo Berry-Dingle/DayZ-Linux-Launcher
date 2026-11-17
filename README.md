@@ -12,7 +12,7 @@ Join the DZLL Discord for help, feedback, testing, and community discussion: htt
 
 ## 📦 Requirements
 
-- 64-bit x86_64 Linux (Fedora, Ubuntu/Debian, or Arch Linux packages are provided; other distributions may use the source install below)
+- 64-bit x86_64 Linux (packages are provided for Fedora 44 and 45, Ubuntu 24.04 and 26.04, Debian 13, and Arch Linux; other distributions may use the source install below)
 - Python 3.10 or newer
 - Native Steam (with DayZ installed)
 - Flatpak Steam is unsupported — use native Steam
@@ -24,8 +24,9 @@ Join the DZLL Discord for help, feedback, testing, and community discussion: htt
 
 ## 🚀 Install DZLL
 
-Prebuilt beta packages are provided in the GitHub release for Fedora x86_64
-(RPM), Ubuntu/Debian amd64 (DEB), and Arch Linux x86_64. Verify downloads with
+Prebuilt beta packages are provided in the GitHub release for Fedora 44 and 45
+x86_64 (RPM), Ubuntu 24.04 LTS, Ubuntu 26.04 LTS and Debian 13 amd64 (one DEB;
+Debian 12 is not supported), and Arch Linux x86_64. Verify downloads with
 `SHA256SUMS` before installing. The Fedora source RPM is for rebuilding the
 Fedora package. Distribution package installation is preferred where available;
 the source installation steps below are for users installing from a source
@@ -79,7 +80,7 @@ cd ~/DayZLinuxLauncher
 # Replace with the downloaded tagged source archive path
 tar -xzf ~/Downloads/dzll-tagged-source.tar.gz
 
-cd DayZ-Linux-Launcher-0.4.2-beta
+cd DayZ-Linux-Launcher-0.5.0-beta
 ```
 
 ---

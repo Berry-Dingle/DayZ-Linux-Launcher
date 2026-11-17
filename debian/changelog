@@ -1,3 +1,17 @@
+dzll-launcher (0.5.0~b0-1) noble; urgency=medium
+
+  * Refresh the rows actually visible in the server browser after scrolling.
+  * Add a server browser status bar with a news ticker.
+  * Server Companion: verify restart cycles, follow time changes, and allow
+    learning data to be deleted.
+  * Move Server Companion persistence and learning rebuilds off the GTK
+    thread.
+  * Build one package for Ubuntu 24.04, Ubuntu 26.04 and Debian 13: stop
+    dh_python3 treating libsteam_api.so as a CPython extension, declare
+    python3 (>= 3.12) and GTK 4.14, and depend on librsvg2-common.
+
+ -- Berry Dingle <dzll-launcher@tutamail.com>  Tue, 17 Nov 2026 00:00:00 +0000
+
 dzll-launcher (0.4.2~b0-1) noble; urgency=medium
 
   * Vendor Steamworks SDK 1.65 for native Steam UGC on amd64.

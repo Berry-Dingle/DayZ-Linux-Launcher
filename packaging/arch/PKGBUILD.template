@@ -1,7 +1,7 @@
 # Release-side template. After tagging, pin the measured GitHub tag archive SHA-256.
 # Keep the finalized PKGBUILD outside the tagged source tree to avoid a self-referential checksum.
 pkgname=dzll-launcher
-pkgver=0.4.2
+pkgver=0.5.0
 pkgrel=1
 pkgdesc="Native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation"
 arch=('x86_64')
@@ -28,16 +28,16 @@ optdepends=(
 )
 # Native Steam is a runtime prerequisite, not a package dependency.
 # Flatpak Steam is unsupported.
-source=("$url/archive/refs/tags/v0.4.2-beta.tar.gz")
-sha256sums=('REPLACE_WITH_V0_4_2_BETA_TAG_ARCHIVE_SHA256')
+source=("$url/archive/refs/tags/v0.5.0-beta.tar.gz")
+sha256sums=('REPLACE_WITH_V0_5_0_BETA_TAG_ARCHIVE_SHA256')
 
 build() {
-  cd "DayZ-Linux-Launcher-0.4.2-beta"
+  cd "DayZ-Linux-Launcher-0.5.0-beta"
   python -m build --wheel --no-isolation
 }
 
 package() {
-  cd "DayZ-Linux-Launcher-0.4.2-beta"
+  cd "DayZ-Linux-Launcher-0.5.0-beta"
 
   python -m installer --destdir="$pkgdir" dist/*.whl
 

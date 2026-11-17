@@ -11,8 +11,11 @@ override_dh_auto_install:
 		src/dzll_launcher/native/linux_x86_64/libsteam_api.so \
 		debian/dzll-launcher/usr/lib/python3/dist-packages/dzll_launcher/native/linux_x86_64/libsteam_api.so
 
+# libsteam_api.so is a ctypes-loaded native library, not a CPython extension.
+# Without --no-ext-rename, dh_python3 renames it with the build interpreter's
+# ABI tag and pins python3 to that minor version (for example << 3.13).
 override_dh_python3:
-	dh_python3
+	dh_python3 --no-ext-rename
 	find debian/dzll-launcher/usr/lib/python3/dist-packages/dzll_launcher/native/linux_x86_64 \
 		-maxdepth 1 -name 'libsteam_api.cpython-*.so' -delete
 

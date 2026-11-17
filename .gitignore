@@ -136,3 +136,6 @@ htmlcov/
 /.agents/
 /.aws/
 /.codex/
+
+# Local release preparation (never commit)
+/.release-staging/

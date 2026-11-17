@@ -1,11 +1,11 @@
 Name:           dzll_launcher
-Version:        0.4.2
+Version:        0.5.0
 Release:        0.beta%{?dist}
 Summary:        DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod preparation
 
 License:        LicenseRef-DZLL-Community-Source-1.0 AND LicenseRef-Valve-Steamworks-SDK-Access-Agreement
 URL:            https://dzllauncher.uk/
-Source0:        %{name}-0.4.2b0.tar.gz
+Source0:        %{name}-0.5.0b0.tar.gz
 
 BuildArch:      x86_64
 ExclusiveArch:  x86_64
@@ -28,6 +28,10 @@ Requires:       gtk4
 Requires:       gdk-pixbuf2
 Requires:       graphene
 # END AUTO-DEPS
+# Fedora 45 builds require GTK 4.24 or newer; Fedora 44 keeps its GTK 4.22 series.
+%if 0%{?fedora} >= 45
+Requires:       gtk4 >= 4.24
+%endif
 
 %description
 DZLL is a native Linux launcher for DayZ with Steam Client Workshop/UGC mod
@@ -35,7 +39,7 @@ preparation. Native Steam is required;
 Flatpak Steam is unsupported.
 
 %prep
-%autosetup -n %{name}-0.4.2b0
+%autosetup -n %{name}-0.5.0b0
 
 %build
 %pyproject_wheel
@@ -65,6 +69,12 @@ install -Dm644 src/dzll_launcher/native/linux_x86_64/NOTICE %{buildroot}%{_licen
 PYTHONPATH=%{buildroot}%{python3_sitelib} %{python3} -c "import dzll_launcher"
 
 %changelog
+* Tue Nov 17 2026 Berry Dingle <dzll-launcher@tutamail.com> - 0.5.0-0.beta
+- Refresh the rows actually visible in the server browser; add a status bar and news ticker
+- Server Companion: verified restart cycles, time-change handling, learning data deletion
+- Move Server Companion persistence and learning rebuilds off the GTK thread
+- Require GTK 4.24 or newer on Fedora 45
+
 * Wed Oct 14 2026 Gareth Brown - 0.4.2-0.beta
 - Vendor Steamworks SDK 1.65 for native Steam UGC on x86-64
 - Improve Steam UGC startup diagnostics and inventory ABI handling

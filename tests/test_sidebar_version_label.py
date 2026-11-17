@@ -75,8 +75,8 @@ def test_default_label_reads_config_app_version():
 
 
 def test_current_release_label():
-    assert config.APP_VERSION == "v0.4.2-beta"
-    assert sidebar_ui.format_sidebar_version_text() == "DZLL - v0.4.2 Beta"
+    assert config.APP_VERSION == "v0.5.0-beta"
+    assert sidebar_ui.format_sidebar_version_text() == "DZLL - v0.5.0 Beta"
 
 
 def test_label_follows_a_version_bump(monkeypatch):
@@ -121,7 +121,7 @@ def test_version_label_is_centred_beneath_disclaimer(gtk_display):
     frame = sidebar_ui.build_sidebar(host, include_toolbar=False)
 
     label = host.sidebar_version_label
-    assert label.get_text() == "DZLL - v0.4.2 Beta"
+    assert label.get_text() == "DZLL - v0.5.0 Beta"
     assert label.get_halign() == Gtk.Align.CENTER
     assert label.get_xalign() == pytest.approx(0.5)
     assert label.has_css_class("sidebar-version")
