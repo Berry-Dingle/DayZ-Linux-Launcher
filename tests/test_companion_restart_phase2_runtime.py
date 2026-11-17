@@ -2,6 +2,7 @@ import ast
 import hashlib
 import inspect
 import json
+import re
 import textwrap
 from dataclasses import replace
 from pathlib import Path
@@ -1287,7 +1288,10 @@ def test_no_reset_means_no_notice_and_shutdown_prevents_late_notice():
 def test_dormant_layers_do_not_resolve_real_config_paths():
     root = Path(__file__).resolve().parents[1]
     source = (root / "src/dzll_launcher/companion_restart_phase2_runtime.py").read_text()
-    assert "/home/gbrown" not in source
+    # No hard-coded user home directory (any account, Linux or macOS layout),
+    # and no runtime resolution of the real home directory.
+    assert re.search(r"/(?:home|var/home|Users)/[^/\s'\"]+", source) is None
+    assert "expanduser(" not in source and "Path.home(" not in source
     assert "Gtk" not in source and "GLib" not in source
 
 
